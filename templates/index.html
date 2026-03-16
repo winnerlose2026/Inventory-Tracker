@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventory Tracker</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #222635;
+    --border: #2e3350;
+    --accent: #4f8ef7;
+    --accent2: #7c3aed;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --radius: 10px;
+  }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; min-height: 100vh; }
+
+  /* Layout */
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 24px 0; display: flex; flex-direction: column; }
+  .sidebar-logo { padding: 0 20px 24px; font-size: 18px; font-weight: 700; color: var(--accent); border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .sidebar-logo span { color: var(--muted); font-size: 12px; font-weight: 400; display: block; margin-top: 2px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 20px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; }
+  .nav-item:hover { color: var(--text); background: var(--surface2); }
+  .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent); }
+  .nav-icon { font-size: 16px; width: 20px; text-align: center; }
+  .main { padding: 28px 32px; overflow-y: auto; }
+  .page { display: none; }
+  .page.active { display: block; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; }
+
+  /* Cards */
+  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+  .stat-value { font-size: 28px; font-weight: 700; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.blue { color: var(--accent); }
+
+  /* Tables */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: 24px; }
+  .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .card-title { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; }
+  th { padding: 10px 16px; text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border); background: var(--surface2); }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); }
+
+  /* Stock bar */
+  .bar-wrap { background: var(--border); border-radius: 4px; height: 6px; width: 100px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width .4s; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-green { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge-yellow { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .badge-red { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge-blue { background: rgba(79,142,247,.15); color: var(--accent); }
+  .badge-purple { background: rgba(124,58,237,.15); color: #a78bfa; }
+
+  /* Buttons */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 7px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; transition: all .15s; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #3a7ce0; }
+  .btn-success { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid rgba(34,197,94,.3); }
+  .btn-success:hover { background: rgba(34,197,94,.25); }
+  .btn-warning { background: rgba(245,158,11,.15); color: var(--yellow); border: 1px solid rgba(245,158,11,.3); }
+  .btn-warning:hover { background: rgba(245,158,11,.25); }
+  .btn-danger { background: rgba(239,68,68,.1); color: var(--red); border: 1px solid rgba(239,68,68,.25); }
+  .btn-danger:hover { background: rgba(239,68,68,.2); }
+  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .btn-ghost:hover { color: var(--text); border-color: var(--muted); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-group { display: flex; gap: 8px; }
+
+  /* Forms / Modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; width: 480px; max-height: 90vh; overflow-y: auto; }
+  .modal h2 { font-size: 17px; margin-bottom: 20px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group.full { grid-column: 1 / -1; }
+  label { font-size: 12px; color: var(--muted); font-weight: 500; }
+  input, select, textarea { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 8px 12px; font-size: 13px; width: 100%; outline: none; transition: border-color .15s; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 60px; }
+  .form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+
+  /* Toast */
+  #toast { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
+  .toast-msg { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 18px; font-size: 13px; max-width: 320px; animation: slideIn .2s ease; }
+  .toast-msg.success { border-left: 3px solid var(--green); }
+  .toast-msg.error { border-left: 3px solid var(--red); }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Report charts */
+  .report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .chart-bar-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .chart-bar-label { width: 140px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chart-bar-track { flex: 1; background: var(--border); border-radius: 4px; height: 8px; overflow: hidden; }
+  .chart-bar-fill { height: 100%; border-radius: 4px; }
+  .chart-bar-val { width: 60px; text-align: right; font-size: 12px; color: var(--muted); }
+
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+
+  /* SKU column */
+  .sku { font-family: monospace; font-size: 12px; color: var(--muted); }
+
+  /* History type pill */
+  .type-use { color: var(--red); }
+  .type-restock { color: var(--green); }
+
+  .actions-col { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      📦 Inventory
+      <span>Tracker v2</span>
+    </div>
+    <nav>
+      <div class="nav-item active" onclick="showPage('dashboard')">
+        <span class="nav-icon">📊</span> Dashboard
+      </div>
+      <div class="nav-item" onclick="showPage('inventory')">
+        <span class="nav-icon">🗂️</span> Inventory
+      </div>
+      <div class="nav-item" onclick="showPage('usage')">
+        <span class="nav-icon">📋</span> Usage Log
+      </div>
+      <div class="nav-item" onclick="showPage('report')">
+        <span class="nav-icon">📈</span> Report
+      </div>
+    </nav>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Dashboard -->
+    <div class="page active" id="page-dashboard">
+      <h1>Dashboard</h1>
+      <p class="subtitle">Overview of your 12 SKUs</p>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-label">Total SKUs</div>
+          <div class="stat-value blue" id="stat-skus">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Inventory Value</div>
+          <div class="stat-value green" id="stat-value">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Low Stock</div>
+          <div class="stat-value yellow" id="stat-low">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Usage Events</div>
+          <div class="stat-value blue" id="stat-events">—</div>
+        </div>
+      </div>
+
+      <!-- Low stock warnings -->
+      <div class="card" id="low-stock-card" style="display:none">
+        <div class="card-header">
+          <span class="card-title">⚠️ Low Stock Alerts</span>
+        </div>
+        <table>
+          <thead><tr><th>SKU</th><th>Name</th><th>Category</th><th>Qty</th><th>Threshold</th><th>Unit</th><th></th></tr></thead>
+          <tbody id="low-stock-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Recent activity -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Recent Activity</span>
+        </div>
+        <table>
+          <thead><tr><th>Time</th><th>Item</th><th>Type</th><th>Amount</th><th>Note</th></tr></thead>
+          <tbody id="recent-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Inventory -->
+    <div class="page" id="page-inventory">
+      <h1>Inventory</h1>
+      <p class="subtitle">Manage all SKUs</p>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">All Items</span>
+          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>SKU / Name</th>
+              <th>Category</th>
+              <th>Qty</th>
+              <th>Stock</th>
+              <th>Price</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="inv-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Usage Log -->
+    <div class="page" id="page-usage">
+      <h1>Usage Log</h1>
+      <p class="subtitle">All usage and restock events</p>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">History</span>
+          <div style="display:flex;gap:10px;align-items:center">
+            <select id="filter-item" onchange="loadUsage()" style="width:180px">
+              <option value="">All items</option>
+            </select>
+            <select id="filter-limit" onchange="loadUsage()" style="width:100px">
+              <option value="50">Last 50</option>
+              <option value="100">Last 100</option>
+              <option value="500">Last 500</option>
+            </select>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Timestamp</th><th>Item</th><th>Type</th><th>Amount</th><th>Unit</th><th>Note</th></tr>
+          </thead>
+          <tbody id="usage-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Report -->
+    <div class="page" id="page-report">
+      <h1>Report</h1>
+      <p class="subtitle">Consumption and restock analysis</p>
+      <div class="report-grid">
+        <div class="card">
+          <div class="card-header"><span class="card-title">🔥 Top Consumed</span></div>
+          <div style="padding:16px 20px" id="chart-consumed"></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">📥 Top Restocked</span></div>
+          <div style="padding:16px 20px" id="chart-restocked"></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Add/Edit Item Modal -->
+<div class="modal-overlay" id="item-modal">
+  <div class="modal">
+    <h2 id="modal-title">Add Item</h2>
+    <div class="form-grid">
+      <div class="form-group full">
+        <label>Item Name *</label>
+        <input id="f-name" type="text" placeholder="e.g. Coffee Beans">
+      </div>
+      <div class="form-group">
+        <label>Quantity *</label>
+        <input id="f-qty" type="number" step="any" min="0" placeholder="0">
+      </div>
+      <div class="form-group">
+        <label>Unit *</label>
+        <input id="f-unit" type="text" placeholder="e.g. kg, pcs, liters">
+      </div>
+      <div class="form-group">
+        <label>Category</label>
+        <input id="f-cat" type="text" placeholder="general">
+      </div>
+      <div class="form-group">
+        <label>Price per unit ($)</label>
+        <input id="f-price" type="number" step="any" min="0" placeholder="0.00">
+      </div>
+      <div class="form-group full">
+        <label>Low Stock Threshold</label>
+        <input id="f-threshold" type="number" step="any" min="0" placeholder="5">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-ghost" onclick="closeModal('item-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="submitItem()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Use / Restock Modal -->
+<div class="modal-overlay" id="txn-modal">
+  <div class="modal">
+    <h2 id="txn-title">Record Usage</h2>
+    <div class="form-grid">
+      <div class="form-group full">
+        <label>Item</label>
+        <input id="txn-name" type="text" readonly style="opacity:.6">
+      </div>
+      <div class="form-group full">
+        <label>Amount *</label>
+        <input id="txn-amount" type="number" step="any" min="0.01" placeholder="0">
+      </div>
+      <div class="form-group full">
+        <label>Note</label>
+        <textarea id="txn-note" placeholder="Optional note…"></textarea>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-ghost" onclick="closeModal('txn-modal')">Cancel</button>
+      <button class="btn btn-primary" id="txn-submit" onclick="submitTxn()">Submit</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toast"></div>
+
+<script>
+// -------------------------------------------------------------------------
+// State
+// -------------------------------------------------------------------------
+let currentPage = 'dashboard';
+let editingName = null;   // null = add mode, string = edit mode
+let txnType = 'use';      // 'use' | 'restock'
+let txnItemName = '';
+
+// -------------------------------------------------------------------------
+// Navigation
+// -------------------------------------------------------------------------
+function showPage(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  event.currentTarget.classList.add('active');
+  currentPage = page;
+  refresh(page);
+}
+
+function refresh(page) {
+  if (page === 'dashboard') loadDashboard();
+  else if (page === 'inventory') loadInventory();
+  else if (page === 'usage') loadUsage();
+  else if (page === 'report') loadReport();
+}
+
+// -------------------------------------------------------------------------
+// Toast
+// -------------------------------------------------------------------------
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = `toast-msg ${type}`;
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// -------------------------------------------------------------------------
+// API helpers
+// -------------------------------------------------------------------------
+async function api(url, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  return r.json();
+}
+
+// -------------------------------------------------------------------------
+// Dashboard
+// -------------------------------------------------------------------------
+async function loadDashboard() {
+  const [inv, report, usage] = await Promise.all([
+    api('/api/inventory'),
+    api('/api/report'),
+    api('/api/usage?limit=10'),
+  ]);
+
+  document.getElementById('stat-skus').textContent = report.total_items;
+  document.getElementById('stat-value').textContent = '$' + report.total_value.toFixed(2);
+  document.getElementById('stat-low').textContent = report.low_stock_count;
+  document.getElementById('stat-events').textContent = report.total_usage_events;
+
+  // Low stock
+  const lowCard = document.getElementById('low-stock-card');
+  const lowTbody = document.getElementById('low-stock-tbody');
+  if (report.low_stock.length > 0) {
+    lowCard.style.display = '';
+    lowTbody.innerHTML = report.low_stock.map(i => `
+      <tr>
+        <td class="sku">${escHtml(i.name.toUpperCase().replace(/\s+/g,'').slice(0,8))}</td>
+        <td>${escHtml(i.name)}</td>
+        <td><span class="badge badge-purple">${escHtml(i.category)}</span></td>
+        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(2)}</td>
+        <td>${i.low_stock_threshold}</td>
+        <td>${escHtml(i.unit)}</td>
+        <td><button class="btn btn-warning btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button></td>
+      </tr>`).join('');
+  } else {
+    lowCard.style.display = 'none';
+  }
+
+  // Recent activity
+  const tbody = document.getElementById('recent-tbody');
+  if (usage.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No activity yet.</td></tr>';
+  } else {
+    tbody.innerHTML = usage.map(e => {
+      const ts = e.timestamp.replace('T',' ').slice(0,19);
+      const isRestock = e.amount < 0;
+      return `<tr>
+        <td style="color:var(--muted);font-size:12px">${ts}</td>
+        <td>${escHtml(e.item_name)}</td>
+        <td><span class="badge ${isRestock ? 'badge-green' : 'badge-red'}">${isRestock ? '▲ Restock' : '▼ Use'}</span></td>
+        <td class="${isRestock ? 'type-restock' : 'type-use'}" style="font-weight:600">${isRestock ? '+' : '-'}${Math.abs(e.amount).toFixed(2)} ${escHtml(e.unit)}</td>
+        <td style="color:var(--muted)">${escHtml(e.note || '')}</td>
+      </tr>`;
+    }).join('');
+  }
+}
+
+// -------------------------------------------------------------------------
+// Inventory
+// -------------------------------------------------------------------------
+async function loadInventory() {
+  const items = await api('/api/inventory');
+  const tbody = document.getElementById('inv-tbody');
+  if (items.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No items yet. Click "Add Item" to get started.</td></tr>';
+    return;
+  }
+  const maxQty = Math.max(...items.map(i => i.quantity), 1);
+  tbody.innerHTML = items.map(item => {
+    const pct = Math.min(100, Math.round(item.quantity / maxQty * 100));
+    const ratio = item.low_stock_threshold > 0 ? item.quantity / item.low_stock_threshold : 2;
+    const barColor = ratio < 1 ? 'var(--red)' : ratio < 1.5 ? 'var(--yellow)' : 'var(--green)';
+    const status = item.quantity <= item.low_stock_threshold
+      ? '<span class="badge badge-red">Low Stock</span>'
+      : item.quantity <= item.low_stock_threshold * 1.5
+        ? '<span class="badge badge-yellow">Watch</span>'
+        : '<span class="badge badge-green">OK</span>';
+    const sku = item.name.toUpperCase().replace(/\s+/g,'').slice(0,8);
+    return `<tr>
+      <td>
+        <div style="font-weight:600">${escHtml(item.name)}</div>
+        <div class="sku">${sku}</div>
+      </td>
+      <td><span class="badge badge-purple">${escHtml(item.category)}</span></td>
+      <td style="font-weight:600">${item.quantity.toFixed(2)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
+      <td>
+        <div class="bar-wrap" style="width:90px">
+          <div class="bar-fill" style="width:${pct}%;background:${barColor}"></div>
+        </div>
+      </td>
+      <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${status}</td>
+      <td class="actions-col">
+        <div class="btn-group">
+          <button class="btn btn-danger btn-sm" onclick="openUseModal('${escAttr(item.name)}')">Use</button>
+          <button class="btn btn-success btn-sm" onclick="openRestockModal('${escAttr(item.name)}')">Restock</button>
+          <button class="btn btn-ghost btn-sm" onclick="openEditModal(${JSON.stringify(item)})">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteItem('${escAttr(item.name)}')">✕</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// -------------------------------------------------------------------------
+// Usage Log
+// -------------------------------------------------------------------------
+async function loadUsage() {
+  // Populate filter dropdown
+  const inv = await api('/api/inventory');
+  const sel = document.getElementById('filter-item');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All items</option>' +
+    inv.map(i => `<option value="${escAttr(i.name)}" ${i.name === current ? 'selected' : ''}>${escHtml(i.name)}</option>`).join('');
+
+  const name = document.getElementById('filter-item').value;
+  const limit = document.getElementById('filter-limit').value;
+  const url = `/api/usage?limit=${limit}${name ? '&name=' + encodeURIComponent(name) : ''}`;
+  const usage = await api(url);
+  const tbody = document.getElementById('usage-tbody');
+  if (usage.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No records found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = usage.map(e => {
+    const ts = e.timestamp.replace('T',' ').slice(0,19);
+    const isRestock = e.amount < 0;
+    return `<tr>
+      <td style="color:var(--muted);font-size:12px;white-space:nowrap">${ts}</td>
+      <td>${escHtml(e.item_name)}</td>
+      <td><span class="badge ${isRestock ? 'badge-green' : 'badge-red'}">${isRestock ? '▲ Restock' : '▼ Use'}</span></td>
+      <td class="${isRestock ? 'type-restock' : 'type-use'}" style="font-weight:600">${isRestock ? '+' : '-'}${Math.abs(e.amount).toFixed(2)}</td>
+      <td>${escHtml(e.unit)}</td>
+      <td style="color:var(--muted)">${escHtml(e.note || '')}</td>
+    </tr>`;
+  }).join('');
+}
+
+// -------------------------------------------------------------------------
+// Report
+// -------------------------------------------------------------------------
+async function loadReport() {
+  const report = await api('/api/report');
+
+  function renderChart(containerId, data, color) {
+    const el = document.getElementById(containerId);
+    if (!data.length) { el.innerHTML = '<div class="empty">No data yet.</div>'; return; }
+    const max = data[0].total;
+    el.innerHTML = data.map(d => `
+      <div class="chart-bar-row">
+        <div class="chart-bar-label" title="${escHtml(d.name)}">${escHtml(d.name)}</div>
+        <div class="chart-bar-track">
+          <div class="chart-bar-fill" style="width:${Math.round(d.total/max*100)}%;background:${color}"></div>
+        </div>
+        <div class="chart-bar-val">${d.total.toFixed(1)} ${escHtml(d.unit)}</div>
+      </div>`).join('');
+  }
+
+  renderChart('chart-consumed', report.top_consumed, 'var(--red)');
+  renderChart('chart-restocked', report.top_restocked, 'var(--green)');
+}
+
+// -------------------------------------------------------------------------
+// Modals – Add / Edit item
+// -------------------------------------------------------------------------
+function openAddModal() {
+  editingName = null;
+  document.getElementById('modal-title').textContent = 'Add Item';
+  ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('f-name').removeAttribute('readonly');
+  document.getElementById('item-modal').classList.add('open');
+  document.getElementById('f-name').focus();
+}
+
+function openEditModal(item) {
+  editingName = item.name;
+  document.getElementById('modal-title').textContent = 'Edit Item';
+  document.getElementById('f-name').value = item.name;
+  document.getElementById('f-name').setAttribute('readonly', true);
+  document.getElementById('f-qty').value = item.quantity;
+  document.getElementById('f-unit').value = item.unit;
+  document.getElementById('f-cat').value = item.category;
+  document.getElementById('f-price').value = item.price || '';
+  document.getElementById('f-threshold').value = item.low_stock_threshold;
+  document.getElementById('item-modal').classList.add('open');
+}
+
+async function submitItem() {
+  const name = document.getElementById('f-name').value.trim();
+  const qty  = parseFloat(document.getElementById('f-qty').value);
+  const unit = document.getElementById('f-unit').value.trim();
+  const cat  = document.getElementById('f-cat').value.trim() || 'general';
+  const price = parseFloat(document.getElementById('f-price').value) || 0;
+  const threshold = parseFloat(document.getElementById('f-threshold').value) || 5;
+
+  if (!name || isNaN(qty) || !unit) {
+    toast('Name, quantity and unit are required.', 'error');
+    return;
+  }
+
+  if (editingName) {
+    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', {
+      quantity: qty, unit, category: cat, price, low_stock_threshold: threshold
+    });
+    toast(`Updated "${editingName}".`);
+  } else {
+    await api('/api/inventory', 'POST', {
+      name, quantity: qty, unit, category: cat, price, low_stock_threshold: threshold
+    });
+    toast(`Added "${name}".`);
+  }
+  closeModal('item-modal');
+  loadInventory();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Modals – Use / Restock
+// -------------------------------------------------------------------------
+function openUseModal(name) {
+  txnType = 'use';
+  txnItemName = name;
+  document.getElementById('txn-title').textContent = `Use: ${name}`;
+  document.getElementById('txn-submit').textContent = 'Record Usage';
+  document.getElementById('txn-submit').className = 'btn btn-danger';
+  document.getElementById('txn-name').value = name;
+  document.getElementById('txn-amount').value = '';
+  document.getElementById('txn-note').value = '';
+  document.getElementById('txn-modal').classList.add('open');
+  document.getElementById('txn-amount').focus();
+}
+
+function openRestockModal(name) {
+  txnType = 'restock';
+  txnItemName = name;
+  document.getElementById('txn-title').textContent = `Restock: ${name}`;
+  document.getElementById('txn-submit').textContent = 'Add Stock';
+  document.getElementById('txn-submit').className = 'btn btn-success';
+  document.getElementById('txn-name').value = name;
+  document.getElementById('txn-amount').value = '';
+  document.getElementById('txn-note').value = '';
+  document.getElementById('txn-modal').classList.add('open');
+  document.getElementById('txn-amount').focus();
+}
+
+async function submitTxn() {
+  const amount = parseFloat(document.getElementById('txn-amount').value);
+  const note = document.getElementById('txn-note').value.trim();
+  if (isNaN(amount) || amount <= 0) {
+    toast('Enter a valid amount.', 'error');
+    return;
+  }
+  const url = txnType === 'use' ? '/api/use' : '/api/restock';
+  await api(url, 'POST', { name: txnItemName, amount, note });
+  toast(`${txnType === 'use' ? 'Used' : 'Restocked'} ${amount} of "${txnItemName}".`);
+  closeModal('txn-modal');
+  if (currentPage === 'inventory') loadInventory();
+  else if (currentPage === 'usage') loadUsage();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Delete
+// -------------------------------------------------------------------------
+async function deleteItem(name) {
+  if (!confirm(`Delete "${name}" from inventory?`)) return;
+  await api(`/api/inventory/${encodeURIComponent(name)}`, 'DELETE');
+  toast(`Removed "${name}".`);
+  loadInventory();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Modal helpers
+// -------------------------------------------------------------------------
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+// Close on backdrop click
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.classList.remove('open');
+  });
+});
+// Close on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
+});
+// Submit on Enter in modal inputs
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+    const itemModal = document.getElementById('item-modal');
+    const txnModal = document.getElementById('txn-modal');
+    if (itemModal.classList.contains('open')) submitItem();
+    else if (txnModal.classList.contains('open')) submitTxn();
+  }
+});
+
+// -------------------------------------------------------------------------
+// Escape HTML helpers
+// -------------------------------------------------------------------------
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return String(s).replace(/'/g,"\\'").replace(/"/g,'&quot;');
+}
+
+// -------------------------------------------------------------------------
+// Boot
+// -------------------------------------------------------------------------
+loadDashboard();
+</script>
+</body>
+</html>
