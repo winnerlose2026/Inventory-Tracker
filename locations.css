@@ -1,0 +1,143 @@
+/* ==========================================================================
+   H&H Bagels — Locations Stylesheet
+   Organizes store locations grouped by U.S. state, with each location
+   listed separately beneath its state heading.
+   Based on https://www.hhbagels.com/contact#locations
+   ========================================================================== */
+
+/* ---------- Page / container ---------- */
+:root {
+    --hh-bg: #fdfaf3;
+    --hh-surface: #ffffff;
+    --hh-ink: #1a1a1a;
+    --hh-muted: #5c5c5c;
+    --hh-accent: #c8102e;       /* H&H red */
+    --hh-accent-dark: #8c0a20;
+    --hh-rule: #e6dfce;
+    --hh-radius: 10px;
+    --hh-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+    --hh-font-body: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --hh-font-display: "Georgia", "Times New Roman", serif;
+}
+
+body.locations-page {
+    margin: 0;
+    background: var(--hh-bg);
+    color: var(--hh-ink);
+    font-family: var(--hh-font-body);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+.locations {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 3rem 1.25rem 4rem;
+}
+
+.locations__title {
+    font-family: var(--hh-font-display);
+    font-size: clamp(2rem, 4vw, 3rem);
+    text-align: center;
+    margin: 0 0 0.5rem;
+    letter-spacing: 0.5px;
+}
+
+.locations__subtitle {
+    text-align: center;
+    color: var(--hh-muted);
+    margin: 0 0 2.5rem;
+    font-size: 1.05rem;
+}
+
+/* ---------- State group ---------- */
+.state-group {
+    margin-bottom: 3rem;
+}
+
+.state-group__name {
+    font-family: var(--hh-font-display);
+    font-size: 1.75rem;
+    color: var(--hh-accent);
+    margin: 0 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid var(--hh-accent);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+}
+
+.state-group__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1.25rem;
+}
+
+/* ---------- Individual location ---------- */
+.location {
+    background: var(--hh-surface);
+    border: 1px solid var(--hh-rule);
+    border-radius: var(--hh-radius);
+    box-shadow: var(--hh-shadow);
+    padding: 1.25rem 1.25rem 1.4rem;
+    transition: transform 0.15s ease, box-shadow 0.15s ease,
+        border-color 0.15s ease;
+}
+
+.location:hover {
+    transform: translateY(-2px);
+    border-color: var(--hh-accent);
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.09);
+}
+
+.location__name {
+    font-family: var(--hh-font-display);
+    font-size: 1.2rem;
+    margin: 0 0 0.5rem;
+    color: var(--hh-ink);
+}
+
+.location__address {
+    font-style: normal;
+    color: var(--hh-ink);
+    margin: 0 0 0.75rem;
+    font-size: 0.95rem;
+}
+
+.location__address > span {
+    display: block;
+}
+
+.location__phone,
+.location__hours {
+    display: block;
+    color: var(--hh-muted);
+    font-size: 0.9rem;
+    margin-top: 0.25rem;
+}
+
+.location__phone a {
+    color: var(--hh-accent-dark);
+    text-decoration: none;
+}
+
+.location__phone a:hover {
+    text-decoration: underline;
+}
+
+/* ---------- Responsive tweaks ---------- */
+@media (max-width: 600px) {
+    .locations {
+        padding: 2rem 1rem 3rem;
+    }
+
+    .state-group__name {
+        font-size: 1.4rem;
+    }
+
+    .state-group__list {
+        grid-template-columns: 1fr;
+    }
+}
