@@ -215,6 +215,19 @@ def api_distributors():
     return jsonify(summary)
 
 
+# ---------------------------------------------------------------------------
+# API – Sync (pull current on-hand from distributors)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    from sync_inventory import sync_all
+
+    dry_run = bool((request.json or {}).get("dry_run", False))
+    reports = sync_all(dry_run=dry_run)
+    return jsonify({"dry_run": dry_run, "reports": reports})
+
+
 @app.route("/api/export.xlsx")
 def api_export_xlsx():
     from openpyxl import Workbook

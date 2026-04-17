@@ -247,8 +247,13 @@
           <h1 style="margin-bottom:6px">Distributors</h1>
           <p class="subtitle" style="margin-bottom:0">Bagels grouped by Cheney Brothers &amp; US Foods</p>
         </div>
-        <a class="btn btn-primary" href="/api/export.xlsx" download>⬇ Export to Excel</a>
+        <div class="btn-group">
+          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
+          <button class="btn btn-success" onclick="runSync(false)">🔄 Sync Now</button>
+          <a class="btn btn-primary" href="/api/export.xlsx" download>⬇ Export to Excel</a>
+        </div>
       </div>
+      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
       <div id="distributors-container"></div>
     </div>
 
@@ -584,6 +589,69 @@ async function loadInventory() {
       </td>
     </tr>`;
   }).join('');
+}
+
+// -------------------------------------------------------------------------
+// Distributor sync
+// -------------------------------------------------------------------------
+async function runSync(dryRun) {
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing sync…' : 'Syncing from distributors…'}</div></div>`;
+  let result;
+  try {
+    result = await api('/api/sync', 'POST', { dry_run: dryRun });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Sync failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  box.innerHTML = renderSyncReport(result);
+  toast(dryRun ? 'Preview complete.' : 'Sync complete.');
+  if (!dryRun) loadDistributors();
+}
+
+function renderSyncReport(result) {
+  const heading = result.dry_run ? 'Sync Preview' : 'Sync Report';
+  const cards = result.reports.map(r => {
+    if (r.status === 'not_configured') {
+      return `<div class="card">
+        <div class="card-header">
+          <span class="card-title">${distributorBadge(r.distributor)} ${r.distributor}</span>
+          <span class="badge badge-yellow">Not configured</span>
+        </div>
+        <div style="padding:14px 20px;color:var(--muted);font-size:13px;white-space:pre-wrap">${escHtml(r.error || '')}</div>
+      </div>`;
+    }
+    const preview = r.changes.slice(0, 8).map(c => {
+      const sign = c.delta >= 0 ? '+' : '';
+      const color = c.delta >= 0 ? 'var(--green)' : 'var(--red)';
+      return `<tr>
+        <td>${escHtml(c.name)}</td>
+        <td style="color:var(--muted)">${escHtml(c.warehouse || '')}</td>
+        <td style="text-align:right">${c.old_quantity.toFixed(0)}</td>
+        <td style="text-align:right;font-weight:600">${c.new_quantity.toFixed(0)}</td>
+        <td style="text-align:right;color:${color}">${sign}${c.delta.toFixed(0)}</td>
+      </tr>`;
+    }).join('');
+    const moreNote = r.changes.length > 8
+      ? `<div style="padding:8px 20px;color:var(--muted);font-size:12px">…and ${r.changes.length - 8} more change(s).</div>` : '';
+    const unmatchedNote = r.unmatched.length
+      ? `<div style="padding:8px 20px;color:var(--yellow);font-size:12px">${r.unmatched.length} row(s) unmatched: ${escHtml(r.unmatched.slice(0, 5).join(', '))}${r.unmatched.length > 5 ? '…' : ''}</div>` : '';
+    return `<div class="card">
+      <div class="card-header">
+        <span class="card-title">${distributorBadge(r.distributor)} ${r.distributor}</span>
+        <span style="color:var(--muted);font-size:12px">
+          source: ${escHtml(r.source)} · fetched ${r.fetched} · updated ${r.updated} · unchanged ${r.unchanged}
+        </span>
+      </div>
+      ${r.changes.length ? `<table>
+        <thead><tr><th>SKU</th><th>Warehouse</th><th style="text-align:right">Was</th><th style="text-align:right">Now</th><th style="text-align:right">Δ</th></tr></thead>
+        <tbody>${preview}</tbody>
+      </table>` : '<div style="padding:16px 20px;color:var(--muted)">No changes.</div>'}
+      ${moreNote}${unmatchedNote}
+    </div>`;
+  }).join('');
+  return `<h2 style="font-size:16px;margin:0 0 12px 4px">${heading}${result.dry_run ? ' (dry run — nothing saved)' : ''}</h2>${cards}`;
 }
 
 // -------------------------------------------------------------------------
