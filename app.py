@@ -42,6 +42,7 @@ def api_add():
         low_stock_threshold=float(d.get("low_stock_threshold", 5)),
         price=float(d.get("price", 0)),
         distributor=d.get("distributor", ""),
+        warehouse=d.get("warehouse", ""),
     )
     return jsonify({"ok": True})
 
@@ -57,6 +58,7 @@ def api_update(name):
         low_stock_threshold=float(d["low_stock_threshold"]) if "low_stock_threshold" in d else None,
         price=float(d["price"]) if "price" in d else None,
         distributor=d.get("distributor"),
+        warehouse=d.get("warehouse"),
     )
     return jsonify({"ok": True})
 
@@ -145,6 +147,31 @@ def api_report():
 
 
 # ---------------------------------------------------------------------------
+# Warehouse catalogue (authoritative list used by UI + seeds)
+# ---------------------------------------------------------------------------
+
+WAREHOUSES = {
+    "Cheney Brothers": [
+        "Riviera Beach, FL",
+        "Ocala, FL",
+        "Punta Gorda, FL",
+    ],
+    "US Foods": [
+        "Manassas, VA",
+        "Zebulon, NC",
+        "La Mirada, CA",
+        "Chicago, IL",
+        "Alcoa, TN",
+    ],
+}
+
+
+@app.route("/api/warehouses")
+def api_warehouses():
+    return jsonify(WAREHOUSES)
+
+
+# ---------------------------------------------------------------------------
 # API – Distributors (unified view across Cheney Brothers and US Foods)
 # ---------------------------------------------------------------------------
 
@@ -161,13 +188,29 @@ def api_distributors():
         total_qty = sum(i["quantity"] for i in items)
         total_value = sum(i["quantity"] * i["price"] for i in items)
         low = [i for i in items if i["quantity"] <= i["low_stock_threshold"]]
+
+        # Sub-group by warehouse
+        wh_groups: dict[str, list] = {}
+        for i in items:
+            wh_groups.setdefault(i.get("warehouse") or "Unassigned", []).append(i)
+        warehouses = []
+        for wh_name, wh_items in sorted(wh_groups.items()):
+            warehouses.append({
+                "warehouse": wh_name,
+                "item_count": len(wh_items),
+                "total_quantity": round(sum(x["quantity"] for x in wh_items), 2),
+                "total_value": round(sum(x["quantity"] * x["price"] for x in wh_items), 2),
+                "low_stock_count": sum(1 for x in wh_items if x["quantity"] <= x["low_stock_threshold"]),
+                "items": sorted(wh_items, key=lambda x: x["name"]),
+            })
+
         summary.append({
             "distributor": dist,
             "item_count": len(items),
             "total_quantity": round(total_qty, 2),
             "total_value": round(total_value, 2),
             "low_stock_count": len(low),
-            "items": sorted(items, key=lambda x: x["name"]),
+            "warehouses": warehouses,
         })
     return jsonify(summary)
 
