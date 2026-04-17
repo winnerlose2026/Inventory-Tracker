@@ -40,6 +40,7 @@ def api_add():
         category=d.get("category", "general"),
         low_stock_threshold=float(d.get("low_stock_threshold", 5)),
         price=float(d.get("price", 0)),
+        distributor=d.get("distributor", ""),
     )
     return jsonify({"ok": True})
 
@@ -54,6 +55,7 @@ def api_update(name):
         category=d.get("category"),
         low_stock_threshold=float(d["low_stock_threshold"]) if "low_stock_threshold" in d else None,
         price=float(d["price"]) if "price" in d else None,
+        distributor=d.get("distributor"),
     )
     return jsonify({"ok": True})
 
@@ -139,6 +141,34 @@ def api_report():
         "top_restocked": top_restocked,
         "total_usage_events": len(usage),
     })
+
+
+# ---------------------------------------------------------------------------
+# API – Distributors (unified view across Cheney Brothers and US Foods)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/distributors")
+def api_distributors():
+    inv = load_inventory()
+    groups: dict[str, list] = {}
+    for item in inv.values():
+        dist = item.get("distributor") or "Unassigned"
+        groups.setdefault(dist, []).append(item)
+
+    summary = []
+    for dist, items in sorted(groups.items()):
+        total_qty = sum(i["quantity"] for i in items)
+        total_value = sum(i["quantity"] * i["price"] for i in items)
+        low = [i for i in items if i["quantity"] <= i["low_stock_threshold"]]
+        summary.append({
+            "distributor": dist,
+            "item_count": len(items),
+            "total_quantity": round(total_qty, 2),
+            "total_value": round(total_value, 2),
+            "low_stock_count": len(low),
+            "items": sorted(items, key=lambda x: x["name"]),
+        })
+    return jsonify(summary)
 
 
 if __name__ == "__main__":
