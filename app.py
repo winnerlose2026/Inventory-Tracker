@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Inventory Tracker - Flask Web GUI"""
 
-from flask import Flask, jsonify, request, render_template
+import io
+from flask import Flask, jsonify, request, render_template, send_file
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     add_item, update_item, record_usage, restock, remove_item,
@@ -169,6 +170,34 @@ def api_distributors():
             "items": sorted(items, key=lambda x: x["name"]),
         })
     return jsonify(summary)
+
+
+@app.route("/api/export.xlsx")
+def api_export_xlsx():
+    from openpyxl import Workbook
+    from export_bagels_xlsx import _write_summary_sheet, _write_items_sheet
+
+    inv = load_inventory()
+    items = list(inv.values())
+    cheney = [i for i in items if (i.get("distributor") or "") == "Cheney Brothers"]
+    usfoods = [i for i in items if (i.get("distributor") or "") == "US Foods"]
+
+    wb = Workbook()
+    _write_summary_sheet(wb.active, inv)
+    wb.active.title = "Summary"
+    _write_items_sheet(wb.create_sheet("Unified List"), items)
+    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
+    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="bagel_inventory.xlsx",
+    )
 
 
 if __name__ == "__main__":
