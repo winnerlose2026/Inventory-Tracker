@@ -19,6 +19,14 @@ house our bagels):
     - Chicago, IL
     - Alcoa, TN
 
+Case economics (set on every SKU so they sync through reports and exports):
+  - Cheney Brothers case cost:  $26.50
+  - US Foods case cost:         $27.00
+  - Case size:                  60 bagels (5 dozen) across both distributors
+
+Each SKU also carries a weekly_usage rate (bagels consumed per week) so the
+tracker can compute days-of-supply and drive reorder planning.
+
 11 varieties × 8 warehouses = 88 SKUs.
 
 Usage:
@@ -30,24 +38,26 @@ import sys
 from inventory_tracker import add_item, load_inventory, save_inventory
 
 
-# Variety -> (Cheney price, US Foods price, base qty, low-stock threshold)
+# Flat case cost per distributor. Both distributors ship 5 doz (60) per case.
+CASE_COST = {"Cheney Brothers": 26.50, "US Foods": 27.00}
+CASE_SIZE = 60
+
+# Variety -> (base weekly usage in bagels/wk, base qty per case, low-stock threshold in bagels)
 VARIETIES = [
-    ("Plain",                   0.55, 0.53, 144, 48),
-    ("Everything",              0.58, 0.56, 144, 48),
-    ("Sesame",                  0.57, 0.55,  72, 36),
-    ("Cinnamon Raisin",         0.62, 0.60,  72, 36),
-    ("Whole Wheat",             0.58, 0.56,  72, 36),
-    ("Whole Wheat Everything",  0.64, 0.62,  36, 24),
-    ("Blueberry",               0.63, 0.60,  72, 36),
-    ("Egg",                     0.57, 0.55,  72, 36),
-    ("Onion",                   0.57, 0.55,  72, 36),
-    ("Asiago",                  0.66, 0.64,  36, 24),
-    ("Jalapeno Cheddar",        0.68, 0.66,  36, 24),
+    ("Plain",                   120, 144, 48),
+    ("Everything",              100, 144, 48),
+    ("Sesame",                   40,  72, 36),
+    ("Cinnamon Raisin",          35,  72, 36),
+    ("Whole Wheat",              40,  72, 36),
+    ("Whole Wheat Everything",   20,  36, 24),
+    ("Blueberry",                35,  72, 36),
+    ("Egg",                      30,  72, 36),
+    ("Onion",                    30,  72, 36),
+    ("Asiago",                   20,  36, 24),
+    ("Jalapeno Cheddar",         20,  36, 24),
 ]
 
 # Distributor -> [(warehouse label, short tag, stock multiplier)]
-# Multipliers roughly reflect relative throughput so each warehouse has its
-# own on-hand count rather than identical numbers.
 WAREHOUSES = {
     "Cheney Brothers": [
         ("Riviera Beach, FL", "Riviera Beach", 1.0),
@@ -68,19 +78,23 @@ DISTRIBUTOR_TAG = {"Cheney Brothers": "CB", "US Foods": "USF"}
 
 def _build_bagels():
     bagels = []
-    for variety, cb_price, usf_price, base_qty, threshold in VARIETIES:
+    for variety, weekly, base_qty, threshold in VARIETIES:
         for distributor, warehouses in WAREHOUSES.items():
-            price = cb_price if distributor == "Cheney Brothers" else usf_price
+            case_cost = CASE_COST[distributor]
+            per_unit_price = round(case_cost / CASE_SIZE, 4)
             tag = DISTRIBUTOR_TAG[distributor]
             for warehouse_full, warehouse_short, mult in warehouses:
                 bagels.append({
                     "name": f"{variety} Bagel 4oz [{tag} - {warehouse_short}]",
                     "quantity": int(round(base_qty * mult)),
                     "unit": "each",
-                    "price": price,
+                    "price": per_unit_price,
                     "threshold": threshold,
                     "distributor": distributor,
                     "warehouse": warehouse_full,
+                    "case_cost": case_cost,
+                    "case_size": CASE_SIZE,
+                    "weekly_usage": round(weekly * mult, 1),
                 })
     return bagels
 
@@ -109,6 +123,9 @@ def seed(reset: bool = False):
             price=b["price"],
             distributor=b["distributor"],
             warehouse=b["warehouse"],
+            case_cost=b["case_cost"],
+            case_size=b["case_size"],
+            weekly_usage=b["weekly_usage"],
         )
         added += 1
 
@@ -117,9 +134,9 @@ def seed(reset: bool = False):
     print()
     print(f"  Seed complete: {added} added, {skipped} already present.")
     print(f"  Varieties: {len(VARIETIES)}")
-    print(f"  Warehouses: "
-          f"{len(WAREHOUSES['Cheney Brothers'])} Cheney + "
-          f"{len(WAREHOUSES['US Foods'])} US Foods")
+    print(f"  Case size: {CASE_SIZE} bagels (5 dozen)")
+    print(f"  Case cost: Cheney ${CASE_COST['Cheney Brothers']:.2f}  "
+          f"US Foods ${CASE_COST['US Foods']:.2f}")
     print(f"  Cheney Brothers SKUs: {cheney}")
     print(f"  US Foods SKUs:        {usf}")
     print(f"  Total SKUs:           {cheney + usf}")

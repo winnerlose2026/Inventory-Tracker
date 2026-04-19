@@ -93,7 +93,15 @@ def _sync_one(client: DistributorClient, inv: dict, usage: list,
         qty_changed = abs(new_qty - old_qty) > 1e-9
         price_changed = sync_item.price is not None and abs(new_price - old_price) > 1e-9
 
-        if not qty_changed and not price_changed:
+        case_cost_changed = (sync_item.case_cost is not None
+                             and abs(sync_item.case_cost - (item.get("case_cost") or 0)) > 1e-9)
+        case_size_changed = (sync_item.case_size is not None
+                             and sync_item.case_size != (item.get("case_size") or 0))
+        weekly_changed = (sync_item.weekly_usage is not None
+                          and abs(sync_item.weekly_usage - (item.get("weekly_usage") or 0)) > 1e-9)
+
+        if not (qty_changed or price_changed or case_cost_changed
+                or case_size_changed or weekly_changed):
             report["unchanged"] += 1
             continue
 
@@ -115,6 +123,12 @@ def _sync_one(client: DistributorClient, inv: dict, usage: list,
         item["quantity"] = new_qty
         if price_changed:
             item["price"] = new_price
+        if case_cost_changed:
+            item["case_cost"] = sync_item.case_cost
+        if case_size_changed:
+            item["case_size"] = sync_item.case_size
+        if weekly_changed:
+            item["weekly_usage"] = sync_item.weekly_usage
         item["updated"] = now
         item["last_synced"] = now
         item["last_synced_from"] = client.name

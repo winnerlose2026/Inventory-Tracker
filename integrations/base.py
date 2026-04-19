@@ -26,6 +26,9 @@ class SyncItem:
     unit: Optional[str] = None
     price: Optional[float] = None
     distributor_sku: Optional[str] = None  # informational
+    case_cost: Optional[float] = None
+    case_size: Optional[int] = None
+    weekly_usage: Optional[float] = None
 
 
 class DistributorClient:

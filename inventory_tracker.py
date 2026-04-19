@@ -53,7 +53,9 @@ def save_usage(usage: list):
 
 def add_item(name: str, quantity: float, unit: str, category: str = "general",
              low_stock_threshold: float = 5.0, price: float = 0.0,
-             distributor: str = "", warehouse: str = ""):
+             distributor: str = "", warehouse: str = "",
+             case_cost: float = 0.0, case_size: int = 0,
+             weekly_usage: float = 0.0):
     inv = load_inventory()
     key = name.lower().strip()
     if key in inv:
@@ -68,6 +70,9 @@ def add_item(name: str, quantity: float, unit: str, category: str = "general",
         "price": price,
         "distributor": distributor,
         "warehouse": warehouse,
+        "case_cost": case_cost,
+        "case_size": case_size,
+        "weekly_usage": weekly_usage,
         "added": datetime.now().isoformat(),
     }
     save_inventory(inv)
@@ -79,7 +84,10 @@ def update_item(name: str, quantity: Optional[float] = None,
                 low_stock_threshold: Optional[float] = None,
                 price: Optional[float] = None,
                 distributor: Optional[str] = None,
-                warehouse: Optional[str] = None):
+                warehouse: Optional[str] = None,
+                case_cost: Optional[float] = None,
+                case_size: Optional[int] = None,
+                weekly_usage: Optional[float] = None):
     inv = load_inventory()
     key = name.lower().strip()
     if key not in inv:
@@ -100,6 +108,12 @@ def update_item(name: str, quantity: Optional[float] = None,
         item["distributor"] = distributor
     if warehouse is not None:
         item["warehouse"] = warehouse
+    if case_cost is not None:
+        item["case_cost"] = case_cost
+    if case_size is not None:
+        item["case_size"] = case_size
+    if weekly_usage is not None:
+        item["weekly_usage"] = weekly_usage
     item["updated"] = datetime.now().isoformat()
     save_inventory(inv)
     print(f"  Updated '{name}'.")

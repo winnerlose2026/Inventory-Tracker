@@ -342,7 +342,19 @@
           <option value="">—</option>
         </select>
       </div>
-      <div class="form-group full">
+      <div class="form-group">
+        <label>Case Cost ($)</label>
+        <input id="f-case-cost" type="number" step="any" min="0" placeholder="0.00">
+      </div>
+      <div class="form-group">
+        <label>Case Size (units)</label>
+        <input id="f-case-size" type="number" step="1" min="0" placeholder="60">
+      </div>
+      <div class="form-group">
+        <label>Weekly Usage (units/wk)</label>
+        <input id="f-weekly" type="number" step="any" min="0" placeholder="0">
+      </div>
+      <div class="form-group">
         <label>Low Stock Threshold</label>
         <input id="f-threshold" type="number" step="any" min="0" placeholder="5">
       </div>
@@ -664,47 +676,76 @@ async function loadDistributors() {
     container.innerHTML = '<div class="empty">No inventory yet.</div>';
     return;
   }
-  container.innerHTML = groups.map(g => `
+  container.innerHTML = groups.map(g => {
+    // A distributor has one flat case cost across all its SKUs.
+    const costs = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_cost || 0)).filter(c => c > 0)
+    );
+    const caseCost = costs.size === 1 ? [...costs][0] : null;
+    const caseSizes = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_size || 0)).filter(c => c > 0)
+    );
+    const caseSize = caseSizes.size === 1 ? [...caseSizes][0] : null;
+    const weeklyTotal = g.warehouses.reduce(
+      (s, w) => s + w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0), 0);
+
+    return `
     <div class="card">
       <div class="card-header">
         <span class="card-title">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)} ${g.distributor}</span>
         <span style="color:var(--muted);font-size:12px">
           ${g.warehouses.length} warehouse(s) · ${g.item_count} SKU(s) · ${g.total_quantity.toFixed(0)} units · $${g.total_value.toFixed(2)}
+          ${caseCost !== null ? ` · case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
+          · ${weeklyTotal.toFixed(0)}/wk
           ${g.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
         </span>
       </div>
       <div style="padding:0 4px 8px">
-        ${g.warehouses.map(w => `
+        ${g.warehouses.map(w => {
+          const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
+          return `
           <div style="padding:14px 16px 4px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-              <div style="font-weight:600">📍 ${escHtml(w.warehouse)}</div>
+              <div style="font-weight:600">${escHtml(w.warehouse)}</div>
               <div style="color:var(--muted);font-size:12px">
                 ${w.item_count} SKU(s) · ${w.total_quantity.toFixed(0)} units · $${w.total_value.toFixed(2)}
+                · ${whWeekly.toFixed(0)}/wk
                 ${w.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
               </div>
             </div>
             <table>
               <thead>
-                <tr><th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th><th>Status</th></tr>
+                <tr>
+                  <th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>
+                  <th>Weekly Usage</th><th>Days of Supply</th><th>Status</th>
+                </tr>
               </thead>
               <tbody>
                 ${w.items.map(i => {
                   const low = i.quantity <= i.low_stock_threshold;
+                  const weekly = i.weekly_usage || 0;
+                  const days = weekly > 0 ? (i.quantity * 7 / weekly) : null;
+                  const daysColor = days === null ? 'color:var(--muted)'
+                    : days < 3 ? 'color:var(--red);font-weight:600'
+                    : days < 7 ? 'color:var(--yellow);font-weight:600'
+                    : '';
                   return `<tr>
                     <td style="font-weight:600">${escHtml(i.name)}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${escHtml(i.unit)}</td>
                     <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td style="${daysColor}">${days !== null ? days.toFixed(1) + ' days' : '<span style="color:var(--muted)">—</span>'}</td>
                     <td>${low ? '<span class="badge badge-red">Low</span>' : '<span class="badge badge-green">OK</span>'}</td>
                   </tr>`;
                 }).join('')}
               </tbody>
             </table>
           </div>
-        `).join('')}
+        `;}).join('')}
       </div>
     </div>
-  `).join('');
+  `;}).join('');
 }
 
 // -------------------------------------------------------------------------
@@ -772,7 +813,8 @@ async function openAddModal() {
   await ensureWarehouses();
   editingName = null;
   document.getElementById('modal-title').textContent = 'Add Item';
-  ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold'].forEach(id => {
+  ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold',
+   'f-case-cost','f-case-size','f-weekly'].forEach(id => {
     document.getElementById(id).value = '';
   });
   document.getElementById('f-distributor').value = '';
@@ -800,6 +842,9 @@ async function openEditModal(item) {
     false
   );
   document.getElementById('f-threshold').value = item.low_stock_threshold;
+  document.getElementById('f-case-cost').value = item.case_cost || '';
+  document.getElementById('f-case-size').value = item.case_size || '';
+  document.getElementById('f-weekly').value = item.weekly_usage || '';
   document.getElementById('item-modal').classList.add('open');
 }
 
@@ -812,21 +857,26 @@ async function submitItem() {
   const distributor = document.getElementById('f-distributor').value;
   const warehouse = document.getElementById('f-warehouse').value;
   const threshold = parseFloat(document.getElementById('f-threshold').value) || 5;
+  const caseCost = parseFloat(document.getElementById('f-case-cost').value) || 0;
+  const caseSize = parseInt(document.getElementById('f-case-size').value) || 0;
+  const weekly = parseFloat(document.getElementById('f-weekly').value) || 0;
 
   if (!name || isNaN(qty) || !unit) {
     toast('Name, quantity and unit are required.', 'error');
     return;
   }
 
+  const payload = {
+    quantity: qty, unit, category: cat, price, distributor, warehouse,
+    low_stock_threshold: threshold,
+    case_cost: caseCost, case_size: caseSize, weekly_usage: weekly,
+  };
+
   if (editingName) {
-    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', {
-      quantity: qty, unit, category: cat, price, distributor, warehouse, low_stock_threshold: threshold
-    });
+    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
     toast(`Updated "${editingName}".`);
   } else {
-    await api('/api/inventory', 'POST', {
-      name, quantity: qty, unit, category: cat, price, distributor, warehouse, low_stock_threshold: threshold
-    });
+    await api('/api/inventory', 'POST', { name, ...payload });
     toast(`Added "${name}".`);
   }
   closeModal('item-modal');

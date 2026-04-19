@@ -43,6 +43,9 @@ def api_add():
         price=float(d.get("price", 0)),
         distributor=d.get("distributor", ""),
         warehouse=d.get("warehouse", ""),
+        case_cost=float(d.get("case_cost", 0)),
+        case_size=int(d.get("case_size", 0) or 0),
+        weekly_usage=float(d.get("weekly_usage", 0)),
     )
     return jsonify({"ok": True})
 
@@ -59,6 +62,9 @@ def api_update(name):
         price=float(d["price"]) if "price" in d else None,
         distributor=d.get("distributor"),
         warehouse=d.get("warehouse"),
+        case_cost=float(d["case_cost"]) if "case_cost" in d else None,
+        case_size=int(d["case_size"]) if "case_size" in d else None,
+        weekly_usage=float(d["weekly_usage"]) if "weekly_usage" in d else None,
     )
     return jsonify({"ok": True})
 
