@@ -1,0 +1,205 @@
+{% comment %}
+  Bagel Inventory — Shopify drop-in widget.
+
+  Paste the contents of this file into a Shopify page (Online Store ->
+  Pages -> Add page -> <> Show HTML) or into a custom theme section. It is
+  self-contained: one <div>, one scoped <style>, one <script>.
+
+  1. Deploy the Flask backend from the repo (render.com / fly.io / etc.).
+     Set ALLOWED_ORIGINS on the backend to your Shopify domain, e.g.
+       ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
+  2. Replace BAGEL_API_BASE below with the backend's public URL.
+  3. (Optional) Change SHOW_LOW_ONLY to true to hide healthy SKUs.
+
+  The widget is read-only by default; it calls GET /api/distributors and
+  /api/report. No writes, no secrets embedded.
+{% endcomment %}
+
+<div id="bagel-inventory" class="bagel-inv">
+  <div class="bi-header">
+    <div>
+      <h2>Bagel Inventory</h2>
+      <p class="bi-sub">Live roll-up across Cheney Brothers and US Foods</p>
+    </div>
+    <div class="bi-stats" id="bi-stats"></div>
+  </div>
+  <div id="bi-body"><div class="bi-empty">Loading…</div></div>
+  <p class="bi-footnote" id="bi-footnote"></p>
+</div>
+
+<style>
+  .bagel-inv { font-family: inherit; color: #1f2a44; max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+  .bagel-inv h2 { font-size: 22px; margin: 0 0 4px; }
+  .bagel-inv .bi-sub { color: #64748b; margin: 0 0 18px; font-size: 13px; }
+  .bagel-inv .bi-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .bagel-inv .bi-stats { display: grid; grid-template-columns: repeat(4, auto); gap: 18px; }
+  .bagel-inv .bi-stat { text-align: right; }
+  .bagel-inv .bi-stat .v { font-size: 20px; font-weight: 700; }
+  .bagel-inv .bi-stat .l { color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .bagel-inv .bi-card { border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; margin-bottom: 18px; background: #fff; }
+  .bagel-inv .bi-card-header { padding: 12px 16px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; background: #f8fafc; }
+  .bagel-inv .bi-card-title { font-weight: 700; font-size: 15px; }
+  .bagel-inv .bi-card-meta { color: #64748b; font-size: 12px; }
+  .bagel-inv .bi-wh { padding: 12px 16px; border-top: 1px solid #f1f5f9; }
+  .bagel-inv .bi-wh:first-child { border-top: none; }
+  .bagel-inv .bi-wh-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .bagel-inv .bi-wh-name { font-weight: 600; }
+  .bagel-inv .bi-wh-meta { color: #64748b; font-size: 12px; }
+  .bagel-inv table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .bagel-inv th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; }
+  .bagel-inv td { padding: 8px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+  .bagel-inv tr:last-child td { border-bottom: none; }
+  .bagel-inv .bi-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .bagel-inv .bi-badge-green { background: #dcfce7; color: #166534; }
+  .bagel-inv .bi-badge-yellow { background: #fef3c7; color: #92400e; }
+  .bagel-inv .bi-badge-red { background: #fee2e2; color: #991b1b; }
+  .bagel-inv .bi-badge-blue { background: #dbeafe; color: #1e40af; }
+  .bagel-inv .bi-low { color: #991b1b; font-weight: 600; }
+  .bagel-inv .bi-short { color: #92400e; font-weight: 600; }
+  .bagel-inv .bi-critical { color: #991b1b; font-weight: 700; }
+  .bagel-inv .bi-muted { color: #94a3b8; }
+  .bagel-inv .bi-empty { padding: 40px; text-align: center; color: #64748b; }
+  .bagel-inv .bi-footnote { margin-top: 8px; color: #94a3b8; font-size: 11px; text-align: right; }
+  .bagel-inv .bi-error { background: #fee2e2; color: #991b1b; padding: 14px; border-radius: 8px; }
+</style>
+
+<script>
+(function () {
+  // --- Configuration ---------------------------------------------------------
+  var BAGEL_API_BASE = 'https://YOUR-BACKEND-HOST.example.com'; // <-- replace
+  var SHOW_LOW_ONLY = false;   // true = only show SKUs under threshold or <4wk
+  var REFRESH_MS = 0;          // set to e.g. 60000 to auto-refresh every minute
+
+  // --- DOM handles -----------------------------------------------------------
+  var root = document.getElementById('bagel-inventory');
+  var body = document.getElementById('bi-body');
+  var stats = document.getElementById('bi-stats');
+  var foot = document.getElementById('bi-footnote');
+  if (!root) return;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function badge(text, kind) { return '<span class="bi-badge bi-badge-' + kind + '">' + esc(text) + '</span>'; }
+
+  function distributorBadge(name) {
+    if (!name || name === 'Unassigned') return '<span class="bi-muted">Unassigned</span>';
+    var kind = name === 'Cheney Brothers' ? 'blue' : name === 'US Foods' ? 'yellow' : 'green';
+    return badge(name, kind);
+  }
+
+  function renderStats(report) {
+    stats.innerHTML =
+      '<div class="bi-stat"><div class="v">' + report.total_items + '</div><div class="l">SKUs</div></div>' +
+      '<div class="bi-stat"><div class="v">$' + report.total_value.toFixed(2) + '</div><div class="l">Value</div></div>' +
+      '<div class="bi-stat"><div class="v">' + report.low_stock_count + '</div><div class="l">Low stock</div></div>' +
+      '<div class="bi-stat"><div class="v">' + (report.total_usage_events || 0) + '</div><div class="l">Events</div></div>';
+  }
+
+  function render(groups) {
+    if (!groups.length) { body.innerHTML = '<div class="bi-empty">No inventory data.</div>'; return; }
+    var html = '';
+    groups.forEach(function (g) {
+      var distShort = 0;
+      g.warehouses.forEach(function (w) {
+        w.items.forEach(function (i) {
+          var wk = i.weekly_usage || 0;
+          if (wk > 0 && i.quantity / wk < 4) distShort++;
+        });
+      });
+      var costs = {};
+      g.warehouses.forEach(function (w) { w.items.forEach(function (i) { if (i.case_cost) costs[i.case_cost] = true; }); });
+      var costKeys = Object.keys(costs);
+      var caseCostStr = costKeys.length === 1 ? ' · case $' + parseFloat(costKeys[0]).toFixed(2) : '';
+
+      html += '<div class="bi-card"><div class="bi-card-header">' +
+        '<span class="bi-card-title">' + distributorBadge(g.distributor) + ' ' + esc(g.distributor) + '</span>' +
+        '<span class="bi-card-meta">' +
+          g.warehouses.length + ' warehouse(s) · ' + g.item_count + ' SKU(s) · ' +
+          g.total_quantity.toFixed(0) + ' units · $' + g.total_value.toFixed(2) +
+          caseCostStr +
+          (distShort > 0 ? ' · <span class="bi-critical">' + distShort + ' under 4 wk</span>' : '') +
+          (g.low_stock_count > 0 ? ' · <span class="bi-short">' + g.low_stock_count + ' low</span>' : '') +
+        '</span></div>';
+
+      g.warehouses.forEach(function (w) {
+        var whShort = w.items.filter(function (i) {
+          var wk = i.weekly_usage || 0; return wk > 0 && i.quantity / wk < 4;
+        }).length;
+        var whWeekly = w.items.reduce(function (a, i) { return a + (i.weekly_usage || 0); }, 0);
+        var items = w.items;
+        if (SHOW_LOW_ONLY) {
+          items = items.filter(function (i) {
+            var low = i.quantity <= i.low_stock_threshold;
+            var wk = i.weekly_usage || 0;
+            var short = wk > 0 && i.quantity / wk < 4;
+            return low || short;
+          });
+          if (!items.length) return;
+        }
+
+        html += '<div class="bi-wh"><div class="bi-wh-head">' +
+          '<div class="bi-wh-name">' + esc(w.warehouse) + '</div>' +
+          '<div class="bi-wh-meta">' +
+            w.item_count + ' SKU(s) · ' + w.total_quantity.toFixed(0) + ' units · $' + w.total_value.toFixed(2) +
+            ' · ' + whWeekly.toFixed(0) + '/wk' +
+            (whShort > 0 ? ' · <span class="bi-critical">' + whShort + ' under 4 wk</span>' : '') +
+            (w.low_stock_count > 0 ? ' · <span class="bi-short">' + w.low_stock_count + ' low</span>' : '') +
+          '</div></div>' +
+          '<table><thead><tr>' +
+            '<th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>' +
+            '<th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>' +
+          '</tr></thead><tbody>';
+
+        items.forEach(function (i) {
+          var low = i.quantity <= i.low_stock_threshold;
+          var wk = i.weekly_usage || 0;
+          var weeks = wk > 0 ? i.quantity / wk : null;
+          var short = weeks !== null && weeks < 4;
+          var weeksCls = weeks === null ? 'bi-muted'
+            : weeks < 2 ? 'bi-critical'
+            : weeks < 4 ? 'bi-short' : '';
+          html += '<tr>' +
+            '<td style="font-weight:600">' + esc(i.name) +
+              (short ? ' ' + badge('&lt;4wk', 'red') : '') + '</td>' +
+            '<td class="' + (low ? 'bi-low' : '') + '">' + i.quantity.toFixed(0) + '</td>' +
+            '<td>' + esc(i.unit) + '</td>' +
+            '<td>' + (i.price > 0 ? '$' + i.price.toFixed(2) : '<span class="bi-muted">—</span>') + '</td>' +
+            '<td>' + (wk > 0 ? wk.toFixed(1) + '/wk' : '<span class="bi-muted">—</span>') + '</td>' +
+            '<td class="' + weeksCls + '">' + (weeks !== null ? weeks.toFixed(1) + ' wk' : '<span class="bi-muted">—</span>') + '</td>' +
+            '<td>' + (low ? badge('Low', 'red') : short ? badge('Short', 'yellow') : badge('OK', 'green')) + '</td>' +
+          '</tr>';
+        });
+        html += '</tbody></table></div>';
+      });
+      html += '</div>';
+    });
+    body.innerHTML = html;
+  }
+
+  function load() {
+    if (!BAGEL_API_BASE || /YOUR-BACKEND-HOST/.test(BAGEL_API_BASE)) {
+      body.innerHTML = '<div class="bi-error">Configure <code>BAGEL_API_BASE</code> in the widget to the public URL of your Flask backend.</div>';
+      return;
+    }
+    body.innerHTML = '<div class="bi-empty">Loading…</div>';
+    Promise.all([
+      fetch(BAGEL_API_BASE + '/api/distributors').then(function (r) { return r.json(); }),
+      fetch(BAGEL_API_BASE + '/api/report').then(function (r) { return r.json(); })
+    ]).then(function (results) {
+      renderStats(results[1]);
+      render(results[0]);
+      foot.textContent = 'Updated ' + new Date().toLocaleString();
+    }).catch(function (err) {
+      body.innerHTML = '<div class="bi-error">Failed to load inventory from ' + esc(BAGEL_API_BASE) +
+        '. Check that the backend is reachable and that ALLOWED_ORIGINS includes this Shopify domain.<br><small>' + esc(String(err)) + '</small></div>';
+    });
+  }
+
+  load();
+  if (REFRESH_MS > 0) setInterval(load, REFRESH_MS);
+})();
+</script>

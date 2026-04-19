@@ -2,7 +2,8 @@
 """Inventory Tracker - Flask Web GUI"""
 
 import io
-from flask import Flask, jsonify, request, render_template, send_file
+import os
+from flask import Flask, jsonify, request, render_template, send_file, make_response
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     add_item, update_item, record_usage, restock, remove_item,
@@ -10,6 +11,48 @@ from inventory_tracker import (
 from datetime import datetime
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# CORS — lets a Shopify-hosted page (or any allowed origin) call /api/*.
+# Set ALLOWED_ORIGINS to a comma-separated list, e.g.
+#   ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
+# Leave unset during local development.
+# ---------------------------------------------------------------------------
+
+def _allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    allowed = _allowed_origins()
+    if not allowed:
+        return False
+    if "*" in allowed:
+        return True
+    return origin in allowed
+
+
+@app.after_request
+def _apply_cors(response):
+    origin = request.headers.get("Origin", "")
+    if _origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Inventory-Token"
+        response.headers["Access-Control-Max-Age"] = "600"
+    return response
+
+
+@app.route("/api/<path:_any>", methods=["OPTIONS"])
+def _cors_preflight(_any):
+    # Short-circuit the preflight; _apply_cors adds the headers.
+    return make_response("", 204)
 
 
 # ---------------------------------------------------------------------------
