@@ -34,7 +34,7 @@ SUBSECTION_FILL = PatternFill("solid", fgColor="F4F6FB")
 HEADERS = [
     "Name", "Distributor", "Warehouse", "Category", "Quantity", "Unit",
     "Price per Unit", "Extended Value", "Case Size", "Case Cost",
-    "Weekly Usage", "Days of Supply", "Low-Stock Threshold", "Status",
+    "Weekly Usage", "Weeks Remaining", "Low-Stock Threshold", "Status",
 ]
 
 # Column indices (1-based) for number-format and total-row formulas.
@@ -44,19 +44,27 @@ COL_EXTENDED = 8
 COL_CASE_SIZE = 9
 COL_CASE_COST = 10
 COL_WEEKLY = 11
-COL_DAYS = 12
+COL_WEEKS = 12
 COL_STATUS = 14
 
+# Any SKU with fewer than this many weeks of supply is flagged.
+WEEKS_THRESHOLD = 4
 
-def _status(item: dict) -> str:
-    return "LOW" if item["quantity"] <= item["low_stock_threshold"] else "OK"
 
-
-def _days_of_supply(item: dict):
+def _weeks_remaining(item: dict):
     weekly = item.get("weekly_usage") or 0
     if weekly <= 0:
         return None
-    return round(item["quantity"] * 7.0 / weekly, 1)
+    return round(item["quantity"] / weekly, 1)
+
+
+def _status(item: dict) -> str:
+    if item["quantity"] <= item["low_stock_threshold"]:
+        return "LOW"
+    weeks = _weeks_remaining(item)
+    if weeks is not None and weeks < WEEKS_THRESHOLD:
+        return "SHORT (<4wk)"
+    return "OK"
 
 
 def _write_header(ws, row=1):
@@ -83,7 +91,7 @@ def _write_row(ws, row: int, item: dict):
         item.get("case_size") or "",
         item.get("case_cost") or 0,
         item.get("weekly_usage") or 0,
-        _days_of_supply(item),
+        _weeks_remaining(item),
         item["low_stock_threshold"],
         _status(item),
     ]
@@ -93,9 +101,16 @@ def _write_row(ws, row: int, item: dict):
     ws.cell(row=row, column=COL_EXTENDED).number_format = '"$"#,##0.00'
     ws.cell(row=row, column=COL_CASE_COST).number_format = '"$"#,##0.00'
     ws.cell(row=row, column=COL_WEEKLY).number_format = '#,##0.0'
-    ws.cell(row=row, column=COL_DAYS).number_format = '#,##0.0'
-    if _status(item) == "LOW":
+    ws.cell(row=row, column=COL_WEEKS).number_format = '#,##0.0'
+
+    weeks = _weeks_remaining(item)
+    if weeks is not None and weeks < WEEKS_THRESHOLD:
+        ws.cell(row=row, column=COL_WEEKS).font = Font(bold=True, color="B91C1C")
+    status = _status(item)
+    if status == "LOW":
         ws.cell(row=row, column=COL_STATUS).font = Font(bold=True, color="B91C1C")
+    elif status.startswith("SHORT"):
+        ws.cell(row=row, column=COL_STATUS).font = Font(bold=True, color="B45309")
 
 
 def _autosize(ws):
@@ -143,7 +158,7 @@ def _write_summary_sheet(ws, inv: dict):
 
     headers = [
         "Distributor / Warehouse", "SKU Count", "Units on Hand", "Inventory Value",
-        "Case Cost", "Weekly Usage", "Low-Stock SKUs",
+        "Case Cost", "Weekly Usage", "Low-Stock SKUs", "SKUs <4wk",
     ]
     for col, label in enumerate(headers, start=1):
         cell = ws.cell(row=4, column=col, value=label)
@@ -153,8 +168,16 @@ def _write_summary_sheet(ws, inv: dict):
     ws.row_dimensions[4].height = 22
     ws.freeze_panes = "A5"
 
+    def _count_short(items):
+        n = 0
+        for it in items:
+            w = _weeks_remaining(it)
+            if w is not None and w < WEEKS_THRESHOLD:
+                n += 1
+        return n
+
     row = 5
-    grand_sku = grand_qty = grand_val = grand_weekly = grand_low = 0
+    grand_sku = grand_qty = grand_val = grand_weekly = grand_low = grand_short = 0
     n_cols = len(headers)
 
     for dist in sorted(dist_groups):
@@ -165,6 +188,7 @@ def _write_summary_sheet(ws, inv: dict):
         d_val = sum(i["quantity"] * i["price"] for i in dist_items)
         d_weekly = sum(i.get("weekly_usage") or 0 for i in dist_items)
         d_low = sum(1 for i in dist_items if i["quantity"] <= i["low_stock_threshold"])
+        d_short = _count_short(dist_items)
         # All SKUs for a distributor share a flat case cost; surface it on the roll-up row.
         d_case_costs = {i.get("case_cost") for i in dist_items if i.get("case_cost")}
         d_case_cost = next(iter(d_case_costs)) if len(d_case_costs) == 1 else None
@@ -186,11 +210,14 @@ def _write_summary_sheet(ws, inv: dict):
         weekly_cell.font = SECTION_FONT
         weekly_cell.number_format = '#,##0.0'
         ws.cell(row=row, column=7, value=d_low).font = SECTION_FONT
+        short_cell = ws.cell(row=row, column=8, value=d_short)
+        short_cell.font = Font(bold=True, color="B91C1C") if d_short else SECTION_FONT
         grand_sku += d_sku
         grand_qty += d_qty
         grand_val += d_val
         grand_weekly += d_weekly
         grand_low += d_low
+        grand_short += d_short
         row += 1
 
         for wh in sorted(warehouses):
@@ -200,6 +227,7 @@ def _write_summary_sheet(ws, inv: dict):
             val = sum(i["quantity"] * i["price"] for i in wh_items)
             weekly = sum(i.get("weekly_usage") or 0 for i in wh_items)
             low = sum(1 for i in wh_items if i["quantity"] <= i["low_stock_threshold"])
+            short = _count_short(wh_items)
             label = ws.cell(row=row, column=1, value=f"    {wh}")
             label.fill = SUBSECTION_FILL
             for c in range(2, n_cols + 1):
@@ -210,6 +238,9 @@ def _write_summary_sheet(ws, inv: dict):
             ws.cell(row=row, column=5, value="")
             ws.cell(row=row, column=6, value=weekly).number_format = '#,##0.0'
             ws.cell(row=row, column=7, value=low)
+            sc = ws.cell(row=row, column=8, value=short)
+            if short:
+                sc.font = Font(bold=True, color="B91C1C")
             row += 1
 
     # Grand total
@@ -223,8 +254,10 @@ def _write_summary_sheet(ws, inv: dict):
     gw.font = Font(bold=True)
     gw.number_format = '#,##0.0'
     ws.cell(row=row, column=7, value=grand_low).font = Font(bold=True)
+    gs = ws.cell(row=row, column=8, value=grand_short)
+    gs.font = Font(bold=True, color="B91C1C") if grand_short else Font(bold=True)
 
-    for col, w in {1: 34, 2: 12, 3: 15, 4: 18, 5: 12, 6: 14, 7: 16}.items():
+    for col, w in {1: 34, 2: 12, 3: 15, 4: 18, 5: 12, 6: 14, 7: 16, 8: 12}.items():
         ws.column_dimensions[get_column_letter(col)].width = w
 
 

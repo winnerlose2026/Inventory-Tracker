@@ -688,6 +688,8 @@ async function loadDistributors() {
     const caseSize = caseSizes.size === 1 ? [...caseSizes][0] : null;
     const weeklyTotal = g.warehouses.reduce(
       (s, w) => s + w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0), 0);
+    const shortCount = g.warehouses.reduce(
+      (s, w) => s + w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length, 0);
 
     return `
     <div class="card">
@@ -697,12 +699,14 @@ async function loadDistributors() {
           ${g.warehouses.length} warehouse(s) · ${g.item_count} SKU(s) · ${g.total_quantity.toFixed(0)} units · $${g.total_value.toFixed(2)}
           ${caseCost !== null ? ` · case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
           · ${weeklyTotal.toFixed(0)}/wk
+          ${shortCount > 0 ? ` · <span style="color:var(--red)">${shortCount} under 4 wk</span>` : ''}
           ${g.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
         </span>
       </div>
       <div style="padding:0 4px 8px">
         ${g.warehouses.map(w => {
           const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
+          const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
           return `
           <div style="padding:14px 16px 4px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
@@ -710,6 +714,7 @@ async function loadDistributors() {
               <div style="color:var(--muted);font-size:12px">
                 ${w.item_count} SKU(s) · ${w.total_quantity.toFixed(0)} units · $${w.total_value.toFixed(2)}
                 · ${whWeekly.toFixed(0)}/wk
+                ${whShort > 0 ? ` · <span style="color:var(--red)">${whShort} under 4 wk</span>` : ''}
                 ${w.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
               </div>
             </div>
@@ -717,26 +722,27 @@ async function loadDistributors() {
               <thead>
                 <tr>
                   <th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>
-                  <th>Weekly Usage</th><th>Days of Supply</th><th>Status</th>
+                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>
                 </tr>
               </thead>
               <tbody>
                 ${w.items.map(i => {
                   const low = i.quantity <= i.low_stock_threshold;
                   const weekly = i.weekly_usage || 0;
-                  const days = weekly > 0 ? (i.quantity * 7 / weekly) : null;
-                  const daysColor = days === null ? 'color:var(--muted)'
-                    : days < 3 ? 'color:var(--red);font-weight:600'
-                    : days < 7 ? 'color:var(--yellow);font-weight:600'
+                  const weeks = weekly > 0 ? (i.quantity / weekly) : null;
+                  const short = weeks !== null && weeks < 4;
+                  const weeksColor = weeks === null ? 'color:var(--muted)'
+                    : weeks < 2 ? 'color:var(--red);font-weight:600'
+                    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
                     : '';
                   return `<tr>
-                    <td style="font-weight:600">${escHtml(i.name)}</td>
+                    <td style="font-weight:600">${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${escHtml(i.unit)}</td>
                     <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
                     <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
-                    <td style="${daysColor}">${days !== null ? days.toFixed(1) + ' days' : '<span style="color:var(--muted)">—</span>'}</td>
-                    <td>${low ? '<span class="badge badge-red">Low</span>' : '<span class="badge badge-green">OK</span>'}</td>
+                    <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
                   </tr>`;
                 }).join('')}
               </tbody>
