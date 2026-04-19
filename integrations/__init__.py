@@ -2,6 +2,7 @@
 
 from .base import DistributorClient, NotConfiguredError, SyncItem
 from .cheney import CheneyBrothersClient
+from .email_scanner import EmailEvent, EmailInboxClient, ScanResult
 from .usfoods import USFoodsClient
 
 __all__ = [
@@ -10,6 +11,9 @@ __all__ = [
     "SyncItem",
     "CheneyBrothersClient",
     "USFoodsClient",
+    "EmailInboxClient",
+    "EmailEvent",
+    "ScanResult",
     "all_clients",
 ]
 

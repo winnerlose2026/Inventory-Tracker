@@ -234,6 +234,15 @@ def api_sync():
     return jsonify({"dry_run": dry_run, "reports": reports})
 
 
+@app.route("/api/email/scan", methods=["POST"])
+def api_email_scan():
+    from sync_inventory import scan_email
+
+    dry_run = bool((request.json or {}).get("dry_run", False))
+    report = scan_email(dry_run=dry_run)
+    return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
 @app.route("/api/export.xlsx")
 def api_export_xlsx():
     from openpyxl import Workbook

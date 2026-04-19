@@ -20,7 +20,7 @@ from typing import Iterable
 
 from integrations import (
     CheneyBrothersClient, USFoodsClient,
-    DistributorClient, NotConfiguredError, SyncItem,
+    DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
 )
 from inventory_tracker import load_inventory, save_inventory, load_usage, save_usage
 
@@ -160,6 +160,113 @@ def sync_all(clients: list[DistributorClient] | None = None,
     return reports
 
 
+# ---------------------------------------------------------------------------
+# Email scanning
+# ---------------------------------------------------------------------------
+
+def _apply_email_event(evt, inv: dict, usage: list, now: str,
+                       report: dict, dry_run: bool) -> None:
+    """Apply a single EmailEvent to the inventory/usage log."""
+    key = _find_local_key(inv, evt.item)
+    if key is None:
+        report["unmatched"].append(
+            evt.item.name or f"{evt.item.variety}@{evt.item.warehouse}"
+        )
+        return
+    item = inv[key]
+    old_qty = item["quantity"]
+    amount = evt.item.quantity
+
+    if evt.event_type == "on_hand":
+        if abs(amount - old_qty) < 1e-9:
+            report["unchanged"] += 1
+            return
+        new_qty = amount
+        delta_usage = round(old_qty - new_qty, 2)  # positive = consumed
+        note = f"Email on-hand sync (subject: {evt.source_subject[:60]})"
+    elif evt.event_type == "restock":
+        new_qty = old_qty + amount
+        delta_usage = -round(amount, 2)  # negative = restock in the log
+        note = f"Email restock (subject: {evt.source_subject[:60]})"
+    elif evt.event_type == "usage":
+        new_qty = max(0.0, old_qty - amount)
+        delta_usage = round(amount, 2)  # positive = consumed
+        note = f"Email usage report (subject: {evt.source_subject[:60]})"
+    else:
+        return
+
+    report["changes"].append({
+        "name": item["name"],
+        "warehouse": item.get("warehouse", ""),
+        "event_type": evt.event_type,
+        "old_quantity": old_qty,
+        "new_quantity": new_qty,
+        "delta": round(new_qty - old_qty, 2),
+    })
+    report["updated"] += 1
+
+    if dry_run:
+        return
+
+    item["quantity"] = new_qty
+    item["updated"] = now
+    item["last_synced"] = now
+    item["last_synced_from"] = "Email Inbox"
+    usage.append({
+        "item_key": key,
+        "item_name": item["name"],
+        "amount": delta_usage,
+        "unit": item["unit"],
+        "note": note,
+        "timestamp": now,
+    })
+
+
+def scan_email(dry_run: bool = False,
+               client: EmailInboxClient | None = None) -> dict:
+    """Scan the mailbox and apply extracted events. Returns a report dict."""
+    client = client or EmailInboxClient()
+    report = {
+        "distributor": "Email Inbox",
+        "source": client.source(),
+        "status": "ok",
+        "fetched": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "unmatched": [],
+        "changes": [],
+        "error": None,
+        "messages_seen": 0,
+        "messages_parsed": 0,
+        "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
+    }
+    try:
+        scan = client.scan()
+    except NotConfiguredError as exc:
+        report["status"] = "not_configured"
+        report["error"] = str(exc)
+        return report
+
+    report["messages_seen"] = scan.messages_seen
+    report["messages_parsed"] = scan.messages_parsed
+    report["fetched"] = len(scan.events)
+    if scan.errors:
+        report["error"] = "; ".join(scan.errors[:5])
+
+    inv = load_inventory()
+    usage = load_usage()
+    now = datetime.now().isoformat()
+    for evt in scan.events:
+        report["by_event_type"][evt.event_type] = \
+            report["by_event_type"].get(evt.event_type, 0) + 1
+        _apply_email_event(evt, inv, usage, now, report, dry_run)
+
+    if not dry_run:
+        save_inventory(inv)
+        save_usage(usage)
+    return report
+
+
 def _print_report(reports: list[dict], dry_run: bool):
     print()
     print("=" * 72)
@@ -190,17 +297,24 @@ def main():
     dry_run = "--dry-run" in args
     only_cheney = "--cheney" in args
     only_usfoods = "--usfoods" in args
+    only_email = "--email" in args
 
-    clients: list[DistributorClient] = []
-    if only_cheney or not only_usfoods:
-        clients.append(CheneyBrothersClient())
-    if only_usfoods or not only_cheney:
-        clients.append(USFoodsClient())
-    # De-dup when both flags are set
-    seen = set()
-    clients = [c for c in clients if not (c.name in seen or seen.add(c.name))]
+    reports: list[dict] = []
 
-    reports = sync_all(clients, dry_run=dry_run)
+    if only_email:
+        reports.append(scan_email(dry_run=dry_run))
+    else:
+        clients: list[DistributorClient] = []
+        if only_cheney or not only_usfoods:
+            clients.append(CheneyBrothersClient())
+        if only_usfoods or not only_cheney:
+            clients.append(USFoodsClient())
+        seen = set()
+        clients = [c for c in clients if not (c.name in seen or seen.add(c.name))]
+        reports.extend(sync_all(clients, dry_run=dry_run))
+        # Always offer email as an optional pass; it's silent when unconfigured.
+        if "--with-email" in args:
+            reports.append(scan_email(dry_run=dry_run))
     _print_report(reports, dry_run)
 
 

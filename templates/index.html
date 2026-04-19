@@ -249,8 +249,10 @@
         </div>
         <div class="btn-group">
           <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
-          <button class="btn btn-success" onclick="runSync(false)">🔄 Sync Now</button>
-          <a class="btn btn-primary" href="/api/export.xlsx" download>⬇ Export to Excel</a>
+          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
+          <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
+          <button class="btn btn-success" onclick="runEmailScan(false)">Scan Email</button>
+          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
         </div>
       </div>
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
@@ -622,8 +624,27 @@ async function runSync(dryRun) {
   if (!dryRun) loadDistributors();
 }
 
+async function runEmailScan(dryRun) {
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing email scan…' : 'Scanning mailbox…'}</div></div>`;
+  let result;
+  try {
+    result = await api('/api/email/scan', 'POST', { dry_run: dryRun });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Email scan failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  box.innerHTML = renderSyncReport(result);
+  toast(dryRun ? 'Email preview complete.' : 'Email scan complete.');
+  if (!dryRun) { loadDistributors(); loadDashboard(); }
+}
+
 function renderSyncReport(result) {
-  const heading = result.dry_run ? 'Sync Preview' : 'Sync Report';
+  const isEmail = result.reports.some(r => r.distributor === 'Email Inbox');
+  const heading = isEmail
+    ? (result.dry_run ? 'Email Scan Preview' : 'Email Scan Report')
+    : (result.dry_run ? 'Sync Preview' : 'Sync Report');
   const cards = result.reports.map(r => {
     if (r.status === 'not_configured') {
       return `<div class="card">
@@ -637,8 +658,10 @@ function renderSyncReport(result) {
     const preview = r.changes.slice(0, 8).map(c => {
       const sign = c.delta >= 0 ? '+' : '';
       const color = c.delta >= 0 ? 'var(--green)' : 'var(--red)';
+      const typePill = c.event_type
+        ? `<span class="badge badge-purple" style="margin-right:6px">${escHtml(c.event_type)}</span>` : '';
       return `<tr>
-        <td>${escHtml(c.name)}</td>
+        <td>${typePill}${escHtml(c.name)}</td>
         <td style="color:var(--muted)">${escHtml(c.warehouse || '')}</td>
         <td style="text-align:right">${c.old_quantity.toFixed(0)}</td>
         <td style="text-align:right;font-weight:600">${c.new_quantity.toFixed(0)}</td>
@@ -649,18 +672,26 @@ function renderSyncReport(result) {
       ? `<div style="padding:8px 20px;color:var(--muted);font-size:12px">…and ${r.changes.length - 8} more change(s).</div>` : '';
     const unmatchedNote = r.unmatched.length
       ? `<div style="padding:8px 20px;color:var(--yellow);font-size:12px">${r.unmatched.length} row(s) unmatched: ${escHtml(r.unmatched.slice(0, 5).join(', '))}${r.unmatched.length > 5 ? '…' : ''}</div>` : '';
+    const emailMeta = (r.distributor === 'Email Inbox')
+      ? ` · messages ${r.messages_parsed}/${r.messages_seen}`
+        + (r.by_event_type
+            ? ` · on_hand ${r.by_event_type.on_hand || 0} · restock ${r.by_event_type.restock || 0} · usage ${r.by_event_type.usage || 0}`
+            : '')
+      : '';
+    const errorNote = r.error
+      ? `<div style="padding:8px 20px;color:var(--red);font-size:12px">${escHtml(r.error)}</div>` : '';
     return `<div class="card">
       <div class="card-header">
-        <span class="card-title">${distributorBadge(r.distributor)} ${r.distributor}</span>
+        <span class="card-title">${distributorBadge(r.distributor === 'Email Inbox' ? '' : r.distributor)} ${r.distributor}</span>
         <span style="color:var(--muted);font-size:12px">
-          source: ${escHtml(r.source)} · fetched ${r.fetched} · updated ${r.updated} · unchanged ${r.unchanged}
+          source: ${escHtml(r.source)} · fetched ${r.fetched} · updated ${r.updated} · unchanged ${r.unchanged}${emailMeta}
         </span>
       </div>
       ${r.changes.length ? `<table>
         <thead><tr><th>SKU</th><th>Warehouse</th><th style="text-align:right">Was</th><th style="text-align:right">Now</th><th style="text-align:right">Δ</th></tr></thead>
         <tbody>${preview}</tbody>
       </table>` : '<div style="padding:16px 20px;color:var(--muted)">No changes.</div>'}
-      ${moreNote}${unmatchedNote}
+      ${moreNote}${unmatchedNote}${errorNote}
     </div>`;
   }).join('');
   return `<h2 style="font-size:16px;margin:0 0 12px 4px">${heading}${result.dry_run ? ' (dry run — nothing saved)' : ''}</h2>${cards}`;
