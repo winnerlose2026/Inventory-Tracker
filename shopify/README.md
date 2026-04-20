@@ -31,6 +31,13 @@ Set environment variables from `.env.example`:
   ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
   ```
   Leave unset in local dev. Set to `*` only for quick testing.
+- `INVENTORY_API_TOKEN` — required for write-mode. Generate a long random
+  string (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
+  and set it on the backend. While unset, the write endpoints
+  (`/api/use`, `/api/restock`, `/api/sync`, `/api/inventory` POST/PUT/DELETE)
+  are open to anyone who knows the URL. When set, they require an
+  `X-Inventory-Token: <value>` header — the widget sends this automatically
+  once an admin clicks "Set admin key" and pastes the token.
 - Cheney / US Foods creds (if you've been issued them).
 - Microsoft 365 creds (`MS365_*`) if you want the email scanner to run.
 
@@ -62,6 +69,11 @@ size (60 = 5 dozen) and weekly usage populated.
    set `REFRESH_MS` to auto-refresh the page (e.g. `60000` for every
    minute).
 7. Save the page. Preview it from the admin.
+8. (Write-mode) On the rendered page, click **Set admin key** in the
+   widget header and paste the value of `INVENTORY_API_TOKEN` from step 1.
+   The key is stored in your browser only (`localStorage`). You'll then
+   see per-row **Use** / **Restock** buttons and a **Sync now** action.
+   Click **Clear admin key** to drop back to read-only on that device.
 
 Alternative: paste the widget into a custom **theme section**
 (`sections/bagel-inventory.liquid`) and drop it onto any template in the
@@ -77,16 +89,22 @@ widget renders on failure.
 
 ## Security notes
 
-The widget is read-only — it calls `GET /api/distributors` and
-`GET /api/report` only. The write endpoints (`POST /api/sync`,
-`POST /api/inventory`, etc.) remain on the Flask backend and are **not**
-exposed by the widget, but they are reachable by anyone who knows the
-backend URL because the Flask app has no built-in auth. If the backend
-URL is discoverable, put it behind:
+By default the widget loads in read-only mode (`GET /api/distributors`
+and `GET /api/report` only). Admins unlock write mode by clicking
+**Set admin key** and pasting the backend's `INVENTORY_API_TOKEN`; all
+writes then carry `X-Inventory-Token` and are gated server-side by
+`app.py`.
 
-- A platform-level auth proxy (Cloudflare Access, a reverse-proxy with
-  basic auth), **or**
-- Extend `app.py` to require a header token on write routes (matched
-  against an env var).
+Recommended posture:
 
-Write-gating is out of scope for this widget but straightforward to add.
+- **Always set `INVENTORY_API_TOKEN` in production.** Without it, the
+  write endpoints are open to anyone who can reach the backend URL.
+- Treat the token like a password. Rotate if staff turnover occurs —
+  the widget's "Clear admin key" only clears the local browser; rotating
+  the env var revokes it everywhere.
+- Optional defence in depth: put the backend behind Cloudflare Access or
+  a reverse-proxy with basic auth so the URL itself isn't reachable.
+
+The token is stored in the Shopify domain's `localStorage`, which is
+isolated per-browser and per-domain. It is never written to Shopify
+itself.

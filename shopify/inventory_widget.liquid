@@ -8,11 +8,16 @@
   1. Deploy the Flask backend from the repo (render.com / fly.io / etc.).
      Set ALLOWED_ORIGINS on the backend to your Shopify domain, e.g.
        ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
-  2. Replace BAGEL_API_BASE below with the backend's public URL.
-  3. (Optional) Change SHOW_LOW_ONLY to true to hide healthy SKUs.
+  2. (Optional but recommended for write-mode) set INVENTORY_API_TOKEN on
+     the backend to a long random string. Without it, the widget's Use /
+     Restock / Sync buttons are open to anyone who knows the URL.
+  3. Replace BAGEL_API_BASE below with the backend's public URL.
+  4. (Optional) Change SHOW_LOW_ONLY to true to hide healthy SKUs.
 
-  The widget is read-only by default; it calls GET /api/distributors and
-  /api/report. No writes, no secrets embedded.
+  The widget runs in read-only mode until the viewer clicks "Set admin key"
+  and enters the INVENTORY_API_TOKEN value. The key is saved in the
+  browser's localStorage (per-device, per-domain) and sent as
+  X-Inventory-Token on every write. Clicking "Clear admin key" removes it.
 {% endcomment %}
 
 <div id="bagel-inventory" class="bagel-inv">
@@ -21,10 +26,34 @@
       <h2>Bagel Inventory</h2>
       <p class="bi-sub">Live roll-up across Cheney Brothers and US Foods</p>
     </div>
-    <div class="bi-stats" id="bi-stats"></div>
+    <div class="bi-header-right">
+      <div class="bi-actions">
+        <button type="button" class="bi-btn bi-btn-ghost" id="bi-auth-btn">Set admin key</button>
+        <button type="button" class="bi-btn bi-btn-primary bi-write" id="bi-sync-btn" hidden>Sync now</button>
+      </div>
+      <div class="bi-stats" id="bi-stats"></div>
+    </div>
   </div>
+  <div id="bi-status" class="bi-status" hidden></div>
   <div id="bi-body"><div class="bi-empty">Loading…</div></div>
   <p class="bi-footnote" id="bi-footnote"></p>
+
+  <div class="bi-modal" id="bi-modal" hidden>
+    <div class="bi-modal-card">
+      <div class="bi-modal-title" id="bi-modal-title">Use</div>
+      <div class="bi-modal-sub" id="bi-modal-sub"></div>
+      <label class="bi-lbl">Amount
+        <input type="number" step="any" min="0" id="bi-modal-amount" class="bi-input" />
+      </label>
+      <label class="bi-lbl">Note (optional)
+        <input type="text" id="bi-modal-note" class="bi-input" placeholder="e.g. Tuesday bake" />
+      </label>
+      <div class="bi-modal-actions">
+        <button type="button" class="bi-btn bi-btn-ghost" id="bi-modal-cancel">Cancel</button>
+        <button type="button" class="bi-btn bi-btn-primary" id="bi-modal-ok">Submit</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <style>
@@ -32,6 +61,8 @@
   .bagel-inv h2 { font-size: 22px; margin: 0 0 4px; }
   .bagel-inv .bi-sub { color: #64748b; margin: 0 0 18px; font-size: 13px; }
   .bagel-inv .bi-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .bagel-inv .bi-header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .bagel-inv .bi-actions { display: flex; gap: 8px; }
   .bagel-inv .bi-stats { display: grid; grid-template-columns: repeat(4, auto); gap: 18px; }
   .bagel-inv .bi-stat { text-align: right; }
   .bagel-inv .bi-stat .v { font-size: 20px; font-weight: 700; }
@@ -61,6 +92,23 @@
   .bagel-inv .bi-empty { padding: 40px; text-align: center; color: #64748b; }
   .bagel-inv .bi-footnote { margin-top: 8px; color: #94a3b8; font-size: 11px; text-align: right; }
   .bagel-inv .bi-error { background: #fee2e2; color: #991b1b; padding: 14px; border-radius: 8px; }
+  .bagel-inv .bi-btn { border: 1px solid transparent; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer; line-height: 1.2; }
+  .bagel-inv .bi-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .bagel-inv .bi-btn-primary { background: #1d4ed8; color: #fff; }
+  .bagel-inv .bi-btn-primary:hover:not(:disabled) { background: #1e40af; }
+  .bagel-inv .bi-btn-ghost { background: #fff; color: #1f2a44; border-color: #cbd5e1; }
+  .bagel-inv .bi-btn-ghost:hover:not(:disabled) { background: #f1f5f9; }
+  .bagel-inv .bi-btn-row { padding: 3px 8px; font-size: 11px; margin-right: 4px; }
+  .bagel-inv .bi-status { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+  .bagel-inv .bi-status-ok { background: #dcfce7; color: #166534; }
+  .bagel-inv .bi-status-err { background: #fee2e2; color: #991b1b; }
+  .bagel-inv .bi-modal { position: fixed; inset: 0; background: rgba(15, 23, 42, .45); display: flex; align-items: center; justify-content: center; z-index: 9999; }
+  .bagel-inv .bi-modal-card { background: #fff; border-radius: 10px; padding: 20px; width: 360px; max-width: 92vw; box-shadow: 0 20px 40px rgba(0,0,0,.2); }
+  .bagel-inv .bi-modal-title { font-weight: 700; font-size: 16px; margin-bottom: 4px; }
+  .bagel-inv .bi-modal-sub { color: #64748b; font-size: 12px; margin-bottom: 14px; }
+  .bagel-inv .bi-lbl { display: block; font-size: 12px; color: #334155; margin-bottom: 10px; }
+  .bagel-inv .bi-input { display: block; width: 100%; box-sizing: border-box; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; margin-top: 4px; }
+  .bagel-inv .bi-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 </style>
 
 <script>
@@ -69,13 +117,32 @@
   var BAGEL_API_BASE = 'https://YOUR-BACKEND-HOST.example.com'; // <-- replace
   var SHOW_LOW_ONLY = false;   // true = only show SKUs under threshold or <4wk
   var REFRESH_MS = 0;          // set to e.g. 60000 to auto-refresh every minute
+  var TOKEN_KEY = 'bagelInvToken';
 
   // --- DOM handles -----------------------------------------------------------
   var root = document.getElementById('bagel-inventory');
   var body = document.getElementById('bi-body');
   var stats = document.getElementById('bi-stats');
   var foot = document.getElementById('bi-footnote');
+  var statusEl = document.getElementById('bi-status');
+  var authBtn = document.getElementById('bi-auth-btn');
+  var syncBtn = document.getElementById('bi-sync-btn');
+  var modal = document.getElementById('bi-modal');
+  var modalTitle = document.getElementById('bi-modal-title');
+  var modalSub = document.getElementById('bi-modal-sub');
+  var modalAmount = document.getElementById('bi-modal-amount');
+  var modalNote = document.getElementById('bi-modal-note');
+  var modalOk = document.getElementById('bi-modal-ok');
+  var modalCancel = document.getElementById('bi-modal-cancel');
   if (!root) return;
+
+  // --- State -----------------------------------------------------------------
+  var writeMode = false;        // show write UI?
+  var tokenRequired = false;    // backend requires a token?
+  var modalCtx = null;          // {action, name}
+
+  function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
+  function setToken(v) { try { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); } catch (e) {} }
 
   function esc(s) {
     return String(s == null ? '' : s)
@@ -90,6 +157,118 @@
     var kind = name === 'Cheney Brothers' ? 'blue' : name === 'US Foods' ? 'yellow' : 'green';
     return badge(name, kind);
   }
+
+  function showStatus(msg, kind) {
+    statusEl.textContent = msg;
+    statusEl.className = 'bi-status ' + (kind === 'err' ? 'bi-status-err' : 'bi-status-ok');
+    statusEl.hidden = false;
+    if (kind !== 'err') setTimeout(function () { statusEl.hidden = true; }, 4000);
+  }
+
+  function authHeaders() {
+    var h = { 'Content-Type': 'application/json' };
+    var t = getToken();
+    if (t) h['X-Inventory-Token'] = t;
+    return h;
+  }
+
+  function refreshAuthButton() {
+    var t = getToken();
+    authBtn.textContent = t ? 'Clear admin key' : 'Set admin key';
+  }
+
+  function applyWriteVisibility() {
+    // writeMode = backend is open, OR backend requires a token and caller has a valid one.
+    syncBtn.hidden = !writeMode;
+    var nodes = root.querySelectorAll('.bi-write');
+    for (var i = 0; i < nodes.length; i++) nodes[i].hidden = !writeMode;
+  }
+
+  function checkAuth() {
+    return fetch(BAGEL_API_BASE + '/api/auth/check', { headers: authHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        tokenRequired = !!j.required;
+        writeMode = !!j.authorized;
+        applyWriteVisibility();
+        if (tokenRequired && !writeMode && getToken()) {
+          showStatus('Admin key rejected. Click "Clear admin key" and set it again.', 'err');
+        }
+      })
+      .catch(function () {
+        tokenRequired = false;
+        writeMode = false;
+        applyWriteVisibility();
+      });
+  }
+
+  authBtn.addEventListener('click', function () {
+    if (getToken()) {
+      setToken('');
+      refreshAuthButton();
+      checkAuth().then(load);
+      showStatus('Admin key cleared. Widget is read-only.', 'ok');
+      return;
+    }
+    var v = window.prompt('Paste the INVENTORY_API_TOKEN from your backend:');
+    if (v == null) return;
+    v = v.trim();
+    if (!v) return;
+    setToken(v);
+    refreshAuthButton();
+    checkAuth().then(function () {
+      if (writeMode) showStatus('Admin key accepted. Write mode enabled.', 'ok');
+      load();
+    });
+  });
+
+  syncBtn.addEventListener('click', function () {
+    if (!writeMode) return;
+    syncBtn.disabled = true;
+    fetch(BAGEL_API_BASE + '/api/sync', { method: 'POST', headers: authHeaders(), body: '{}' })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+      .then(function (res) {
+        if (res.status === 401) { showStatus('Sync rejected: bad admin key.', 'err'); return; }
+        showStatus('Sync complete.', 'ok');
+        load();
+      })
+      .catch(function (err) { showStatus('Sync failed: ' + String(err), 'err'); })
+      .then(function () { syncBtn.disabled = false; });
+  });
+
+  function openModal(action, name) {
+    modalCtx = { action: action, name: name };
+    modalTitle.textContent = action === 'restock' ? 'Restock' : 'Record usage';
+    modalSub.textContent = name;
+    modalAmount.value = '';
+    modalNote.value = '';
+    modal.hidden = false;
+    setTimeout(function () { modalAmount.focus(); }, 20);
+  }
+
+  function closeModal() { modal.hidden = true; modalCtx = null; }
+
+  modalCancel.addEventListener('click', closeModal);
+  modal.addEventListener('click', function (e) { if (e.target === modal) closeModal(); });
+  modalOk.addEventListener('click', function () {
+    if (!modalCtx) return;
+    var amt = parseFloat(modalAmount.value);
+    if (!isFinite(amt) || amt <= 0) { modalAmount.focus(); return; }
+    var route = modalCtx.action === 'restock' ? '/api/restock' : '/api/use';
+    var payload = JSON.stringify({ name: modalCtx.name, amount: amt, note: modalNote.value || '' });
+    modalOk.disabled = true;
+    fetch(BAGEL_API_BASE + route, { method: 'POST', headers: authHeaders(), body: payload })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+      .then(function (res) {
+        if (res.status === 401) { showStatus('Rejected: bad admin key.', 'err'); return; }
+        if (!res.json || res.json.ok !== true) { showStatus('Failed: ' + (res.json && res.json.error || 'unknown error'), 'err'); return; }
+        showStatus((modalCtx.action === 'restock' ? 'Restocked ' : 'Used ') + amt + ' × ' + modalCtx.name, 'ok');
+        closeModal();
+        load();
+      })
+      .catch(function (err) { showStatus('Failed: ' + String(err), 'err'); })
+      .then(function () { modalOk.disabled = false; });
+  });
 
   function renderStats(report) {
     stats.innerHTML =
@@ -152,6 +331,7 @@
           '<table><thead><tr>' +
             '<th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>' +
             '<th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>' +
+            '<th class="bi-write"' + (writeMode ? '' : ' hidden') + '>Actions</th>' +
           '</tr></thead><tbody>';
 
         items.forEach(function (i) {
@@ -162,8 +342,9 @@
           var weeksCls = weeks === null ? 'bi-muted'
             : weeks < 2 ? 'bi-critical'
             : weeks < 4 ? 'bi-short' : '';
+          var safeName = esc(i.name);
           html += '<tr>' +
-            '<td style="font-weight:600">' + esc(i.name) +
+            '<td style="font-weight:600">' + safeName +
               (short ? ' ' + badge('&lt;4wk', 'red') : '') + '</td>' +
             '<td class="' + (low ? 'bi-low' : '') + '">' + i.quantity.toFixed(0) + '</td>' +
             '<td>' + esc(i.unit) + '</td>' +
@@ -171,6 +352,10 @@
             '<td>' + (wk > 0 ? wk.toFixed(1) + '/wk' : '<span class="bi-muted">—</span>') + '</td>' +
             '<td class="' + weeksCls + '">' + (weeks !== null ? weeks.toFixed(1) + ' wk' : '<span class="bi-muted">—</span>') + '</td>' +
             '<td>' + (low ? badge('Low', 'red') : short ? badge('Short', 'yellow') : badge('OK', 'green')) + '</td>' +
+            '<td class="bi-write"' + (writeMode ? '' : ' hidden') + '>' +
+              '<button type="button" class="bi-btn bi-btn-ghost bi-btn-row" data-action="use" data-name="' + safeName + '">Use</button>' +
+              '<button type="button" class="bi-btn bi-btn-ghost bi-btn-row" data-action="restock" data-name="' + safeName + '">Restock</button>' +
+            '</td>' +
           '</tr>';
         });
         html += '</tbody></table></div>';
@@ -178,6 +363,12 @@
       html += '</div>';
     });
     body.innerHTML = html;
+
+    body.querySelectorAll('button[data-action]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        openModal(btn.getAttribute('data-action'), btn.getAttribute('data-name'));
+      });
+    });
   }
 
   function load() {
@@ -199,7 +390,8 @@
     });
   }
 
-  load();
+  refreshAuthButton();
+  checkAuth().then(load);
   if (REFRESH_MS > 0) setInterval(load, REFRESH_MS);
 })();
 </script>

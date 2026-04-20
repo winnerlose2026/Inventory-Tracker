@@ -56,6 +56,40 @@ def _cors_preflight(_any):
 
 
 # ---------------------------------------------------------------------------
+# Write-endpoint auth. When INVENTORY_API_TOKEN is set, every write route
+# requires `X-Inventory-Token: <value>`. Unset (the default) = open, matches
+# the original local-only behaviour.
+# ---------------------------------------------------------------------------
+
+def _require_write_token():
+    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
+    if not expected:
+        return None
+    got = (request.headers.get("X-Inventory-Token") or "").strip()
+    if got != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
+
+
+@app.before_request
+def _gate_writes():
+    if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
+        denial = _require_write_token()
+        if denial is not None:
+            return denial
+
+
+@app.route("/api/auth/check")
+def api_auth_check():
+    """Let the widget ask 'does this backend require a token, and is mine good?'"""
+    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
+    if not expected:
+        return jsonify({"required": False, "authorized": True})
+    got = (request.headers.get("X-Inventory-Token") or "").strip()
+    return jsonify({"required": True, "authorized": got == expected})
+
+
+# ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 
