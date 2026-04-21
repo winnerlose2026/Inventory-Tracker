@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Inventory Tracker - Flask Web GUI"""
 
-from flask import Flask, jsonify, request, render_template
+import io
+import os
+from flask import Flask, jsonify, request, render_template, send_file, make_response
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     add_item, update_item, record_usage, restock, remove_item,
@@ -9,6 +11,82 @@ from inventory_tracker import (
 from datetime import datetime
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# CORS — lets a Shopify-hosted page (or any allowed origin) call /api/*.
+# Set ALLOWED_ORIGINS to a comma-separated list, e.g.
+#   ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
+# Leave unset during local development.
+# ---------------------------------------------------------------------------
+
+def _allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    allowed = _allowed_origins()
+    if not allowed:
+        return False
+    if "*" in allowed:
+        return True
+    return origin in allowed
+
+
+@app.after_request
+def _apply_cors(response):
+    origin = request.headers.get("Origin", "")
+    if _origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Inventory-Token"
+        response.headers["Access-Control-Max-Age"] = "600"
+    return response
+
+
+@app.route("/api/<path:_any>", methods=["OPTIONS"])
+def _cors_preflight(_any):
+    # Short-circuit the preflight; _apply_cors adds the headers.
+    return make_response("", 204)
+
+
+# ---------------------------------------------------------------------------
+# Write-endpoint auth. When INVENTORY_API_TOKEN is set, every write route
+# requires `X-Inventory-Token: <value>`. Unset (the default) = open, matches
+# the original local-only behaviour.
+# ---------------------------------------------------------------------------
+
+def _require_write_token():
+    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
+    if not expected:
+        return None
+    got = (request.headers.get("X-Inventory-Token") or "").strip()
+    if got != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
+
+
+@app.before_request
+def _gate_writes():
+    if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
+        denial = _require_write_token()
+        if denial is not None:
+            return denial
+
+
+@app.route("/api/auth/check")
+def api_auth_check():
+    """Let the widget ask 'does this backend require a token, and is mine good?'"""
+    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
+    if not expected:
+        return jsonify({"required": False, "authorized": True})
+    got = (request.headers.get("X-Inventory-Token") or "").strip()
+    return jsonify({"required": True, "authorized": got == expected})
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +118,11 @@ def api_add():
         category=d.get("category", "general"),
         low_stock_threshold=float(d.get("low_stock_threshold", 5)),
         price=float(d.get("price", 0)),
+        distributor=d.get("distributor", ""),
+        warehouse=d.get("warehouse", ""),
+        case_cost=float(d.get("case_cost", 0)),
+        case_size=int(d.get("case_size", 0) or 0),
+        weekly_usage=float(d.get("weekly_usage", 0)),
     )
     return jsonify({"ok": True})
 
@@ -54,6 +137,11 @@ def api_update(name):
         category=d.get("category"),
         low_stock_threshold=float(d["low_stock_threshold"]) if "low_stock_threshold" in d else None,
         price=float(d["price"]) if "price" in d else None,
+        distributor=d.get("distributor"),
+        warehouse=d.get("warehouse"),
+        case_cost=float(d["case_cost"]) if "case_cost" in d else None,
+        case_size=int(d["case_size"]) if "case_size" in d else None,
+        weekly_usage=float(d["weekly_usage"]) if "weekly_usage" in d else None,
     )
     return jsonify({"ok": True})
 
@@ -139,6 +227,125 @@ def api_report():
         "top_restocked": top_restocked,
         "total_usage_events": len(usage),
     })
+
+
+# ---------------------------------------------------------------------------
+# Warehouse catalogue (authoritative list used by UI + seeds)
+# ---------------------------------------------------------------------------
+
+WAREHOUSES = {
+    "Cheney Brothers": [
+        "Riviera Beach, FL",
+        "Ocala, FL",
+        "Punta Gorda, FL",
+    ],
+    "US Foods": [
+        "Manassas, VA",
+        "Zebulon, NC",
+        "La Mirada, CA",
+        "Chicago, IL",
+        "Alcoa, TN",
+    ],
+}
+
+
+@app.route("/api/warehouses")
+def api_warehouses():
+    return jsonify(WAREHOUSES)
+
+
+# ---------------------------------------------------------------------------
+# API – Distributors (unified view across Cheney Brothers and US Foods)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/distributors")
+def api_distributors():
+    inv = load_inventory()
+    groups: dict[str, list] = {}
+    for item in inv.values():
+        dist = item.get("distributor") or "Unassigned"
+        groups.setdefault(dist, []).append(item)
+
+    summary = []
+    for dist, items in sorted(groups.items()):
+        total_qty = sum(i["quantity"] for i in items)
+        total_value = sum(i["quantity"] * i["price"] for i in items)
+        low = [i for i in items if i["quantity"] <= i["low_stock_threshold"]]
+
+        # Sub-group by warehouse
+        wh_groups: dict[str, list] = {}
+        for i in items:
+            wh_groups.setdefault(i.get("warehouse") or "Unassigned", []).append(i)
+        warehouses = []
+        for wh_name, wh_items in sorted(wh_groups.items()):
+            warehouses.append({
+                "warehouse": wh_name,
+                "item_count": len(wh_items),
+                "total_quantity": round(sum(x["quantity"] for x in wh_items), 2),
+                "total_value": round(sum(x["quantity"] * x["price"] for x in wh_items), 2),
+                "low_stock_count": sum(1 for x in wh_items if x["quantity"] <= x["low_stock_threshold"]),
+                "items": sorted(wh_items, key=lambda x: x["name"]),
+            })
+
+        summary.append({
+            "distributor": dist,
+            "item_count": len(items),
+            "total_quantity": round(total_qty, 2),
+            "total_value": round(total_value, 2),
+            "low_stock_count": len(low),
+            "warehouses": warehouses,
+        })
+    return jsonify(summary)
+
+
+# ---------------------------------------------------------------------------
+# API – Sync (pull current on-hand from distributors)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    from sync_inventory import sync_all
+
+    dry_run = bool((request.json or {}).get("dry_run", False))
+    reports = sync_all(dry_run=dry_run)
+    return jsonify({"dry_run": dry_run, "reports": reports})
+
+
+@app.route("/api/email/scan", methods=["POST"])
+def api_email_scan():
+    from sync_inventory import scan_email
+
+    dry_run = bool((request.json or {}).get("dry_run", False))
+    report = scan_email(dry_run=dry_run)
+    return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@app.route("/api/export.xlsx")
+def api_export_xlsx():
+    from openpyxl import Workbook
+    from export_bagels_xlsx import _write_summary_sheet, _write_items_sheet
+
+    inv = load_inventory()
+    items = list(inv.values())
+    cheney = [i for i in items if (i.get("distributor") or "") == "Cheney Brothers"]
+    usfoods = [i for i in items if (i.get("distributor") or "") == "US Foods"]
+
+    wb = Workbook()
+    _write_summary_sheet(wb.active, inv)
+    wb.active.title = "Summary"
+    _write_items_sheet(wb.create_sheet("Unified List"), items)
+    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
+    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="bagel_inventory.xlsx",
+    )
 
 
 if __name__ == "__main__":

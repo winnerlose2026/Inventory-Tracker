@@ -52,7 +52,10 @@ def save_usage(usage: list):
 # ---------------------------------------------------------------------------
 
 def add_item(name: str, quantity: float, unit: str, category: str = "general",
-             low_stock_threshold: float = 5.0, price: float = 0.0):
+             low_stock_threshold: float = 5.0, price: float = 0.0,
+             distributor: str = "", warehouse: str = "",
+             case_cost: float = 0.0, case_size: int = 0,
+             weekly_usage: float = 0.0):
     inv = load_inventory()
     key = name.lower().strip()
     if key in inv:
@@ -65,6 +68,11 @@ def add_item(name: str, quantity: float, unit: str, category: str = "general",
         "category": category,
         "low_stock_threshold": low_stock_threshold,
         "price": price,
+        "distributor": distributor,
+        "warehouse": warehouse,
+        "case_cost": case_cost,
+        "case_size": case_size,
+        "weekly_usage": weekly_usage,
         "added": datetime.now().isoformat(),
     }
     save_inventory(inv)
@@ -74,7 +82,12 @@ def add_item(name: str, quantity: float, unit: str, category: str = "general",
 def update_item(name: str, quantity: Optional[float] = None,
                 unit: Optional[str] = None, category: Optional[str] = None,
                 low_stock_threshold: Optional[float] = None,
-                price: Optional[float] = None):
+                price: Optional[float] = None,
+                distributor: Optional[str] = None,
+                warehouse: Optional[str] = None,
+                case_cost: Optional[float] = None,
+                case_size: Optional[int] = None,
+                weekly_usage: Optional[float] = None):
     inv = load_inventory()
     key = name.lower().strip()
     if key not in inv:
@@ -91,6 +104,16 @@ def update_item(name: str, quantity: Optional[float] = None,
         item["low_stock_threshold"] = low_stock_threshold
     if price is not None:
         item["price"] = price
+    if distributor is not None:
+        item["distributor"] = distributor
+    if warehouse is not None:
+        item["warehouse"] = warehouse
+    if case_cost is not None:
+        item["case_cost"] = case_cost
+    if case_size is not None:
+        item["case_size"] = case_size
+    if weekly_usage is not None:
+        item["weekly_usage"] = weekly_usage
     item["updated"] = datetime.now().isoformat()
     save_inventory(inv)
     print(f"  Updated '{name}'.")
@@ -197,14 +220,15 @@ def show_inventory(category: Optional[str] = None):
     print("=" * 72)
     for cat, cat_items in sorted(cats.items()):
         print(f"\n  [{cat.upper()}]")
-        print(f"  {'Name':<22} {'Qty':>8} {'Unit':<8} {'Bar':<22} {'Price':>7}  Alert")
-        print("  " + "-" * 68)
-        for item in sorted(cat_items, key=lambda x: x["name"]):
+        print(f"  {'Name':<40} {'Qty':>6} {'Distributor':<18} {'Warehouse':<20} {'Price':>7}  Alert")
+        print("  " + "-" * 100)
+        for item in sorted(cat_items, key=lambda x: (x.get("distributor", ""), x.get("warehouse", ""), x["name"])):
             alert = "(!)" if item["quantity"] <= item["low_stock_threshold"] else "   "
-            bar = _bar(item["quantity"], max_qty)
             price = f"${item['price']:.2f}" if item["price"] else "  -   "
-            print(f"  {item['name']:<22} {item['quantity']:>8.2f} "
-                  f"{item['unit']:<8} [{bar}] {price:>7}  {alert}")
+            dist = (item.get("distributor") or "—")[:18]
+            wh = (item.get("warehouse") or "—")[:20]
+            name = item["name"][:40]
+            print(f"  {name:<40} {item['quantity']:>6.1f} {dist:<18} {wh:<20} {price:>7}  {alert}")
     print()
     print("=" * 72)
     low = [i["name"] for i in items if i["quantity"] <= i["low_stock_threshold"]]
@@ -309,8 +333,8 @@ USAGE_TEXT = """
 Inventory Tracker with Usage
 
 Usage:
-  inventory_tracker.py add <name> <qty> <unit> [category] [threshold] [price]
-  inventory_tracker.py update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P]
+  inventory_tracker.py add <name> <qty> <unit> [category] [threshold] [price] [distributor] [warehouse]
+  inventory_tracker.py update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P] [--distributor=D] [--warehouse=W]
   inventory_tracker.py use <name> <amount> [note]
   inventory_tracker.py restock <name> <amount> [note]
   inventory_tracker.py remove <name>
@@ -346,7 +370,7 @@ def main():
 
     if cmd == "add":
         if len(args) < 4:
-            print("  Usage: add <name> <qty> <unit> [category] [threshold] [price]")
+            print("  Usage: add <name> <qty> <unit> [category] [threshold] [price] [distributor] [warehouse]")
             return
         name = args[1]
         qty = float(args[2])
@@ -354,11 +378,13 @@ def main():
         category = args[4] if len(args) > 4 else "general"
         threshold = float(args[5]) if len(args) > 5 else 5.0
         price = float(args[6]) if len(args) > 6 else 0.0
-        add_item(name, qty, unit, category, threshold, price)
+        distributor = args[7] if len(args) > 7 else ""
+        warehouse = args[8] if len(args) > 8 else ""
+        add_item(name, qty, unit, category, threshold, price, distributor, warehouse)
 
     elif cmd == "update":
         if len(args) < 2:
-            print("  Usage: update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P]")
+            print("  Usage: update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P] [--distributor=D] [--warehouse=W]")
             return
         name = args[1]
         qty_s = parse_kwarg(args[2:], "qty")
@@ -366,6 +392,8 @@ def main():
         cat_s = parse_kwarg(args[2:], "cat")
         thr_s = parse_kwarg(args[2:], "threshold")
         price_s = parse_kwarg(args[2:], "price")
+        dist_s = parse_kwarg(args[2:], "distributor")
+        wh_s = parse_kwarg(args[2:], "warehouse")
         update_item(
             name,
             quantity=float(qty_s) if qty_s else None,
@@ -373,6 +401,8 @@ def main():
             category=cat_s,
             low_stock_threshold=float(thr_s) if thr_s else None,
             price=float(price_s) if price_s else None,
+            distributor=dist_s,
+            warehouse=wh_s,
         )
 
     elif cmd == "use":

@@ -144,6 +144,9 @@
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
+      <div class="nav-item" onclick="showPage('distributors')">
+        <span class="nav-icon">🚚</span> Distributors
+      </div>
       <div class="nav-item" onclick="showPage('report')">
         <span class="nav-icon">📈</span> Report
       </div>
@@ -202,19 +205,31 @@
     <!-- Inventory -->
     <div class="page" id="page-inventory">
       <h1>Inventory</h1>
-      <p class="subtitle">Manage all SKUs</p>
+      <p class="subtitle">Unified list across all distributors and warehouses</p>
       <div class="card">
         <div class="card-header">
           <span class="card-title">All Items</span>
-          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+          <div style="display:flex;gap:10px;align-items:center">
+            <select id="inv-filter-distributor" onchange="onDistributorFilterChange()" style="width:180px">
+              <option value="">All distributors</option>
+              <option value="Cheney Brothers">Cheney Brothers</option>
+              <option value="US Foods">US Foods</option>
+              <option value="Unassigned">Unassigned</option>
+            </select>
+            <select id="inv-filter-warehouse" onchange="loadInventory()" style="width:200px">
+              <option value="">All warehouses</option>
+            </select>
+            <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+          </div>
         </div>
         <table>
           <thead>
             <tr>
               <th>SKU / Name</th>
               <th>Category</th>
+              <th>Distributor</th>
+              <th>Warehouse</th>
               <th>Qty</th>
-              <th>Stock</th>
               <th>Price</th>
               <th>Status</th>
               <th>Actions</th>
@@ -223,6 +238,25 @@
           <tbody id="inv-tbody"></tbody>
         </table>
       </div>
+    </div>
+
+    <!-- Distributors -->
+    <div class="page" id="page-distributors">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Distributors</h1>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by Cheney Brothers &amp; US Foods</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
+          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
+          <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
+          <button class="btn btn-success" onclick="runEmailScan(false)">Scan Email</button>
+          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
+        </div>
+      </div>
+      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
+      <div id="distributors-container"></div>
     </div>
 
     <!-- Usage Log -->
@@ -296,7 +330,33 @@
         <label>Price per unit ($)</label>
         <input id="f-price" type="number" step="any" min="0" placeholder="0.00">
       </div>
-      <div class="form-group full">
+      <div class="form-group">
+        <label>Distributor</label>
+        <select id="f-distributor" onchange="onFormDistributorChange()">
+          <option value="">—</option>
+          <option value="Cheney Brothers">Cheney Brothers</option>
+          <option value="US Foods">US Foods</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Warehouse</label>
+        <select id="f-warehouse">
+          <option value="">—</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Case Cost ($)</label>
+        <input id="f-case-cost" type="number" step="any" min="0" placeholder="0.00">
+      </div>
+      <div class="form-group">
+        <label>Case Size (units)</label>
+        <input id="f-case-size" type="number" step="1" min="0" placeholder="60">
+      </div>
+      <div class="form-group">
+        <label>Weekly Usage (units/wk)</label>
+        <input id="f-weekly" type="number" step="any" min="0" placeholder="0">
+      </div>
+      <div class="form-group">
         <label>Low Stock Threshold</label>
         <input id="f-threshold" type="number" step="any" min="0" placeholder="5">
       </div>
@@ -344,6 +404,46 @@ let currentPage = 'dashboard';
 let editingName = null;   // null = add mode, string = edit mode
 let txnType = 'use';      // 'use' | 'restock'
 let txnItemName = '';
+let warehouseCatalog = {}; // { "Cheney Brothers": [...], "US Foods": [...] }
+
+async function ensureWarehouses() {
+  if (Object.keys(warehouseCatalog).length) return warehouseCatalog;
+  warehouseCatalog = await api('/api/warehouses');
+  return warehouseCatalog;
+}
+
+function populateWarehouseSelect(selectEl, distributor, selected = '', includeAll = false) {
+  const options = [];
+  if (includeAll) options.push('<option value="">All warehouses</option>');
+  else options.push('<option value="">—</option>');
+  const list = distributor ? (warehouseCatalog[distributor] || [])
+                           : [].concat(...Object.values(warehouseCatalog));
+  for (const wh of list) {
+    options.push(`<option value="${escAttr(wh)}" ${wh === selected ? 'selected' : ''}>${escHtml(wh)}</option>`);
+  }
+  selectEl.innerHTML = options.join('');
+}
+
+async function onDistributorFilterChange() {
+  await ensureWarehouses();
+  populateWarehouseSelect(
+    document.getElementById('inv-filter-warehouse'),
+    document.getElementById('inv-filter-distributor').value,
+    '',
+    true
+  );
+  loadInventory();
+}
+
+async function onFormDistributorChange() {
+  await ensureWarehouses();
+  populateWarehouseSelect(
+    document.getElementById('f-warehouse'),
+    document.getElementById('f-distributor').value,
+    '',
+    false
+  );
+}
 
 // -------------------------------------------------------------------------
 // Navigation
@@ -361,7 +461,16 @@ function refresh(page) {
   if (page === 'dashboard') loadDashboard();
   else if (page === 'inventory') loadInventory();
   else if (page === 'usage') loadUsage();
+  else if (page === 'distributors') loadDistributors();
   else if (page === 'report') loadReport();
+}
+
+function distributorBadge(name) {
+  if (!name) return '<span style="color:var(--muted)">—</span>';
+  const cls = name === 'Cheney Brothers' ? 'badge-blue'
+            : name === 'US Foods' ? 'badge-yellow'
+            : 'badge-purple';
+  return `<span class="badge ${cls}">${escHtml(name)}</span>`;
 }
 
 // -------------------------------------------------------------------------
@@ -442,17 +551,31 @@ async function loadDashboard() {
 // Inventory
 // -------------------------------------------------------------------------
 async function loadInventory() {
-  const items = await api('/api/inventory');
+  await ensureWarehouses();
+  // Ensure warehouse filter dropdown is populated on first load
+  if (document.getElementById('inv-filter-warehouse').options.length <= 1) {
+    populateWarehouseSelect(
+      document.getElementById('inv-filter-warehouse'),
+      document.getElementById('inv-filter-distributor').value,
+      '',
+      true
+    );
+  }
+  let items = await api('/api/inventory');
+  const distFilter = document.getElementById('inv-filter-distributor').value;
+  const whFilter = document.getElementById('inv-filter-warehouse').value;
+  if (distFilter) {
+    items = items.filter(i => (i.distributor || 'Unassigned') === distFilter);
+  }
+  if (whFilter) {
+    items = items.filter(i => (i.warehouse || '') === whFilter);
+  }
   const tbody = document.getElementById('inv-tbody');
   if (items.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">No items yet. Click "Add Item" to get started.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No items match this filter.</td></tr>';
     return;
   }
-  const maxQty = Math.max(...items.map(i => i.quantity), 1);
   tbody.innerHTML = items.map(item => {
-    const pct = Math.min(100, Math.round(item.quantity / maxQty * 100));
-    const ratio = item.low_stock_threshold > 0 ? item.quantity / item.low_stock_threshold : 2;
-    const barColor = ratio < 1 ? 'var(--red)' : ratio < 1.5 ? 'var(--yellow)' : 'var(--green)';
     const status = item.quantity <= item.low_stock_threshold
       ? '<span class="badge badge-red">Low Stock</span>'
       : item.quantity <= item.low_stock_threshold * 1.5
@@ -465,12 +588,9 @@ async function loadInventory() {
         <div class="sku">${sku}</div>
       </td>
       <td><span class="badge badge-purple">${escHtml(item.category)}</span></td>
+      <td>${distributorBadge(item.distributor)}</td>
+      <td>${item.warehouse ? escHtml(item.warehouse) : '<span style="color:var(--muted)">—</span>'}</td>
       <td style="font-weight:600">${item.quantity.toFixed(2)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
-      <td>
-        <div class="bar-wrap" style="width:90px">
-          <div class="bar-fill" style="width:${pct}%;background:${barColor}"></div>
-        </div>
-      </td>
       <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${status}</td>
       <td class="actions-col">
@@ -483,6 +603,186 @@ async function loadInventory() {
       </td>
     </tr>`;
   }).join('');
+}
+
+// -------------------------------------------------------------------------
+// Distributor sync
+// -------------------------------------------------------------------------
+async function runSync(dryRun) {
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing sync…' : 'Syncing from distributors…'}</div></div>`;
+  let result;
+  try {
+    result = await api('/api/sync', 'POST', { dry_run: dryRun });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Sync failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  box.innerHTML = renderSyncReport(result);
+  toast(dryRun ? 'Preview complete.' : 'Sync complete.');
+  if (!dryRun) loadDistributors();
+}
+
+async function runEmailScan(dryRun) {
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing email scan…' : 'Scanning mailbox…'}</div></div>`;
+  let result;
+  try {
+    result = await api('/api/email/scan', 'POST', { dry_run: dryRun });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Email scan failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  box.innerHTML = renderSyncReport(result);
+  toast(dryRun ? 'Email preview complete.' : 'Email scan complete.');
+  if (!dryRun) { loadDistributors(); loadDashboard(); }
+}
+
+function renderSyncReport(result) {
+  const isEmail = result.reports.some(r => r.distributor === 'Email Inbox');
+  const heading = isEmail
+    ? (result.dry_run ? 'Email Scan Preview' : 'Email Scan Report')
+    : (result.dry_run ? 'Sync Preview' : 'Sync Report');
+  const cards = result.reports.map(r => {
+    if (r.status === 'not_configured') {
+      return `<div class="card">
+        <div class="card-header">
+          <span class="card-title">${distributorBadge(r.distributor)} ${r.distributor}</span>
+          <span class="badge badge-yellow">Not configured</span>
+        </div>
+        <div style="padding:14px 20px;color:var(--muted);font-size:13px;white-space:pre-wrap">${escHtml(r.error || '')}</div>
+      </div>`;
+    }
+    const preview = r.changes.slice(0, 8).map(c => {
+      const sign = c.delta >= 0 ? '+' : '';
+      const color = c.delta >= 0 ? 'var(--green)' : 'var(--red)';
+      const typePill = c.event_type
+        ? `<span class="badge badge-purple" style="margin-right:6px">${escHtml(c.event_type)}</span>` : '';
+      return `<tr>
+        <td>${typePill}${escHtml(c.name)}</td>
+        <td style="color:var(--muted)">${escHtml(c.warehouse || '')}</td>
+        <td style="text-align:right">${c.old_quantity.toFixed(0)}</td>
+        <td style="text-align:right;font-weight:600">${c.new_quantity.toFixed(0)}</td>
+        <td style="text-align:right;color:${color}">${sign}${c.delta.toFixed(0)}</td>
+      </tr>`;
+    }).join('');
+    const moreNote = r.changes.length > 8
+      ? `<div style="padding:8px 20px;color:var(--muted);font-size:12px">…and ${r.changes.length - 8} more change(s).</div>` : '';
+    const unmatchedNote = r.unmatched.length
+      ? `<div style="padding:8px 20px;color:var(--yellow);font-size:12px">${r.unmatched.length} row(s) unmatched: ${escHtml(r.unmatched.slice(0, 5).join(', '))}${r.unmatched.length > 5 ? '…' : ''}</div>` : '';
+    const emailMeta = (r.distributor === 'Email Inbox')
+      ? ` · messages ${r.messages_parsed}/${r.messages_seen}`
+        + (r.by_event_type
+            ? ` · on_hand ${r.by_event_type.on_hand || 0} · restock ${r.by_event_type.restock || 0} · usage ${r.by_event_type.usage || 0}`
+            : '')
+      : '';
+    const errorNote = r.error
+      ? `<div style="padding:8px 20px;color:var(--red);font-size:12px">${escHtml(r.error)}</div>` : '';
+    return `<div class="card">
+      <div class="card-header">
+        <span class="card-title">${distributorBadge(r.distributor === 'Email Inbox' ? '' : r.distributor)} ${r.distributor}</span>
+        <span style="color:var(--muted);font-size:12px">
+          source: ${escHtml(r.source)} · fetched ${r.fetched} · updated ${r.updated} · unchanged ${r.unchanged}${emailMeta}
+        </span>
+      </div>
+      ${r.changes.length ? `<table>
+        <thead><tr><th>SKU</th><th>Warehouse</th><th style="text-align:right">Was</th><th style="text-align:right">Now</th><th style="text-align:right">Δ</th></tr></thead>
+        <tbody>${preview}</tbody>
+      </table>` : '<div style="padding:16px 20px;color:var(--muted)">No changes.</div>'}
+      ${moreNote}${unmatchedNote}${errorNote}
+    </div>`;
+  }).join('');
+  return `<h2 style="font-size:16px;margin:0 0 12px 4px">${heading}${result.dry_run ? ' (dry run — nothing saved)' : ''}</h2>${cards}`;
+}
+
+// -------------------------------------------------------------------------
+// Distributors (unified view)
+// -------------------------------------------------------------------------
+async function loadDistributors() {
+  const groups = await api('/api/distributors');
+  const container = document.getElementById('distributors-container');
+  if (!groups.length) {
+    container.innerHTML = '<div class="empty">No inventory yet.</div>';
+    return;
+  }
+  container.innerHTML = groups.map(g => {
+    // A distributor has one flat case cost across all its SKUs.
+    const costs = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_cost || 0)).filter(c => c > 0)
+    );
+    const caseCost = costs.size === 1 ? [...costs][0] : null;
+    const caseSizes = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_size || 0)).filter(c => c > 0)
+    );
+    const caseSize = caseSizes.size === 1 ? [...caseSizes][0] : null;
+    const weeklyTotal = g.warehouses.reduce(
+      (s, w) => s + w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0), 0);
+    const shortCount = g.warehouses.reduce(
+      (s, w) => s + w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length, 0);
+
+    return `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)} ${g.distributor}</span>
+        <span style="color:var(--muted);font-size:12px">
+          ${g.warehouses.length} warehouse(s) · ${g.item_count} SKU(s) · ${g.total_quantity.toFixed(0)} units · $${g.total_value.toFixed(2)}
+          ${caseCost !== null ? ` · case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
+          · ${weeklyTotal.toFixed(0)}/wk
+          ${shortCount > 0 ? ` · <span style="color:var(--red)">${shortCount} under 4 wk</span>` : ''}
+          ${g.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
+        </span>
+      </div>
+      <div style="padding:0 4px 8px">
+        ${g.warehouses.map(w => {
+          const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
+          const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
+          return `
+          <div style="padding:14px 16px 4px">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+              <div style="font-weight:600">${escHtml(w.warehouse)}</div>
+              <div style="color:var(--muted);font-size:12px">
+                ${w.item_count} SKU(s) · ${w.total_quantity.toFixed(0)} units · $${w.total_value.toFixed(2)}
+                · ${whWeekly.toFixed(0)}/wk
+                ${whShort > 0 ? ` · <span style="color:var(--red)">${whShort} under 4 wk</span>` : ''}
+                ${w.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
+              </div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>
+                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${w.items.map(i => {
+                  const low = i.quantity <= i.low_stock_threshold;
+                  const weekly = i.weekly_usage || 0;
+                  const weeks = weekly > 0 ? (i.quantity / weekly) : null;
+                  const short = weeks !== null && weeks < 4;
+                  const weeksColor = weeks === null ? 'color:var(--muted)'
+                    : weeks < 2 ? 'color:var(--red);font-weight:600'
+                    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
+                    : '';
+                  return `<tr>
+                    <td style="font-weight:600">${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}</td>
+                    <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td>${escHtml(i.unit)}</td>
+                    <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">—</span>'}</td>
+                    <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        `;}).join('')}
+      </div>
+    </div>
+  `;}).join('');
 }
 
 // -------------------------------------------------------------------------
@@ -546,18 +846,23 @@ async function loadReport() {
 // -------------------------------------------------------------------------
 // Modals – Add / Edit item
 // -------------------------------------------------------------------------
-function openAddModal() {
+async function openAddModal() {
+  await ensureWarehouses();
   editingName = null;
   document.getElementById('modal-title').textContent = 'Add Item';
-  ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold'].forEach(id => {
+  ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold',
+   'f-case-cost','f-case-size','f-weekly'].forEach(id => {
     document.getElementById(id).value = '';
   });
+  document.getElementById('f-distributor').value = '';
+  populateWarehouseSelect(document.getElementById('f-warehouse'), '', '', false);
   document.getElementById('f-name').removeAttribute('readonly');
   document.getElementById('item-modal').classList.add('open');
   document.getElementById('f-name').focus();
 }
 
-function openEditModal(item) {
+async function openEditModal(item) {
+  await ensureWarehouses();
   editingName = item.name;
   document.getElementById('modal-title').textContent = 'Edit Item';
   document.getElementById('f-name').value = item.name;
@@ -566,7 +871,17 @@ function openEditModal(item) {
   document.getElementById('f-unit').value = item.unit;
   document.getElementById('f-cat').value = item.category;
   document.getElementById('f-price').value = item.price || '';
+  document.getElementById('f-distributor').value = item.distributor || '';
+  populateWarehouseSelect(
+    document.getElementById('f-warehouse'),
+    item.distributor || '',
+    item.warehouse || '',
+    false
+  );
   document.getElementById('f-threshold').value = item.low_stock_threshold;
+  document.getElementById('f-case-cost').value = item.case_cost || '';
+  document.getElementById('f-case-size').value = item.case_size || '';
+  document.getElementById('f-weekly').value = item.weekly_usage || '';
   document.getElementById('item-modal').classList.add('open');
 }
 
@@ -576,22 +891,29 @@ async function submitItem() {
   const unit = document.getElementById('f-unit').value.trim();
   const cat  = document.getElementById('f-cat').value.trim() || 'general';
   const price = parseFloat(document.getElementById('f-price').value) || 0;
+  const distributor = document.getElementById('f-distributor').value;
+  const warehouse = document.getElementById('f-warehouse').value;
   const threshold = parseFloat(document.getElementById('f-threshold').value) || 5;
+  const caseCost = parseFloat(document.getElementById('f-case-cost').value) || 0;
+  const caseSize = parseInt(document.getElementById('f-case-size').value) || 0;
+  const weekly = parseFloat(document.getElementById('f-weekly').value) || 0;
 
   if (!name || isNaN(qty) || !unit) {
     toast('Name, quantity and unit are required.', 'error');
     return;
   }
 
+  const payload = {
+    quantity: qty, unit, category: cat, price, distributor, warehouse,
+    low_stock_threshold: threshold,
+    case_cost: caseCost, case_size: caseSize, weekly_usage: weekly,
+  };
+
   if (editingName) {
-    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', {
-      quantity: qty, unit, category: cat, price, low_stock_threshold: threshold
-    });
+    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
     toast(`Updated "${editingName}".`);
   } else {
-    await api('/api/inventory', 'POST', {
-      name, quantity: qty, unit, category: cat, price, low_stock_threshold: threshold
-    });
+    await api('/api/inventory', 'POST', { name, ...payload });
     toast(`Added "${name}".`);
   }
   closeModal('item-modal');

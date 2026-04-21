@@ -1,0 +1,16 @@
+variety,warehouse,quantity,unit,price,case_cost,case_size,weekly_usage,distributor_sku
+Plain,"Riviera Beach, FL",132,each,0.4417,26.50,60,120,CB-BGL-PLN-4
+Plain,"Ocala, FL",960,each,0.4417,26.50,60,144,CB-BGL-PLN-4
+Plain,"Punta Gorda, FL",88,each,0.4417,26.50,60,84,CB-BGL-PLN-4
+Everything,"Riviera Beach, FL",140,each,0.4417,26.50,60,100,CB-BGL-EVR-4
+Everything,"Ocala, FL",1008,each,0.4417,26.50,60,120,CB-BGL-EVR-4
+Everything,"Punta Gorda, FL",96,each,0.4417,26.50,60,70,CB-BGL-EVR-4
+Sesame,"Ocala, FL",504,each,0.4417,26.50,60,48,CB-BGL-SES-4
+Cinnamon Raisin,"Ocala, FL",480,each,0.4417,26.50,60,42,CB-BGL-CRN-4
+Whole Wheat,"Ocala, FL",504,each,0.4417,26.50,60,48,CB-BGL-WWH-4
+Whole Wheat Everything,"Ocala, FL",240,each,0.4417,26.50,60,24,CB-BGL-WWE-4
+Blueberry,"Ocala, FL",500,each,0.4417,26.50,60,42,CB-BGL-BLU-4
+Egg,"Ocala, FL",490,each,0.4417,26.50,60,36,CB-BGL-EGG-4
+Onion,"Ocala, FL",498,each,0.4417,26.50,60,36,CB-BGL-ONI-4
+Asiago,"Ocala, FL",240,each,0.4417,26.50,60,24,CB-BGL-ASI-4
+Jalapeno Cheddar,"Ocala, FL",238,each,0.4417,26.50,60,24,CB-BGL-JCH-4

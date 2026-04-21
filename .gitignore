@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 data/
+.env
+integrations/cheney_brothers_inventory.csv
+integrations/us_foods_inventory.csv
