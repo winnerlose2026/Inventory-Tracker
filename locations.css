@@ -118,6 +118,29 @@ body.locations-page {
     margin-top: 0.25rem;
 }
 
+/* ---------- Coming Soon badge ---------- */
+.location--coming-soon {
+    border-style: dashed;
+    background: #fff9ec;
+}
+
+.location__badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: #fff;
+    background: var(--hh-accent);
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    margin-bottom: 0.6rem;
+}
+
+.location--coming-soon .location__badge {
+    background: #b47a00;
+}
+
 .location__phone a {
     color: var(--hh-accent-dark);
     text-decoration: none;
