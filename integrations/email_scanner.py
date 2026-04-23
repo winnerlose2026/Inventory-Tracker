@@ -82,7 +82,16 @@ from typing import Literal, Optional
 
 from .base import NotConfiguredError, SyncItem
 from .csv_loader import read_csv
-from .usfoods_po_parser import UsFoodsPO, UsFoodsPOLine, parse_po_pdf
+from .usfoods_po_parser import (
+    UsFoodsPO,
+    UsFoodsPOLine,
+    parse_po_pdf as _usfoods_parse_po_pdf,
+)
+from .cheney_po_parser import (
+    CheneyPO,
+    CheneyPOLine,
+    parse_po_pdf as _cheney_parse_po_pdf,
+)
 
 
 EventType = Literal["on_hand", "restock", "usage"]
@@ -244,7 +253,7 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
     events = []
     errors = []
     try:
-        po = parse_po_pdf(pdf_bytes)
+        po = _usfoods_parse_po_pdf(pdf_bytes)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"usfoods PO PDF parse failed ({subject!r}): {exc}")
         return events, errors
@@ -286,12 +295,69 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
     return events, errors
 
 
+def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject):
+    """Parse a Cheney Brothers PO PDF and convert each line to a restock
+    EmailEvent.
+
+    Returns (events, errors). One event is emitted per ``CheneyPOLine``
+    with an ``event_type`` of ``"restock"``. The PO number is preserved
+    exactly as printed on the PDF (leading zeros retained). Cheney POs
+    don't expose a revision number, so ``po_revision`` is emitted as ``""``.
+    Cheney's ``Mfg#`` column is the same H&H internal SKU code that US
+    Foods uses, so variety resolution shares ``hh_mfg_codes``.
+    """
+    events = []
+    errors = []
+    try:
+        po = _cheney_parse_po_pdf(pdf_bytes)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"cheney PO PDF parse failed ({subject!r}): {exc}")
+        return events, errors
+
+    if po.unmapped_items:
+        errors.append(
+            f"cheney PO {po.po_number or '?'}: unmapped Mfg# codes "
+            f"{sorted(set(po.unmapped_items))} — add them to "
+            "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
+        )
+    if po.ship_to_city and not po.warehouse:
+        errors.append(
+            f"cheney PO {po.po_number or '?'}: unknown ship-to DC "
+            f"{po.ship_to_city!r} — add it to "
+            "cheney_po_parser.CHENEY_DC_CITY_TO_WAREHOUSE"
+        )
+
+    for line in po.lines:
+        if not line.variety or not po.warehouse:
+            continue
+        events.append(EmailEvent(
+            event_type="restock",
+            item=SyncItem(
+                quantity=line.quantity,
+                distributor=distributor,
+                variety=line.variety,
+                warehouse=po.warehouse,
+                unit=(line.quantity_um or "CS").lower(),
+                case_cost=line.net_cost,
+                case_size=line.case_size,
+                distributor_sku=line.mfg_code,
+            ),
+            source_message_id=msg_id,
+            source_subject=subject,
+            po_number=po.po_number or "",
+            po_revision="",
+        ))
+
+    return events, errors
+
+
 def parse_message_with_errors(msg):
     """Extract events from an email message and surface non-fatal issues.
 
     Attachment precedence:
-      1. US Foods PO PDF attachment (sender from usfoods.com, .pdf file)
-         -> per-line ``restock`` events.
+      1. Distributor PO PDF attachment -> per-line ``restock`` events.
+         Currently routed: US Foods (usfoods.com), Cheney Brothers
+         (cheneybrothers.com).
       2. Any .csv attachment -> event type inferred from filename.
       3. Structured text body (tag lines) -> fallback if no attachments
          produced events.
@@ -312,18 +378,22 @@ def parse_message_with_errors(msg):
     events = []
     errors = []
 
-    # 1) US Foods PO PDF attachments (real POs arrive as PDFs, not CSVs).
-    is_usfoods = distributor == "US Foods"
+    # 1) Distributor PO PDF attachments (real POs arrive as PDFs, not CSVs).
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".pdf"):
             continue
-        if not is_usfoods:
+        if distributor == "US Foods":
+            d_events, d_errs = _usfoods_po_to_events(
+                payload, distributor, msg_id, subject,
+            )
+        elif distributor == "Cheney Brothers":
+            d_events, d_errs = _cheney_po_to_events(
+                payload, distributor, msg_id, subject,
+            )
+        else:
             continue
-        usf_events, usf_errs = _usfoods_po_to_events(
-            payload, distributor, msg_id, subject,
-        )
-        events.extend(usf_events)
-        errors.extend(usf_errs)
+        events.extend(d_events)
+        errors.extend(d_errs)
 
     # 2) CSV attachments
     for fname, payload in _attachments(msg):

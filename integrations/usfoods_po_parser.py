@@ -45,24 +45,17 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # USF item # → canonical H&H variety name.
 #
-# The H&H seed list uses 11 varieties (see seed_bagels.py). USF's PO uses
-# short 4-digit item codes. The "cheese wheat" variants are mapped back onto
-# the existing Asiago and Jalapeño Cheddar SKUs per JD's instruction (they
-# are wheat-flour variants of the same SKU, not new SKUs).
-#
-# Poppy Seed (1152) is NOT in the current seed list — mapping it here still
-# so downstream code can surface it clearly; the inventory match will fail
-# until a Poppy Seed SKU is added.
+# USF's "item #" column is H&H's own internal bagel SKU code. The same code
+# appears in Cheney's "Mfg#" field on Cheney POs. So the variety map is
+# shared — defined in integrations/hh_mfg_codes.py. USF_ITEM_TO_VARIETY is
+# kept as a backward-compat alias for any callers that imported it by name.
 # ---------------------------------------------------------------------------
-USF_ITEM_TO_VARIETY: dict[str, str] = {
-    "1150": "Plain",
-    "1152": "Poppy Seed",          # not in current seed — will need an SKU
-    "1153": "Sesame",
-    "1158": "Everything",
-    "1159": "Asiago",              # from "ASIGO CHS WHEAT" — mapped per JD
-    "1184": "Egg",
-    "1189": "Jalapeno Cheddar",    # from "JLP CHEDR CHS WHEAT" — mapped per JD
-}
+try:
+    from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY as _HH_MFG_MAP
+except ImportError:  # standalone / test use
+    from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY as _HH_MFG_MAP  # type: ignore
+
+USF_ITEM_TO_VARIETY: dict[str, str] = _HH_MFG_MAP
 
 # City (uppercase) seen on USF ship-to labels -> canonical "<City>, <ST>"
 # used by seed_bagels.py. Extend as new DCs appear on POs.

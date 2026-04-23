@@ -394,17 +394,18 @@ def scan_email(dry_run: bool = False,
         new_rev_int = _po_rev_int(new_rev)
         existing_rev_int, active_idx = _highest_applied_rev(usage, po_num)
 
-        if existing_rev_int and new_rev_int <= existing_rev_int:
-            # Idempotent skip: the same-or-older revision is already applied.
-            # This makes re-scans safe (e.g. after a restart) and means a
-            # duplicate of rev1 after rev2 won't undo rev2.
+        if active_idx and new_rev_int <= existing_rev_int:
+            # Idempotent skip: we've already booked this PO at the same-or-
+            # higher revision. Guard is `active_idx`, not `existing_rev_int`,
+            # so POs that don't expose a revision (e.g. Cheney) — which parse
+            # to rev_int 0 — still skip correctly on replay.
             report["po_revisions_skipped"].append(
                 f"PO {po_num} rev {new_rev or '(none)'}: already applied at "
                 f"rev {existing_rev_int} or higher - skipped {len(grp)} event(s)."
             )
             continue
 
-        if existing_rev_int:
+        if existing_rev_int and new_rev_int > existing_rev_int:
             # Higher revision arriving for a PO we've already booked - reverse
             # prior entries before posting the new ones.
             _reverse_po_entries(po_num, new_rev, active_idx, inv, usage, now,
@@ -473,9 +474,4 @@ def main():
         reports.extend(sync_all(clients, dry_run=dry_run))
         # Always offer email as an optional pass; it's silent when unconfigured.
         if "--with-email" in args:
-            reports.append(scan_email(dry_run=dry_run))
-    _print_report(reports, dry_run)
-
-
-if __name__ == "__main__":
-    main()
+            report
