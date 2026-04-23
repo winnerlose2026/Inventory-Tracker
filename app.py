@@ -311,6 +311,18 @@ def api_sync():
     return jsonify({"dry_run": dry_run, "reports": reports})
 
 
+@app.route("/api/seed", methods=["POST"])
+def api_seed():
+    from seed_bagels import seed
+
+    reset = bool((request.json or {}).get("reset", False))
+    try:
+        summary = seed(reset=reset)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 200
+    return jsonify({"ok": True, **summary})
+
+
 @app.route("/api/email/scan", methods=["POST"])
 def api_email_scan():
     from sync_inventory import scan_email

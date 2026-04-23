@@ -142,6 +142,14 @@ def seed(reset: bool = False):
     print(f"  Cheney Brothers SKUs: {cheney}")
     print(f"  US Foods SKUs:        {usf}")
     print(f"  Total SKUs:           {cheney + usf}")
+    return {
+        "added": added,
+        "skipped": skipped,
+        "total": cheney + usf,
+        "cheney": cheney,
+        "us_foods": usf,
+        "reset": bool(reset),
+    }
 
 
 if __name__ == "__main__":

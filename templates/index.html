@@ -267,6 +267,7 @@
           <p class="subtitle" style="margin-bottom:0">Bagels grouped by Cheney Brothers &amp; US Foods</p>
         </div>
         <div class="btn-group">
+          <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
           <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
           <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
           <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
@@ -711,6 +712,33 @@ async function runSync(dryRun) {
   box.innerHTML = renderSyncReport(result);
   toast(dryRun ? 'Preview complete.' : 'Sync complete.');
   if (!dryRun) loadDistributors();
+}
+
+async function runSeed() {
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">Seeding bagel catalog…</div></div>`;
+  let result;
+  try {
+    result = await api('/api/seed', 'POST', { reset: false });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Seed failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  if (!result.ok) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Seed failed: ${escHtml(result.error || 'unknown error')}</div></div>`;
+    return;
+  }
+  box.innerHTML = `<div class="card">
+    <div class="card-header"><span class="card-title">Seed Complete</span></div>
+    <div style="padding:14px 20px;font-size:13px">
+      Added <strong>${result.added}</strong> SKU(s), skipped <strong>${result.skipped}</strong> existing.
+      Catalog total: ${result.total} (Cheney ${result.cheney} · US Foods ${result.us_foods}).
+    </div>
+  </div>`;
+  toast('Bagel catalog seeded.');
+  loadDistributors();
+  loadDashboard();
 }
 
 async function runEmailScan(dryRun) {
