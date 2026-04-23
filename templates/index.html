@@ -123,6 +123,15 @@
   .type-restock { color: var(--green); }
 
   .actions-col { white-space: nowrap; }
+
+  /* Admin token panel (sidebar footer) */
+  .sidebar-footer { margin-top: auto; padding: 16px 20px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .token-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .token-dot.ok { background: var(--green); }
+  .token-dot.missing { background: var(--red); }
+  .token-actions { display: flex; gap: 6px; }
+  .token-actions .btn { flex: 1; padding: 5px 8px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -151,6 +160,16 @@
         <span class="nav-icon">📈</span> Report
       </div>
     </nav>
+    <div class="sidebar-footer">
+      <div class="token-status" id="token-status">
+        <span class="token-dot" id="token-dot"></span>
+        <span id="token-status-label">Checking…</span>
+      </div>
+      <div class="token-actions">
+        <button class="btn btn-ghost" onclick="promptAdminToken()" id="token-set-btn">Set admin key</button>
+        <button class="btn btn-ghost" onclick="clearAdminToken()" id="token-clear-btn" style="display:none">Clear</button>
+      </div>
+    </div>
   </aside>
 
   <!-- Main -->
@@ -485,12 +504,82 @@ function toast(msg, type = 'success') {
 }
 
 // -------------------------------------------------------------------------
+// Admin token (X-Inventory-Token on write requests)
+// -------------------------------------------------------------------------
+const ADMIN_TOKEN_KEY = 'bagelInvToken';
+let tokenRequired = false;
+
+function getAdminToken() {
+  try { return localStorage.getItem(ADMIN_TOKEN_KEY) || ''; } catch (e) { return ''; }
+}
+function setAdminToken(v) {
+  try {
+    if (v) localStorage.setItem(ADMIN_TOKEN_KEY, v);
+    else localStorage.removeItem(ADMIN_TOKEN_KEY);
+  } catch (e) {}
+}
+function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  const t = getAdminToken();
+  if (t) h['X-Inventory-Token'] = t;
+  return h;
+}
+function promptAdminToken() {
+  const v = window.prompt('Paste the INVENTORY_API_TOKEN value from Render:', getAdminToken());
+  if (v === null) return;
+  setAdminToken(v.trim());
+  refreshAuthStatus().then(() => {
+    if (getAdminToken()) toast('Admin key saved.');
+    refresh(currentPage);
+  });
+}
+function clearAdminToken() {
+  setAdminToken('');
+  refreshAuthStatus();
+  toast('Admin key cleared.');
+}
+async function refreshAuthStatus() {
+  const dot = document.getElementById('token-dot');
+  const label = document.getElementById('token-status-label');
+  const clearBtn = document.getElementById('token-clear-btn');
+  const setBtn = document.getElementById('token-set-btn');
+  try {
+    const r = await fetch('/api/auth/check', { headers: authHeaders() });
+    const j = await r.json();
+    tokenRequired = !!j.required;
+    if (!j.required) {
+      dot.className = 'token-dot ok';
+      label.textContent = 'Open backend';
+      clearBtn.style.display = 'none';
+      setBtn.textContent = 'Set admin key';
+    } else if (j.authorized) {
+      dot.className = 'token-dot ok';
+      label.textContent = 'Admin key OK';
+      clearBtn.style.display = '';
+      setBtn.textContent = 'Change';
+    } else {
+      dot.className = 'token-dot missing';
+      label.textContent = getAdminToken() ? 'Key rejected' : 'Admin key required';
+      clearBtn.style.display = getAdminToken() ? '' : 'none';
+      setBtn.textContent = 'Set admin key';
+    }
+  } catch (e) {
+    dot.className = 'token-dot';
+    label.textContent = 'Auth check failed';
+  }
+}
+
+// -------------------------------------------------------------------------
 // API helpers
 // -------------------------------------------------------------------------
 async function api(url, method = 'GET', body = null) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const opts = { method, headers: authHeaders() };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(url, opts);
+  let r = await fetch(url, opts);
+  if (r.status === 401 && (method === 'POST' || method === 'PUT' || method === 'DELETE')) {
+    toast('Write blocked: admin key required.', 'error');
+    refreshAuthStatus();
+  }
   return r.json();
 }
 
@@ -1016,6 +1105,11 @@ function escAttr(s) {
 // -------------------------------------------------------------------------
 // Boot
 // -------------------------------------------------------------------------
+refreshAuthStatus().then(() => {
+  if (tokenRequired && !getAdminToken()) {
+    promptAdminToken();
+  }
+});
 loadDashboard();
 </script>
 </body>
