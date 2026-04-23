@@ -580,15 +580,19 @@ class EmailInboxClient:
         user = urllib.parse.quote(os.environ["MS365_USER"])
         folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
         mark_read = os.environ.get("MS365_MARK_READ") == "1"
-        filt = os.environ.get("MS365_FILTER") or "isRead eq false"
+        # Default: no $filter at all, so both read and unread messages are
+        # returned (bounded by max_messages and $orderby desc). Set
+        # MS365_FILTER to narrow it, e.g. "receivedDateTime ge 2026-01-01T00:00:00Z".
+        filt = os.environ.get("MS365_FILTER", "").strip()
 
         top = min(max_messages, 50)
         q = {
             "$top": str(top),
             "$select": "id,subject,from,receivedDateTime,isRead,hasAttachments",
             "$orderby": "receivedDateTime desc",
-            "$filter": filt,
         }
+        if filt:
+            q["$filter"] = filt
         list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
                     f"?{urllib.parse.urlencode(q)}")
 

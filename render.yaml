@@ -1,0 +1,52 @@
+# Render Blueprint. Apply via Render dashboard -> Blueprints -> New Blueprint
+# Instance, or keep as documentation for the existing manually-created services.
+#
+# The web service config here mirrors what we already have in Procfile and
+# the dashboard. The cron service is the new piece: it hits the web service's
+# /api/email/scan endpoint every day at 09:00 America/New_York so POs parked
+# in unread *or* read mail get picked up automatically.
+
+services:
+  - type: web
+    name: bagel-inventory
+    runtime: python
+    plan: starter
+    branch: claude/update-m365-credentials-QvulU
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 2 --timeout 180 --bind 0.0.0.0:$PORT app:app
+    disk:
+      name: inventory-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: INVENTORY_API_TOKEN
+        sync: false
+      - key: MS365_TENANT_ID
+        sync: false
+      - key: MS365_CLIENT_ID
+        sync: false
+      - key: MS365_CLIENT_SECRET
+        sync: false
+      - key: MS365_USER
+        sync: false
+      - key: MS365_FOLDER
+        value: Inbox
+      - key: PO_LEAD_DAYS
+        value: "30"
+
+  - type: cron
+    name: bagel-inventory-daily-scan
+    runtime: python
+    plan: starter
+    branch: claude/update-m365-credentials-QvulU
+    # 09:00 America/New_York. Render cron schedules are in UTC.
+    # 13:00 UTC = 09:00 EDT (spring/summer) / 08:00 EST (fall/winter).
+    # If you want it pinned to 09:00 EST in winter too, change to "0 14 * * *".
+    schedule: "0 13 * * *"
+    buildCommand: "true"
+    startCommand: python scripts/trigger_email_scan.py
+    envVars:
+      - key: APP_URL
+        sync: false  # set to https://<your-service>.onrender.com
+      - key: INVENTORY_API_TOKEN
+        sync: false
