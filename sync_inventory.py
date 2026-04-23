@@ -355,6 +355,10 @@ def scan_email(dry_run: bool = False,
         report["status"] = "not_configured"
         report["error"] = str(exc)
         return report
+    except Exception as exc:  # noqa: BLE001
+        report["status"] = "error"
+        report["error"] = str(exc)
+        return report
 
     report["messages_seen"] = scan.messages_seen
     report["messages_parsed"] = scan.messages_parsed

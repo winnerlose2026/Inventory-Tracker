@@ -109,6 +109,33 @@ GRAPH_TOKEN_URL_FMT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/to
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 
+def _graph_error(verb: str, url: str, exc: "urllib.error.HTTPError") -> RuntimeError:
+    """Turn an HTTPError from Graph into a RuntimeError that includes the
+    response body's error code + message. urllib swallows the body otherwise,
+    which makes 401/403 from Graph look identical to 401 from the token
+    endpoint."""
+    body = ""
+    code = ""
+    message = ""
+    try:
+        raw = exc.read()
+        body = raw.decode("utf-8", errors="replace")
+        try:
+            j = json.loads(body)
+            err = j.get("error") or {}
+            code = err.get("code", "") or ""
+            message = err.get("message", "") or ""
+        except (ValueError, AttributeError):
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    path = url.split("?", 1)[0]
+    detail = f"{code}: {message}" if code else body[:400]
+    return RuntimeError(
+        f"Microsoft Graph {verb} {path} failed ({exc.code} {exc.reason}). {detail}".strip()
+    )
+
+
 @dataclass
 class EmailEvent:
     """One actionable signal pulled out of a message."""
@@ -499,14 +526,18 @@ class EmailInboxClient:
             "scope": os.environ.get("MS365_SCOPE", GRAPH_DEFAULT_SCOPE),
             "grant_type": "client_credentials",
         }).encode()
+        token_url = GRAPH_TOKEN_URL_FMT.format(tenant=urllib.parse.quote(tenant))
         req = urllib.request.Request(
-            GRAPH_TOKEN_URL_FMT.format(tenant=urllib.parse.quote(tenant)),
+            token_url,
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise _graph_error("POST", token_url, exc) from exc
         token = payload.get("access_token")
         if not token:
             raise NotConfiguredError(
@@ -522,8 +553,11 @@ class EmailInboxClient:
             headers={"Authorization": f"Bearer {token}", "Accept": accept},
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read(), resp.headers
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read(), resp.headers
+        except urllib.error.HTTPError as exc:
+            raise _graph_error("GET", url, exc) from exc
 
     def _graph_patch(self, url, token, body):
         req = urllib.request.Request(
@@ -535,8 +569,11 @@ class EmailInboxClient:
             },
             method="PATCH",
         )
-        with urllib.request.urlopen(req, timeout=30):
-            pass
+        try:
+            with urllib.request.urlopen(req, timeout=30):
+                pass
+        except urllib.error.HTTPError as exc:
+            raise _graph_error("PATCH", url, exc) from exc
 
     def _scan_ms365(self, result, max_messages):
         token = self._ms365_token()

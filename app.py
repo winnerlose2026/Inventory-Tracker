@@ -316,7 +316,22 @@ def api_email_scan():
     from sync_inventory import scan_email
 
     dry_run = bool((request.json or {}).get("dry_run", False))
-    report = scan_email(dry_run=dry_run)
+    try:
+        report = scan_email(dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001
+        report = {
+            "distributor": "Email Inbox",
+            "source": "unknown",
+            "status": "error",
+            "fetched": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "unmatched": [],
+            "changes": [],
+            "error": str(exc),
+            "messages_seen": 0,
+            "messages_parsed": 0,
+        }
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
