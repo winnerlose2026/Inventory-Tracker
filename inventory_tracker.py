@@ -32,7 +32,14 @@ def _save(path: Path, data):
 
 
 def load_inventory() -> dict:
-    return _load(INVENTORY_FILE)
+    inv = _load(INVENTORY_FILE)
+    if _rollover_on_order(inv):
+        # Promoted at least one pending order — persist both sides.
+        usage = _load(USAGE_FILE)
+        _append_rollover_usage(inv, usage)
+        _save(INVENTORY_FILE, inv)
+        _save(USAGE_FILE, usage)
+    return inv
 
 
 def save_inventory(inv: dict):
@@ -45,6 +52,83 @@ def load_usage() -> list:
 
 def save_usage(usage: list):
     _save(USAGE_FILE, usage)
+
+
+# ---------------------------------------------------------------------------
+# On-order rollover
+# ---------------------------------------------------------------------------
+# PO-tagged restock events from email scans are parked in item["on_order"]
+# with an ETA = ordered_at + lead time. When the ETA passes we promote them
+# into item["quantity"] and append a matching usage entry so history stays
+# consistent. This runs on every load_inventory() so readers always see
+# current state without needing a separate scheduler.
+
+# Staged arrivals that have been promoted get stashed here between the
+# _rollover_on_order pass (which mutates the inventory dict) and the
+# _append_rollover_usage pass (which mutates the usage list). Not thread-safe
+# — we rely on the single-process Flask dev/gunicorn model.
+_PENDING_ROLLOVER_AUDIT: list = []
+
+
+def _rollover_on_order(inv: dict) -> bool:
+    """Promote on_order entries whose ETA has passed into quantity.
+    Mutates `inv` in place. Returns True if any entry was promoted."""
+    global _PENDING_ROLLOVER_AUDIT
+    _PENDING_ROLLOVER_AUDIT = []
+    now = datetime.now()
+    changed = False
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        if not pending:
+            continue
+        kept = []
+        for entry in pending:
+            eta_str = entry.get("eta", "")
+            try:
+                eta = datetime.fromisoformat(eta_str)
+            except (TypeError, ValueError):
+                kept.append(entry)
+                continue
+            if eta > now:
+                kept.append(entry)
+                continue
+            qty = float(entry.get("qty") or 0)
+            if qty <= 0:
+                changed = True
+                continue
+            item["quantity"] = float(item.get("quantity", 0)) + qty
+            item["updated"] = now.isoformat()
+            _PENDING_ROLLOVER_AUDIT.append({
+                "item_key": key,
+                "item_name": item.get("name", key),
+                "unit": item.get("unit", ""),
+                "qty": qty,
+                "po_number": entry.get("po_number", ""),
+                "po_revision": entry.get("po_revision", ""),
+                "eta": eta_str,
+                "timestamp": now.isoformat(),
+            })
+            changed = True
+        item["on_order"] = kept
+    return changed
+
+
+def _append_rollover_usage(inv: dict, usage: list) -> None:
+    """Append a usage-log entry for each promoted on_order entry."""
+    for audit in _PENDING_ROLLOVER_AUDIT:
+        usage.append({
+            "item_key": audit["item_key"],
+            "item_name": audit["item_name"],
+            "amount": -audit["qty"],  # negative = restock in the log convention
+            "unit": audit["unit"],
+            "note": (f"PO {audit['po_number']} arrived (ETA {audit['eta'][:10]})"
+                     if audit["po_number"] else "On-order arrival"),
+            "timestamp": audit["timestamp"],
+            "po_number": audit["po_number"],
+            "po_revision": audit["po_revision"],
+            "source": "on_order_rollover",
+        })
+    _PENDING_ROLLOVER_AUDIT.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -102,10 +102,21 @@ def index():
 # API – Inventory
 # ---------------------------------------------------------------------------
 
+def _enrich_on_order(item: dict) -> dict:
+    """Add convenience fields summarising pending on_order entries."""
+    pending = item.get("on_order") or []
+    total = round(sum(float(p.get("qty") or 0) for p in pending), 2)
+    etas = [p.get("eta", "") for p in pending if p.get("eta")]
+    next_eta = min(etas) if etas else ""
+    item["on_order_qty"] = total
+    item["on_order_next_eta"] = next_eta
+    return item
+
+
 @app.route("/api/inventory")
 def api_inventory():
     inv = load_inventory()
-    return jsonify(list(inv.values()))
+    return jsonify([_enrich_on_order(dict(v)) for v in inv.values()])
 
 
 @app.route("/api/inventory", methods=["POST"])
@@ -261,8 +272,9 @@ def api_warehouses():
 @app.route("/api/distributors")
 def api_distributors():
     inv = load_inventory()
+    items_enriched = [_enrich_on_order(dict(v)) for v in inv.values()]
     groups: dict[str, list] = {}
-    for item in inv.values():
+    for item in items_enriched:
         dist = item.get("distributor") or "Unassigned"
         groups.setdefault(dist, []).append(item)
 
@@ -270,6 +282,7 @@ def api_distributors():
     for dist, items in sorted(groups.items()):
         total_qty = sum(i["quantity"] for i in items)
         total_value = sum(i["quantity"] * i["price"] for i in items)
+        total_on_order = sum(i.get("on_order_qty", 0) for i in items)
         low = [i for i in items if i["quantity"] <= i["low_stock_threshold"]]
 
         # Sub-group by warehouse
@@ -283,6 +296,7 @@ def api_distributors():
                 "item_count": len(wh_items),
                 "total_quantity": round(sum(x["quantity"] for x in wh_items), 2),
                 "total_value": round(sum(x["quantity"] * x["price"] for x in wh_items), 2),
+                "total_on_order": round(sum(x.get("on_order_qty", 0) for x in wh_items), 2),
                 "low_stock_count": sum(1 for x in wh_items if x["quantity"] <= x["low_stock_threshold"]),
                 "items": sorted(wh_items, key=lambda x: x["name"]),
             })
@@ -292,6 +306,7 @@ def api_distributors():
             "item_count": len(items),
             "total_quantity": round(total_qty, 2),
             "total_value": round(total_value, 2),
+            "total_on_order": round(total_on_order, 2),
             "low_stock_count": len(low),
             "warehouses": warehouses,
         })

@@ -14,8 +14,9 @@ Usage:
     python sync_inventory.py --usfoods    # sync only US Foods
 """
 
+import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from integrations import (
@@ -27,6 +28,14 @@ from inventory_tracker import load_inventory, save_inventory, load_usage, save_u
 
 # Must match the naming convention in seed_bagels.py
 DISTRIBUTOR_TAG = {"Cheney Brothers": "CB", "US Foods": "USF"}
+
+# Incoming POs are booked to on_order with this lead time before promoting
+# into quantity. Overridable via env var for testing.
+def _po_lead_days() -> int:
+    try:
+        return max(0, int(os.environ.get("PO_LEAD_DAYS", "30")))
+    except (TypeError, ValueError):
+        return 30
 
 
 def _warehouse_short(full: str) -> str:
@@ -266,6 +275,89 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
         })
 
 
+def _apply_po_on_order(evt, item: dict, key: str, now: str,
+                       report: dict, dry_run: bool) -> None:
+    """Record a PO-tagged restock as a pending on_order entry instead of
+    bumping on-hand quantity. The rollover in inventory_tracker promotes
+    it once ETA passes."""
+    amount = float(evt.item.quantity or 0)
+    if amount <= 0:
+        return
+    lead_days = _po_lead_days()
+    try:
+        ordered_at_dt = datetime.fromisoformat(now)
+    except (TypeError, ValueError):
+        ordered_at_dt = datetime.now()
+    eta_dt = ordered_at_dt + timedelta(days=lead_days)
+    pending = item.get("on_order") or []
+    existing_qty = sum(float(p.get("qty") or 0) for p in pending)
+
+    entry = {
+        "qty": amount,
+        "unit": item.get("unit", ""),
+        "eta": eta_dt.isoformat(),
+        "ordered_at": ordered_at_dt.isoformat(),
+        "po_number": evt.po_number,
+        "po_revision": getattr(evt, "po_revision", "") or "",
+        "source": "Email Inbox",
+        "source_subject": (evt.source_subject or "")[:120],
+        "lead_days": lead_days,
+    }
+
+    report["changes"].append({
+        "name": item["name"],
+        "warehouse": item.get("warehouse", ""),
+        "event_type": "on_order",
+        "old_quantity": item["quantity"],
+        "new_quantity": item["quantity"],
+        "delta": 0,
+        "on_order_delta": round(amount, 2),
+        "on_order_total": round(existing_qty + amount, 2),
+        "eta": eta_dt.isoformat(),
+        "po_number": evt.po_number,
+        "po_revision": entry["po_revision"],
+    })
+    report["updated"] += 1
+    report.setdefault("by_event_type", {})["on_order"] = \
+        report["by_event_type"].get("on_order", 0) + 1
+
+    if dry_run:
+        return
+
+    item["on_order"] = pending + [entry]
+    item["updated"] = now
+    item["last_synced"] = now
+    item["last_synced_from"] = "Email Inbox"
+
+
+def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
+                           now: str, report: dict, dry_run: bool) -> None:
+    """Drop pending on_order entries for a superseded PO."""
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        if not pending:
+            continue
+        removed = [p for p in pending if p.get("po_number") == po_number]
+        if not removed:
+            continue
+        kept = [p for p in pending if p.get("po_number") != po_number]
+        removed_qty = round(sum(float(p.get("qty") or 0) for p in removed), 2)
+        report["changes"].append({
+            "name": item["name"],
+            "warehouse": item.get("warehouse", ""),
+            "event_type": "on_order_reversed",
+            "old_quantity": item["quantity"],
+            "new_quantity": item["quantity"],
+            "delta": 0,
+            "on_order_delta": -removed_qty,
+            "po_number": po_number,
+            "superseded_by_revision": str(new_rev or ""),
+        })
+        if not dry_run:
+            item["on_order"] = kept
+            item["updated"] = now
+
+
 def _apply_email_event(evt, inv: dict, usage: list, now: str,
                        report: dict, dry_run: bool) -> None:
     """Apply a single EmailEvent to the inventory/usage log."""
@@ -278,6 +370,14 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     item = inv[key]
     old_qty = item["quantity"]
     amount = evt.item.quantity
+    po_num = getattr(evt, "po_number", "") or ""
+
+    # PO-tagged restocks don't hit on-hand immediately. They're parked in
+    # item["on_order"] with a lead-time ETA and promoted by the rollover
+    # in inventory_tracker.load_inventory when ETA passes.
+    if evt.event_type == "restock" and po_num:
+        _apply_po_on_order(evt, item, key, now, report, dry_run)
+        return
 
     if evt.event_type == "on_hand":
         if abs(amount - old_qty) < 1e-9:
@@ -418,6 +518,11 @@ def scan_email(dry_run: bool = False,
                 f"PO {po_num}: rev {existing_rev_int} superseded by rev "
                 f"{new_rev_int} ({len(active_idx)} line(s) reversed)."
             )
+
+        # Always clear pending on_order rows tagged with this PO before
+        # posting new ones. Covers the case where the prior revision never
+        # finished its lead time (so nothing is in usage yet).
+        _remove_on_order_by_po(po_num, new_rev, inv, now, report, dry_run)
 
         for evt in grp:
             _apply_email_event(evt, inv, usage, now, report, dry_run)

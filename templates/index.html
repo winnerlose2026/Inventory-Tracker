@@ -249,6 +249,7 @@
               <th>Distributor</th>
               <th>Warehouse</th>
               <th>Qty</th>
+              <th>On Order</th>
               <th>Price</th>
               <th>Status</th>
               <th>Actions</th>
@@ -662,7 +663,7 @@ async function loadInventory() {
   }
   const tbody = document.getElementById('inv-tbody');
   if (items.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">No items match this filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">No items match this filter.</td></tr>';
     return;
   }
   tbody.innerHTML = items.map(item => {
@@ -681,6 +682,7 @@ async function loadInventory() {
       <td>${distributorBadge(item.distributor)}</td>
       <td>${item.warehouse ? escHtml(item.warehouse) : '<span style="color:var(--muted)">—</span>'}</td>
       <td style="font-weight:600">${item.quantity.toFixed(2)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
+      <td>${renderOnOrder(item)}</td>
       <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${status}</td>
       <td class="actions-col">
@@ -773,16 +775,27 @@ function renderSyncReport(result) {
       </div>`;
     }
     const preview = r.changes.slice(0, 8).map(c => {
-      const sign = c.delta >= 0 ? '+' : '';
-      const color = c.delta >= 0 ? 'var(--green)' : 'var(--red)';
-      const typePill = c.event_type
-        ? `<span class="badge badge-purple" style="margin-right:6px">${escHtml(c.event_type)}</span>` : '';
+      // on_order events don't change on-hand yet — show the pending delta instead.
+      const isPending = (c.event_type === 'on_order' || c.event_type === 'on_order_reversed')
+                        && (c.on_order_delta !== undefined);
+      const displayDelta = isPending ? c.on_order_delta : c.delta;
+      const sign = displayDelta >= 0 ? '+' : '';
+      const color = isPending ? 'var(--accent)'
+                              : (displayDelta >= 0 ? 'var(--green)' : 'var(--red)');
+      const typeLabel = c.event_type === 'on_order' ? 'on order'
+                      : c.event_type === 'on_order_reversed' ? 'on order ↻'
+                      : c.event_type;
+      const typePill = typeLabel
+        ? `<span class="badge badge-purple" style="margin-right:6px">${escHtml(typeLabel)}</span>` : '';
+      const etaSuffix = isPending && c.eta
+        ? ` <span style="color:var(--muted);font-size:11px">ETA ${c.eta.slice(0, 10)}</span>`
+        : '';
       return `<tr>
-        <td>${typePill}${escHtml(c.name)}</td>
+        <td>${typePill}${escHtml(c.name)}${etaSuffix}</td>
         <td style="color:var(--muted)">${escHtml(c.warehouse || '')}</td>
         <td style="text-align:right">${c.old_quantity.toFixed(0)}</td>
         <td style="text-align:right;font-weight:600">${c.new_quantity.toFixed(0)}</td>
-        <td style="text-align:right;color:${color}">${sign}${c.delta.toFixed(0)}</td>
+        <td style="text-align:right;color:${color}">${sign}${displayDelta.toFixed(0)}</td>
       </tr>`;
     }).join('');
     const moreNote = r.changes.length > 8
@@ -793,6 +806,7 @@ function renderSyncReport(result) {
       ? ` · messages ${r.messages_parsed}/${r.messages_seen}`
         + (r.by_event_type
             ? ` · on_hand ${r.by_event_type.on_hand || 0} · restock ${r.by_event_type.restock || 0} · usage ${r.by_event_type.usage || 0}`
+              + ((r.by_event_type.on_order || 0) ? ` · on_order ${r.by_event_type.on_order}` : '')
             : '')
       : '';
     const errorNote = r.error
@@ -847,6 +861,7 @@ async function loadDistributors() {
           ${g.warehouses.length} warehouse(s) · ${g.item_count} SKU(s) · ${g.total_quantity.toFixed(0)} units · $${g.total_value.toFixed(2)}
           ${caseCost !== null ? ` · case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
           · ${weeklyTotal.toFixed(0)}/wk
+          ${(g.total_on_order || 0) > 0 ? ` · <span style="color:var(--accent)">${g.total_on_order.toFixed(0)} on order</span>` : ''}
           ${shortCount > 0 ? ` · <span style="color:var(--red)">${shortCount} under 4 wk</span>` : ''}
           ${g.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
         </span>
@@ -869,7 +884,7 @@ async function loadDistributors() {
             <table>
               <thead>
                 <tr>
-                  <th>Variety</th><th>Qty</th><th>Unit</th><th>Price</th>
+                  <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
                   <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>
                 </tr>
               </thead>
@@ -886,6 +901,7 @@ async function loadDistributors() {
                   return `<tr>
                     <td style="font-weight:600">${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td>${renderOnOrder(i)}</td>
                     <td>${escHtml(i.unit)}</td>
                     <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
                     <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
@@ -1119,6 +1135,18 @@ document.addEventListener('keydown', e => {
     else if (txnModal.classList.contains('open')) submitTxn();
   }
 });
+
+// -------------------------------------------------------------------------
+// On-order column rendering
+// -------------------------------------------------------------------------
+function renderOnOrder(item) {
+  const qty = +(item.on_order_qty || 0);
+  if (!qty) return '<span style="color:var(--muted)">—</span>';
+  const eta = (item.on_order_next_eta || '').slice(0, 10);
+  const tip = eta ? `next arrival ${eta}` : 'pending lead time';
+  return `<span class="badge badge-blue" title="${escAttr(tip)}">+${qty.toFixed(0)}</span>`
+       + (eta ? ` <span style="color:var(--muted);font-size:11px">${eta}</span>` : '');
+}
 
 // -------------------------------------------------------------------------
 // Escape HTML helpers
