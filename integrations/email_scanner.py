@@ -51,7 +51,9 @@ Configuration
   MS365_CLIENT_ID       app registration (client) ID
   MS365_CLIENT_SECRET   app registration client secret
   MS365_USER            mailbox to scan (UPN / email) — requires
-                        Mail.Read application permission granted admin consent
+                        Mail.Read application permission granted admin consent.
+                        May be a comma-separated list to scan multiple
+                        mailboxes, e.g. "ops@foo.com,orders@foo.com".
   MS365_FOLDER          default "Inbox"
   MS365_FILTER          optional Graph $filter, e.g.
                         "isRead eq false and receivedDateTime ge 2025-01-01T00:00:00Z"
@@ -577,7 +579,18 @@ class EmailInboxClient:
 
     def _scan_ms365(self, result, max_messages):
         token = self._ms365_token()
-        user = urllib.parse.quote(os.environ["MS365_USER"])
+        # MS365_USER may be a single UPN or a comma-separated list. Each
+        # mailbox is scanned up to max_messages independently so we don't
+        # have to decide a priori how to split a shared budget. All share
+        # the same tenant / app / token, so one Mail.Read admin-consent
+        # covers every mailbox in the list.
+        users_raw = os.environ.get("MS365_USER", "")
+        users = [u.strip() for u in users_raw.split(",") if u.strip()]
+        if not users:
+            raise NotConfiguredError(
+                "MS365_USER is empty. Set it to a mailbox UPN, or a comma-"
+                "separated list of UPNs to scan multiple mailboxes."
+            )
         folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
         mark_read = os.environ.get("MS365_MARK_READ") == "1"
         # Default: no $filter at all, so both read and unread messages are
@@ -585,6 +598,19 @@ class EmailInboxClient:
         # MS365_FILTER to narrow it, e.g. "receivedDateTime ge 2026-01-01T00:00:00Z".
         filt = os.environ.get("MS365_FILTER", "").strip()
 
+        for upn in users:
+            try:
+                self._scan_ms365_mailbox(
+                    result, token, upn, folder, filt, mark_read, max_messages,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Keep going so a permission problem on one shared mailbox
+                # doesn't kill the scan of the others.
+                result.errors.append(f"ms365 scan failed for {upn}: {exc}")
+
+    def _scan_ms365_mailbox(self, result, token, upn, folder, filt, mark_read,
+                            max_messages):
+        user = urllib.parse.quote(upn)
         top = min(max_messages, 50)
         q = {
             "$top": str(top),
@@ -616,7 +642,7 @@ class EmailInboxClient:
                     events, errs = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(
-                        f"ms365 parse failed for {m.get('subject', mid)!r}: {exc}"
+                        f"ms365 parse failed for {upn}:{m.get('subject', mid)!r}: {exc}"
                     )
                     continue
                 result.errors.extend(errs)
@@ -632,7 +658,7 @@ class EmailInboxClient:
                             )
                         except Exception as exc:  # noqa: BLE001
                             result.errors.append(
-                                f"ms365 mark-read failed for {mid}: {exc}"
+                                f"ms365 mark-read failed for {upn}:{mid}: {exc}"
                             )
             list_url = page.get("@odata.nextLink")
 
