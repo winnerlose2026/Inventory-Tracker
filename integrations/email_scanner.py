@@ -22,14 +22,20 @@ Three mailbox sources are supported, tried in this order:
 
 Input formats understood (in priority order):
 
-  1. **CSV attachment** on the message — parsed via the shared csv_loader.
+  1. **US Foods PO PDF attachment** — when a message from a usfoods.com
+     sender carries a PDF attachment (typical filename
+     ``US Foods PO Request - <po#> - Date <mmyyyy>.PDF``), the PDF is
+     parsed via ``usfoods_po_parser.parse_po_pdf`` and each line item is
+     emitted as a ``restock`` event keyed to the PO's ship-to warehouse.
+
+  2. **CSV attachment** on the message — parsed via the shared csv_loader.
      The attachment filename hints at the event type:
         *on_hand*.csv, *inventory*.csv      -> on_hand
         *invoice*.csv, *restock*.csv, *po*.csv -> restock
         *usage*.csv, *consumption*.csv      -> usage
      Default if no hint: on_hand.
 
-  2. **Structured body text** — a tag line `# event: on_hand|restock|usage`
+  3. **Structured body text** — a tag line `# event: on_hand|restock|usage`
      followed by lines like `Plain @ Ocala, FL: 480 each` or
      `Plain Bagel 4oz [CB - Ocala]: 72`.
 
@@ -76,6 +82,7 @@ from typing import Literal, Optional
 
 from .base import NotConfiguredError, SyncItem
 from .csv_loader import read_csv
+from .usfoods_po_parser import UsFoodsPO, UsFoodsPOLine, parse_po_pdf
 
 
 EventType = Literal["on_hand", "restock", "usage"]
@@ -100,6 +107,11 @@ class EmailEvent:
     item: SyncItem
     source_message_id: str = ""
     source_subject: str = ""
+    # Populated only for events sourced from a distributor PO. The apply
+    # path uses these to detect revisions: a later revision for the same
+    # po_number fully supersedes earlier events (not line-by-line dedup).
+    po_number: str = ""
+    po_revision: str = ""
 
 
 @dataclass
@@ -193,15 +205,14 @@ def _attachments(msg: Message):
         yield fname, payload
 
 
-def _parse_body_items(body: str, distributor: str,
-                      default_event: EventType) -> tuple[EventType, str, list[SyncItem]]:
+def _parse_body_items(body, distributor, default_event):
     """Parse a structured body. Returns (event_type, warehouse_override, items)."""
     tags = {m.group(1).lower(): m.group(2).strip() for m in _TAG_RE.finditer(body)}
-    event_type = tags.get("event", default_event).lower()  # type: ignore[assignment]
+    event_type = tags.get("event", default_event).lower()
     if event_type not in ("on_hand", "restock", "usage"):
         event_type = default_event
     warehouse_override = tags.get("warehouse", "")
-    items: list[SyncItem] = []
+    items = []
     for line in body.splitlines():
         if line.strip().startswith("#"):
             continue
@@ -219,11 +230,74 @@ def _parse_body_items(body: str, distributor: str,
             warehouse=warehouse or None,
             unit=unit,
         ))
-    return event_type, warehouse_override, items  # type: ignore[return-value]
+    return event_type, warehouse_override, items
 
 
-def parse_message(msg: Message) -> list[EmailEvent]:
-    """Extract all events from a single email message."""
+def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
+    """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
+
+    Returns (events, errors). Errors are strings suitable for
+    ``ScanResult.errors`` — e.g., unmapped USF item numbers or an unknown
+    ship-to DC. One event is emitted per ``UsFoodsPOLine`` with an
+    ``event_type`` of ``"restock"``.
+    """
+    events = []
+    errors = []
+    try:
+        po = parse_po_pdf(pdf_bytes)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"usfoods PO PDF parse failed ({subject!r}): {exc}")
+        return events, errors
+
+    if po.unmapped_items:
+        errors.append(
+            f"usfoods PO {po.po_number or '?'}: unmapped USF item #s "
+            f"{sorted(set(po.unmapped_items))} — add them to "
+            "usfoods_po_parser.USF_ITEM_TO_VARIETY"
+        )
+    if po.ship_to_city and not po.warehouse:
+        errors.append(
+            f"usfoods PO {po.po_number or '?'}: unknown ship-to DC "
+            f"{po.ship_to_city!r} — add it to "
+            "usfoods_po_parser.USF_DC_CITY_TO_WAREHOUSE"
+        )
+
+    for line in po.lines:
+        if not line.variety or not po.warehouse:
+            continue
+        events.append(EmailEvent(
+            event_type="restock",
+            item=SyncItem(
+                quantity=line.quantity,
+                distributor=distributor,
+                variety=line.variety,
+                warehouse=po.warehouse,
+                unit=(line.unit or "cases").lower(),
+                case_cost=line.net_cost,
+                case_size=line.case_size,
+                distributor_sku=line.usf_item_no,
+            ),
+            source_message_id=msg_id,
+            source_subject=subject,
+            po_number=po.po_number or "",
+            po_revision=po.po_revision or "",
+        ))
+
+    return events, errors
+
+
+def parse_message_with_errors(msg):
+    """Extract events from an email message and surface non-fatal issues.
+
+    Attachment precedence:
+      1. US Foods PO PDF attachment (sender from usfoods.com, .pdf file)
+         -> per-line ``restock`` events.
+      2. Any .csv attachment -> event type inferred from filename.
+      3. Structured text body (tag lines) -> fallback if no attachments
+         produced events.
+
+    Returns (events, errors).
+    """
     subject = str(msg.get("Subject", ""))
     msg_id = str(msg.get("Message-ID", ""))
     from_hdr = str(msg.get("From", ""))
@@ -235,9 +309,23 @@ def parse_message(msg: Message) -> list[EmailEvent]:
                    or _distributor_from_sender(from_hdr)
                    or "Unassigned")
 
-    events: list[EmailEvent] = []
+    events = []
+    errors = []
 
-    # 1) CSV attachments
+    # 1) US Foods PO PDF attachments (real POs arrive as PDFs, not CSVs).
+    is_usfoods = distributor == "US Foods"
+    for fname, payload in _attachments(msg):
+        if not fname.lower().endswith(".pdf"):
+            continue
+        if not is_usfoods:
+            continue
+        usf_events, usf_errs = _usfoods_po_to_events(
+            payload, distributor, msg_id, subject,
+        )
+        events.extend(usf_events)
+        errors.extend(usf_errs)
+
+    # 2) CSV attachments
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".csv"):
             continue
@@ -255,7 +343,7 @@ def parse_message(msg: Message) -> list[EmailEvent]:
         finally:
             tmp.unlink(missing_ok=True)
 
-    # 2) Structured body
+    # 3) Structured body (only if no attachment produced events)
     if body and not events:
         event_type, _, items = _parse_body_items(body, distributor, "on_hand")
         for it in items:
@@ -266,6 +354,12 @@ def parse_message(msg: Message) -> list[EmailEvent]:
                 source_subject=subject,
             ))
 
+    return events, errors
+
+
+def parse_message(msg):
+    """Thin wrapper over parse_message_with_errors that discards diagnostics."""
+    events, _ = parse_message_with_errors(msg)
     return events
 
 
@@ -274,13 +368,11 @@ def parse_message(msg: Message) -> list[EmailEvent]:
 # ---------------------------------------------------------------------------
 
 class EmailInboxClient:
-    """Scans a mailbox (MS 365 → IMAP → local dumps) for inventory events."""
+    """Scans a mailbox (MS 365 -> IMAP -> local dumps) for inventory events."""
 
     name = "Email Inbox"
 
-    # ----- Configuration helpers -----
-
-    def _has_ms365_credentials(self) -> bool:
+    def _has_ms365_credentials(self):
         return bool(
             os.environ.get("MS365_TENANT_ID")
             and os.environ.get("MS365_CLIENT_ID")
@@ -288,17 +380,17 @@ class EmailInboxClient:
             and os.environ.get("MS365_USER")
         )
 
-    def _has_imap_credentials(self) -> bool:
+    def _has_imap_credentials(self):
         return bool(
             os.environ.get("EMAIL_IMAP_HOST")
             and os.environ.get("EMAIL_IMAP_USER")
             and os.environ.get("EMAIL_IMAP_PASSWORD")
         )
 
-    def dumps_path(self) -> Path:
+    def dumps_path(self):
         return Path(__file__).parent / "email_dumps"
 
-    def source(self) -> str:
+    def source(self):
         if self._has_ms365_credentials():
             return "ms365"
         if self._has_imap_credentials():
@@ -307,9 +399,7 @@ class EmailInboxClient:
             return "dumps"
         return "unconfigured"
 
-    # ----- Entry point -----
-
-    def scan(self, max_messages: int = 200) -> ScanResult:
+    def scan(self, max_messages=200):
         src = self.source()
         result = ScanResult(source=src)
         if src == "ms365":
@@ -331,9 +421,7 @@ class EmailInboxClient:
             )
         return result
 
-    # ----- Microsoft 365 (Graph) -----
-
-    def _ms365_token(self) -> str:
+    def _ms365_token(self):
         tenant = os.environ["MS365_TENANT_ID"]
         body = urllib.parse.urlencode({
             "client_id": os.environ["MS365_CLIENT_ID"],
@@ -358,7 +446,7 @@ class EmailInboxClient:
             )
         return token
 
-    def _graph_get(self, url: str, token: str, accept: str = "application/json"):
+    def _graph_get(self, url, token, accept="application/json"):
         req = urllib.request.Request(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": accept},
@@ -367,7 +455,7 @@ class EmailInboxClient:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read(), resp.headers
 
-    def _graph_patch(self, url: str, token: str, body: dict) -> None:
+    def _graph_patch(self, url, token, body):
         req = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -380,7 +468,7 @@ class EmailInboxClient:
         with urllib.request.urlopen(req, timeout=30):
             pass
 
-    def _scan_ms365(self, result: ScanResult, max_messages: int) -> None:
+    def _scan_ms365(self, result, max_messages):
         token = self._ms365_token()
         user = urllib.parse.quote(os.environ["MS365_USER"])
         folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
@@ -414,12 +502,13 @@ class EmailInboxClient:
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
                     msg = email.message_from_bytes(mime_bytes)
-                    events = parse_message(msg)
+                    events, errs = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(
                         f"ms365 parse failed for {m.get('subject', mid)!r}: {exc}"
                     )
                     continue
+                result.errors.extend(errs)
                 if events:
                     result.messages_parsed += 1
                     result.events.extend(events)
@@ -436,9 +525,7 @@ class EmailInboxClient:
                             )
             list_url = page.get("@odata.nextLink")
 
-    # ----- IMAP fallback -----
-
-    def _scan_imap(self, result: ScanResult, max_messages: int) -> None:
+    def _scan_imap(self, result, max_messages):
         host = os.environ["EMAIL_IMAP_HOST"]
         port = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
         user = os.environ["EMAIL_IMAP_USER"]
@@ -467,32 +554,39 @@ class EmailInboxClient:
                 raw = msg_data[0][1]
                 try:
                     msg = email.message_from_bytes(raw)
-                    events = parse_message(msg)
+                    events, errs = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"parse failed for {msg_id!r}: {exc}")
                     continue
+                result.errors.extend(errs)
                 if events:
                     result.messages_parsed += 1
                     result.events.extend(events)
                     if not mark_read:
                         imap.store(msg_id, "-FLAGS", "\\Seen")
 
-    # ----- Local .eml dump fallback -----
-
-    def _scan_dumps(self, result: ScanResult, max_messages: int) -> None:
+    def _scan_dumps(self, result, max_messages):
         paths = sorted(self.dumps_path().glob("*.eml"))[:max_messages]
         result.messages_seen = len(paths)
         for path in paths:
             try:
                 with open(path, "rb") as f:
                     msg = email.message_from_bytes(f.read())
-                events = parse_message(msg)
+                events, errs = parse_message_with_errors(msg)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"{path.name}: {exc}")
                 continue
+            result.errors.extend(errs)
             if events:
                 result.messages_parsed += 1
                 result.events.extend(events)
 
 
-__all__ = ["EmailInboxClient", "EmailEvent", "ScanResult", "parse_message"]
+__all__ = [
+    "EmailInboxClient",
+    "EmailEvent",
+    "ScanResult",
+    "parse_message",
+    "parse_message_with_errors",
+]
+        

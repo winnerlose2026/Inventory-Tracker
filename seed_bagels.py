@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Seed the inventory with our unified bagel list from Cheney Brothers and US Foods.
 
-Varieties carried: plain, everything, sesame, cinnamon raisin, whole wheat,
-whole wheat everything, blueberry, egg, onion, asiago, jalapeno cheddar.
+Varieties carried: plain, everything, sesame, poppy seed, cinnamon raisin,
+whole wheat, whole wheat everything, blueberry, egg, onion, asiago,
+jalapeno cheddar.
 
 Stock is tracked per warehouse (each distributor has multiple warehouses that
 house our bagels):
@@ -27,7 +28,7 @@ Case economics (set on every SKU so they sync through reports and exports):
 Each SKU also carries a weekly_usage rate (bagels consumed per week) so the
 tracker can compute days-of-supply and drive reorder planning.
 
-11 varieties × 8 warehouses = 88 SKUs.
+12 varieties x 8 warehouses = 96 SKUs.
 
 Usage:
     python seed_bagels.py          # add missing items, skip existing
@@ -47,6 +48,7 @@ VARIETIES = [
     ("Plain",                   120, 144, 48),
     ("Everything",              100, 144, 48),
     ("Sesame",                   40,  72, 36),
+    ("Poppy Seed",               40,  72, 36),
     ("Cinnamon Raisin",          35,  72, 36),
     ("Whole Wheat",              40,  72, 36),
     ("Whole Wheat Everything",   20,  36, 24),
