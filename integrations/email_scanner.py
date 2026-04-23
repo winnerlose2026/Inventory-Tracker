@@ -498,7 +498,7 @@ class EmailInboxClient:
             return "dumps"
         return "unconfigured"
 
-    def scan(self, max_messages=200):
+    def scan(self, max_messages=300):
         src = self.source()
         result = ScanResult(source=src)
         if src == "ms365":
