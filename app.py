@@ -362,6 +362,127 @@ def api_email_scan():
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
+@app.route("/api/email/ingest-events", methods=["POST"])
+def api_email_ingest_events():
+    """Accept externally-parsed EmailEvents and apply them through the same
+    PO revision-replace pipeline as /api/email/scan.
+
+    Used by the Cowork scheduled routine that reads M365 mailboxes via the
+    Outlook MCP, parses attachments client-side, and POSTs events here -- so
+    the web service never needs outbound Graph credentials.
+
+    Request body:
+        {
+          "dry_run": false,
+          "source": "cowork-routine",        # free-form tag for the report
+          "messages_seen": 12,
+          "messages_parsed": 3,
+          "errors": ["..."],
+          "events": [
+            {
+              "event_type": "restock"|"on_hand"|"usage",
+              "item": {
+                "quantity": 24.0,
+                "distributor": "US Foods",
+                "name": "Plain Bagel 4oz [USF - Manassas]",   # optional
+                "variety": "Plain",                            # optional
+                "warehouse": "Manassas, VA",                   # optional
+                "unit": "each",                                # optional
+                "price": 0.0,                                  # optional
+                "case_cost": 27.0,                             # optional
+                "case_size": 168,                              # optional
+                "weekly_usage": 0                              # optional
+              },
+              "source_message_id": "...",
+              "source_subject": "...",
+              "po_number": "2125123456",   # required for PO revision semantics
+              "po_revision": "1"           # numeric string; "" allowed
+            }, ...
+          ]
+        }
+    """
+    from integrations import EmailEvent, SyncItem
+    from sync_inventory import _apply_events
+
+    payload = request.json or {}
+    dry_run = bool(payload.get("dry_run", False))
+    source = str(payload.get("source") or "external").strip() or "external"
+    messages_seen = int(payload.get("messages_seen") or 0)
+    messages_parsed = int(payload.get("messages_parsed") or 0)
+    errors = list(payload.get("errors") or [])
+    raw_events = payload.get("events") or []
+
+    if not isinstance(raw_events, list):
+        return jsonify({"ok": False, "error": "events must be a list"}), 400
+
+    built: list[EmailEvent] = []
+    build_errors: list[str] = []
+    for idx, e in enumerate(raw_events):
+        if not isinstance(e, dict):
+            build_errors.append(f"events[{idx}]: not an object")
+            continue
+        try:
+            etype = e.get("event_type")
+            if etype not in ("on_hand", "restock", "usage"):
+                build_errors.append(f"events[{idx}]: bad event_type {etype!r}")
+                continue
+            raw_item = e.get("item") or {}
+            item = SyncItem(
+                quantity=float(raw_item.get("quantity") or 0),
+                distributor=str(raw_item.get("distributor") or ""),
+                name=raw_item.get("name"),
+                variety=raw_item.get("variety"),
+                warehouse=raw_item.get("warehouse"),
+                unit=raw_item.get("unit"),
+                price=(float(raw_item["price"])
+                       if raw_item.get("price") is not None else None),
+                distributor_sku=raw_item.get("distributor_sku"),
+                case_cost=(float(raw_item["case_cost"])
+                           if raw_item.get("case_cost") is not None else None),
+                case_size=(int(raw_item["case_size"])
+                           if raw_item.get("case_size") is not None else None),
+                weekly_usage=(float(raw_item["weekly_usage"])
+                              if raw_item.get("weekly_usage") is not None else None),
+            )
+            built.append(EmailEvent(
+                event_type=etype,
+                item=item,
+                source_message_id=str(e.get("source_message_id") or ""),
+                source_subject=str(e.get("source_subject") or ""),
+                po_number=str(e.get("po_number") or ""),
+                po_revision=str(e.get("po_revision") or ""),
+            ))
+        except (TypeError, ValueError, KeyError) as exc:
+            build_errors.append(f"events[{idx}]: {exc}")
+
+    try:
+        report = _apply_events(
+            events=built,
+            messages_seen=messages_seen,
+            messages_parsed=messages_parsed,
+            errors=errors + build_errors,
+            dry_run=dry_run,
+            source=source,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "dry_run": dry_run,
+            "reports": [{
+                "distributor": "Email Inbox",
+                "source": source,
+                "status": "error",
+                "fetched": len(built),
+                "updated": 0, "unchanged": 0,
+                "unmatched": [], "changes": [],
+                "error": str(exc),
+                "messages_seen": messages_seen,
+                "messages_parsed": messages_parsed,
+            }],
+        }), 500
+
+    return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
 @app.route("/api/export.xlsx")
 def api_export_xlsx():
     from openpyxl import Workbook

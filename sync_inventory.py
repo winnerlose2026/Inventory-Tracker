@@ -431,40 +431,36 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     usage.append(entry)
 
 
-def scan_email(dry_run: bool = False,
-               client: EmailInboxClient | None = None) -> dict:
-    """Scan the mailbox and apply extracted events. Returns a report dict."""
-    client = client or EmailInboxClient()
+def _apply_events(events: list,
+                  messages_seen: int = 0,
+                  messages_parsed: int = 0,
+                  errors: list | None = None,
+                  dry_run: bool = False,
+                  source: str = "Email Inbox") -> dict:
+    """Apply a list of already-parsed EmailEvent objects to inventory.
+
+    This is the "second half" of scan_email() -- it handles PO revision
+    replace / supersede, on_order tracking, and writing to usage+inventory.
+    Callers that parse email themselves (e.g. a Cowork routine running the
+    M365 fetch outside the web service) can POST events to
+    /api/email/ingest-events, which invokes this helper. No mailbox access
+    is performed here.
+    """
+    errors = list(errors or [])
     report = {
         "distributor": "Email Inbox",
-        "source": client.source(),
+        "source": source,
         "status": "ok",
-        "fetched": 0,
+        "fetched": len(events),
         "updated": 0,
         "unchanged": 0,
         "unmatched": [],
         "changes": [],
-        "error": None,
-        "messages_seen": 0,
-        "messages_parsed": 0,
+        "error": "; ".join(errors[:5]) if errors else None,
+        "messages_seen": messages_seen,
+        "messages_parsed": messages_parsed,
         "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
     }
-    try:
-        scan = client.scan()
-    except NotConfiguredError as exc:
-        report["status"] = "not_configured"
-        report["error"] = str(exc)
-        return report
-    except Exception as exc:  # noqa: BLE001
-        report["status"] = "error"
-        report["error"] = str(exc)
-        return report
-
-    report["messages_seen"] = scan.messages_seen
-    report["messages_parsed"] = scan.messages_parsed
-    report["fetched"] = len(scan.events)
-    if scan.errors:
-        report["error"] = "; ".join(scan.errors[:5])
 
     inv = load_inventory()
     usage = load_usage()
@@ -472,7 +468,7 @@ def scan_email(dry_run: bool = False,
 
     # Count event types up front so the by-type totals reflect everything
     # the scanner produced, even if a later revision ends up skipped.
-    for evt in scan.events:
+    for evt in events:
         report["by_event_type"][evt.event_type] = \
             report["by_event_type"].get(evt.event_type, 0) + 1
 
@@ -481,7 +477,7 @@ def scan_email(dry_run: bool = False,
     # PO share the same po_number and po_revision, so grouping is safe.
     po_groups: dict[str, list] = {}
     non_po_events: list = []
-    for evt in scan.events:
+    for evt in events:
         po_num = getattr(evt, "po_number", "")
         if po_num:
             po_groups.setdefault(po_num, []).append(evt)
@@ -533,6 +529,52 @@ def scan_email(dry_run: bool = False,
     if not dry_run:
         save_inventory(inv)
         save_usage(usage)
+    return report
+
+
+def scan_email(dry_run: bool = False,
+               client: EmailInboxClient | None = None) -> dict:
+    """Scan the mailbox and apply extracted events. Returns a report dict.
+
+    Thin wrapper: fetch a ScanResult via EmailInboxClient.scan() and delegate
+    the apply pipeline to _apply_events(). External callers that fetch mail
+    themselves (e.g. a Cowork routine with delegated Outlook MCP access) can
+    call _apply_events directly or POST to /api/email/ingest-events.
+    """
+    client = client or EmailInboxClient()
+    try:
+        scan = client.scan()
+    except NotConfiguredError as exc:
+        return {
+            "distributor": "Email Inbox",
+            "source": client.source(),
+            "status": "not_configured",
+            "fetched": 0, "updated": 0, "unchanged": 0,
+            "unmatched": [], "changes": [],
+            "error": str(exc),
+            "messages_seen": 0, "messages_parsed": 0,
+            "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "distributor": "Email Inbox",
+            "source": client.source(),
+            "status": "error",
+            "fetched": 0, "updated": 0, "unchanged": 0,
+            "unmatched": [], "changes": [],
+            "error": str(exc),
+            "messages_seen": 0, "messages_parsed": 0,
+            "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
+        }
+
+    report = _apply_events(
+        events=list(scan.events),
+        messages_seen=scan.messages_seen,
+        messages_parsed=scan.messages_parsed,
+        errors=list(scan.errors or []),
+        dry_run=dry_run,
+        source=client.source(),
+    )
     return report
 
 
