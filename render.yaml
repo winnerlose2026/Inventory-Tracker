@@ -3,8 +3,9 @@
 #
 # The web service config here mirrors what we already have in Procfile and
 # the dashboard. The cron service is the new piece: it hits the web service's
-# /api/email/scan endpoint every day at 09:00 America/New_York so POs parked
-# in unread *or* read mail get picked up automatically.
+# /api/email/scan endpoint every 4 hours so POs parked in unread *or* read
+# mail get picked up automatically across all configured mailboxes (see
+# MS365_USER on the web service, which accepts a comma-separated list).
 
 services:
   - type: web
@@ -35,14 +36,15 @@ services:
         value: "30"
 
   - type: cron
-    name: bagel-inventory-daily-scan
+    name: bagel-inventory-4h-scan
     runtime: python
     plan: starter
     branch: claude/update-m365-credentials-QvulU
-    # 09:00 America/New_York. Render cron schedules are in UTC.
-    # 13:00 UTC = 09:00 EDT (spring/summer) / 08:00 EST (fall/winter).
-    # If you want it pinned to 09:00 EST in winter too, change to "0 14 * * *".
-    schedule: "0 13 * * *"
+    # Every 4 hours, on the hour (UTC). Runs at 00, 04, 08, 12, 16, 20 UTC
+    # every day, which covers all U.S. business hours year-round regardless of
+    # daylight saving. The PO revision idempotency in sync_inventory means
+    # re-scanning the same message is safe.
+    schedule: "0 */4 * * *"
     buildCommand: "true"
     startCommand: python scripts/trigger_email_scan.py
     envVars:

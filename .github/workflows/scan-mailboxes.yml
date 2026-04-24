@@ -1,0 +1,51 @@
+# Scan the H&H inventory mailboxes (all addresses in MS365_USER) every 4
+# hours by POSTing to the live web service's /api/email/scan endpoint.
+#
+# Why GitHub Actions: Render crons require a paid plan; the free tier
+# we're on doesn't support scheduled services. Actions' cron is free for
+# public repos and runs on GitHub's infrastructure regardless of whether
+# anyone's PC is on.
+#
+# The job re-uses scripts/trigger_email_scan.py — the exact script the
+# Render blueprint was going to run — so behavior stays identical if we
+# later move the schedule to Render.
+#
+# Required GitHub repo secrets (Settings -> Secrets and variables ->
+# Actions -> New repository secret):
+#   APP_URL                 e.g. https://bagel-inventory.onrender.com
+#   INVENTORY_API_TOKEN     must match the token set on the web service
+
+name: Scan mailboxes every 4 hours
+
+on:
+  schedule:
+    # Runs at minute 0 of every 4th hour (UTC): 00, 04, 08, 12, 16, 20.
+    # Covers all U.S. business hours year-round regardless of DST.
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+concurrency:
+  # Never let two scans overlap — PO revision idempotency in
+  # sync_inventory makes replay safe, but serialized calls keep the
+  # on-hand disk writes clean.
+  group: mailbox-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fire /api/email/scan on live web service
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          INVENTORY_API_TOKEN: ${{ secrets.INVENTORY_API_TOKEN }}
+        run: python scripts/trigger_email_scan.py
