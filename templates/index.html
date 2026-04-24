@@ -269,6 +269,7 @@
         </div>
         <div class="btn-group">
           <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
+          <button class="btn btn-ghost" onclick="runMigrateUnits()">Convert to Cases</button>
           <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
           <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
           <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
@@ -740,6 +741,37 @@ async function runSeed() {
   </div>`;
   toast('Bagel catalog seeded.');
   loadDistributors();
+  loadDashboard();
+}
+
+async function runMigrateUnits() {
+  if (!confirm('This converts every item from "each" to "cs": quantity, threshold, and weekly usage are divided by case_size, and price becomes the case cost. Run only once on a fresh deploy. Proceed?')) return;
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">Converting units to cases…</div></div>`;
+  let result;
+  try {
+    result = await api('/api/migrate-units', 'POST', {});
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  if (!result.ok) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(result.error || 'unknown error')}</div></div>`;
+    return;
+  }
+  box.innerHTML = `<div class="card">
+    <div class="card-header"><span class="card-title">Unit Conversion Complete</span></div>
+    <div style="padding:14px 20px;font-size:13px">
+      Converted <strong>${result.converted}</strong> SKU(s) to cases.
+      ${result.already_in_cases ? `Already in cases: ${result.already_in_cases}. ` : ''}
+      ${result.skipped_no_case_size ? `<span style="color:var(--yellow)">Skipped (no case_size set): ${result.skipped_no_case_size}.</span> ` : ''}
+      Total catalog: ${result.total}.
+    </div>
+  </div>`;
+  toast(`Converted ${result.converted} SKU(s) to case units.`);
+  loadDistributors();
+  loadInventory();
   loadDashboard();
 }
 

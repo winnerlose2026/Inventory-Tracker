@@ -132,8 +132,49 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core operations
+# Unit migration: each -> cs
 # ---------------------------------------------------------------------------
+# Original seed stored quantities, thresholds, weekly_usage in individual
+# bagels (unit="each"). PO parsers always emit case quantities, which meant
+# applied restocks were 60x undercount-as-stock. This converts in place; the
+# units_migrated flag makes it idempotent.
+
+def migrate_units_to_case(inv: dict) -> dict:
+    converted = 0
+    skipped_no_case_size = 0
+    already = 0
+    for item in inv.values():
+        if item.get("units_migrated") or item.get("unit") == "cs":
+            already += 1
+            continue
+        case_size = float(item.get("case_size") or 0)
+        if case_size <= 0:
+            skipped_no_case_size += 1
+            continue
+        case_cost = float(item.get("case_cost") or 0)
+
+        item["quantity"] = round(
+            float(item.get("quantity") or 0) / case_size, 2)
+        item["low_stock_threshold"] = round(
+            float(item.get("low_stock_threshold") or 0) / case_size, 2)
+        item["weekly_usage"] = round(
+            float(item.get("weekly_usage") or 0) / case_size, 2)
+        if case_cost > 0:
+            item["price"] = round(case_cost, 2)
+        item["unit"] = "cs"
+        # on_order entries already hold case counts (PO parser quantity is
+        # in cases); just relabel the unit so they read consistently.
+        for o in (item.get("on_order") or []):
+            o["unit"] = "cs"
+        item["units_migrated"] = True
+        converted += 1
+    return {
+        "converted": converted,
+        "already_in_cases": already,
+        "skipped_no_case_size": skipped_no_case_size,
+        "total": len(inv),
+    }
+
 
 def add_item(name: str, quantity: float, unit: str, category: str = "general",
              low_stock_threshold: float = 5.0, price: float = 0.0,

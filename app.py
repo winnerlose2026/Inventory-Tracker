@@ -338,6 +338,19 @@ def api_seed():
     return jsonify({"ok": True, **summary})
 
 
+@app.route("/api/migrate-units", methods=["POST"])
+def api_migrate_units():
+    from inventory_tracker import migrate_units_to_case
+
+    inv = load_inventory()
+    try:
+        summary = migrate_units_to_case(inv)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 200
+    save_inventory(inv)
+    return jsonify({"ok": True, **summary})
+
+
 @app.route("/api/email/scan", methods=["POST"])
 def api_email_scan():
     from sync_inventory import scan_email

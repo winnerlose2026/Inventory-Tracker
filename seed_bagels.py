@@ -25,8 +25,9 @@ Case economics (set on every SKU so they sync through reports and exports):
   - US Foods case cost:         $27.00
   - Case size:                  60 bagels (5 dozen) across both distributors
 
-Each SKU also carries a weekly_usage rate (bagels consumed per week) so the
-tracker can compute days-of-supply and drive reorder planning.
+Quantities, thresholds, and weekly_usage are all stored in CASES (unit="cs")
+so they line up with PO parser output and case-priced reordering. Multiply
+by case_size when you need a per-bagel figure.
 
 12 varieties x 8 warehouses = 96 SKUs.
 
@@ -43,20 +44,23 @@ from inventory_tracker import add_item, load_inventory, save_inventory
 CASE_COST = {"Cheney Brothers": 26.50, "US Foods": 27.00}
 CASE_SIZE = 60
 
-# Variety -> (base weekly usage in bagels/wk, base qty per case, low-stock threshold in bagels)
+# Variety -> (weekly usage cs/wk, on-hand cases, low-stock threshold cases).
+# Quantities are in CASES so they line up with PO parser output (which is
+# also in CS) and the inventory unit ("cs"). Mechanical conversion of the
+# old per-bagel numbers via /CASE_SIZE.
 VARIETIES = [
-    ("Plain",                   120, 144, 48),
-    ("Everything",              100, 144, 48),
-    ("Sesame",                   40,  72, 36),
-    ("Poppy Seed",               40,  72, 36),
-    ("Cinnamon Raisin",          35,  72, 36),
-    ("Whole Wheat",              40,  72, 36),
-    ("Whole Wheat Everything",   20,  36, 24),
-    ("Blueberry",                35,  72, 36),
-    ("Egg",                      30,  72, 36),
-    ("Onion",                    30,  72, 36),
-    ("Asiago",                   20,  36, 24),
-    ("Jalapeno Cheddar",         20,  36, 24),
+    ("Plain",                   2.0, 2.4, 0.8),
+    ("Everything",              1.7, 2.4, 0.8),
+    ("Sesame",                  0.7, 1.2, 0.6),
+    ("Poppy Seed",              0.7, 1.2, 0.6),
+    ("Cinnamon Raisin",         0.6, 1.2, 0.6),
+    ("Whole Wheat",             0.7, 1.2, 0.6),
+    ("Whole Wheat Everything",  0.3, 0.6, 0.4),
+    ("Blueberry",               0.6, 1.2, 0.6),
+    ("Egg",                     0.5, 1.2, 0.6),
+    ("Onion",                   0.5, 1.2, 0.6),
+    ("Asiago",                  0.3, 0.6, 0.4),
+    ("Jalapeno Cheddar",        0.3, 0.6, 0.4),
 ]
 
 # Distributor -> [(warehouse label, short tag, stock multiplier)]
@@ -83,20 +87,19 @@ def _build_bagels():
     for variety, weekly, base_qty, threshold in VARIETIES:
         for distributor, warehouses in WAREHOUSES.items():
             case_cost = CASE_COST[distributor]
-            per_unit_price = round(case_cost / CASE_SIZE, 4)
             tag = DISTRIBUTOR_TAG[distributor]
             for warehouse_full, warehouse_short, mult in warehouses:
                 bagels.append({
                     "name": f"{variety} Bagel 4oz [{tag} - {warehouse_short}]",
-                    "quantity": int(round(base_qty * mult)),
-                    "unit": "each",
-                    "price": per_unit_price,
-                    "threshold": threshold,
+                    "quantity": round(base_qty * mult, 1),
+                    "unit": "cs",
+                    "price": case_cost,
+                    "threshold": round(threshold, 1),
                     "distributor": distributor,
                     "warehouse": warehouse_full,
                     "case_cost": case_cost,
                     "case_size": CASE_SIZE,
-                    "weekly_usage": round(weekly * mult, 1),
+                    "weekly_usage": round(weekly * mult, 2),
                 })
     return bagels
 
