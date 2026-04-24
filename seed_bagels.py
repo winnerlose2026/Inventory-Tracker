@@ -45,22 +45,21 @@ CASE_COST = {"Cheney Brothers": 26.50, "US Foods": 27.00}
 CASE_SIZE = 60
 
 # Variety -> (weekly usage cs/wk, on-hand cases, low-stock threshold cases).
-# Quantities are in CASES so they line up with PO parser output (which is
-# also in CS) and the inventory unit ("cs"). Mechanical conversion of the
-# old per-bagel numbers via /CASE_SIZE.
+# Quantities and thresholds are whole cases. Weekly usage is a rate so it's
+# allowed to be fractional.
 VARIETIES = [
-    ("Plain",                   2.0, 2.4, 0.8),
-    ("Everything",              1.7, 2.4, 0.8),
-    ("Sesame",                  0.7, 1.2, 0.6),
-    ("Poppy Seed",              0.7, 1.2, 0.6),
-    ("Cinnamon Raisin",         0.6, 1.2, 0.6),
-    ("Whole Wheat",             0.7, 1.2, 0.6),
-    ("Whole Wheat Everything",  0.3, 0.6, 0.4),
-    ("Blueberry",               0.6, 1.2, 0.6),
-    ("Egg",                     0.5, 1.2, 0.6),
-    ("Onion",                   0.5, 1.2, 0.6),
-    ("Asiago",                  0.3, 0.6, 0.4),
-    ("Jalapeno Cheddar",        0.3, 0.6, 0.4),
+    ("Plain",                   2.0, 2, 1),
+    ("Everything",              1.7, 2, 1),
+    ("Sesame",                  0.7, 1, 1),
+    ("Poppy Seed",              0.7, 1, 1),
+    ("Cinnamon Raisin",         0.6, 1, 1),
+    ("Whole Wheat",             0.7, 1, 1),
+    ("Whole Wheat Everything",  0.3, 1, 1),
+    ("Blueberry",               0.6, 1, 1),
+    ("Egg",                     0.5, 1, 1),
+    ("Onion",                   0.5, 1, 1),
+    ("Asiago",                  0.3, 1, 1),
+    ("Jalapeno Cheddar",        0.3, 1, 1),
 ]
 
 # Distributor -> [(warehouse label, short tag, stock multiplier)]
@@ -91,15 +90,15 @@ def _build_bagels():
             for warehouse_full, warehouse_short, mult in warehouses:
                 bagels.append({
                     "name": f"{variety} Bagel 4oz [{tag} - {warehouse_short}]",
-                    "quantity": round(base_qty * mult, 1),
+                    "quantity": int(round(base_qty * mult)),
                     "unit": "cs",
                     "price": case_cost,
-                    "threshold": round(threshold, 1),
+                    "threshold": int(threshold),
                     "distributor": distributor,
                     "warehouse": warehouse_full,
                     "case_cost": case_cost,
                     "case_size": CASE_SIZE,
-                    "weekly_usage": round(weekly * mult, 2),
+                    "weekly_usage": round(weekly * mult, 1),
                 })
     return bagels
 

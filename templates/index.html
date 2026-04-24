@@ -338,7 +338,7 @@
       </div>
       <div class="form-group">
         <label>Quantity *</label>
-        <input id="f-qty" type="number" step="any" min="0" placeholder="0">
+        <input id="f-qty" type="number" step="1" min="0" placeholder="0">
       </div>
       <div class="form-group">
         <label>Unit *</label>
@@ -380,7 +380,7 @@
       </div>
       <div class="form-group">
         <label>Low Stock Threshold</label>
-        <input id="f-threshold" type="number" step="any" min="0" placeholder="5">
+        <input id="f-threshold" type="number" step="1" min="0" placeholder="1">
       </div>
     </div>
     <div class="form-actions">
@@ -401,7 +401,7 @@
       </div>
       <div class="form-group full">
         <label>Amount *</label>
-        <input id="txn-amount" type="number" step="any" min="0.01" placeholder="0">
+        <input id="txn-amount" type="number" step="1" min="1" placeholder="0">
       </div>
       <div class="form-group full">
         <label>Note</label>
@@ -611,7 +611,7 @@ async function loadDashboard() {
         <td class="sku">${escHtml(i.name.toUpperCase().replace(/\s+/g,'').slice(0,8))}</td>
         <td>${escHtml(i.name)}</td>
         <td><span class="badge badge-purple">${escHtml(i.category)}</span></td>
-        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(2)}</td>
+        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(0)}</td>
         <td>${i.low_stock_threshold}</td>
         <td>${escHtml(i.unit)}</td>
         <td><button class="btn btn-warning btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button></td>
@@ -682,7 +682,7 @@ async function loadInventory() {
       <td><span class="badge badge-purple">${escHtml(item.category)}</span></td>
       <td>${distributorBadge(item.distributor)}</td>
       <td>${item.warehouse ? escHtml(item.warehouse) : '<span style="color:var(--muted)">—</span>'}</td>
-      <td style="font-weight:600">${item.quantity.toFixed(2)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
+      <td style="font-weight:600">${item.quantity.toFixed(0)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
       <td>${renderOnOrder(item)}</td>
       <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${status}</td>
@@ -1052,13 +1052,13 @@ async function openEditModal(item) {
 
 async function submitItem() {
   const name = document.getElementById('f-name').value.trim();
-  const qty  = parseFloat(document.getElementById('f-qty').value);
+  const qty  = Math.round(parseFloat(document.getElementById('f-qty').value));
   const unit = document.getElementById('f-unit').value.trim();
   const cat  = document.getElementById('f-cat').value.trim() || 'general';
   const price = parseFloat(document.getElementById('f-price').value) || 0;
   const distributor = document.getElementById('f-distributor').value;
   const warehouse = document.getElementById('f-warehouse').value;
-  const threshold = parseFloat(document.getElementById('f-threshold').value) || 5;
+  const threshold = Math.round(parseFloat(document.getElementById('f-threshold').value)) || 1;
   const caseCost = parseFloat(document.getElementById('f-case-cost').value) || 0;
   const caseSize = parseInt(document.getElementById('f-case-size').value) || 0;
   const weekly = parseFloat(document.getElementById('f-weekly').value) || 0;
@@ -1116,10 +1116,10 @@ function openRestockModal(name) {
 }
 
 async function submitTxn() {
-  const amount = parseFloat(document.getElementById('txn-amount').value);
+  const amount = Math.round(parseFloat(document.getElementById('txn-amount').value));
   const note = document.getElementById('txn-note').value.trim();
   if (isNaN(amount) || amount <= 0) {
-    toast('Enter a valid amount.', 'error');
+    toast('Enter a valid whole-case amount.', 'error');
     return;
   }
   const url = txnType === 'use' ? '/api/use' : '/api/restock';
