@@ -353,10 +353,15 @@ def api_migrate_units():
 
 @app.route("/api/email/scan", methods=["POST"])
 def api_email_scan():
-    from sync_inventory import scan_email
-
-    dry_run = bool((request.json or {}).get("dry_run", False))
+    # The whole route runs inside one try block so that ANY failure (import,
+    # JSON parse, scan_email itself) becomes a structured 200 with status:
+    # "error" + a traceback excerpt -- never a generic Flask 500. That's a
+    # lot easier to debug from the client side when there are no logs handy.
+    import traceback as _tb
+    dry_run = False
     try:
+        from sync_inventory import scan_email
+        dry_run = bool((request.json or {}).get("dry_run", False))
         report = scan_email(dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001
         report = {
@@ -368,7 +373,8 @@ def api_email_scan():
             "unchanged": 0,
             "unmatched": [],
             "changes": [],
-            "error": str(exc),
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": _tb.format_exc()[-2000:],
             "messages_seen": 0,
             "messages_parsed": 0,
         }
@@ -414,8 +420,28 @@ def api_email_ingest_events():
           ]
         }
     """
-    from integrations import EmailEvent, SyncItem
-    from sync_inventory import _apply_events
+    import traceback as _tb
+    try:
+        from integrations import EmailEvent, SyncItem
+        from sync_inventory import _apply_events
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "dry_run": False,
+            "reports": [{
+                "distributor": "Email Inbox",
+                "source": "external",
+                "status": "error",
+                "fetched": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "unmatched": [],
+                "changes": [],
+                "error": f"import failed: {type(exc).__name__}: {exc}",
+                "traceback": _tb.format_exc()[-2000:],
+                "messages_seen": 0,
+                "messages_parsed": 0,
+            }],
+        })
 
     payload = request.json or {}
     dry_run = bool(payload.get("dry_run", False))
