@@ -357,12 +357,54 @@ def api_email_scan():
     # JSON parse, scan_email itself) becomes a structured 200 with status:
     # "error" + a traceback excerpt -- never a generic Flask 500. That's a
     # lot easier to debug from the client side when there are no logs handy.
+    #
+    # Bound the work so we don't blow past gunicorn's worker timeout. The
+    # original default (300 messages * N mailboxes, each pulling full MIME
+    # bytes via Graph) regularly killed the worker on Render's starter
+    # plan, which surfaced as a generic 500 at the edge regardless of the
+    # try/except below. Callers can override `max_messages` in the body or
+    # set MS365_FILTER for a wider sweep done out of band.
     import traceback as _tb
+    from integrations.email_scanner import EmailInboxClient
     dry_run = False
     try:
-        from sync_inventory import scan_email
-        dry_run = bool((request.json or {}).get("dry_run", False))
-        report = scan_email(dry_run=dry_run)
+        from sync_inventory import _apply_events
+        body = request.json or {}
+        dry_run = bool(body.get("dry_run", False))
+        # Keep within gunicorn's 180s budget. Each MIME fetch is one Graph
+        # round-trip; 60 messages * 2 mailboxes is comfortable.
+        try:
+            max_messages = int(body.get("max_messages") or 60)
+        except (TypeError, ValueError):
+            max_messages = 60
+        max_messages = max(1, min(max_messages, 200))
+
+        client = EmailInboxClient()
+        try:
+            scan = client.scan(max_messages=max_messages)
+        except Exception as exc:  # noqa: BLE001 — surface NotConfigured + transport
+            report = {
+                "distributor": "Email Inbox",
+                "source": client.source(),
+                "status": ("not_configured" if type(exc).__name__ == "NotConfiguredError"
+                           else "error"),
+                "fetched": 0, "updated": 0, "unchanged": 0,
+                "unmatched": [], "changes": [],
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": _tb.format_exc()[-2000:],
+                "messages_seen": 0, "messages_parsed": 0,
+                "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
+            }
+            return jsonify({"dry_run": dry_run, "reports": [report]})
+
+        report = _apply_events(
+            events=list(scan.events),
+            messages_seen=scan.messages_seen,
+            messages_parsed=scan.messages_parsed,
+            errors=list(scan.errors or []),
+            dry_run=dry_run,
+            source=client.source(),
+        )
     except Exception as exc:  # noqa: BLE001
         report = {
             "distributor": "Email Inbox",
