@@ -365,9 +365,9 @@ def api_email_scan():
     # try/except below. Callers can override `max_messages` in the body or
     # set MS365_FILTER for a wider sweep done out of band.
     import traceback as _tb
-    from integrations.email_scanner import EmailInboxClient
     dry_run = False
     try:
+        from integrations.email_scanner import EmailInboxClient
         from sync_inventory import _apply_events
         body = request.json or {}
         dry_run = bool(body.get("dry_run", False))
