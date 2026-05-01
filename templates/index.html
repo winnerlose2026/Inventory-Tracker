@@ -8,9 +8,8 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <!-- Stand-ins for hhbagels.com's licensed faces:
      Libre Caslon Text ~ Caslon Ionic (display serif)
-     Inter ~ GT Walsheim (geometric sans, body/UI)
-     Caveat ~ Workhorse Script (handwritten accent) -->
-<link href="https://fonts.googleapis.com/css2?family=Libre+Caslon+Text:ital,wght@0,400;0,700;1,400&family=Inter:wght@400;500;600;700&family=Caveat:wght@500;700&display=swap" rel="stylesheet">
+     Inter ~ GT Walsheim (geometric sans, body/UI) -->
+<link href="https://fonts.googleapis.com/css2?family=Libre+Caslon+Text:ital,wght@0,400;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -30,15 +29,15 @@
     --radius-pill: 9999px;
     --font-display: 'Libre Caslon Text', Georgia, 'Times New Roman', serif;
     --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
-    --font-script: 'Caveat', cursive;
   }
   body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 14px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
 
   /* Layout */
   .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
   .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 28px 0 24px; display: flex; flex-direction: column; }
-  .sidebar-logo { padding: 0 22px 20px; border-bottom: 1px solid var(--border); margin-bottom: 12px; font-family: var(--font-display); font-size: 22px; font-weight: 700; color: var(--accent); letter-spacing: .01em; line-height: 1.1; }
-  .sidebar-logo .tag { display: block; margin-top: 6px; font-family: var(--font-script); font-size: 16px; font-weight: 500; color: var(--accent2); letter-spacing: 0; }
+  .sidebar-logo { padding: 4px 22px 22px; border-bottom: 1px solid var(--border); margin-bottom: 12px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; }
+  .sidebar-logo svg { width: 96px; height: auto; display: block; }
+  .sidebar-logo .wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; line-height: 1; }
   .nav-item { display: flex; align-items: center; gap: 10px; padding: 11px 22px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; font-weight: 500; }
   .nav-item:hover { color: var(--text); background: var(--surface2); }
   .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent2); font-weight: 600; }
@@ -153,8 +152,8 @@
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-logo">
-      H&amp;H Inventory
-      <span class="tag">Tracker</span>
+      <svg width="476" height="318" viewBox="0 0 476 323" fill="none" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="H&amp;H Bagels"><path d="M476 63.6C379.61 63.6 334.39 0 238 0C141.61 0 96.39 63.6 0 63.6V254.4C96.39 254.4 141.61 318 238 318C334.39 318 379.61 254.4 476 254.4V63.6Z" fill="#051747"></path><path d="M115.43 168.047H71.0908V216.598H49.7422V101.402H71.0908V147.973H115.43V101.402H136.779V216.598H115.43V168.047Z" fill="#FFFFFF"></path><path d="M404.823 168.047H360.483V216.598H339.135V101.402H360.483V147.973H404.823V101.402H426.171V216.598H404.823V168.047Z" fill="#FFFFFF"></path><path d="M171.186 194.87C171.186 170.551 184.053 149.722 204.839 139.379C193.843 130.515 188.885 118.018 188.885 105.926C188.885 80.1281 209.805 60.6426 237.826 60.6426C257 60.6426 272.55 69.642 280.729 83.7533L261.023 94.0962C256.326 86.8379 248.02 82.0043 237.556 82.0043C222.808 82.0043 211.146 91.274 211.146 106.323C211.146 118.145 218.651 128.361 232.463 130.913V151.201C211.281 152.68 193.986 169.073 193.986 193.924C193.986 218.776 212.225 235.304 237.564 235.304C262.903 235.304 279.531 220.66 279.531 199.561C279.531 186.125 272.423 177.261 261.427 177.261C251.106 177.261 244.133 185.052 244.133 198.893H223.887C226.029 148.236 281.007 164.764 283.284 124.457H304.069C304.069 141.518 295.62 154.151 281.142 162.888C293.882 169.741 301.792 183.176 301.792 200.507C301.792 232.887 274.041 257.342 237.437 257.342C200.832 257.342 171.201 231.814 171.201 194.862L171.186 194.87Z" fill="#FFFFFF"></path></svg>
+      <div class="wordmark">Inventory Tracker</div>
     </div>
     <nav>
       <div class="nav-item active" onclick="showPage('dashboard')">
