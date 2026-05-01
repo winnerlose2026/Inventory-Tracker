@@ -132,8 +132,60 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core operations
+# Unit migration: each -> cs
 # ---------------------------------------------------------------------------
+# Original seed stored quantities, thresholds, weekly_usage in individual
+# bagels (unit="each"). PO parsers always emit case quantities, which meant
+# applied restocks were 60x undercount-as-stock. This converts in place; the
+# units_migrated flag makes it idempotent.
+
+def migrate_units_to_case(inv: dict) -> dict:
+    converted = 0
+    rounded = 0
+    skipped_no_case_size = 0
+    for item in inv.values():
+        case_size = float(item.get("case_size") or 0)
+        already_cs = item.get("units_migrated") or item.get("unit") == "cs"
+
+        if not already_cs:
+            if case_size <= 0:
+                skipped_no_case_size += 1
+                continue
+            case_cost = float(item.get("case_cost") or 0)
+            item["quantity"] = float(item.get("quantity") or 0) / case_size
+            item["low_stock_threshold"] = (
+                float(item.get("low_stock_threshold") or 0) / case_size)
+            item["weekly_usage"] = (
+                float(item.get("weekly_usage") or 0) / case_size)
+            if case_cost > 0:
+                item["price"] = round(case_cost, 2)
+            item["unit"] = "cs"
+            # on_order qty is already in cases (PO parser unit); just relabel.
+            for o in (item.get("on_order") or []):
+                o["unit"] = "cs"
+            item["units_migrated"] = True
+            converted += 1
+
+        # Cases are whole numbers. Round on-hand, threshold, and pending
+        # on-order qty to integers; weekly_usage stays a float (it's a rate).
+        before_qty = float(item.get("quantity") or 0)
+        before_thr = float(item.get("low_stock_threshold") or 0)
+        item["quantity"] = int(round(before_qty))
+        item["low_stock_threshold"] = int(round(before_thr))
+        item["weekly_usage"] = round(float(item.get("weekly_usage") or 0), 1)
+        for o in (item.get("on_order") or []):
+            o["qty"] = int(round(float(o.get("qty") or 0)))
+        if (item["quantity"] != before_qty
+                or item["low_stock_threshold"] != before_thr):
+            rounded += 1
+
+    return {
+        "converted": converted,
+        "rounded": rounded,
+        "skipped_no_case_size": skipped_no_case_size,
+        "total": len(inv),
+    }
+
 
 def add_item(name: str, quantity: float, unit: str, category: str = "general",
              low_stock_threshold: float = 5.0, price: float = 0.0,

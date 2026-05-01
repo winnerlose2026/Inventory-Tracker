@@ -52,3 +52,39 @@ services:
         sync: false  # set to https://<your-service>.onrender.com
       - key: INVENTORY_API_TOKEN
         sync: false
+
+  - type: cron
+    name: bagel-inventory-sftp-pull
+    runtime: python
+    plan: starter
+    branch: claude/update-m365-credentials-QvulU
+    # Pull distributor CSVs from the FTPS inbox (cPanel-hosted at
+    # sftp.hhbagels.com) every 15 minutes. Files we've already processed
+    # are tracked locally in data/sftp_cursor.json (cron-container-local,
+    # ephemeral) and ALSO moved into processed/ on the FTPS host so we
+    # see them server-side too. Re-ingestion safety is additionally
+    # guaranteed by the PO revision-replace logic on the receiving end.
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/pull_sftp_inbox.py
+    envVars:
+      - key: APP_URL
+        sync: false  # https://bagel-inventory.onrender.com
+      - key: INVENTORY_API_TOKEN
+        sync: false
+      - key: SFTP_HOST
+        value: sftp.hhbagels.com
+      - key: SFTP_PORT
+        value: "21"
+      - key: SFTP_USERNAME_USFOODS
+        sync: false
+      - key: SFTP_PASSWORD_USFOODS
+        sync: false
+      - key: SFTP_USERNAME_CHENEY
+        sync: false
+      - key: SFTP_PASSWORD_CHENEY
+        sync: false
+      - key: SFTP_INCOMING_DIR
+        value: incoming
+      - key: SFTP_PROCESSED_DIR
+        value: processed

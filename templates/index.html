@@ -4,44 +4,56 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Inventory Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Stand-ins for hhbagels.com's licensed faces:
+     Libre Caslon Text ~ Caslon Ionic (display serif)
+     Inter ~ GT Walsheim (geometric sans, body/UI) -->
+<link href="https://fonts.googleapis.com/css2?family=Libre+Caslon+Text:ital,wght@0,400;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg: #0f1117;
-    --surface: #1a1d27;
-    --surface2: #222635;
-    --border: #2e3350;
-    --accent: #4f8ef7;
-    --accent2: #7c3aed;
-    --green: #22c55e;
-    --red: #ef4444;
-    --yellow: #f59e0b;
-    --text: #e2e8f0;
-    --muted: #64748b;
-    --radius: 10px;
+    /* H&H Bagels palette: cream backgrounds, navy primary, red-orange CTA */
+    --bg: #FAF6F0;          /* page cream */
+    --surface: #FFFFFF;     /* card surface */
+    --surface2: #F0ECE6;    /* secondary cream / table header */
+    --border: #E6DFD2;      /* warm beige border */
+    --text: #051747;        /* navy primary text */
+    --muted: #6B6657;       /* warm grey */
+    --accent: #051747;      /* primary brand navy */
+    --accent2: #EC5039;     /* red-orange CTA */
+    --green: #2B7D5E;       /* warmer green */
+    --red: #EC5039;         /* same as accent2 */
+    --yellow: #F0B323;      /* mustard */
+    --radius: 8px;
+    --radius-pill: 9999px;
+    --font-display: 'Libre Caslon Text', Georgia, 'Times New Roman', serif;
+    --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
-  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; min-height: 100vh; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 14px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
 
   /* Layout */
-  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 24px 0; display: flex; flex-direction: column; }
-  .sidebar-logo { padding: 0 20px 24px; font-size: 18px; font-weight: 700; color: var(--accent); border-bottom: 1px solid var(--border); margin-bottom: 16px; }
-  .sidebar-logo span { color: var(--muted); font-size: 12px; font-weight: 400; display: block; margin-top: 2px; }
-  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 20px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; }
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 28px 0 24px; display: flex; flex-direction: column; }
+  .sidebar-logo { padding: 4px 22px 22px; border-bottom: 1px solid var(--border); margin-bottom: 12px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; }
+  .sidebar-logo svg { width: 96px; height: auto; display: block; }
+  .sidebar-logo .wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; line-height: 1; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 11px 22px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; font-weight: 500; }
   .nav-item:hover { color: var(--text); background: var(--surface2); }
-  .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent); }
+  .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent2); font-weight: 600; }
   .nav-icon { font-size: 16px; width: 20px; text-align: center; }
-  .main { padding: 28px 32px; overflow-y: auto; }
+  .main { padding: 32px 36px; overflow-y: auto; }
   .page { display: none; }
   .page.active { display: block; }
-  h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
-  .subtitle { color: var(--muted); margin-bottom: 24px; }
+  h1 { font-family: var(--font-display); font-size: 32px; font-weight: 700; letter-spacing: -.005em; line-height: 1.1; margin-bottom: 6px; color: var(--accent); }
+  h2, .modal h2 { font-family: var(--font-display); font-weight: 700; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-style: italic; }
 
   /* Cards */
   .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
-  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
-  .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
-  .stat-value { font-size: 28px; font-weight: 700; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
+  .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; font-weight: 600; }
+  .stat-value { font-family: var(--font-display); font-size: 32px; font-weight: 700; color: var(--accent); }
   .stat-value.green { color: var(--green); }
   .stat-value.yellow { color: var(--yellow); }
   .stat-value.red { color: var(--red); }
@@ -49,11 +61,11 @@
 
   /* Tables */
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: 24px; }
-  .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-  .card-title { font-weight: 600; }
+  .card-header { padding: 16px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .card-title { font-family: var(--font-display); font-weight: 700; font-size: 16px; color: var(--accent); }
   table { width: 100%; border-collapse: collapse; }
-  th { padding: 10px 16px; text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--border); background: var(--surface2); }
-  td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { padding: 10px 16px; text-align: left; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--border); background: var(--surface2); font-weight: 600; }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; color: var(--text); }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--surface2); }
 
@@ -62,45 +74,45 @@
   .bar-fill { height: 100%; border-radius: 4px; transition: width .4s; }
 
   /* Badges */
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
-  .badge-green { background: rgba(34,197,94,.15); color: var(--green); }
-  .badge-yellow { background: rgba(245,158,11,.15); color: var(--yellow); }
-  .badge-red { background: rgba(239,68,68,.15); color: var(--red); }
-  .badge-blue { background: rgba(79,142,247,.15); color: var(--accent); }
-  .badge-purple { background: rgba(124,58,237,.15); color: #a78bfa; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+  .badge-green { background: rgba(43,125,94,.12); color: var(--green); }
+  .badge-yellow { background: rgba(240,179,35,.16); color: #B07F0E; }
+  .badge-red { background: rgba(236,80,57,.12); color: var(--red); }
+  .badge-blue { background: rgba(5,23,71,.10); color: var(--accent); }
+  .badge-purple { background: rgba(5,23,71,.06); color: var(--accent); }
 
-  /* Buttons */
-  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 7px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; transition: all .15s; }
+  /* Buttons — pill primary, rounded for everything else */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border-radius: var(--radius-pill); border: 1px solid transparent; cursor: pointer; font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: .02em; transition: all .15s; text-transform: uppercase; }
   .btn-primary { background: var(--accent); color: #fff; }
-  .btn-primary:hover { background: #3a7ce0; }
-  .btn-success { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid rgba(34,197,94,.3); }
-  .btn-success:hover { background: rgba(34,197,94,.25); }
-  .btn-warning { background: rgba(245,158,11,.15); color: var(--yellow); border: 1px solid rgba(245,158,11,.3); }
-  .btn-warning:hover { background: rgba(245,158,11,.25); }
-  .btn-danger { background: rgba(239,68,68,.1); color: var(--red); border: 1px solid rgba(239,68,68,.25); }
-  .btn-danger:hover { background: rgba(239,68,68,.2); }
-  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
-  .btn-ghost:hover { color: var(--text); border-color: var(--muted); }
-  .btn-sm { padding: 5px 10px; font-size: 12px; }
-  .btn-group { display: flex; gap: 8px; }
+  .btn-primary:hover { background: #0A2466; }
+  .btn-success { background: var(--accent2); color: #fff; border-color: var(--accent2); }
+  .btn-success:hover { background: #d8442d; border-color: #d8442d; }
+  .btn-warning { background: var(--yellow); color: #5A3F00; border-color: var(--yellow); }
+  .btn-warning:hover { background: #d99a18; border-color: #d99a18; }
+  .btn-danger { background: transparent; color: var(--red); border-color: var(--red); }
+  .btn-danger:hover { background: var(--red); color: #fff; }
+  .btn-ghost { background: transparent; color: var(--accent); border-color: var(--border); }
+  .btn-ghost:hover { color: var(--accent); border-color: var(--accent); background: var(--surface2); }
+  .btn-sm { padding: 5px 12px; font-size: 11px; }
+  .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
 
   /* Forms / Modal */
-  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(5,23,71,.45); z-index: 100; align-items: center; justify-content: center; }
   .modal-overlay.open { display: flex; }
-  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; width: 480px; max-height: 90vh; overflow-y: auto; }
-  .modal h2 { font-size: 17px; margin-bottom: 20px; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; width: 480px; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 50px rgba(5,23,71,.18); }
+  .modal h2 { font-size: 22px; margin-bottom: 20px; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   .form-group { display: flex; flex-direction: column; gap: 6px; }
   .form-group.full { grid-column: 1 / -1; }
-  label { font-size: 12px; color: var(--muted); font-weight: 500; }
-  input, select, textarea { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 8px 12px; font-size: 13px; width: 100%; outline: none; transition: border-color .15s; }
-  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  input, select, textarea { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius); padding: 9px 12px; font-size: 13px; width: 100%; outline: none; transition: border-color .15s; font-family: var(--font-body); }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(5,23,71,.08); }
   textarea { resize: vertical; min-height: 60px; }
   .form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 
   /* Toast */
   #toast { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
-  .toast-msg { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 18px; font-size: 13px; max-width: 320px; animation: slideIn .2s ease; }
+  .toast-msg { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 18px; font-size: 13px; max-width: 320px; box-shadow: 0 10px 30px rgba(5,23,71,.12); animation: slideIn .2s ease; }
   .toast-msg.success { border-left: 3px solid var(--green); }
   .toast-msg.error { border-left: 3px solid var(--red); }
   @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
@@ -113,10 +125,10 @@
   .chart-bar-fill { height: 100%; border-radius: 4px; }
   .chart-bar-val { width: 60px; text-align: right; font-size: 12px; color: var(--muted); }
 
-  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; font-style: italic; }
 
   /* SKU column */
-  .sku { font-family: monospace; font-size: 12px; color: var(--muted); }
+  .sku { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; font-size: 11px; color: var(--muted); letter-spacing: .04em; }
 
   /* History type pill */
   .type-use { color: var(--red); }
@@ -125,13 +137,13 @@
   .actions-col { white-space: nowrap; }
 
   /* Admin token panel (sidebar footer) */
-  .sidebar-footer { margin-top: auto; padding: 16px 20px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
-  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .sidebar-footer { margin-top: auto; padding: 16px 22px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; font-weight: 500; }
   .token-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
   .token-dot.ok { background: var(--green); }
   .token-dot.missing { background: var(--red); }
   .token-actions { display: flex; gap: 6px; }
-  .token-actions .btn { flex: 1; padding: 5px 8px; font-size: 11px; }
+  .token-actions .btn { flex: 1; padding: 5px 10px; font-size: 10px; }
 </style>
 </head>
 <body>
@@ -140,8 +152,8 @@
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-logo">
-      📦 Inventory
-      <span>Tracker v2</span>
+      <svg width="476" height="318" viewBox="0 0 476 323" fill="none" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="H&amp;H Bagels"><path d="M476 63.6C379.61 63.6 334.39 0 238 0C141.61 0 96.39 63.6 0 63.6V254.4C96.39 254.4 141.61 318 238 318C334.39 318 379.61 254.4 476 254.4V63.6Z" fill="#051747"></path><path d="M115.43 168.047H71.0908V216.598H49.7422V101.402H71.0908V147.973H115.43V101.402H136.779V216.598H115.43V168.047Z" fill="#FFFFFF"></path><path d="M404.823 168.047H360.483V216.598H339.135V101.402H360.483V147.973H404.823V101.402H426.171V216.598H404.823V168.047Z" fill="#FFFFFF"></path><path d="M171.186 194.87C171.186 170.551 184.053 149.722 204.839 139.379C193.843 130.515 188.885 118.018 188.885 105.926C188.885 80.1281 209.805 60.6426 237.826 60.6426C257 60.6426 272.55 69.642 280.729 83.7533L261.023 94.0962C256.326 86.8379 248.02 82.0043 237.556 82.0043C222.808 82.0043 211.146 91.274 211.146 106.323C211.146 118.145 218.651 128.361 232.463 130.913V151.201C211.281 152.68 193.986 169.073 193.986 193.924C193.986 218.776 212.225 235.304 237.564 235.304C262.903 235.304 279.531 220.66 279.531 199.561C279.531 186.125 272.423 177.261 261.427 177.261C251.106 177.261 244.133 185.052 244.133 198.893H223.887C226.029 148.236 281.007 164.764 283.284 124.457H304.069C304.069 141.518 295.62 154.151 281.142 162.888C293.882 169.741 301.792 183.176 301.792 200.507C301.792 232.887 274.041 257.342 237.437 257.342C200.832 257.342 171.201 231.814 171.201 194.862L171.186 194.87Z" fill="#FFFFFF"></path></svg>
+      <div class="wordmark">Inventory Tracker</div>
     </div>
     <nav>
       <div class="nav-item active" onclick="showPage('dashboard')">
@@ -269,6 +281,7 @@
         </div>
         <div class="btn-group">
           <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
+          <button class="btn btn-ghost" onclick="runMigrateUnits()">Convert to Cases</button>
           <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
           <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
           <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
@@ -337,7 +350,7 @@
       </div>
       <div class="form-group">
         <label>Quantity *</label>
-        <input id="f-qty" type="number" step="any" min="0" placeholder="0">
+        <input id="f-qty" type="number" step="1" min="0" placeholder="0">
       </div>
       <div class="form-group">
         <label>Unit *</label>
@@ -379,7 +392,7 @@
       </div>
       <div class="form-group">
         <label>Low Stock Threshold</label>
-        <input id="f-threshold" type="number" step="any" min="0" placeholder="5">
+        <input id="f-threshold" type="number" step="1" min="0" placeholder="1">
       </div>
     </div>
     <div class="form-actions">
@@ -400,7 +413,7 @@
       </div>
       <div class="form-group full">
         <label>Amount *</label>
-        <input id="txn-amount" type="number" step="any" min="0.01" placeholder="0">
+        <input id="txn-amount" type="number" step="1" min="1" placeholder="0">
       </div>
       <div class="form-group full">
         <label>Note</label>
@@ -610,7 +623,7 @@ async function loadDashboard() {
         <td class="sku">${escHtml(i.name.toUpperCase().replace(/\s+/g,'').slice(0,8))}</td>
         <td>${escHtml(i.name)}</td>
         <td><span class="badge badge-purple">${escHtml(i.category)}</span></td>
-        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(2)}</td>
+        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(0)}</td>
         <td>${i.low_stock_threshold}</td>
         <td>${escHtml(i.unit)}</td>
         <td><button class="btn btn-warning btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button></td>
@@ -681,7 +694,7 @@ async function loadInventory() {
       <td><span class="badge badge-purple">${escHtml(item.category)}</span></td>
       <td>${distributorBadge(item.distributor)}</td>
       <td>${item.warehouse ? escHtml(item.warehouse) : '<span style="color:var(--muted)">—</span>'}</td>
-      <td style="font-weight:600">${item.quantity.toFixed(2)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
+      <td style="font-weight:600">${item.quantity.toFixed(0)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
       <td>${renderOnOrder(item)}</td>
       <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${status}</td>
@@ -740,6 +753,37 @@ async function runSeed() {
   </div>`;
   toast('Bagel catalog seeded.');
   loadDistributors();
+  loadDashboard();
+}
+
+async function runMigrateUnits() {
+  if (!confirm('This converts every item from "each" to "cs": quantity, threshold, and weekly usage are divided by case_size, and price becomes the case cost. Run only once on a fresh deploy. Proceed?')) return;
+  const box = document.getElementById('sync-report');
+  box.style.display = '';
+  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">Converting units to cases…</div></div>`;
+  let result;
+  try {
+    result = await api('/api/migrate-units', 'POST', {});
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(String(e))}</div></div>`;
+    return;
+  }
+  if (!result.ok) {
+    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(result.error || 'unknown error')}</div></div>`;
+    return;
+  }
+  box.innerHTML = `<div class="card">
+    <div class="card-header"><span class="card-title">Unit Conversion Complete</span></div>
+    <div style="padding:14px 20px;font-size:13px">
+      Converted <strong>${result.converted}</strong> SKU(s) to cases.
+      ${result.already_in_cases ? `Already in cases: ${result.already_in_cases}. ` : ''}
+      ${result.skipped_no_case_size ? `<span style="color:var(--yellow)">Skipped (no case_size set): ${result.skipped_no_case_size}.</span> ` : ''}
+      Total catalog: ${result.total}.
+    </div>
+  </div>`;
+  toast(`Converted ${result.converted} SKU(s) to case units.`);
+  loadDistributors();
+  loadInventory();
   loadDashboard();
 }
 
@@ -1020,13 +1064,13 @@ async function openEditModal(item) {
 
 async function submitItem() {
   const name = document.getElementById('f-name').value.trim();
-  const qty  = parseFloat(document.getElementById('f-qty').value);
+  const qty  = Math.round(parseFloat(document.getElementById('f-qty').value));
   const unit = document.getElementById('f-unit').value.trim();
   const cat  = document.getElementById('f-cat').value.trim() || 'general';
   const price = parseFloat(document.getElementById('f-price').value) || 0;
   const distributor = document.getElementById('f-distributor').value;
   const warehouse = document.getElementById('f-warehouse').value;
-  const threshold = parseFloat(document.getElementById('f-threshold').value) || 5;
+  const threshold = Math.round(parseFloat(document.getElementById('f-threshold').value)) || 1;
   const caseCost = parseFloat(document.getElementById('f-case-cost').value) || 0;
   const caseSize = parseInt(document.getElementById('f-case-size').value) || 0;
   const weekly = parseFloat(document.getElementById('f-weekly').value) || 0;
@@ -1084,10 +1128,10 @@ function openRestockModal(name) {
 }
 
 async function submitTxn() {
-  const amount = parseFloat(document.getElementById('txn-amount').value);
+  const amount = Math.round(parseFloat(document.getElementById('txn-amount').value));
   const note = document.getElementById('txn-note').value.trim();
   if (isNaN(amount) || amount <= 0) {
-    toast('Enter a valid amount.', 'error');
+    toast('Enter a valid whole-case amount.', 'error');
     return;
   }
   const url = txnType === 'use' ? '/api/use' : '/api/restock';
