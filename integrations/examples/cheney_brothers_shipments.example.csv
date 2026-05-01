@@ -1,0 +1,5 @@
+order_date,po_number,warehouse,distributor_sku,variety,quantity,unit,case_size,case_cost
+2026-04-12,CB-50012345,"Ocala, FL",CB-BGL-PLN-4,Plain,16,cs,60,26.50
+2026-04-12,CB-50012345,"Ocala, FL",CB-BGL-EVR-4,Everything,12,cs,60,26.50
+2026-04-19,CB-50012398,"Riviera Beach, FL",CB-BGL-PLN-4,Plain,8,cs,60,26.50
+2026-04-19,CB-50012398,"Riviera Beach, FL",CB-BGL-SES-4,Sesame,4,cs,60,26.50

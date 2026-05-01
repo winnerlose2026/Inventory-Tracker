@@ -1,0 +1,6 @@
+order_date,po_number,po_revision,warehouse,distributor_sku,variety,quantity,unit,case_size,case_cost
+2026-04-15,388549,1,"Manassas, VA",USF-100234,Plain,12,cs,60,27.00
+2026-04-15,388549,1,"Manassas, VA",USF-100235,Everything,8,cs,60,27.00
+2026-04-15,388549,1,"Manassas, VA",USF-100236,Sesame,4,cs,60,27.00
+2026-04-22,436370,1,"Manassas, VA",USF-100234,Plain,10,cs,60,27.00
+2026-04-22,436370,1,"Manassas, VA",USF-100237,Cinnamon Raisin,4,cs,60,27.00
