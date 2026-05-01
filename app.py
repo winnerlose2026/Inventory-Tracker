@@ -581,4 +581,38 @@ def api_email_ingest_events():
                 "messages_seen": messages_seen,
                 "messages_parsed": messages_parsed,
             }],
-        })
+        }), 500
+
+    return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@app.route("/api/export.xlsx")
+def api_export_xlsx():
+    from openpyxl import Workbook
+    from export_bagels_xlsx import _write_summary_sheet, _write_items_sheet
+
+    inv = load_inventory()
+    items = list(inv.values())
+    cheney = [i for i in items if (i.get("distributor") or "") == "Cheney Brothers"]
+    usfoods = [i for i in items if (i.get("distributor") or "") == "US Foods"]
+
+    wb = Workbook()
+    _write_summary_sheet(wb.active, inv)
+    wb.active.title = "Summary"
+    _write_items_sheet(wb.create_sheet("Unified List"), items)
+    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
+    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="bagel_inventory.xlsx",
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)

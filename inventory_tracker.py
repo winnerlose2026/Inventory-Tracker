@@ -585,4 +585,88 @@ def main():
             print("  Usage: add <name> <qty> <unit> [category] [threshold] [price] [distributor] [warehouse]")
             return
         name = args[1]
-     
+        qty = float(args[2])
+        unit = args[3]
+        category = args[4] if len(args) > 4 else "general"
+        threshold = float(args[5]) if len(args) > 5 else 5.0
+        price = float(args[6]) if len(args) > 6 else 0.0
+        distributor = args[7] if len(args) > 7 else ""
+        warehouse = args[8] if len(args) > 8 else ""
+        add_item(name, qty, unit, category, threshold, price, distributor, warehouse)
+
+    elif cmd == "update":
+        if len(args) < 2:
+            print("  Usage: update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P] [--distributor=D] [--warehouse=W]")
+            return
+        name = args[1]
+        qty_s = parse_kwarg(args[2:], "qty")
+        unit_s = parse_kwarg(args[2:], "unit")
+        cat_s = parse_kwarg(args[2:], "cat")
+        thr_s = parse_kwarg(args[2:], "threshold")
+        price_s = parse_kwarg(args[2:], "price")
+        dist_s = parse_kwarg(args[2:], "distributor")
+        wh_s = parse_kwarg(args[2:], "warehouse")
+        update_item(
+            name,
+            quantity=float(qty_s) if qty_s else None,
+            unit=unit_s,
+            category=cat_s,
+            low_stock_threshold=float(thr_s) if thr_s else None,
+            price=float(price_s) if price_s else None,
+            distributor=dist_s,
+            warehouse=wh_s,
+        )
+
+    elif cmd == "use":
+        if len(args) < 3:
+            print("  Usage: use <name> <amount> [note]")
+            return
+        name = args[1]
+        amount = float(args[2])
+        note = args[3] if len(args) > 3 else ""
+        record_usage(name, amount, note)
+
+    elif cmd == "restock":
+        if len(args) < 3:
+            print("  Usage: restock <name> <amount> [note]")
+            return
+        name = args[1]
+        amount = float(args[2])
+        note = args[3] if len(args) > 3 else ""
+        restock(name, amount, note)
+
+    elif cmd == "remove":
+        if len(args) < 2:
+            print("  Usage: remove <name>")
+            return
+        remove_item(args[1])
+
+    elif cmd in ("list", "ls"):
+        category = args[1] if len(args) > 1 else None
+        show_inventory(category)
+
+    elif cmd in ("history", "log"):
+        name = None
+        limit = 20
+        remaining = args[1:]
+        limit_s = parse_kwarg(remaining, "limit")
+        if limit_s:
+            limit = int(limit_s)
+            remaining = [a for a in remaining if not a.startswith("--limit=")]
+        if remaining:
+            name = remaining[0]
+        show_usage(name, limit)
+
+    elif cmd == "report":
+        show_report()
+
+    elif cmd in ("help", "--help", "-h"):
+        print(USAGE_TEXT)
+
+    else:
+        print(f"  Unknown command: '{cmd}'")
+        print(USAGE_TEXT)
+
+
+if __name__ == "__main__":
+    main()

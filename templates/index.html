@@ -1121,3 +1121,191 @@ async function openAddModal() {
   document.getElementById('f-name').removeAttribute('readonly');
   document.getElementById('item-modal').classList.add('open');
   document.getElementById('f-name').focus();
+}
+
+async function openEditModal(name) {
+  await ensureWarehouses();
+  // Resolve the item from the cache; refetch if it isn't there yet.
+  let item = findCachedItem(name);
+  if (!item) {
+    inventoryCache = await api('/api/inventory');
+    item = findCachedItem(name);
+  }
+  if (!item) {
+    toast(`Could not load "${name}" for editing.`, 'error');
+    return;
+  }
+  editingName = item.name;
+  document.getElementById('modal-title').textContent = 'Edit Item';
+  document.getElementById('f-name').value = item.name;
+  document.getElementById('f-name').setAttribute('readonly', true);
+  document.getElementById('f-qty').value = item.quantity;
+  document.getElementById('f-unit').value = item.unit;
+  document.getElementById('f-cat').value = item.category;
+  document.getElementById('f-price').value = item.price || '';
+  document.getElementById('f-distributor').value = item.distributor || '';
+  populateWarehouseSelect(
+    document.getElementById('f-warehouse'),
+    item.distributor || '',
+    item.warehouse || '',
+    false
+  );
+  document.getElementById('f-threshold').value = item.low_stock_threshold;
+  document.getElementById('f-case-cost').value = item.case_cost || '';
+  document.getElementById('f-case-size').value = item.case_size || '';
+  document.getElementById('f-weekly').value = item.weekly_usage || '';
+  document.getElementById('item-modal').classList.add('open');
+}
+
+async function submitItem() {
+  const name = document.getElementById('f-name').value.trim();
+  const qty  = Math.round(parseFloat(document.getElementById('f-qty').value));
+  const unit = document.getElementById('f-unit').value.trim();
+  const cat  = document.getElementById('f-cat').value.trim() || 'general';
+  const price = parseFloat(document.getElementById('f-price').value) || 0;
+  const distributor = document.getElementById('f-distributor').value;
+  const warehouse = document.getElementById('f-warehouse').value;
+  const threshold = Math.round(parseFloat(document.getElementById('f-threshold').value)) || 1;
+  const caseCost = parseFloat(document.getElementById('f-case-cost').value) || 0;
+  const caseSize = parseInt(document.getElementById('f-case-size').value) || 0;
+  const weekly = parseFloat(document.getElementById('f-weekly').value) || 0;
+
+  if (!name || isNaN(qty) || !unit) {
+    toast('Name, quantity and unit are required.', 'error');
+    return;
+  }
+
+  const payload = {
+    quantity: qty, unit, category: cat, price, distributor, warehouse,
+    low_stock_threshold: threshold,
+    case_cost: caseCost, case_size: caseSize, weekly_usage: weekly,
+  };
+
+  if (editingName) {
+    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
+    toast(`Updated "${editingName}".`);
+  } else {
+    await api('/api/inventory', 'POST', { name, ...payload });
+    toast(`Added "${name}".`);
+  }
+  closeModal('item-modal');
+  loadInventory();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Modals – Use / Restock
+// -------------------------------------------------------------------------
+function openUseModal(name) {
+  txnType = 'use';
+  txnItemName = name;
+  document.getElementById('txn-title').textContent = `Use: ${name}`;
+  document.getElementById('txn-submit').textContent = 'Record Usage';
+  document.getElementById('txn-submit').className = 'btn btn-danger';
+  document.getElementById('txn-name').value = name;
+  document.getElementById('txn-amount').value = '';
+  document.getElementById('txn-note').value = '';
+  document.getElementById('txn-modal').classList.add('open');
+  document.getElementById('txn-amount').focus();
+}
+
+function openRestockModal(name) {
+  txnType = 'restock';
+  txnItemName = name;
+  document.getElementById('txn-title').textContent = `Restock: ${name}`;
+  document.getElementById('txn-submit').textContent = 'Add Stock';
+  document.getElementById('txn-submit').className = 'btn btn-success';
+  document.getElementById('txn-name').value = name;
+  document.getElementById('txn-amount').value = '';
+  document.getElementById('txn-note').value = '';
+  document.getElementById('txn-modal').classList.add('open');
+  document.getElementById('txn-amount').focus();
+}
+
+async function submitTxn() {
+  const amount = Math.round(parseFloat(document.getElementById('txn-amount').value));
+  const note = document.getElementById('txn-note').value.trim();
+  if (isNaN(amount) || amount <= 0) {
+    toast('Enter a valid whole-case amount.', 'error');
+    return;
+  }
+  const url = txnType === 'use' ? '/api/use' : '/api/restock';
+  await api(url, 'POST', { name: txnItemName, amount, note });
+  toast(`${txnType === 'use' ? 'Used' : 'Restocked'} ${amount} of "${txnItemName}".`);
+  closeModal('txn-modal');
+  if (currentPage === 'inventory') loadInventory();
+  else if (currentPage === 'usage') loadUsage();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Delete
+// -------------------------------------------------------------------------
+async function deleteItem(name) {
+  if (!confirm(`Delete "${name}" from inventory?`)) return;
+  await api(`/api/inventory/${encodeURIComponent(name)}`, 'DELETE');
+  toast(`Removed "${name}".`);
+  loadInventory();
+  loadDashboard();
+}
+
+// -------------------------------------------------------------------------
+// Modal helpers
+// -------------------------------------------------------------------------
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+// Close on backdrop click
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.classList.remove('open');
+  });
+});
+// Close on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => m.classList.remove('open'));
+});
+// Submit on Enter in modal inputs
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+    const itemModal = document.getElementById('item-modal');
+    const txnModal = document.getElementById('txn-modal');
+    if (itemModal.classList.contains('open')) submitItem();
+    else if (txnModal.classList.contains('open')) submitTxn();
+  }
+});
+
+// -------------------------------------------------------------------------
+// On-order column rendering
+// -------------------------------------------------------------------------
+function renderOnOrder(item) {
+  const qty = +(item.on_order_qty || 0);
+  if (!qty) return '<span style="color:var(--muted)">—</span>';
+  const eta = (item.on_order_next_eta || '').slice(0, 10);
+  const tip = eta ? `next arrival ${eta}` : 'pending lead time';
+  return `<span class="badge badge-blue" title="${escAttr(tip)}">+${qty.toFixed(0)}</span>`
+       + (eta ? ` <span style="color:var(--muted);font-size:11px">${eta}</span>` : '');
+}
+
+// -------------------------------------------------------------------------
+// Escape HTML helpers
+// -------------------------------------------------------------------------
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return String(s).replace(/'/g,"\\'").replace(/"/g,'&quot;');
+}
+
+// -------------------------------------------------------------------------
+// Boot
+// -------------------------------------------------------------------------
+refreshAuthStatus().then(() => {
+  if (tokenRequired && !getAdminToken()) {
+    promptAdminToken();
+  }
+});
+loadDashboard();
+</script>
+</body>
+</html>
