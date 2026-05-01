@@ -96,7 +96,17 @@ def api_auth_check():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # When INVENTORY_AUTO_AUTH is on, hand the admin token to the page so the
+    # browser doesn't have to prompt on each fresh login / incognito window.
+    # Off by default — turning it on means "anyone who can load this page is
+    # treated as admin." Acceptable for a single-tenant deployment behind an
+    # obscure URL; not for a shared one. Accepted truthy values:
+    # 1, true, yes, on (case-insensitive).
+    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
+    auto_flag = os.environ.get("INVENTORY_AUTO_AUTH", "").strip().lower()
+    auto_on = auto_flag in ("1", "true", "yes", "on")
+    auto_token = expected if (expected and auto_on) else ""
+    return render_template("index.html", auto_admin_token=auto_token)
 
 
 # ---------------------------------------------------------------------------
@@ -571,24 +581,4 @@ def api_email_ingest_events():
                 "messages_seen": messages_seen,
                 "messages_parsed": messages_parsed,
             }],
-        }), 500
-
-    return jsonify({"dry_run": dry_run, "reports": [report]})
-
-
-@app.route("/api/export.xlsx")
-def api_export_xlsx():
-    from openpyxl import Workbook
-    from export_bagels_xlsx import _write_summary_sheet, _write_items_sheet
-
-    inv = load_inventory()
-    items = list(inv.values())
-    cheney = [i for i in items if (i.get("distributor") or "") == "Cheney Brothers"]
-    usfoods = [i for i in items if (i.get("distributor") or "") == "US Foods"]
-
-    wb = Workbook()
-    _write_summary_sheet(wb.active, inv)
-    wb.active.title = "Summary"
-    _write_items_sheet(wb.create_sheet("Unified List"), items)
-    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
-    _writ
+        })

@@ -558,6 +558,16 @@ function clearAdminToken() {
   refreshAuthStatus();
   toast('Admin key cleared.');
 }
+
+// Server-injected admin token. When INVENTORY_AUTO_AUTH is set on Render, the
+// Flask handler renders the real INVENTORY_API_TOKEN value here. If it's
+// non-empty, save it to localStorage before the auth check runs so the user
+// isn't prompted on every fresh browser. Empty string means "auto-auth off,"
+// in which case behaviour is unchanged from before.
+const __AUTO_ADMIN_TOKEN__ = {{ auto_admin_token|tojson }};
+if (__AUTO_ADMIN_TOKEN__ && getAdminToken() !== __AUTO_ADMIN_TOKEN__) {
+  setAdminToken(__AUTO_ADMIN_TOKEN__);
+}
 async function refreshAuthStatus() {
   const dot = document.getElementById('token-dot');
   const label = document.getElementById('token-status-label');
@@ -1111,21 +1121,3 @@ async function openAddModal() {
   document.getElementById('f-name').removeAttribute('readonly');
   document.getElementById('item-modal').classList.add('open');
   document.getElementById('f-name').focus();
-}
-
-async function openEditModal(name) {
-  await ensureWarehouses();
-  // Resolve the item from the cache; refetch if it isn't there yet.
-  let item = findCachedItem(name);
-  if (!item) {
-    inventoryCache = await api('/api/inventory');
-    item = findCachedItem(name);
-  }
-  if (!item) {
-    toast(`Could not load "${name}" for editing.`, 'error');
-    return;
-  }
-  editingName = item.name;
-  document.getElementById('modal-title').textContent = 'Edit Item';
-  document.getElementById('f-name').value = item.name;
-  document
