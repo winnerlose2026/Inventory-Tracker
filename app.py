@@ -7,6 +7,7 @@ from flask import Flask, jsonify, request, render_template, send_file, make_resp
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     add_item, update_item, record_usage, restock, remove_item,
+    reverse_usage,
 )
 from datetime import datetime
 
@@ -191,6 +192,17 @@ def api_usage():
         usage = [e for e in usage if e["item_key"] == key]
     usage = list(reversed(usage))[:limit]
     return jsonify(usage)
+
+
+@app.route("/api/usage/reverse", methods=["POST"])
+def api_usage_reverse():
+    """Undo a single usage/restock entry by its timestamp."""
+    d = request.json or {}
+    ts = (d.get("timestamp") or "").strip()
+    if not ts:
+        return jsonify({"ok": False, "error": "timestamp required"}), 400
+    result = reverse_usage(ts)
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------
@@ -579,18 +591,4 @@ def api_export_xlsx():
     wb.active.title = "Summary"
     _write_items_sheet(wb.create_sheet("Unified List"), items)
     _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
-    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return send_file(
-        buf,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name="bagel_inventory.xlsx",
-    )
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    _writ

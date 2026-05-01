@@ -306,6 +306,82 @@ def _record_usage(key: str, display_name: str, amount: float,
     save_usage(usage)
 
 
+def reverse_usage(timestamp: str) -> dict:
+    """Reverse a usage/restock entry identified by its ISO timestamp.
+
+    Effects:
+      - Inverts the original entry's effect on item quantity (clamped at 0).
+      - Marks the original entry as `reversed: true` (kept for audit).
+      - Appends a new usage record with `source: "reversal"` so the action
+        shows up in the activity log.
+      - Refuses to double-reverse, reverse a reversal record, or operate on
+        a missing item.
+    """
+    inv = load_inventory()
+    usage = load_usage()
+
+    target = None
+    for entry in usage:
+        if entry.get("timestamp") == timestamp:
+            target = entry
+            break
+    if target is None:
+        return {"ok": False, "error": "Activity entry not found."}
+    if target.get("reversed"):
+        return {"ok": False, "error": "This entry has already been reversed."}
+    if target.get("source") == "reversal":
+        return {"ok": False, "error": "Cannot reverse a reversal record."}
+
+    key = target.get("item_key", "")
+    if key not in inv:
+        return {"ok": False,
+                "error": f"Item '{target.get('item_name', key)}' "
+                         f"is no longer in inventory."}
+
+    item = inv[key]
+    amount = float(target.get("amount") or 0)
+    # The log convention: amount > 0 = use (qty was decreased by `amount`);
+    # amount < 0 = restock (qty was increased by `abs(amount)`). The original
+    # effect on inventory is therefore -amount, so the reversal effect is
+    # +amount. Clamp at 0 to keep on-hand non-negative.
+    new_qty = float(item.get("quantity", 0)) + amount
+    item["quantity"] = max(0, new_qty)
+    now_iso = datetime.now().isoformat()
+    item["updated"] = now_iso
+
+    target["reversed"] = True
+    target["reversed_at"] = now_iso
+
+    original_note = (target.get("note") or "").strip()
+    short_ts = target["timestamp"][:19].replace("T", " ")
+    if original_note:
+        reversal_note = f"Reversed [{short_ts}]: {original_note}"
+    else:
+        reversal_note = f"Reversed entry from {short_ts}"
+
+    # Reversal log entry — sign flipped from the original so the running
+    # "Top Consumed/Restocked" totals stay correct.
+    usage.append({
+        "item_key": key,
+        "item_name": target.get("item_name", item.get("name", key)),
+        "amount": -amount,
+        "unit": target.get("unit", item.get("unit", "")),
+        "note": reversal_note,
+        "timestamp": now_iso,
+        "source": "reversal",
+        "reverses_timestamp": target["timestamp"],
+    })
+
+    save_inventory(inv)
+    save_usage(usage)
+    return {
+        "ok": True,
+        "item_name": target.get("item_name", ""),
+        "new_quantity": item["quantity"],
+        "reversed_amount": amount,
+    }
+
+
 def remove_item(name: str):
     inv = load_inventory()
     key = name.lower().strip()
@@ -509,88 +585,4 @@ def main():
             print("  Usage: add <name> <qty> <unit> [category] [threshold] [price] [distributor] [warehouse]")
             return
         name = args[1]
-        qty = float(args[2])
-        unit = args[3]
-        category = args[4] if len(args) > 4 else "general"
-        threshold = float(args[5]) if len(args) > 5 else 5.0
-        price = float(args[6]) if len(args) > 6 else 0.0
-        distributor = args[7] if len(args) > 7 else ""
-        warehouse = args[8] if len(args) > 8 else ""
-        add_item(name, qty, unit, category, threshold, price, distributor, warehouse)
-
-    elif cmd == "update":
-        if len(args) < 2:
-            print("  Usage: update <name> [--qty=N] [--unit=U] [--cat=C] [--threshold=T] [--price=P] [--distributor=D] [--warehouse=W]")
-            return
-        name = args[1]
-        qty_s = parse_kwarg(args[2:], "qty")
-        unit_s = parse_kwarg(args[2:], "unit")
-        cat_s = parse_kwarg(args[2:], "cat")
-        thr_s = parse_kwarg(args[2:], "threshold")
-        price_s = parse_kwarg(args[2:], "price")
-        dist_s = parse_kwarg(args[2:], "distributor")
-        wh_s = parse_kwarg(args[2:], "warehouse")
-        update_item(
-            name,
-            quantity=float(qty_s) if qty_s else None,
-            unit=unit_s,
-            category=cat_s,
-            low_stock_threshold=float(thr_s) if thr_s else None,
-            price=float(price_s) if price_s else None,
-            distributor=dist_s,
-            warehouse=wh_s,
-        )
-
-    elif cmd == "use":
-        if len(args) < 3:
-            print("  Usage: use <name> <amount> [note]")
-            return
-        name = args[1]
-        amount = float(args[2])
-        note = args[3] if len(args) > 3 else ""
-        record_usage(name, amount, note)
-
-    elif cmd == "restock":
-        if len(args) < 3:
-            print("  Usage: restock <name> <amount> [note]")
-            return
-        name = args[1]
-        amount = float(args[2])
-        note = args[3] if len(args) > 3 else ""
-        restock(name, amount, note)
-
-    elif cmd == "remove":
-        if len(args) < 2:
-            print("  Usage: remove <name>")
-            return
-        remove_item(args[1])
-
-    elif cmd in ("list", "ls"):
-        category = args[1] if len(args) > 1 else None
-        show_inventory(category)
-
-    elif cmd in ("history", "log"):
-        name = None
-        limit = 20
-        remaining = args[1:]
-        limit_s = parse_kwarg(remaining, "limit")
-        if limit_s:
-            limit = int(limit_s)
-            remaining = [a for a in remaining if not a.startswith("--limit=")]
-        if remaining:
-            name = remaining[0]
-        show_usage(name, limit)
-
-    elif cmd == "report":
-        show_report()
-
-    elif cmd in ("help", "--help", "-h"):
-        print(USAGE_TEXT)
-
-    else:
-        print(f"  Unknown command: '{cmd}'")
-        print(USAGE_TEXT)
-
-
-if __name__ == "__main__":
-    main()
+     
