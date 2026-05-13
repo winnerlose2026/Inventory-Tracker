@@ -393,13 +393,16 @@ def api_email_scan():
         from sync_inventory import _apply_events
         body = request.json or {}
         dry_run = bool(body.get("dry_run", False))
-        # Keep within gunicorn's 180s budget. Each MIME fetch is one Graph
-        # round-trip; 60 messages * 2 mailboxes is comfortable.
+        # Default keeps within gunicorn's 180s budget (60 messages * 2
+        # mailboxes is comfortable). The hard cap of 2000 lets ad-hoc deep
+        # sweeps go further when paired with a narrowing MS365_FILTER; the
+        # 180s worker timeout still binds, so callers requesting more than a
+        # few hundred without a filter should expect a 504.
         try:
             max_messages = int(body.get("max_messages") or 60)
         except (TypeError, ValueError):
             max_messages = 60
-        max_messages = max(1, min(max_messages, 200))
+        max_messages = max(1, min(max_messages, 2000))
 
         client = EmailInboxClient()
         try:
