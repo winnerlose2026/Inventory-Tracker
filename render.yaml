@@ -14,7 +14,7 @@ services:
     name: bagel-inventory
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 2 --timeout 180 --bind 0.0.0.0:$PORT app:app
     disk:
@@ -41,7 +41,7 @@ services:
     name: bagel-inventory-4h-scan
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     # Every 4 hours, on the hour (UTC). Runs at 00, 04, 08, 12, 16, 20 UTC
     # every day, which covers all U.S. business hours year-round regardless of
     # daylight saving.
@@ -79,7 +79,7 @@ services:
     name: bagel-inventory-sftp-pull
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     # Pull distributor CSVs from the FTPS inbox (cPanel-hosted at
     # sftp.hhbagels.com) every 15 minutes. Files we've already processed
     # are tracked locally in data/sftp_cursor.json (cron-container-local,
