@@ -2,17 +2,19 @@
 # Instance, or keep as documentation for the existing manually-created services.
 #
 # The web service config here mirrors what we already have in Procfile and
-# the dashboard. The cron service is the new piece: it hits the web service's
-# /api/email/scan endpoint every 4 hours so POs parked in unread *or* read
-# mail get picked up automatically across all configured mailboxes (see
-# MS365_USER on the web service, which accepts a comma-separated list).
+# the dashboard. The 4h cron service runs scripts/cowork_graph_scan.py:
+# it talks to Microsoft Graph directly from the cron container, parses PO
+# PDFs out-of-process, and POSTs pre-parsed events to /api/email/ingest-events.
+# This bypasses the gunicorn-worker-timeout failure mode that the in-process
+# /api/email/scan endpoint has historically hit on attachment fetches, and
+# means the scan no longer depends on any local machine.
 
 services:
   - type: web
     name: bagel-inventory
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 2 --timeout 180 --bind 0.0.0.0:$PORT app:app
     disk:
@@ -39,25 +41,45 @@ services:
     name: bagel-inventory-4h-scan
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     # Every 4 hours, on the hour (UTC). Runs at 00, 04, 08, 12, 16, 20 UTC
     # every day, which covers all U.S. business hours year-round regardless of
-    # daylight saving. The PO revision idempotency in sync_inventory means
-    # re-scanning the same message is safe.
+    # daylight saving.
+    #
+    # The cowork_graph_scan.py script talks to Microsoft Graph directly using
+    # the same MS365_* client-credentials that the web service uses, fetches
+    # PO PDFs from the JD@ and info@ mailboxes, parses them out-of-process,
+    # and POSTs the resulting events to /api/email/ingest-events on the web
+    # service. PO-revision idempotency in sync_inventory means re-scanning
+    # the same message (or a stale revision) cannot double-count the
+    # on_order column; the per-cron-container .cowork_seen_ids.txt is a
+    # nice-to-have message-level shortcut but is not required for safety.
+    #
+    # cowork_graph_scan.py imports integrations.email_scanner (which pulls
+    # in pypdf for PDF parsing), so the cron service needs the full
+    # requirements.txt installed in its build.
     schedule: "0 */4 * * *"
-    buildCommand: "true"
-    startCommand: python scripts/trigger_email_scan.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/cowork_graph_scan.py --lookback-hours 24
     envVars:
       - key: APP_URL
         sync: false  # set to https://<your-service>.onrender.com
       - key: INVENTORY_API_TOKEN
         sync: false
+      - key: MS365_TENANT_ID
+        sync: false
+      - key: MS365_CLIENT_ID
+        sync: false
+      - key: MS365_CLIENT_SECRET
+        sync: false
+      - key: MAILBOXES
+        value: JD@ms.hhbagels.com,info@ms.hhbagels.com
 
   - type: cron
     name: bagel-inventory-sftp-pull
     runtime: python
     plan: starter
-    branch: claude/update-m365-credentials-QvulU
+    branch: main
     # Pull distributor CSVs from the FTPS inbox (cPanel-hosted at
     # sftp.hhbagels.com) every 15 minutes. Files we've already processed
     # are tracked locally in data/sftp_cursor.json (cron-container-local,
