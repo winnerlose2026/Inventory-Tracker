@@ -38,13 +38,14 @@ services:
         value: "30"
 
   - type: cron
-    name: bagel-inventory-4h-scan
+    name: bagel-inventory-6h-scan
     runtime: python
     plan: starter
     branch: main
-    # Every 4 hours, on the hour (UTC). Runs at 00, 04, 08, 12, 16, 20 UTC
-    # every day, which covers all U.S. business hours year-round regardless of
-    # daylight saving.
+    # Every 6 hours, on the hour (UTC). Runs at 00, 06, 12, 18 UTC every
+    # day. Covers U.S. business hours year-round regardless of daylight
+    # saving (a fixed UTC cron drifts an hour against local time twice a
+    # year, which is fine for an order-ingestion scan).
     #
     # The cowork_graph_scan.py script talks to Microsoft Graph directly using
     # the same MS365_* client-credentials that the web service uses, fetches
@@ -58,7 +59,7 @@ services:
     # cowork_graph_scan.py imports integrations.email_scanner (which pulls
     # in pypdf for PDF parsing), so the cron service needs the full
     # requirements.txt installed in its build.
-    schedule: "0 */4 * * *"
+    schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python scripts/cowork_graph_scan.py --lookback-hours 24
     envVars:
