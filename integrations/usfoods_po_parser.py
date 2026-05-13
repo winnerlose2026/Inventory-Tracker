@@ -167,9 +167,15 @@ _CITY_ST_ZIP_RE = re.compile(
 )
 
 # Line 1 of an item block:
-#   "              10859313006226  6/10/4.06   -H&HBAGELS  1055010"
+#   "              10859313006226  6/10/4.06    -H&HBAGELS  1055010"
+#   "              10859313006226  6/10/4.06OZ -H&HBAGELS  1055010"
+# Northeast/Manassas POs print "<pack>" with a trailing space; West/La
+# Mirada POs glue the unit suffix on (e.g. "OZ"). Accept either by
+# permitting an optional uppercase-letter run after the pack triple — it
+# lives outside the pack capture group so case_size_from_pack still sees
+# just the numbers.
 _ITEM_LINE1_RE = re.compile(
-    r"^\s+(?P<scc>\d{12,14})\s+(?P<pack>\d+/\d+/[\d.]+)\s+-\S+\s+(?P<mfr>\d+)\s*$"
+    r"^\s+(?P<scc>\d{12,14})\s+(?P<pack>\d+/\d+/[\d.]+)[A-Z]*\s+-\S+\s+(?P<mfr>\d+)\s*$"
 )
 # Line 2 of an item block:
 #   "    8 CASES   1184            BAGEL, EGG 4.06 Z UNSL HEAT &        27.00                          27.00"

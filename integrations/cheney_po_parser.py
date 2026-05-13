@@ -153,7 +153,11 @@ _SHIP_BLOCK_RE = re.compile(
 )
 
 # Line-item head: position, 6-10 digit cheney item, description, brand H&H,
-# pack "nnn/nn", pack UM (2-4 letters), quantity, quantity UM.
+# pack "nnn/nn", pack UM (2-4 letters), quantity, quantity UM. Riviera Beach
+# and Punta Gorda POs end the head line at qty_um; Ocala POs append a unit-
+# price/unit-price-UM/net-amount triple ("... 40 CS 26.50 CS 1060.00").
+# Both layouts are accepted; the price columns are captured but not used
+# downstream (CHENEY_CASE_COST is applied per line regardless).
 _LINE_HEAD_RE = re.compile(
     r"^\s{2,}(?P<pos>\d+)\s+"
     r"(?P<cheney>\d{6,10})\s+"
@@ -162,7 +166,9 @@ _LINE_HEAD_RE = re.compile(
     r"(?P<pack>\d{3}/\d+)\s+"
     r"(?P<pack_um>[A-Z]{2,4})\s+"
     r"(?P<qty>[\d,.]+)\s+"
-    r"(?P<qty_um>[A-Z]{2,4})\s*$"
+    r"(?P<qty_um>[A-Z]{2,4})"
+    r"(?:\s+[\d,.]+\s+[A-Z]{2,4}\s+[\d,.]+)?"
+    r"\s*$"
 )
 
 # Mfg# line follows the head line (may have trailing GTIN#).

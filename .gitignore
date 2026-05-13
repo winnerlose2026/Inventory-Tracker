@@ -3,5 +3,6 @@ __pycache__/
 *.pyo
 data/
 .env
+.cowork_seen_ids.txt
 integrations/cheney_brothers_inventory.csv
 integrations/us_foods_inventory.csv
