@@ -1,13 +1,26 @@
-# Render Blueprint. Apply via Render dashboard -> Blueprints -> New Blueprint
-# Instance, or keep as documentation for the existing manually-created services.
+# Render Blueprint — source of truth for the bagel-inventory web service,
+# the 6-hourly mailbox scan cron, and the 15-minute SFTP pull cron.
 #
-# The web service config here mirrors what we already have in Procfile and
-# the dashboard. The 4h cron service runs scripts/cowork_graph_scan.py:
-# it talks to Microsoft Graph directly from the cron container, parses PO
-# PDFs out-of-process, and POSTs pre-parsed events to /api/email/ingest-events.
-# This bypasses the gunicorn-worker-timeout failure mode that the in-process
-# /api/email/scan endpoint has historically hit on attachment fetches, and
-# means the scan no longer depends on any local machine.
+# Adoption: open Render -> Blueprints -> New Blueprint Instance, point it
+# at this repo on branch `main`. For each service Render will detect the
+# matching existing service by name and offer to adopt it rather than
+# create a duplicate (web=bagel-inventory, crons=bagel-inventory-6h-scan
+# and bagel-inventory-sftp-pull). After adoption, any commit to main that
+# touches render.yaml auto-syncs to the dashboard.
+#
+# Why each piece exists:
+#   - Web service: serves the Flask app + dashboard, persists inventory.json
+#     and usage.json on the mounted disk.
+#   - 6h-scan cron: scripts/cowork_graph_scan.py talks to Microsoft Graph
+#     directly, fetches PO PDFs from JD@/info@, parses out-of-process, and
+#     POSTs to /api/email/ingest-events. Out-of-process so the gunicorn
+#     worker isn't blocked on big attachment fetches.
+#   - sftp-pull cron: pulls distributor CSVs from sftp.hhbagels.com.
+#
+# Secrets (sync:false) are NOT carried in this file. Set them once on
+# each service in the dashboard; Render preserves them across blueprint
+# re-syncs. Only non-secret values (schedules, mailbox list, etc.) live
+# here.
 
 services:
   - type: web
