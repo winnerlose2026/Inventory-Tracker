@@ -9,23 +9,29 @@ code alongside their own catalog number:
 Both point to the same canonical H&H variety. This module is the single
 source of truth. Extend as new codes appear on POs.
 
-Coverage today (9 codes, 2026-04-23):
-    1150  Plain             (USF POs)
-    1152  Poppy Seed        (USF + Cheney POs)
-    1153  Sesame            (USF POs)
-    1155  Cinnamon Raisin   (Cheney POs)
-    1158  Everything        (USF + Cheney POs)
-    1159  Asiago            (USF POs - from "ASIGO CHS WHEAT")
-    1171  Blueberry         (Cheney POs)
-    1184  Egg               (USF POs)
-    1189  Jalapeno Cheddar  (USF POs - from "JLP CHEDR CHS WHEAT")
+Coverage today (12 codes, 2026-05-13):
+    1150  Plain                   (USF POs)
+    1151  Onion                   (USF POs - from "BAGEL, ONION 4.25 Z UNSL PARBK")
+    1152  Poppy Seed              (USF + Cheney POs)
+    1153  Sesame                  (USF POs)
+    1155  Cinnamon Raisin         (Cheney POs)
+    1156  Whole Wheat             (USF + Cheney POs - "BAGEL, WHL WHEAT 4.25 Z UNSL")
+    1157  Whole Wheat Everything  (USF POs - "BAGEL, EVTHG WHL WHEAT 4.06 Z")
+    1158  Everything              (USF + Cheney POs)
+    1159  Asiago                  (USF POs - from "ASIGO CHS WHEAT")
+    1171  Blueberry               (Cheney POs)
+    1184  Egg                     (USF POs)
+    1189  Jalapeno Cheddar        (USF POs - from "JLP CHEDR CHS WHEAT")
 """
 
 HH_MFG_CODE_TO_VARIETY: dict[str, str] = {
     "1150": "Plain",
+    "1151": "Onion",
     "1152": "Poppy Seed",
     "1153": "Sesame",
     "1155": "Cinnamon Raisin",
+    "1156": "Whole Wheat",
+    "1157": "Whole Wheat Everything",
     "1158": "Everything",
     "1159": "Asiago",
     "1171": "Blueberry",

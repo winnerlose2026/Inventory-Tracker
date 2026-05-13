@@ -178,30 +178,28 @@ def _graph_get_bytes(token: str, path: str, *, verbose: bool = False) -> bytes:
 
 def _list_recent_messages(token: str, mailbox: str, since_dt: datetime,
                           *, verbose: bool = False) -> list[dict]:
-    """Return list of recent messages with attachments for one mailbox.
+    """Return attachment-bearing messages received since `since_dt`.
 
-    Graph rejects (`hasAttachments eq true and receivedDateTime ge X`) +
-    `$orderby receivedDateTime` as `InefficientFilter`. We work around that
-    by filtering on receivedDateTime alone (Graph returns most-recent-first
-    by default) and screening `hasAttachments` client-side. That keeps the
-    result set bounded by the lookback window and avoids the Graph hint.
+    `hasAttachments eq true and receivedDateTime ge X` is valid without
+    `$orderby` — the combination errors as `InefficientFilter` when paired
+    with an explicit sort. Without orderby Graph still returns every match;
+    paging just isn't strictly date-ordered. Filtering server-side keeps a
+    high-volume mailbox from burning the page budget on non-PO mail.
     """
     since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     qs = urllib.parse.urlencode({
         "$select": ("id,subject,from,toRecipients,receivedDateTime,"
                     "hasAttachments,internetMessageId"),
-        "$filter": f"receivedDateTime ge {since_iso}",
+        "$filter": f"hasAttachments eq true and receivedDateTime ge {since_iso}",
         "$top": "100",
     })
     out: list[dict] = []
     next_url = (f"/users/{urllib.parse.quote(mailbox)}/messages?{qs}")
     pages = 0
-    while next_url and pages < 5:
+    while next_url and pages < 20:
         pages += 1
         page = _graph_get(token, next_url, verbose=verbose)
-        for m in page.get("value") or []:
-            if m.get("hasAttachments"):
-                out.append(m)
+        out.extend(page.get("value") or [])
         nxt = page.get("@odata.nextLink")
         next_url = nxt if nxt else None
     return out
@@ -388,7 +386,13 @@ def run(argv: list[str] | None = None) -> int:
     since = datetime.now(timezone.utc) - timedelta(hours=args.lookback_hours)
 
     # ---- discover qualifying messages
-    qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
+    #
+    # A message qualifies only if (a) the sender is Cheney/USF and (b) at least
+    # one attachment is a PDF. Non-PDF attachments (calendar invites, images,
+    # docx forwards from buyer threads) are skipped silently — we only parse
+    # PO PDFs here.
+    error_strs: list[str] = []
+    qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor, pdf_atts}]
     for mb in mailboxes:
         try:
             msgs = _list_recent_messages(token, mb, since, verbose=args.verbose)
@@ -406,12 +410,26 @@ def run(argv: list[str] | None = None) -> int:
             dist = _classify(sender, subject)
             if not dist:
                 continue
+            try:
+                atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
+            except Exception as exc:
+                msg = _redact(str(exc), secrets_to_redact)
+                error_strs.append(f"{mid[:12]}.. [list-att]: {msg}")
+                continue
+            pdf_atts = [
+                a for a in atts
+                if (a.get("name") or "").lower().endswith(".pdf")
+                or (a.get("contentType") or "").lower() == "application/pdf"
+            ]
+            if not pdf_atts:
+                continue
             qualifying.append({
                 "mailbox": mb,
                 "id": mid,
                 "subject": subject,
                 "sender": sender,
                 "distributor": dist,
+                "pdf_atts": pdf_atts,
             })
 
     if not qualifying:
@@ -420,25 +438,11 @@ def run(argv: list[str] | None = None) -> int:
 
     # ---- fetch attachments + parse
     events_out: list[dict] = []
-    error_strs: list[str] = []
     msgs_parsed = 0
 
     for q in qualifying:
         mb, mid, subject, dist = q["mailbox"], q["id"], q["subject"], q["distributor"]
-        try:
-            atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
-        except Exception as exc:
-            msg = _redact(str(exc), secrets_to_redact)
-            error_strs.append(f"{mid[:12]}.. [list-att]: {msg}")
-            continue
-
-        any_pdf = False
-        for a in atts:
-            name = (a.get("name") or "").lower()
-            ctype = (a.get("contentType") or "").lower()
-            if not (name.endswith(".pdf") or ctype == "application/pdf"):
-                continue
-            any_pdf = True
+        for a in q["pdf_atts"]:
             try:
                 pdf_bytes = _fetch_attachment_bytes(
                     token, mb, mid, a.get("id") or "", verbose=args.verbose,
@@ -458,10 +462,7 @@ def run(argv: list[str] | None = None) -> int:
                 events_out.append(asdict(e))
             for er in errors:
                 error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
-        if any_pdf:
-            msgs_parsed += 1
-        else:
-            error_strs.append(f"{mid[:12]}.. [{dist}]: no PDF attachment found")
+        msgs_parsed += 1
 
     payload = {
         "dry_run": bool(args.dry_run),
