@@ -85,9 +85,43 @@ def save_usage(usage: list):
 _PENDING_ROLLOVER_AUDIT: list = []
 
 
+def _rollover_trigger(entry: dict) -> "datetime | None":
+    """Resolve the effective rollover trigger for a pending on_order entry.
+
+    Rule of precedence (per the dashboard's ship-date feature):
+      1. ``arrival_date`` if set — set to ship_date + 7 days when an
+         operator records a ship date on the PO. Supersedes the 30-day
+         ETA rule.
+      2. ``eta`` otherwise — the default ordered_at + lead_days date.
+
+    Returns the parsed datetime, or None if neither field is parseable.
+    """
+    arrival = (entry.get("arrival_date") or "").strip()
+    if arrival:
+        try:
+            return datetime.fromisoformat(arrival)
+        except ValueError:
+            pass
+    eta = (entry.get("eta") or "").strip()
+    if eta:
+        try:
+            return datetime.fromisoformat(eta)
+        except ValueError:
+            pass
+    return None
+
+
 def _rollover_on_order(inv: dict) -> bool:
-    """Promote on_order entries whose ETA has passed into quantity.
-    Mutates `inv` in place. Returns True if any entry was promoted."""
+    """Promote on_order entries whose effective trigger has passed into
+    quantity. Mutates ``inv`` in place. Returns True if any entry was
+    promoted.
+
+    The trigger is normally the entry's ``eta`` (ordered_at + 30 days).
+    If an operator sets a ship_date via /api/on-order/ship-date,
+    arrival_date = ship_date + 7 days is stored on the entry and used
+    INSTEAD of eta as the trigger. Promotion is idempotent: once an
+    entry has been added to quantity and the entry removed from
+    on_order it cannot be added again."""
     global _PENDING_ROLLOVER_AUDIT
     _PENDING_ROLLOVER_AUDIT = []
     now = datetime.now()
@@ -98,13 +132,13 @@ def _rollover_on_order(inv: dict) -> bool:
             continue
         kept = []
         for entry in pending:
-            eta_str = entry.get("eta", "")
-            try:
-                eta = datetime.fromisoformat(eta_str)
-            except (TypeError, ValueError):
+            trigger = _rollover_trigger(entry)
+            if trigger is None:
+                # No usable trigger date — leave pending so an operator
+                # can correct it (typically via /api/on-order/ship-date).
                 kept.append(entry)
                 continue
-            if eta > now:
+            if trigger > now:
                 kept.append(entry)
                 continue
             qty = float(entry.get("qty") or 0)
@@ -120,7 +154,7 @@ def _rollover_on_order(inv: dict) -> bool:
                 "qty": qty,
                 "po_number": entry.get("po_number", ""),
                 "po_revision": entry.get("po_revision", ""),
-                "eta": eta_str,
+                "eta": trigger.isoformat(),
                 "timestamp": now.isoformat(),
             })
             changed = True

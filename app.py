@@ -174,6 +174,79 @@ def api_remove(name):
     return jsonify({"ok": True})
 
 
+@app.route("/api/on-order/ship-date", methods=["POST"])
+def api_on_order_ship_date():
+    """Set (or clear) a ship_date on all pending on_order entries for a PO.
+
+    Body:
+      po_number   (required)
+      ship_date   ISO date or empty/null to clear
+      item_key    (optional) limit the update to a single SKU; default
+                  is to update every SKU's on_order list that carries
+                  this PO. Per-PO is the common case because a PO ships
+                  as a whole — every line item arrives together.
+
+    Behavior:
+      - Stores ship_date on each matching entry.
+      - Computes arrival_date = ship_date + 7 days and stores it.
+      - Clearing ship_date (empty string / null) also clears
+        arrival_date, returning the entry to the default 30-day-from-
+        ordered_at rollover.
+      - inventory.load_inventory()'s rollover pass picks up the new
+        arrival_date on its next call, so a ship_date that's already in
+        the past promotes the entry immediately (after the +7).
+    """
+    from datetime import datetime, timedelta
+    from inventory_tracker import load_inventory, save_inventory
+
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    item_key = (body.get("item_key") or "").strip().lower() or None
+    ship_raw = body.get("ship_date")
+
+    # Empty value clears.
+    if ship_raw is None or (isinstance(ship_raw, str) and not ship_raw.strip()):
+        ship_iso = ""
+        arrival_iso = ""
+    else:
+        try:
+            ship_dt = datetime.fromisoformat(str(ship_raw).strip())
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": "ship_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
+            }), 400
+        ship_iso = ship_dt.isoformat()
+        arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+
+    inv = load_inventory()
+    updated = 0
+    touched_items = []
+    for key, item in inv.items():
+        if item_key and key != item_key:
+            continue
+        pending = item.get("on_order") or []
+        for entry in pending:
+            if (entry.get("po_number") or "") != po_number:
+                continue
+            entry["ship_date"] = ship_iso
+            entry["arrival_date"] = arrival_iso
+            updated += 1
+            if item.get("name") not in touched_items:
+                touched_items.append(item.get("name") or key)
+    save_inventory(inv)
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "ship_date": ship_iso,
+        "arrival_date": arrival_iso,
+        "entries_updated": updated,
+        "items": touched_items,
+    })
+
+
 @app.route("/api/admin/remove-po", methods=["POST"])
 def api_admin_remove_po():
     """Drop all pending on_order entries matching a po_number.

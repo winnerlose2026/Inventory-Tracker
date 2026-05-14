@@ -267,6 +267,121 @@ def test_collapse_preserves_legitimate_two_line_pos():
         assert qtys == [8.0, 16.0]
 
 
+
+
+def test_ship_date_arrival_supersedes_30day_eta():
+    """When ship_date+7 (arrival_date) is set, it triggers rollover
+    INSTEAD of the original 30-day-from-ordered_at eta."""
+    from datetime import datetime, timedelta
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, _ = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target = "plain bagel 4oz [usf - manassas]"
+        inv = it._load(it.INVENTORY_FILE)
+        qty_before = inv[target]["quantity"]
+        # Entry whose eta is 25 days OUT (would normally stay pending)
+        # but whose arrival_date is YESTERDAY (set via a past ship date).
+        future_eta = (datetime.now() + timedelta(days=25)).isoformat()
+        past_arrival = (datetime.now() - timedelta(days=1)).isoformat()
+        inv[target]["on_order"] = [{
+            "qty": 8.0, "unit": "cs",
+            "ordered_at": (datetime.now() - timedelta(days=5)).isoformat(),
+            "eta": future_eta,
+            "ship_date": (datetime.now() - timedelta(days=8)).isoformat(),
+            "arrival_date": past_arrival,
+            "po_number": "TESTPO99", "po_revision": "0000001",
+        }]
+        it.save_inventory(inv)
+
+        reloaded = it.load_inventory()
+        assert reloaded[target]["quantity"] == qty_before + 8.0
+        assert reloaded[target]["on_order"] == []
+
+
+def test_ship_date_not_double_rolled():
+    """The promotion happens once. After rollover the entry is removed
+    from on_order, so the 30-day rule cannot re-promote it."""
+    from datetime import datetime, timedelta
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, _ = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target = "egg bagel 4oz [usf - manassas]"
+        inv = it._load(it.INVENTORY_FILE)
+        qty_before = inv[target]["quantity"]
+        inv[target]["on_order"] = [{
+            "qty": 5.0, "unit": "cs",
+            "ordered_at": (datetime.now() - timedelta(days=5)).isoformat(),
+            "eta": (datetime.now() - timedelta(days=1)).isoformat(),
+            "ship_date": (datetime.now() - timedelta(days=8)).isoformat(),
+            "arrival_date": (datetime.now() - timedelta(days=1)).isoformat(),
+            "po_number": "DOUBLECHECK", "po_revision": "0000001",
+        }]
+        it.save_inventory(inv)
+
+        # First load promotes
+        r1 = it.load_inventory()
+        assert r1[target]["quantity"] == qty_before + 5.0
+        # Second load is a no-op for this entry
+        r2 = it.load_inventory()
+        assert r2[target]["quantity"] == qty_before + 5.0
+        assert r2[target]["on_order"] == []
+
+
+def test_no_ship_date_falls_back_to_30day_eta():
+    """When no ship_date is set, the 30-day eta rule still fires
+    (original behavior is preserved)."""
+    from datetime import datetime, timedelta
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, _ = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target = "sesame bagel 4oz [usf - manassas]"
+        inv = it._load(it.INVENTORY_FILE)
+        qty_before = inv[target]["quantity"]
+        inv[target]["on_order"] = [{
+            "qty": 3.0, "unit": "cs",
+            "ordered_at": (datetime.now() - timedelta(days=35)).isoformat(),
+            "eta": (datetime.now() - timedelta(days=5)).isoformat(),
+            # no ship_date / no arrival_date
+            "po_number": "FALLBACK", "po_revision": "0000001",
+        }]
+        it.save_inventory(inv)
+        r = it.load_inventory()
+        assert r[target]["quantity"] == qty_before + 3.0
+
+
+def test_future_arrival_keeps_entry_pending():
+    """A ship_date in the future means arrival is future too — entry
+    must stay pending until that arrival date."""
+    from datetime import datetime, timedelta
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, _ = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target = "asiago bagel 4oz [usf - manassas]"
+        inv = it._load(it.INVENTORY_FILE)
+        qty_before = inv[target]["quantity"]
+        inv[target]["on_order"] = [{
+            "qty": 7.0, "unit": "cs",
+            "ordered_at": (datetime.now() - timedelta(days=40)).isoformat(),
+            "eta": (datetime.now() - timedelta(days=10)).isoformat(),
+            "ship_date": (datetime.now() + timedelta(days=3)).isoformat(),
+            "arrival_date": (datetime.now() + timedelta(days=10)).isoformat(),
+            "po_number": "FUTURE_ARRIVAL", "po_revision": "0000001",
+        }]
+        it.save_inventory(inv)
+        r = it.load_inventory()
+        # Even though eta is past, future arrival_date keeps it pending.
+        assert r[target]["quantity"] == qty_before
+        assert len(r[target]["on_order"]) == 1
+
+
 if __name__ == "__main__":
     test_apply_path_dedupes_duplicate_lines_in_same_batch()
     print("OK test_apply_path_dedupes_duplicate_lines_in_same_batch")
@@ -284,4 +399,12 @@ if __name__ == "__main__":
     print("OK test_collapse_keeps_highest_revision_for_same_po")
     test_collapse_preserves_legitimate_two_line_pos()
     print("OK test_collapse_preserves_legitimate_two_line_pos")
+    test_ship_date_arrival_supersedes_30day_eta()
+    print("OK test_ship_date_arrival_supersedes_30day_eta")
+    test_ship_date_not_double_rolled()
+    print("OK test_ship_date_not_double_rolled")
+    test_no_ship_date_falls_back_to_30day_eta()
+    print("OK test_no_ship_date_falls_back_to_30day_eta")
+    test_future_arrival_keeps_entry_pending()
+    print("OK test_future_arrival_keeps_entry_pending")
     print("ALL TESTS PASS")
