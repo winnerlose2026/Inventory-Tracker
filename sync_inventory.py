@@ -173,16 +173,34 @@ def sync_all(clients: list[DistributorClient] | None = None,
 # Email scanning
 # ---------------------------------------------------------------------------
 
+# USF occasionally re-issues a PO with the literal revision token
+# "REPRINT" (an entire copy of the latest state, not a numbered rev).
+# In USF's workflow REPRINT is ALWAYS newer than any numbered revision
+# that preceded it -- so we sort it after every integer. Same treatment
+# for any other non-numeric token we might see in the future.
+_REPRINT_REV_SENTINEL = 10_000_000
+
+
 def _po_rev_int(s) -> int:
-    """Coerce a PO revision string (e.g. '0000002' or '2') to an int.
-    Returns 0 when the value is missing or non-numeric so older-than-any-
-    real-rev comparisons still work."""
+    """Coerce a PO revision string to an int suitable for ordering.
+
+    Integer strings ('0000002', '2', '17') round-trip to their int.
+    Non-numeric tokens (USF's 'REPRINT', any other free-form revision
+    label) sort AFTER any plausible numeric revision via a fixed
+    sentinel. Missing / empty strings are treated as rev 0 (older than
+    everything) so an unrevised PO doesn't accidentally outrank a real
+    revision.
+    """
     if not s:
         return 0
-    try:
-        return int(str(s).lstrip("0") or "0")
-    except (ValueError, TypeError):
+    raw = str(s).strip()
+    if not raw:
         return 0
+    try:
+        return int(raw.lstrip("0") or "0")
+    except (ValueError, TypeError):
+        # Non-numeric token (REPRINT etc.) — treat as latest.
+        return _REPRINT_REV_SENTINEL
 
 
 def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:

@@ -236,13 +236,20 @@ def _collapse_revision_dupes(inv: dict) -> bool:
             if len(entries) < 2 or not po:
                 kept.extend(entries)
                 continue
-            # Map po_revision -> integer; treat empty as 0.
+            # Map po_revision -> integer using the same precedence as
+            # sync_inventory._po_rev_int: numeric strings -> their int,
+            # non-numeric tokens like "REPRINT" -> a large sentinel so
+            # they always supersede prior numbered revisions (matches
+            # USF's actual issuing semantics).
+            _REPRINT_SENTINEL = 10_000_000
             def _rev_int(e):
                 s = str(e.get("po_revision") or "").strip()
-                try:
-                    return int(s)
-                except (TypeError, ValueError):
+                if not s:
                     return 0
+                try:
+                    return int(s.lstrip("0") or "0")
+                except (TypeError, ValueError):
+                    return _REPRINT_SENTINEL
             max_rev = max(_rev_int(e) for e in entries)
             survivors = [e for e in entries if _rev_int(e) == max_rev]
             dropped = len(entries) - len(survivors)

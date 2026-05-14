@@ -382,6 +382,74 @@ def test_future_arrival_keeps_entry_pending():
         assert len(r[target]["on_order"]) == 1
 
 
+
+
+def test_reprint_supersedes_numeric_revision():
+    """USF's 'REPRINT' token must be treated as newer than any
+    numeric revision when collapsing same-(item, po) duplicates."""
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, _ = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target = "asiago bagel 4oz [usf - la mirada]"
+        inv = it._load(it.INVENTORY_FILE)
+        inv[target]["on_order"] = [
+            {"qty": 8.0, "unit": "cs", "eta": "2030-12-31T00:00:00",
+             "ordered_at": "2026-04-28T20:00:00",
+             "po_number": "TESTREPRINT", "po_revision": "0000004"},
+            {"qty": 88.0, "unit": "cs", "eta": "2030-12-31T00:00:00",
+             "ordered_at": "2026-04-28T20:00:00",
+             "po_number": "TESTREPRINT", "po_revision": "REPRINT"},
+        ]
+        it.save_inventory(inv)
+        reloaded = it.load_inventory()
+        pending = reloaded[target]["on_order"]
+        assert len(pending) == 1, f"expected 1 pending after collapse, got {len(pending)}"
+        assert pending[0]["po_revision"] == "REPRINT"
+        assert pending[0]["qty"] == 88.0
+
+
+def test_apply_path_supersedes_numeric_with_reprint():
+    """When events with rev='REPRINT' arrive AFTER events with rev='0000004'
+    in /api/email/ingest-events, the apply path must supersede the
+    numeric revision (treat REPRINT as latest)."""
+    from datetime import datetime
+    from integrations.base import SyncItem
+    from integrations.email_scanner import EmailEvent
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, sync = _setup_temp_inventory(Path(td))
+        _seed(it)
+
+        target_variety = "Plain"
+        target = "plain bagel 4oz [usf - la mirada]"
+
+        def make_evt(qty, rev):
+            return EmailEvent(
+                event_type="restock",
+                item=SyncItem(quantity=qty, distributor="US Foods",
+                              variety=target_variety, warehouse="La Mirada, CA",
+                              unit="cases"),
+                source_message_id="m", source_subject="USF PO 5334574C",
+                po_number="5334574C", po_revision=rev,
+            )
+
+        # First wave: apply rev 0000004 with qty=80
+        sync._apply_events([make_evt(80.0, "0000004")], dry_run=False)
+        inv = it._load(it.INVENTORY_FILE)
+        assert inv[target]["on_order"][0]["qty"] == 80.0
+
+        # Second wave: apply REPRINT with qty=136 (USF re-issue at a
+        # corrected quantity). Must supersede.
+        sync._apply_events([make_evt(136.0, "REPRINT")], dry_run=False)
+        inv = it._load(it.INVENTORY_FILE)
+        pending = inv[target]["on_order"]
+        assert len(pending) == 1, f"expected exactly 1 pending after supersede; got {len(pending)}"
+        assert pending[0]["qty"] == 136.0
+        assert pending[0]["po_revision"] == "REPRINT"
+
+
 if __name__ == "__main__":
     test_apply_path_dedupes_duplicate_lines_in_same_batch()
     print("OK test_apply_path_dedupes_duplicate_lines_in_same_batch")
@@ -407,4 +475,8 @@ if __name__ == "__main__":
     print("OK test_no_ship_date_falls_back_to_30day_eta")
     test_future_arrival_keeps_entry_pending()
     print("OK test_future_arrival_keeps_entry_pending")
+    test_reprint_supersedes_numeric_revision()
+    print("OK test_reprint_supersedes_numeric_revision")
+    test_apply_path_supersedes_numeric_with_reprint()
+    print("OK test_apply_path_supersedes_numeric_with_reprint")
     print("ALL TESTS PASS")

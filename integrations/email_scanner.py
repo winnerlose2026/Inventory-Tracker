@@ -652,7 +652,7 @@ class EmailInboxClient:
         top = min(max_messages, 50)
         q = {
             "$top": str(top),
-            "$select": "id,subject,from,receivedDateTime,isRead,hasAttachments",
+            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments",
             "$orderby": "receivedDateTime desc",
         }
         if filt:
@@ -692,13 +692,24 @@ class EmailInboxClient:
                 # older PO mail without ballooning gunicorn budget on
                 # non-PO attachments.
                 if filt and "hasAttachments" in filt:
+                    # Build a list of every address on the message — sender
+                    # plus every To/Cc recipient. We qualify if ANY of them
+                    # match a known distributor domain. Captures both the
+                    # direct distributor-outbound case (sender = USF) and
+                    # the reply-chain case (sender = info@hhbagels.com,
+                    # recipient = USF) where the same PDF rides along on
+                    # H&H's confirmation back to the distributor.
+                    addresses = []
                     sender = (((m.get("from") or {}).get("emailAddress") or {})
                               .get("address") or "")
-                    # Use the same subdomain-aware match as the rest of
-                    # the scanner — Cheney/USF mail occasionally arrives
-                    # from a subdomain (mail.cheneybrothers.com, etc.) and
-                    # an exact-domain check would silently drop them.
-                    if _distributor_from_sender(f"<{sender}>") is None:
+                    if sender:
+                        addresses.append(sender)
+                    for collection in ("toRecipients", "ccRecipients"):
+                        for r in (m.get(collection) or []):
+                            a = ((r.get("emailAddress") or {}).get("address") or "")
+                            if a:
+                                addresses.append(a)
+                    if not any(_distributor_from_sender(f"<{a}>") for a in addresses):
                         continue
                 fetched += 1
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
