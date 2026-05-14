@@ -533,11 +533,11 @@ class EmailInboxClient:
             return "dumps"
         return "unconfigured"
 
-    def scan(self, max_messages=300):
+    def scan(self, max_messages=300, filter_override=None):
         src = self.source()
         result = ScanResult(source=src)
         if src == "ms365":
-            self._scan_ms365(result, max_messages)
+            self._scan_ms365(result, max_messages, filter_override=filter_override)
         elif src == "imap":
             self._scan_imap(result, max_messages)
         elif src == "dumps":
@@ -612,7 +612,7 @@ class EmailInboxClient:
         except urllib.error.HTTPError as exc:
             raise _graph_error("PATCH", url, exc) from exc
 
-    def _scan_ms365(self, result, max_messages):
+    def _scan_ms365(self, result, max_messages, filter_override=None):
         token = self._ms365_token()
         # MS365_USER may be a single UPN or a comma-separated list. Each
         # mailbox is scanned up to max_messages independently so we don't
@@ -631,7 +631,10 @@ class EmailInboxClient:
         # Default: no $filter at all, so both read and unread messages are
         # returned (bounded by max_messages and $orderby desc). Set
         # MS365_FILTER to narrow it, e.g. "receivedDateTime ge 2026-01-01T00:00:00Z".
-        filt = os.environ.get("MS365_FILTER", "").strip()
+        # filter_override (passed by an API caller) wins when set; this lets
+        # /api/email/scan accept a one-shot lookback_days without mutating
+        # the env var on the running gunicorn worker.
+        filt = (filter_override or os.environ.get("MS365_FILTER", "") or "").strip()
 
         for upn in users:
             try:

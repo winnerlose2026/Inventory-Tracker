@@ -404,9 +404,27 @@ def api_email_scan():
             max_messages = 60
         max_messages = max(1, min(max_messages, 2000))
 
+        # Optional wide-lookback override. Without this, the scan uses
+        # whatever MS365_FILTER is set to on the service (typically empty,
+        # which returns the most recent max_messages). Pass `lookback_days`
+        # to one-shot a deeper sweep -- useful for backfilling on_order
+        # entries whose source emails predate the normal scan window.
+        filter_override = None
+        try:
+            lookback_days = int(body.get("lookback_days") or 0)
+        except (TypeError, ValueError):
+            lookback_days = 0
+        if lookback_days > 0:
+            from datetime import datetime, timezone, timedelta
+            since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            # Graph wants ISO 8601 with a Z suffix, no microseconds.
+            iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            filter_override = f"receivedDateTime ge {iso}"
+
         client = EmailInboxClient()
         try:
-            scan = client.scan(max_messages=max_messages)
+            scan = client.scan(max_messages=max_messages,
+                               filter_override=filter_override)
         except Exception as exc:  # noqa: BLE001 — surface NotConfigured + transport
             report = {
                 "distributor": "Email Inbox",
