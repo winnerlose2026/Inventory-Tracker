@@ -524,6 +524,7 @@ def api_production_scan():
         max_messages = 200
     max_messages = max(1, min(max_messages, 2000))
     dry_run = bool(body.get("dry_run", False))
+    refresh = bool(body.get("refresh", False))
 
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -593,7 +594,7 @@ def api_production_scan():
                     continue
                 qualifying_count += 1
                 msg_id = m.get("internetMessageId") or m.get("id") or ""
-                if msg_id and msg_id in seen_msg_ids:
+                if msg_id and msg_id in seen_msg_ids and not refresh:
                     continue  # already ingested
                 # Pull the attachments list
                 att_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments"
@@ -666,8 +667,19 @@ def api_production_scan():
                     "ingested_at":        datetime.now().isoformat(),
                     "parse_error":        "",
                 }
-                existing.append(record)
-                seen_msg_ids.add(msg_id)
+                if refresh and msg_id and msg_id in seen_msg_ids:
+                    # Update in place rather than append a duplicate.
+                    for i, r in enumerate(existing):
+                        if r.get("source_message_id") == msg_id:
+                            # Preserve original received_at if already set;
+                            # overwrite parsed-from-PDF fields with the
+                            # fresh values.
+                            record["received_at"] = r.get("received_at") or record["received_at"]
+                            existing[i] = record
+                            break
+                else:
+                    existing.append(record)
+                    seen_msg_ids.add(msg_id)
                 ingested += 1
                 brief_records.append({
                     "subject": subject, "po_number": sheet.po_number,
