@@ -28,6 +28,7 @@ services:
     runtime: python
     plan: starter
     branch: main
+    region: virginia
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 2 --timeout 180 --bind 0.0.0.0:$PORT app:app
     disk:
@@ -55,6 +56,7 @@ services:
     runtime: python
     plan: starter
     branch: main
+    region: virginia
     # Every 6 hours, on the hour (UTC). Runs at 00, 06, 12, 18 UTC every
     # day. Covers U.S. business hours year-round regardless of daylight
     # saving (a fixed UTC cron drifts an hour against local time twice a
@@ -94,6 +96,7 @@ services:
     runtime: python
     plan: starter
     branch: main
+    region: virginia
     # Pull distributor CSVs from the FTPS inbox (cPanel-hosted at
     # sftp.hhbagels.com) every 15 minutes. Files we've already processed
     # are tracked locally in data/sftp_cursor.json (cron-container-local,
