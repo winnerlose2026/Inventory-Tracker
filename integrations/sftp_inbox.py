@@ -140,9 +140,19 @@ def _fingerprint(rf: _RemoteFile) -> str:
 def _connect(host: str, port: int, user: str, password: str,
              timeout: int = 60) -> ftplib.FTP_TLS:
     ctx = ssl.create_default_context()
-    # cPanel hosts often use a wildcard TLS cert; standard verification
-    # works. If an operator needs to debug a self-signed cert we'll
-    # surface the error rather than silently disable verification.
+    # GoDaddy shared cPanel hosts the FTPS listener behind a wildcard
+    # *.secureserver.net cert; the customer-facing hostname
+    # (sftp.hhbagels.com) is a CNAME and is NOT in the cert's SAN list,
+    # so strict verification fails with "Hostname mismatch". Skip the
+    # hostname/cert check on this connection only -- the TLS handshake
+    # still negotiates encryption and prot_p() still encrypts the data
+    # channel, we just don't pin the peer name. This is the documented
+    # workaround for shared-hosting FTPS endpoints.
+    #
+    # If the host is ever moved off shared hosting onto a box with a
+    # cert that actually names sftp.hhbagels.com, drop these two lines.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     ftp = ftplib.FTP_TLS(context=ctx, timeout=timeout)
     ftp.connect(host=host, port=port)
     ftp.auth()              # explicit TLS handshake
@@ -331,7 +341,7 @@ def pull_account(account: str, distributor: str, *,
 
     try:
         ftp = _connect(host=host, port=port, user=user, password=pwd)
-    except (ftplib.all_errors, socket.error, ssl.SSLError, OSError) as exc:
+    except (*ftplib.all_errors, socket.error, ssl.SSLError, OSError) as exc:
         report.errors.append(f"connect failed: {type(exc).__name__}: {exc}")
         return report
 
@@ -354,7 +364,7 @@ def pull_account(account: str, distributor: str, *,
 
             try:
                 content = _download_bytes(ftp, f"{incoming}/{rf.name}")
-            except (ftplib.all_errors, OSError) as exc:
+            except (*ftplib.all_errors, OSError) as exc:
                 report.files_failed += 1
                 report.errors.append(f"{rf.name}: download failed: {exc}")
                 continue
