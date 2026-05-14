@@ -550,6 +550,7 @@ def api_production_scan():
     brief_records = []
     existing = load_production()
     seen_msg_ids = {r.get("source_message_id") for r in existing if r.get("source_message_id")}
+    touched_msg_ids = set()  # records modified or added in THIS run
 
     for upn in users:
         user = urllib.parse.quote(upn)
@@ -639,6 +640,8 @@ def api_production_scan():
                     }
                     existing.append(record)
                     seen_msg_ids.add(msg_id)
+                    if msg_id:
+                        touched_msg_ids.add(msg_id)
                     brief_records.append({"subject": subject, "po_number": "",
                                           "warehouse": "", "total_cases": 0,
                                           "parse_error": sheet.error})
@@ -680,6 +683,8 @@ def api_production_scan():
                 else:
                     existing.append(record)
                     seen_msg_ids.add(msg_id)
+                if msg_id:
+                    touched_msg_ids.add(msg_id)
                 ingested += 1
                 brief_records.append({
                     "subject": subject, "po_number": sheet.po_number,
@@ -699,6 +704,19 @@ def api_production_scan():
         current = load_production()
         by_msg = {r.get("source_message_id"): r for r in current
                   if r.get("source_message_id")}
+        # Records this call touched (added OR refreshed in place) live in
+        # `existing` and are keyed by source_message_id in `touched_msg_ids`.
+        # For msg_ids we touched, our in-memory version wins over the disk
+        # version (e.g. refresh=true rewrote the lines with lot codes).
+        # For msg_ids we did NOT touch but are present in BOTH `current` and
+        # `existing`, the disk version wins (it may have been refreshed by a
+        # concurrent scan). For msg_ids only in `existing`, those are new
+        # additions — keep them.
+        existing_by_msg = {r.get("source_message_id"): r for r in existing
+                           if r.get("source_message_id")}
+        for mid in touched_msg_ids:
+            if mid in existing_by_msg:
+                by_msg[mid] = existing_by_msg[mid]
         for r in existing:
             mid = r.get("source_message_id")
             if mid and mid not in by_msg:
