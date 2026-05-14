@@ -1953,7 +1953,7 @@ function renderProductionDetail() {
     const srcSender = (r.source_sender || '').match(/<([^>]+)>/)?.[1] || r.source_sender || '';
     // Cross-link to live PO data (if any line of this PO is still
     // pending). When no match is found the PO has already rolled into
-    // the SKU's quantity — show as "Rolled in".
+    // the SKU's quantity — show as "Arrived".
     const po = (r.po_number || '').trim();
     const linked = po ? prodPoLookup[po] : null;
     let shipCell, arrivalCell, statusCell;
@@ -1977,7 +1977,7 @@ function renderProductionDetail() {
       // PO no longer in on_order = it rolled over into quantity
       shipCell    = '<span style="color:var(--muted)">—</span>';
       arrivalCell = '<span style="color:var(--muted)">—</span>';
-      statusCell  = `<span class="badge badge-green" style="font-size:10px">Rolled in</span>`;
+      statusCell  = `<span class="badge badge-green" style="font-size:10px">Arrived</span>`;
     } else {
       shipCell    = '<span style="color:var(--muted)">—</span>';
       arrivalCell = '<span style="color:var(--muted)">—</span>';
