@@ -515,6 +515,10 @@ def api_production_scan():
     except (TypeError, ValueError):
         lookback_days = 365
     try:
+        until_days = int(body.get("until_days") or 0)
+    except (TypeError, ValueError):
+        until_days = 0
+    try:
         max_messages = int(body.get("max_messages") or 200)
     except (TypeError, ValueError):
         max_messages = 200
@@ -523,6 +527,10 @@ def api_production_scan():
 
     since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    until_iso = None
+    if until_days > 0:
+        until = datetime.now(timezone.utc) - timedelta(days=until_days)
+        until_iso = until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     client = EmailInboxClient()
     try:
@@ -544,11 +552,16 @@ def api_production_scan():
 
     for upn in users:
         user = urllib.parse.quote(upn)
+        # Build a date filter; narrow to a window if `until_days` was given.
+        date_filter = f"receivedDateTime ge {since_iso}"
+        if until_iso:
+            date_filter += f" and receivedDateTime lt {until_iso}"
         qs = urllib.parse.urlencode({
             "$top": "100",
             "$select": ("id,subject,from,toRecipients,receivedDateTime,"
                         "hasAttachments,internetMessageId"),
-            "$filter": f"hasAttachments eq true and receivedDateTime ge {since_iso}",
+            "$filter": f"hasAttachments eq true and {date_filter}",
+            "$search": '"Daily Production"',
         })
         next_url = f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages?{qs}"
         pages = 0
@@ -556,8 +569,12 @@ def api_production_scan():
         while next_url and pages < 40 and per_mailbox < max_messages:
             pages += 1
             try:
-                raw, _ = client._graph_get(next_url, token)
-                page = _json.loads(raw.decode("utf-8"))
+                req = urllib.request.Request(next_url, method="GET")
+                req.add_header("Authorization", f"Bearer {token}")
+                req.add_header("Accept", "application/json")
+                req.add_header("ConsistencyLevel", "eventual")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    page = _json.loads(resp.read().decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 parse_errors.append(f"{upn} page {pages}: {exc}")
                 break
