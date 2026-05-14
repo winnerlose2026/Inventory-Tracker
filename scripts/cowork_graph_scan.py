@@ -72,6 +72,12 @@ DEFAULT_MAILBOXES = "JD@ms.hhbagels.com,info@ms.hhbagels.com"
 # the subject contains "Purchase Order".
 USF_DOMAINS = {"usfoods.com", "usfood.com"}
 CHENEY_DOMAINS = {"cheneybrothers.com", "cheney.com"}
+# H&H's own domain — used to recognize internal Daily Production sheet
+# emails. The production team sends them between hhbagels.com addresses
+# (typically gabo@ -> isaiah@, with JD@ on cc/bcc), so neither
+# sender nor recipient looks like a distributor.
+HH_DOMAINS = {"hhbagels.com", "ms.hhbagels.com"}
+PRODUCTION_SUBJECT_RE = re.compile(r"\bDaily\s+[Pp]roduction\b")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +115,20 @@ def _classify(sender: str, subject: str) -> str | None:
     # accept those automatically — the original PDF is the source of truth
     # and will arrive in the original distributor message too.
     return None
+
+
+def _is_production_email(sender: str, subject: str) -> bool:
+    """Return True for H&H internal "Daily Production Sheet" emails.
+
+    These don't go through the PO ingest path — they describe what was
+    BAKED for a PO, not the PO itself. They're sent within H&H from the
+    production team. Sender + subject pattern; safer than relying on
+    either alone.
+    """
+    dom = _domain_of(sender)
+    if dom not in HH_DOMAINS and not any(dom.endswith("." + d) for d in HH_DOMAINS):
+        return False
+    return bool(PRODUCTION_SUBJECT_RE.search(subject or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +412,8 @@ def run(argv: list[str] | None = None) -> int:
     # docx forwards from buyer threads) are skipped silently — we only parse
     # PO PDFs here.
     error_strs: list[str] = []
-    qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor, pdf_atts}]
+    qualifying: list[dict] = []   # PO emails {mailbox, id, subject, sender, distributor, pdf_atts}
+    production_qualifying: list[dict] = []  # Daily Production emails
     for mb in mailboxes:
         try:
             msgs = _list_recent_messages(token, mb, since, verbose=args.verbose)
@@ -407,8 +428,10 @@ def run(argv: list[str] | None = None) -> int:
                 continue
             sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""
             subject = m.get("subject") or ""
+            received = m.get("receivedDateTime") or ""
             dist = _classify(sender, subject)
-            if not dist:
+            is_prod = _is_production_email(sender, subject)
+            if not dist and not is_prod:
                 continue
             try:
                 atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
@@ -423,16 +446,24 @@ def run(argv: list[str] | None = None) -> int:
             ]
             if not pdf_atts:
                 continue
-            qualifying.append({
+            entry = {
                 "mailbox": mb,
                 "id": mid,
                 "subject": subject,
                 "sender": sender,
-                "distributor": dist,
+                "received_at": received,
                 "pdf_atts": pdf_atts,
-            })
+            }
+            if dist:
+                entry["distributor"] = dist
+                qualifying.append(entry)
+            if is_prod:
+                # Production emails are processed via a separate path;
+                # collect them in a sibling list. Both paths share the
+                # same seen-IDs set so we never re-process the same msg.
+                production_qualifying.append(entry)
 
-    if not qualifying:
+    if not qualifying and not production_qualifying:
         print(f"nothing new; seen-set size = {len(seen_ids)}")
         return 0
 
@@ -494,10 +525,52 @@ def run(argv: list[str] | None = None) -> int:
     rep_updated = rep0.get("updated") or 0
     rep_errors = len(rep0.get("error") and [rep0["error"]] or []) + len(error_strs)
 
+    # ---- production POSTs (independent of PO ingest)
+    prod_posted = 0
+    prod_errors: list[str] = []
+    for q in production_qualifying:
+        mb, mid, subject, sender = q["mailbox"], q["id"], q["subject"], q["sender"]
+        received_at = q.get("received_at", "")
+        for a in q["pdf_atts"]:
+            try:
+                pdf_bytes = _fetch_attachment_bytes(
+                    token, mb, mid, a.get("id") or "", verbose=args.verbose,
+                )
+            except Exception as exc:
+                msg = _redact(str(exc), secrets_to_redact)
+                prod_errors.append(f"{mid[:12]}.. [prod-fetch]: {msg}")
+                continue
+            import base64
+            prod_payload = {
+                "pdf_b64":     base64.b64encode(pdf_bytes).decode(),
+                "subject":     subject,
+                "sender":      sender,
+                "message_id":  mid,
+                "received_at": received_at,
+            }
+            try:
+                url = f"{args.app_url.rstrip('/')}/api/production/ingest"
+                req = urllib.request.Request(
+                    url, data=json.dumps(prod_payload).encode(),
+                    headers={"Content-Type": "application/json",
+                             "X-Inventory-Token": args.api_token},
+                    method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    d = json.loads(resp.read().decode())
+                if d.get("status") == "ingested":
+                    prod_posted += 1
+                elif d.get("status") == "parse_error":
+                    prod_errors.append(f"{mid[:12]}.. [prod-parse]: {d.get('error','')}")
+            except Exception as exc:
+                msg = _redact(str(exc), secrets_to_redact)
+                prod_errors.append(f"{mid[:12]}.. [prod-post]: {msg}")
+
     # ---- update seen-IDs only on real success (skip on dry-run)
     if not args.dry_run and status == 200 and rep_status in ("ok", "not_configured"):
         try:
-            _write_seen_state(state_path, [q["id"] for q in qualifying])
+            _write_seen_state(state_path,
+                               [q["id"] for q in qualifying]
+                               + [q["id"] for q in production_qualifying])
         except OSError as exc:
             _vlog(args.verbose, f"failed to update seen-state: {exc}")
 
@@ -506,7 +579,8 @@ def run(argv: list[str] | None = None) -> int:
         f"ingest-events {'DRY ' if args.dry_run else ''}OK: "
         f"{msgs_parsed} parsed, {len(events_out)} events, "
         f"{rep_errors} errors; status={rep_status}; updated={rep_updated}; "
-        f"seen-set now {new_seen_size}"
+        f"seen-set now {new_seen_size}; "
+        f"prod-ingested {prod_posted}, prod-errors {len(prod_errors)}"
     )
     if args.verbose:
         _vlog(True, "report (full):")
