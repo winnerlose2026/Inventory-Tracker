@@ -410,6 +410,9 @@
               <th>PO #</th>
               <th>Items</th>
               <th class="sortable" data-sort="total_cases" style="text-align:right">Total cs <span class="sort-ind"></span></th>
+              <th>Ship Date</th>
+              <th>Arrival</th>
+              <th>Status</th>
               <th>Source</th>
             </tr>
           </thead>
@@ -1694,6 +1697,37 @@ function renderPendingPOs() {
 // -------------------------------------------------------------------------
 // Daily Production page
 // -------------------------------------------------------------------------
+// Build {po_number: aggregated PO info} from the inventory 's on_order
+// entries. Each PO has one ship_date / arrival_date / eta because the
+// API ship-date endpoint fans out across all line items.
+function _buildProdPoLookup(items) {
+  const map = {};
+  items.forEach(item => {
+    (item.on_order || []).forEach(e => {
+      const po = (e.po_number || '').trim();
+      if (!po) return;
+      const existing = map[po];
+      if (!existing) {
+        map[po] = {
+          po_number:    po,
+          ship_date:    e.ship_date || '',
+          arrival_date: e.arrival_date || '',
+          eta:          e.eta || '',
+          warehouses:   new Set([item.warehouse || '']),
+          line_count:   1,
+        };
+      } else {
+        // Prefer a non-empty ship_date / arrival across line items
+        if (!existing.ship_date    && e.ship_date)    existing.ship_date    = e.ship_date;
+        if (!existing.arrival_date && e.arrival_date) existing.arrival_date = e.arrival_date;
+        existing.warehouses.add(item.warehouse || '');
+        existing.line_count += 1;
+      }
+    });
+  });
+  return map;
+}
+
 let prodPeriod = 'week';        // 'day' | 'week' | 'month'
 let prodSortKey = 'production_date';
 let prodSortDir = -1;            // newest first by default
@@ -1716,10 +1750,19 @@ function onProdSortClick(key) {
   renderProductionDetail();
 }
 
+let prodPoLookup = {};  // po_number -> aggregated on_order info
+
 async function loadProduction() {
   await ensureWarehouses();
-  const records = await api('/api/production');
+  // Pull production records AND inventory in parallel — the inventory call
+  // gives us live on_order data so we can show ship/arrival on each
+  // production row by matching po_number.
+  const [records, inventory] = await Promise.all([
+    api('/api/production'),
+    api('/api/inventory'),
+  ]);
   prodCache = records;
+  prodPoLookup = _buildProdPoLookup(inventory || []);
 
   // Populate warehouse filter from the records actually present
   const wSel = document.getElementById('prod-filter-warehouse');
@@ -1891,7 +1934,7 @@ function renderProductionDetail() {
   }
 
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">No production records match this filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">No production records match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
     return;
   }
@@ -1908,6 +1951,38 @@ function renderProductionDetail() {
       : '';
     const srcSubj = (r.source_subject || '').replace(/^Daily [Pp]roduction\s*/, '');
     const srcSender = (r.source_sender || '').match(/<([^>]+)>/)?.[1] || r.source_sender || '';
+    // Cross-link to live PO data (if any line of this PO is still
+    // pending). When no match is found the PO has already rolled into
+    // the SKU's quantity — show as "Rolled in".
+    const po = (r.po_number || '').trim();
+    const linked = po ? prodPoLookup[po] : null;
+    let shipCell, arrivalCell, statusCell;
+    if (linked) {
+      shipCell = linked.ship_date
+        ? formatDate(linked.ship_date)
+        : '<span style="color:var(--muted)">—</span>';
+      arrivalCell = linked.arrival_date
+        ? formatDate(linked.arrival_date)
+        : '<span style="color:var(--muted)">—</span>';
+      const trigger = linked.arrival_date || linked.eta;
+      const overdue = trigger && new Date(trigger) < new Date();
+      if (overdue) {
+        statusCell = `<span class="badge badge-red" style="font-size:10px">Overdue</span>`;
+      } else if (linked.ship_date) {
+        statusCell = `<span class="badge badge-blue" style="font-size:10px">In transit</span>`;
+      } else {
+        statusCell = `<span class="badge badge-yellow" style="font-size:10px">Open</span>`;
+      }
+    } else if (po) {
+      // PO no longer in on_order = it rolled over into quantity
+      shipCell    = '<span style="color:var(--muted)">—</span>';
+      arrivalCell = '<span style="color:var(--muted)">—</span>';
+      statusCell  = `<span class="badge badge-green" style="font-size:10px">Rolled in</span>`;
+    } else {
+      shipCell    = '<span style="color:var(--muted)">—</span>';
+      arrivalCell = '<span style="color:var(--muted)">—</span>';
+      statusCell  = '<span style="color:var(--muted)">—</span>';
+    }
     return `<tr>
       <td style="white-space:nowrap;font-weight:600">${r.production_date ? formatDate(r.production_date) : '<span style="color:var(--warning,#c00)">—</span>'}</td>
       <td>${escHtml(r.warehouse || '')}${r.warehouse_raw && r.warehouse_raw !== r.warehouse ? ` <span style="color:var(--muted);font-size:11px">(${escHtml(r.warehouse_raw)})</span>` : ''}</td>
@@ -1918,6 +1993,9 @@ function renderProductionDetail() {
         <div style="color:var(--muted);font-size:11px">${lines.length} item${lines.length === 1 ? '' : 's'}</div>
       </td>
       <td style="text-align:right;font-weight:600">${(r.total_cases || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap;font-size:12px">${shipCell}</td>
+      <td style="white-space:nowrap;font-size:12px">${arrivalCell}</td>
+      <td>${statusCell}</td>
       <td style="font-size:11px;color:var(--muted)">
         <div>${escHtml(srcSubj || '—')}</div>
         <div>${escHtml(srcSender)}</div>
