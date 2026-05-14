@@ -100,6 +100,12 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "ALCOA":                 ("Alcoa, TN",              "US Foods"),
     "CWNY":                  ("Chefs Warehouse, NY",    "Chefs Warehouse"),
     "CWFL":                  ("Chefs Warehouse, FL",    "Chefs Warehouse"),
+    "CWC":                   ("Chefs Warehouse, Chicago",      "Chefs Warehouse"),
+    "CWMID":                 ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
+    # H&H's production sheet uses "JACKSON VILLE" (two words) for the
+    # production destined to Cheney's Ocala DC — per JD, route it there.
+    "JACKSON VILLE":         ("Ocala, FL",              "Cheney Brothers"),
+    "JACKSONVILLE":          ("Ocala, FL",              "Cheney Brothers"),
 }
 
 
@@ -151,6 +157,58 @@ _DATE_RE = re.compile(r"(?<!\d)((?:0?[1-9]|1[0-2])/\d{1,2}/\d{4})(?!\d)|(?:^|\D)
 
 
 # --------------------------------------------------------------------------
+# Warehouse classification
+# --------------------------------------------------------------------------
+
+# Aliases for partial "US FOODS <abbr>" — JD's production team uses
+# short city abbreviations on the sheet that don't match the canonical
+# city in _WAREHOUSE_TO_CANONICAL. Add new entries here as they surface.
+_USF_CITY_ALIASES: dict[str, str] = {
+    "LA": "LA MIRADA",     # observed in "US FOODS LA"
+}
+
+
+def _classify_warehouse(raw: str) -> "tuple[str, str]":
+    """Resolve a raw warehouse label to (canonical_warehouse, distributor).
+
+    Order of precedence:
+      1. Empty / missing -> ("In-House Inventory", "H&H Bagels") —
+         production sheets without a header pointed at a specific
+         distributor PO; per JD these are baked for general inventory.
+      2. Exact match in _WAREHOUSE_TO_CANONICAL
+      3. "CW<XX>" 2-letter state code   -> Chefs Warehouse, <XX>
+      4. "US FOODS <CITY-OR-ABBR>" prefix -> look up city (with alias
+         table for shorthand like LA -> LA MIRADA)
+      5. Otherwise, pass through the raw label with empty distributor
+
+    Always returns a 2-tuple.
+    """
+    if not raw or not raw.strip():
+        return "In-House Inventory", "H&H Bagels"
+    key = raw.strip().upper()
+    canonical = _WAREHOUSE_TO_CANONICAL.get(key)
+    if canonical:
+        return canonical
+
+    # 2-letter CW<STATE> codes (CWDC, CWTX, etc.). Multi-letter region
+    # codes (CWC, CWMID) are handled via explicit entries above.
+    cw_match = re.match(r"^CW([A-Z]{2})$", key)
+    if cw_match:
+        return (f"Chefs Warehouse, {cw_match.group(1)}", "Chefs Warehouse")
+
+    # "US FOODS <CITY>" — strip the prefix and look up the city alone.
+    # Apply alias table (LA -> LA MIRADA) so shorthand variants resolve.
+    if key.startswith("US FOODS "):
+        city_key = key[len("US FOODS "):].strip()
+        city_key = _USF_CITY_ALIASES.get(city_key, city_key)
+        cm = _WAREHOUSE_TO_CANONICAL.get(city_key)
+        if cm:
+            return cm
+
+    return (raw, "")
+
+
+# --------------------------------------------------------------------------
 # Parse entrypoints
 # --------------------------------------------------------------------------
 
@@ -174,19 +232,7 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
         sheet.total_cases = int(m.group(1))
         sheet.warehouse_raw = m.group(2).strip()
         sheet.po_number = m.group(3).strip()
-        canonical = _WAREHOUSE_TO_CANONICAL.get(sheet.warehouse_raw.upper())
-        if canonical:
-            sheet.warehouse, sheet.distributor = canonical
-        else:
-            # Fallback: any "CW<STATE>" code is Chefs Warehouse <STATE>.
-            # Lets us handle new Chefs Warehouse regions (CWDC, CWTX, ...)
-            # without an explicit entry in _WAREHOUSE_TO_CANONICAL.
-            cw_match = re.match(r"^CW([A-Z]{2})$", sheet.warehouse_raw.upper())
-            if cw_match:
-                sheet.warehouse = f"Chefs Warehouse, {cw_match.group(1)}"
-                sheet.distributor = "Chefs Warehouse"
-            else:
-                sheet.warehouse = sheet.warehouse_raw
+        sheet.warehouse, sheet.distributor = _classify_warehouse(sheet.warehouse_raw)
 
     # Production date — prefer a slash-format MM/DD/YYYY anywhere in the
     # document (Riviera Beach / Punta Gorda / CWNY style). Fall back to

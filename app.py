@@ -708,6 +708,57 @@ def api_production_scan():
     })
 
 
+@app.route("/api/admin/production/reclassify", methods=["POST"])
+def api_admin_production_reclassify():
+    """Re-run the warehouse classifier on every stored production record.
+
+    Useful after we add new entries to _WAREHOUSE_TO_CANONICAL or extend
+    _classify_warehouse — historical records ingested under the old
+    rules keep their warehouse/distributor unchanged unless we ask the
+    parser to look at them again. This walks data/production.json,
+    re-classifies each row using its existing warehouse_raw (or empty
+    -> "In-House Inventory" for older sheets without a header), and
+    persists the updates.
+
+    Body: { dry_run: bool }
+    """
+    from inventory_tracker import load_production, save_production
+    from integrations.production_pdf_parser import _classify_warehouse
+
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run", False))
+    records = load_production()
+    changed_count = 0
+    samples = []
+    for r in records:
+        raw = r.get("warehouse_raw") or ""
+        new_wh, new_dist = _classify_warehouse(raw)
+        old_wh   = r.get("warehouse") or ""
+        old_dist = r.get("distributor") or ""
+        if new_wh == old_wh and new_dist == old_dist:
+            continue
+        changed_count += 1
+        if len(samples) < 25:
+            samples.append({
+                "warehouse_raw": raw,
+                "old_warehouse": old_wh,
+                "new_warehouse": new_wh,
+                "old_distributor": old_dist,
+                "new_distributor": new_dist,
+            })
+        if not dry_run:
+            r["warehouse"] = new_wh
+            r["distributor"] = new_dist
+    if not dry_run:
+        save_production(records)
+    return jsonify({
+        "ok": True, "dry_run": dry_run,
+        "total_records": len(records),
+        "changed": changed_count,
+        "samples": samples,
+    })
+
+
 @app.route("/api/production/<source_message_id>", methods=["DELETE"])
 def api_production_delete(source_message_id):
     """Drop a production record by its source_message_id."""
