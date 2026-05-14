@@ -470,8 +470,12 @@
 
     <!-- Report -->
     <div class="page" id="page-report">
-      <h1>Report</h1>
-      <p class="subtitle">Consumption and restock analysis</p>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Report</h1>
+          <p class="subtitle" style="margin-bottom:0">Consumption, restock, and variety ranking by location</p>
+        </div>
+      </div>
       <div class="report-grid">
         <div class="card">
           <div class="card-header"><span class="card-title">🔥 Top Consumed</span></div>
@@ -481,6 +485,20 @@
           <div class="card-header"><span class="card-title">📥 Top Restocked</span></div>
           <div style="padding:16px 20px" id="chart-restocked"></div>
         </div>
+      </div>
+
+      <!-- Variety ranking by location (production-based) -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span class="card-title">📊 Variety ranking by location</span>
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm active" id="vrank-period-week" onclick="setVarietyRankingPeriod('week')">Weekly</button>
+            <button class="btn btn-ghost btn-sm" id="vrank-period-month" onclick="setVarietyRankingPeriod('month')">Monthly</button>
+            <button class="btn btn-ghost btn-sm" id="vrank-period-all" onclick="setVarietyRankingPeriod('all')">All time</button>
+          </div>
+        </div>
+        <div style="padding:8px 20px;color:var(--muted);font-size:12px" id="vrank-range-label"></div>
+        <div style="padding:0 20px 20px 20px" id="vrank-container"></div>
       </div>
     </div>
 
@@ -1252,8 +1270,28 @@ async function loadUsage() {
 // -------------------------------------------------------------------------
 // Report
 // -------------------------------------------------------------------------
+// Variety ranking state. Defaults to weekly; results pull from
+// production records (data/production.json) — i.e. what was BAKED
+// per warehouse, since that's the operational truth (orders may
+// shift; bakes don't).
+let vrankPeriod = 'week';      // 'week' | 'month' | 'all'
+let vrankProdCache = [];
+
+function setVarietyRankingPeriod(p) {
+  vrankPeriod = p;
+  ['week','month','all'].forEach(m => {
+    const btn = document.getElementById('vrank-period-' + m);
+    if (btn) btn.classList.toggle('active', m === p);
+  });
+  renderVarietyRanking();
+}
+
 async function loadReport() {
-  const report = await api('/api/report');
+  const [report, prod] = await Promise.all([
+    api('/api/report'),
+    api('/api/production'),
+  ]);
+  vrankProdCache = prod || [];
 
   function renderChart(containerId, data, color) {
     const el = document.getElementById(containerId);
@@ -1271,6 +1309,100 @@ async function loadReport() {
 
   renderChart('chart-consumed', report.top_consumed, 'var(--red)');
   renderChart('chart-restocked', report.top_restocked, 'var(--green)');
+
+  renderVarietyRanking();
+}
+
+function _vrankWindow() {
+  // Returns [sinceISO, untilISO|null, label]. untilISO is null = open.
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  if (vrankPeriod === 'week') {
+    // ISO week, Monday-start
+    const day = now.getDay() || 7;   // Sun=0 -> 7
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (day - 1));
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    return [monday.toISOString().slice(0, 10),
+            sunday.toISOString().slice(0, 10),
+            `${formatDate(monday.toISOString())} – ${formatDate(sunday.toISOString())}`];
+  }
+  if (vrankPeriod === 'month') {
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    return [start.toISOString().slice(0, 10),
+            end.toISOString().slice(0, 10),
+            now.toLocaleString('en-US', { month: 'long', year: 'numeric' })];
+  }
+  return ['', '', 'all time'];
+}
+
+function renderVarietyRanking() {
+  const container = document.getElementById('vrank-container');
+  const rangeLabel = document.getElementById('vrank-range-label');
+  if (!container) return;
+
+  const [since, until, label] = _vrankWindow();
+  rangeLabel.textContent = `Showing production for ${label}`;
+
+  // Filter records to the window
+  const records = vrankProdCache.filter(r => {
+    const d = (r.production_date || '').slice(0, 10);
+    if (!d) return false;
+    if (since && d < since) return false;
+    if (until && d > until) return false;
+    return true;
+  });
+
+  if (records.length === 0) {
+    container.innerHTML = '<div class="empty" style="padding:24px">No production logged in this window.</div>';
+    return;
+  }
+
+  // Group by warehouse, then by variety
+  const byWh = {};
+  records.forEach(r => {
+    const wh = r.warehouse || r.warehouse_raw || 'Unassigned';
+    const slot = byWh[wh] = byWh[wh] || { warehouse: wh, distributor: r.distributor || '', total: 0, varieties: {} };
+    (r.lines || []).forEach(L => {
+      const v = L.variety || L.raw_variety || 'Unknown';
+      const cs = Number(L.cs_count) || 0;
+      slot.varieties[v] = (slot.varieties[v] || 0) + cs;
+      slot.total += cs;
+    });
+  });
+
+  // Sort warehouses by total cs (largest first)
+  const warehouses = Object.values(byWh).sort((a, b) => b.total - a.total);
+
+  container.innerHTML = warehouses.map(w => {
+    const sortedV = Object.entries(w.varieties).sort((a, b) => b[1] - a[1]);
+    const max = sortedV.length ? sortedV[0][1] : 1;
+    const rows = sortedV.map(([variety, cs], i) => {
+      const pct = w.total ? Math.round((cs / w.total) * 100) : 0;
+      const barPct = max ? Math.round((cs / max) * 100) : 0;
+      return `<div class="chart-bar-row">
+        <div class="chart-bar-label" title="${escHtml(variety)}">
+          <span style="color:var(--muted);width:18px;display:inline-block">${i + 1}.</span> ${escHtml(variety)}
+        </div>
+        <div class="chart-bar-track">
+          <div class="chart-bar-fill" style="width:${barPct}%;background:var(--accent2,var(--accent))"></div>
+        </div>
+        <div class="chart-bar-val">${cs.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs · ${pct}%</span></div>
+      </div>`;
+    }).join('');
+    return `<div style="margin-top:18px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px">
+        <div>
+          <strong style="font-size:14px">${escHtml(w.warehouse)}</strong>
+          ${w.distributor ? `&nbsp;${distributorBadge(w.distributor)}` : ''}
+        </div>
+        <div style="color:var(--muted);font-size:12px">${w.total.toFixed(0)} cs total · ${sortedV.length} variet${sortedV.length === 1 ? 'y' : 'ies'}</div>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
 }
 
 // -------------------------------------------------------------------------
