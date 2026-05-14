@@ -150,6 +150,12 @@ class EmailEvent:
     # po_number fully supersedes earlier events (not line-by-line dedup).
     po_number: str = ""
     po_revision: str = ""
+    # ISO date string (YYYY-MM-DD) of the PO's actual order date, parsed
+    # from the PDF. Used by sync_inventory._apply_po_on_order to anchor
+    # the on_order entry's ordered_at to when the PO was placed (not
+    # when we happened to scan it), so the 30-day rollover into quantity
+    # tracks the real lead time even for backlogged messages.
+    po_order_date: str = ""
 
 
 @dataclass
@@ -271,6 +277,33 @@ def _parse_body_items(body, distributor, default_event):
     return event_type, warehouse_override, items
 
 
+def _iso_from_usf_date(s: str) -> str:
+    """USF stamps order_date as 'mm/dd/yy'. Convert to ISO YYYY-MM-DD.
+    Returns empty string on any parse failure -- the apply path then
+    falls back to the ingestion timestamp."""
+    if not s:
+        return ""
+    m = re.match(r"^\s*(\d{2})/(\d{2})/(\d{2})\s*$", s)
+    if not m:
+        return ""
+    mm, dd, yy = m.groups()
+    # 2-digit year window: 00-69 -> 2000s, 70-99 -> 1900s. USF POs are
+    # never going to be from the 1900s but the cutoff is harmless.
+    year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
+    return f"{year:04d}-{int(mm):02d}-{int(dd):02d}"
+
+
+def _iso_from_cheney_date(s: str) -> str:
+    """Cheney stamps order_date as 'MM/DD/YYYY'. Convert to ISO."""
+    if not s:
+        return ""
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
+    if not m:
+        return ""
+    mm, dd, yyyy = m.groups()
+    return f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+
+
 def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
     """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
 
@@ -319,6 +352,7 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
             source_subject=subject,
             po_number=po.po_number or "",
             po_revision=po.po_revision or "",
+            po_order_date=_iso_from_usf_date(po.order_date),
         ))
 
     return events, errors
@@ -375,6 +409,7 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject):
             source_subject=subject,
             po_number=po.po_number or "",
             po_revision="",
+            po_order_date=_iso_from_cheney_date(po.order_date),
         ))
 
     return events, errors

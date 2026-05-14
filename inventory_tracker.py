@@ -4,7 +4,7 @@
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -33,12 +33,21 @@ def _save(path: Path, data):
 
 def load_inventory() -> dict:
     inv = _load(INVENTORY_FILE)
-    # Run dedup BEFORE rollover: duplicate pending entries with past ETAs
-    # would otherwise be promoted twice into quantity, double-counting the
-    # restock. Dedup is idempotent and cheap.
+    # The order of these passes matters:
+    #   1. Rebase ordered_at on legacy entries (uses email subject as a
+    #      proxy for the PO date when the parser didn't supply one).
+    #   2. Collapse cross-revision dupes — keeps only the highest
+    #      po_revision per (SKU, po_number). Catches data that landed
+    #      before the apply-path supersede logic existed.
+    #   3. Dedup identical (po, rev, qty) entries on the same SKU.
+    #   4. Rollover entries whose newly-correct eta is in the past
+    #      into the SKU's quantity. Must run AFTER rebase, otherwise
+    #      backlogged POs would stay pending until ingest_time + 30d.
+    rebased = _rebase_ordered_at_from_subject(inv)
+    rev_collapsed = _collapse_revision_dupes(inv)
     deduped = _dedup_on_order(inv)
     rolled = _rollover_on_order(inv)
-    if rolled or deduped:
+    if rebased or rev_collapsed or deduped or rolled:
         usage = _load(USAGE_FILE) if rolled else None
         if rolled:
             _append_rollover_usage(inv, usage)
@@ -116,6 +125,99 @@ def _rollover_on_order(inv: dict) -> bool:
             })
             changed = True
         item["on_order"] = kept
+    return changed
+
+
+_USF_DATE_RE = __import__("re").compile(r"\b(\d{2})/(\d{2})/(\d{2})\b")
+_LEAD_DAYS_DEFAULT = 30
+
+
+def _po_lead_days_local() -> int:
+    """Mirror sync_inventory._po_lead_days() without the circular import."""
+    import os
+    try:
+        return int(os.environ.get("PO_LEAD_DAYS", _LEAD_DAYS_DEFAULT))
+    except (TypeError, ValueError):
+        return _LEAD_DAYS_DEFAULT
+
+
+def _rebase_ordered_at_from_subject(inv: dict) -> bool:
+    """Backfill ``ordered_at`` from the PO date embedded in source_subject.
+
+    Historical on_order entries store ``ordered_at`` = ingestion time,
+    but the real PO order date sits in the email subject for US Foods
+    POs (e.g. ``USF PO 533457 4C/4120 04/28/26 ...``). When we can
+    parse a date out of the subject, rewrite ordered_at + eta so the
+    rollover into quantity tracks real lead time. Cheney subjects
+    don't carry the date, so those entries are left alone (future
+    ingests will populate ``po_order_date`` directly via the parser).
+
+    Returns True if anything changed.
+    """
+    lead = _po_lead_days_local()
+    changed = False
+    for key, item in inv.items():
+        for entry in (item.get("on_order") or []):
+            subj = entry.get("source_subject") or ""
+            m = _USF_DATE_RE.search(subj)
+            if not m:
+                continue
+            mm, dd, yy = m.groups()
+            year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
+            iso = f"{year:04d}-{int(mm):02d}-{int(dd):02d}T00:00:00"
+            try:
+                dt = datetime.fromisoformat(iso)
+            except ValueError:
+                continue
+            new_ordered_at = dt.isoformat()
+            if entry.get("ordered_at") == new_ordered_at:
+                continue
+            entry["ordered_at"] = new_ordered_at
+            entry["eta"] = (dt + timedelta(days=lead)).isoformat()
+            changed = True
+    return changed
+
+
+def _collapse_revision_dupes(inv: dict) -> bool:
+    """When the same SKU has multiple pending entries for the same
+    ``po_number`` but different ``po_revision``, keep only the highest
+    revision. The supersede logic in sync_inventory normally handles
+    this at apply time, but legacy data can still carry pre-supersede
+    entries (e.g. revision 0000001 + 0000002 of the same line both
+    sitting pending). Returns True if anything changed.
+
+    Same SKU + same PO + same revision but different qty (legit
+    separate lines on a single PO with repeats) are preserved.
+    """
+    changed = False
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        if len(pending) < 2:
+            continue
+        by_po: dict = {}
+        for entry in pending:
+            by_po.setdefault(entry.get("po_number") or "", []).append(entry)
+        kept = []
+        for po, entries in by_po.items():
+            if len(entries) < 2 or not po:
+                kept.extend(entries)
+                continue
+            # Map po_revision -> integer; treat empty as 0.
+            def _rev_int(e):
+                s = str(e.get("po_revision") or "").strip()
+                try:
+                    return int(s)
+                except (TypeError, ValueError):
+                    return 0
+            max_rev = max(_rev_int(e) for e in entries)
+            survivors = [e for e in entries if _rev_int(e) == max_rev]
+            dropped = len(entries) - len(survivors)
+            if dropped:
+                changed = True
+            kept.extend(survivors)
+        if changed:
+            kept.sort(key=lambda e: (e.get("ordered_at") or ""))
+            item["on_order"] = kept
     return changed
 
 

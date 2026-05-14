@@ -284,10 +284,24 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
     if amount <= 0:
         return
     lead_days = _po_lead_days()
-    try:
-        ordered_at_dt = datetime.fromisoformat(now)
-    except (TypeError, ValueError):
-        ordered_at_dt = datetime.now()
+    # Anchor ordered_at to the PO's actual order date (parsed from the
+    # PDF) rather than "now". When a backlogged PO is scanned weeks
+    # after it was placed, this lets the 30-day rollover into quantity
+    # track real lead time instead of restarting the clock at ingest.
+    # Falls back to `now` when the parser didn't surface a date.
+    po_date_iso = (getattr(evt, "po_order_date", "") or "").strip()
+    if po_date_iso:
+        try:
+            ordered_at_dt = datetime.fromisoformat(po_date_iso)
+        except ValueError:
+            ordered_at_dt = None
+    else:
+        ordered_at_dt = None
+    if ordered_at_dt is None:
+        try:
+            ordered_at_dt = datetime.fromisoformat(now)
+        except (TypeError, ValueError):
+            ordered_at_dt = datetime.now()
     eta_dt = ordered_at_dt + timedelta(days=lead_days)
     pending = item.get("on_order") or []
     existing_qty = sum(float(p.get("qty") or 0) for p in pending)
