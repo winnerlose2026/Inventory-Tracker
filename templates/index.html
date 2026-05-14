@@ -365,6 +365,8 @@
               <th>Period</th>
               <th>Range</th>
               <th style="text-align:right">Total cs</th>
+              <th style="text-align:center">Days</th>
+              <th>Missing days <span style="color:var(--muted);font-weight:normal">(Mon–Sat)</span></th>
               <th>By distributor</th>
               <th>Top varieties</th>
             </tr>
@@ -1775,12 +1777,23 @@ function renderProductionSummary(data) {
   });
   cards.innerHTML = cardHtml.join('');
 
+  // Build a {date -> [records]} index from prodCache so we can compute
+  // distinct production dates per bucket (the API summary only ships
+  // aggregates).
+  const recordsByDate = {};
+  (prodCache || []).forEach(r => {
+    const d = (r.production_date || '').slice(0, 10);
+    if (!d) return;
+    (recordsByDate[d] = recordsByDate[d] || []).push(r);
+  });
+
   // Bucket table
   const tbody = document.getElementById('prod-summary-tbody');
   if (buckets.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty">No production records yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No production records yet.</td></tr>';
     return;
   }
+  const todayISO = new Date().toISOString().slice(0, 10);
   tbody.innerHTML = buckets.map(b => {
     const dist = Object.entries(b.by_distributor || {})
       .sort((x, y) => y[1] - x[1])
@@ -1792,10 +1805,40 @@ function renderProductionSummary(data) {
       .map(([n, c]) => `${escHtml(n)}&nbsp;<span style="color:var(--muted)">${c}</span>`)
       .join(' · ');
     const rangeLabel = b.start === b.end ? formatDate(b.start) : `${formatDate(b.start)} – ${formatDate(b.end)}`;
-    return `<tr>
-      <td style="font-weight:600">${escHtml(b.key)}</td>
+
+    // ---- Production-day gap analysis ---------------------------------
+    // Expected production days = every Mon-Sat (skip Sunday) in the
+    // bucket range, BUT clipped at today so we don't flag the future
+    // half of an in-progress week / month.
+    const start = new Date(b.start + 'T00:00:00');
+    const end   = new Date(b.end   + 'T00:00:00');
+    const expected = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const iso = d.toISOString().slice(0, 10);
+      if (iso > todayISO) break;
+      if (d.getDay() === 0) continue;  // 0 = Sunday
+      expected.push(iso);
+    }
+    const actualSet = new Set(expected.filter(d => recordsByDate[d]));
+    const missing   = expected.filter(d => !actualSet.has(d));
+    const inProgress = b.end > todayISO;
+    const daysOk     = inProgress
+      ? actualSet.size >= 1   // current bucket: just need at least one day so far
+      : actualSet.size >= 5;  // closed bucket: 5+ days is healthy
+    const daysCellStyle = daysOk ? '' : 'color:var(--warning,#c00);font-weight:600';
+    const missingLabel = missing.length === 0
+      ? '<span style="color:var(--muted)">—</span>'
+      : missing.slice(0, 3).map(d => formatDate(d)).join(', ')
+        + (missing.length > 3 ? ` <span style="color:var(--muted)">+${missing.length - 3} more</span>` : '');
+    const expectedCount = expected.length || (inProgress ? '—' : 0);
+    const rowStyle = !daysOk ? ' style="background:rgba(217, 119, 6, 0.08)"' : '';
+
+    return `<tr${rowStyle}>
+      <td style="font-weight:600">${escHtml(b.key)}${inProgress ? ' <span style="color:var(--muted);font-size:11px">in progress</span>' : ''}</td>
       <td>${rangeLabel}</td>
       <td style="text-align:right;font-weight:600">${(b.total_cs || 0).toFixed(0)}</td>
+      <td style="text-align:center;${daysCellStyle}">${actualSet.size}<span style="color:var(--muted);font-weight:normal"> / ${expectedCount}</span></td>
+      <td style="font-size:12px">${missingLabel}</td>
       <td>${dist || '<span style="color:var(--muted)">—</span>'}</td>
       <td>${variety || '<span style="color:var(--muted)">—</span>'}</td>
     </tr>`;
