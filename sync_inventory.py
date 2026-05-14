@@ -488,6 +488,32 @@ def _apply_events(events: list,
     report["po_revisions_superseded"] = []
 
     for po_num, grp in po_groups.items():
+        # Collapse duplicate lines that arrived in the same scan. The
+        # scanner pulls from multiple mailboxes (JD@ and info@), and the
+        # same PO email is often delivered to both, so each line item
+        # appears twice. Dedupe by (variety, warehouse, distributor, qty)
+        # within the group — same item + same qty in the same PO means
+        # the scanner double-parsed it.
+        seen_lines: set[tuple] = set()
+        deduped_grp = []
+        for _evt in grp:
+            line_key = (
+                (_evt.item.variety or "").strip().lower(),
+                (_evt.item.warehouse or "").strip().lower(),
+                (_evt.item.distributor or "").strip().lower(),
+                round(float(_evt.item.quantity or 0), 4),
+            )
+            if line_key in seen_lines:
+                continue
+            seen_lines.add(line_key)
+            deduped_grp.append(_evt)
+        if len(deduped_grp) < len(grp):
+            report.setdefault("dedup_dropped", []).append(
+                f"PO {po_num}: collapsed {len(grp) - len(deduped_grp)} "
+                f"duplicate line(s) within the scan batch."
+            )
+        grp = deduped_grp
+
         # All events in a group share the same revision; take it from the
         # first one. Fall back to "" if the parser didn't set it.
         new_rev = getattr(grp[0], "po_revision", "") or ""

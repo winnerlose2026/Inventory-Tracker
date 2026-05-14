@@ -33,12 +33,18 @@ def _save(path: Path, data):
 
 def load_inventory() -> dict:
     inv = _load(INVENTORY_FILE)
-    if _rollover_on_order(inv):
-        # Promoted at least one pending order — persist both sides.
-        usage = _load(USAGE_FILE)
-        _append_rollover_usage(inv, usage)
+    # Run dedup BEFORE rollover: duplicate pending entries with past ETAs
+    # would otherwise be promoted twice into quantity, double-counting the
+    # restock. Dedup is idempotent and cheap.
+    deduped = _dedup_on_order(inv)
+    rolled = _rollover_on_order(inv)
+    if rolled or deduped:
+        usage = _load(USAGE_FILE) if rolled else None
+        if rolled:
+            _append_rollover_usage(inv, usage)
         _save(INVENTORY_FILE, inv)
-        _save(USAGE_FILE, usage)
+        if rolled:
+            _save(USAGE_FILE, usage)
     return inv
 
 
@@ -109,6 +115,54 @@ def _rollover_on_order(inv: dict) -> bool:
                 "timestamp": now.isoformat(),
             })
             changed = True
+        item["on_order"] = kept
+    return changed
+
+
+def _dedup_on_order(inv: dict) -> bool:
+    """Collapse duplicate pending on_order entries within each item.
+
+    A duplicate is two or more entries with the same
+    (po_number, po_revision, qty) on the same SKU. Keeps the entry with
+    the earliest ``ordered_at`` so downstream ETAs stay anchored to the
+    first booking. Mutates ``inv`` in place. Returns True if anything was
+    changed.
+
+    This is belt-and-suspenders to the dedup that already runs in
+    ``sync_inventory._apply_events``: that one prevents new duplicates
+    from being booked. This one cleans up duplicates that slipped
+    through in the past (historical data, manual API posts, replays
+    before the apply-path dedup landed) every time the inventory is
+    loaded, so the on_order column self-heals.
+    """
+    changed = False
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        if len(pending) < 2:
+            continue
+        groups: dict = {}
+        for entry in pending:
+            line_key = (
+                str(entry.get("po_number") or ""),
+                str(entry.get("po_revision") or ""),
+                round(float(entry.get("qty") or 0), 4),
+            )
+            groups.setdefault(line_key, []).append(entry)
+        if all(len(v) == 1 for v in groups.values()):
+            continue
+        kept = []
+        for entries in groups.values():
+            if len(entries) == 1:
+                kept.append(entries[0])
+                continue
+            # Two or more identical-line entries: keep the earliest by
+            # ordered_at; the timestamps are usually identical when this
+            # came from a single scan, in which case the sort is a no-op.
+            entries.sort(key=lambda e: (e.get("ordered_at") or ""))
+            kept.append(entries[0])
+            changed = True
+        # Preserve a stable order so the UI doesn't shuffle on every load.
+        kept.sort(key=lambda e: (e.get("ordered_at") or ""))
         item["on_order"] = kept
     return changed
 
