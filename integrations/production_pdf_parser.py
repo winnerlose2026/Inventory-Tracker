@@ -110,6 +110,14 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     # correctly-spelled originals so the operator doesn't have to.
     "MNASSAS":               ("Manassas, VA",           "US Foods"),
     "CWFLL":                 ("Chefs Warehouse, FL",    "Chefs Warehouse"),
+    # Customers / additional distributors that surfaced in the historical
+    # data and JD has tagged with a canonical mapping.
+    # DeliBag is a South Korean account — full-container loads (1120 cs /
+    # 20 pallets at a time) ship out under their own distributor entry.
+    "DELIBAG":               ("DeliBag, South Korea",   "DeliBag"),
+    "CARMELA FOODS":         ("Carmela Foods",          "Carmela Foods"),
+    # Bare "CHENEY" without a city defaults to Riviera Beach per JD.
+    "CHENEY":                ("Riviera Beach, FL",      "Cheney Brothers"),
 }
 
 
