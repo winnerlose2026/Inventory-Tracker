@@ -492,6 +492,206 @@ def api_production_delete(source_message_id):
 
 
 # ---------------------------------------------------------------------------
+# API – $PLH report (production revenue per labor hour at the bakery)
+# ---------------------------------------------------------------------------
+# Per-case sell prices (revenue side):
+#   US Foods           $27.00
+#   Cheney Brothers    $26.50
+#   anything else      $29.50   (Chefs Warehouse, unassigned, etc.)
+# Default labor rate $17/hr used to back-fill `dollars` on a labor entry
+# that only carries `hours`. PLH = revenue / labor_hours.
+
+CASE_PRICE_BY_DISTRIBUTOR = {
+    "US Foods":        27.00,
+    "Cheney Brothers": 26.50,
+}
+CASE_PRICE_DEFAULT = 29.50
+LABOR_RATE_DEFAULT = 17.00
+
+
+def _case_price_for(distributor: str) -> float:
+    return CASE_PRICE_BY_DISTRIBUTOR.get((distributor or "").strip(),
+                                         CASE_PRICE_DEFAULT)
+
+
+def _plh_bucket_keys(grain: str):
+    """Return [(key, start_iso, end_iso, label)] for the buckets in scope.
+
+    grain = "week"     -> last 4 ISO weeks ending this week (Mon-Sun)
+    grain = "month"    -> the 3 months of the current calendar quarter
+    grain = "quarter"  -> the 4 quarters of the current calendar year
+    """
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+
+    if grain == "month":
+        # Quarter the current month belongs to (1-3, 4-6, 7-9, 10-12)
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        out = []
+        for i in range(3):
+            mm = q_start_month + i
+            start = datetime(today.year, mm, 1).date()
+            nxt_mm = mm + 1
+            nxt_yy = today.year
+            if nxt_mm > 12:
+                nxt_mm = 1
+                nxt_yy = today.year + 1
+            end = (datetime(nxt_yy, nxt_mm, 1).date() - timedelta(days=1))
+            key   = start.strftime("%Y-%m")
+            label = start.strftime("%b %Y")
+            out.append((key, start.isoformat(), end.isoformat(), label))
+        return out
+
+    if grain == "quarter":
+        out = []
+        for q in range(1, 5):
+            start_mm = (q - 1) * 3 + 1
+            start = datetime(today.year, start_mm, 1).date()
+            end_mm = start_mm + 3
+            end_yy = today.year
+            if end_mm > 12:
+                end_mm = 1
+                end_yy = today.year + 1
+            end = (datetime(end_yy, end_mm, 1).date() - timedelta(days=1))
+            key   = f"{today.year}-Q{q}"
+            label = f"Q{q} {today.year}"
+            out.append((key, start.isoformat(), end.isoformat(), label))
+        return out
+
+    # default: weekly. 4 ISO weeks ending this week (Mon-Sun)
+    day = today.weekday()        # Mon=0..Sun=6
+    this_monday = today - timedelta(days=day)
+    out = []
+    for i in range(3, -1, -1):    # 3 weeks ago -> this week
+        wk_start = this_monday - timedelta(days=7 * i)
+        wk_end   = wk_start + timedelta(days=6)
+        iso = wk_start.isocalendar()
+        key   = f"{iso.year:04d}-W{iso.week:02d}"
+        label = f"Week of {wk_start.strftime('%b %d')}"
+        out.append((key, wk_start.isoformat(), wk_end.isoformat(), label))
+    return out
+
+
+def _date_in_range(d: str, start: str, end: str) -> bool:
+    if not d:
+        return False
+    d = d[:10]
+    return start <= d <= end
+
+
+@app.route("/api/report/plh")
+def api_report_plh():
+    """Production revenue, labor hours, and $PLH per time bucket."""
+    from inventory_tracker import load_production, load_labor
+    grain = (request.args.get("grain") or "week").lower()
+    buckets = _plh_bucket_keys(grain)
+    prod = load_production()
+    labor = load_labor()
+
+    out = []
+    for key, start, end, label in buckets:
+        bucket = {
+            "key": key, "label": label, "start": start, "end": end,
+            "total_cs": 0,
+            "revenue_dollars": 0.0,
+            "by_distributor": {},
+            "labor_hours": 0.0,
+            "labor_dollars": 0.0,
+            "plh": None,
+        }
+        for r in prod:
+            if not _date_in_range(r.get("production_date") or "", start, end):
+                continue
+            dist = r.get("distributor") or ""
+            price = _case_price_for(dist)
+            for line in (r.get("lines") or []):
+                cs = int(line.get("cs_count") or 0)
+                bucket["total_cs"] += cs
+                bucket["revenue_dollars"] += cs * price
+                bdist = bucket["by_distributor"].setdefault(
+                    dist or "Other", {"cs": 0, "revenue_dollars": 0.0})
+                bdist["cs"] += cs
+                bdist["revenue_dollars"] += cs * price
+        for e in labor:
+            if not _date_in_range(e.get("date") or "", start, end):
+                continue
+            bucket["labor_hours"]   += float(e.get("hours") or 0)
+            bucket["labor_dollars"] += float(e.get("dollars") or 0)
+        # If we have hours but no dollars on any entry, impute via the default
+        # rate so the cost picture is at least directionally right.
+        if bucket["labor_hours"] and not bucket["labor_dollars"]:
+            bucket["labor_dollars"] = bucket["labor_hours"] * LABOR_RATE_DEFAULT
+            bucket["labor_dollars_imputed"] = True
+        if bucket["labor_hours"]:
+            bucket["plh"] = bucket["revenue_dollars"] / bucket["labor_hours"]
+        out.append(bucket)
+
+    return jsonify({
+        "grain": grain,
+        "case_prices": {
+            "US Foods": 27.00, "Cheney Brothers": 26.50, "default": 29.50,
+        },
+        "labor_rate_default": LABOR_RATE_DEFAULT,
+        "buckets": out,
+    })
+
+
+@app.route("/api/admin/labor/ingest", methods=["POST"])
+def api_admin_labor_ingest():
+    """Append or replace bakery labor entries.
+
+    Body:
+      entries:  [{date: YYYY-MM-DD, hours: float, dollars?: float, source?: str}]
+      replace:  bool — when true, REPLACE all entries from the same `source`
+                with the new set; when false (default), append + dedupe by
+                (date, source) keeping the new entry.
+
+    No Toast call here — this is the "feed me labor data from any source"
+    endpoint. A separate script can pull from Toast and POST. CSV upload
+    or manual entry can use this same endpoint.
+    """
+    from inventory_tracker import load_labor, save_labor
+    body = request.json or {}
+    incoming = body.get("entries") or []
+    replace = bool(body.get("replace", False))
+    if not incoming:
+        return jsonify({"ok": False, "error": "entries required"}), 400
+
+    existing = load_labor()
+    sources_in_incoming = {(e.get("source") or "manual") for e in incoming}
+    if replace:
+        existing = [e for e in existing if (e.get("source") or "manual")
+                    not in sources_in_incoming]
+
+    # Dedupe by (date, source). Newer wins.
+    by_key = {}
+    for e in existing:
+        by_key[(e.get("date"), e.get("source") or "manual")] = e
+    for e in incoming:
+        d = (e.get("date") or "").strip()
+        if not d:
+            continue
+        rec = {
+            "date":    d,
+            "hours":   float(e.get("hours") or 0),
+            "dollars": float(e.get("dollars") or 0),
+            "source":  e.get("source") or "manual",
+            "ingested_at": datetime_now_iso(),
+        }
+        by_key[(rec["date"], rec["source"])] = rec
+    merged = list(by_key.values())
+    save_labor(merged)
+    return jsonify({"ok": True, "total_entries": len(merged),
+                    "added_or_updated": len(incoming)})
+
+
+def datetime_now_iso() -> str:
+    from datetime import datetime
+    return datetime.now().isoformat()
+
+
+
+# ---------------------------------------------------------------------------
 # API – Usage
 # ---------------------------------------------------------------------------
 

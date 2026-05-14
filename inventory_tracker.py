@@ -87,6 +87,26 @@ def save_production(records: list):
         json.dump(records, f, indent=2)
 
 
+# Bakery labor — feeds the $PLH report on the Report page. One entry per
+# date {date: YYYY-MM-DD, hours: float, dollars: float, source: str}.
+# `source` is informational (e.g. "toast:mvt-dc", "manual-upload") so we
+# can re-seed from a different source later without losing audit trail.
+LABOR_FILE = DATA_DIR / "labor.json"
+
+
+def load_labor() -> list:
+    if LABOR_FILE.exists():
+        with open(LABOR_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_labor(entries: list):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(LABOR_FILE, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # On-order rollover
 # ---------------------------------------------------------------------------
