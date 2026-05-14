@@ -1876,10 +1876,9 @@ function renderProductionDetail() {
 async function onShipDateChange(poNumber, shipDate) {
   if (!poNumber) return;
   try {
-    const r = await api('/api/on-order/ship-date', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ po_number: poNumber, ship_date: shipDate || null }),
+    const r = await api('/api/on-order/ship-date', 'POST', {
+      po_number: poNumber,
+      ship_date: shipDate || null,
     });
     if (r && r.ok) {
       toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})`);
