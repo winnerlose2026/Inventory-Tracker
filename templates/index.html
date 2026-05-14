@@ -2331,7 +2331,10 @@ function renderProductionDetail() {
       `${escHtml(L.variety)}&nbsp;<span style="color:var(--muted)">${L.cs_count}</span>`
     ).join(' · ');
     const more = lines.length > 4 ? ` · <span style="color:var(--muted)">+${lines.length - 4} more</span>` : '';
-    const tipText = lines.map(L => `${L.variety}: ${L.cs_count} cs`).join('\n');
+    const tipText = lines.map(L => {
+      const lot = L.lot_number ? `  [lot ${L.lot_number}]` : '';
+      return `${L.variety}: ${L.cs_count} cs${lot}`;
+    }).join('\n');
     const errBadge = r.parse_error
       ? '<div style="color:var(--warning,#c00);font-size:11px;margin-top:2px">PDF needs re-scan</div>'
       : '';

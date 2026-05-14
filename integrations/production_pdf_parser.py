@@ -277,6 +277,30 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
         ))
     sheet.unmapped_varieties = sorted(seen_unknown)
 
+    # Pair each line with its lot for traceability.
+    # Lots are queued per variety (item-code -> variety via
+    # HH_MFG_CODE_TO_VARIETY) and assigned to each matching line in
+    # text-position order. This handles:
+    #   - The single-day case (one lot per line, same variety)
+    #   - Multi-day production (same variety appears on multiple lines
+    #     with different lots — each line gets its own)
+    #   - PDF quirks where one lot lands above the "Lot#" header in
+    #     text-flow (we sort by source text offset, not column position)
+    try:
+        from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY
+    except ImportError:  # standalone test invocation
+        from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY  # type: ignore
+    lots_by_variety: dict = {}
+    for lot in _extract_lots(text):
+        canonical = HH_MFG_CODE_TO_VARIETY.get(lot["item_code"])
+        if not canonical:
+            continue
+        lots_by_variety.setdefault(canonical, []).append(lot["lot"])
+    for line in sheet.lines:
+        queue = lots_by_variety.get(line.variety)
+        if queue:
+            line.lot_number = queue.pop(0)
+
     # If the header total didn't parse but we got lines, compute it.
     if not sheet.total_cases and sheet.lines:
         sheet.total_cases = sum(L.cs_count for L in sheet.lines)
@@ -297,64 +321,79 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
 _DIGIT_RUN_RE = re.compile(r"\d{10,}")
 
 
-def _dates_from_lot_numbers(text: str) -> set:
-    """Return the set of ISO production dates encoded in lot numbers.
+def _extract_lots(text: str) -> list:
+    """Walk every digit run in the text and return the lots we can
+    confidently parse.
 
-    H&H lot format = ``<4-digit item_code><date>``. The date is rendered
-    one of two ways depending on which template version produced the
-    sheet:
+    Each lot is {lot: str, item_code: str, date_iso: str}. Preserves
+    order of appearance in the source text so callers that need to
+    pair lots with line items positionally can do so.
 
-      * Current format: ``MMDDYYYY`` (8 digits) -> total lot is 12 chars.
-        e.g. 115005142026 = item 1150, produced 05/14/2026.
-      * Legacy format:   ``MMDDYY``   (6 digits) -> total lot is 10 chars.
-        e.g. 1184050726 = item 1184, produced 05/07/26.
-
-    Both formats can end up adjacent to other digits in the pypdf text
-    extraction (the slash production_date "5/11/2026" sometimes glues
-    onto the last lot in the same run). So we slide every plausible
-    window over each digit run, prefer the 12-digit interpretation when
-    its year column reads 19xx or 20xx, and fall back to 10-digit when
-    that fails.
+    H&H lot codes are <4-digit item><MMDDYYYY> (current 12-digit) or
+    <4-digit item><MMDDYY> (legacy 10-digit). We prefer the 12-digit
+    interpretation per run and fall back to 10-digit when nothing
+    plausible parsed at 12.
     """
-    out = set()
+    out = []
+    seen_starts = set()
     for m in _DIGIT_RUN_RE.finditer(text):
         run = m.group(0)
-        run_hits: set[str] = set()
-        # First pass: 12-char windows as <item><MMDDYYYY>. Accept only if
-        # the year column is a plausible 19xx / 20xx so we don't false-
-        # positive on runs that happen to be 12+ digits long for other
-        # reasons.
-        for i in range(0, len(run) - 11):
+        run_offset = m.start()
+        run_hits: list = []
+        # 12-digit pass
+        i = 0
+        while i <= len(run) - 12:
             window = run[i:i+12]
             mm, dd, yyyy = window[4:6], window[6:8], window[8:12]
             try:
                 mm_i, dd_i, yyyy_i = int(mm), int(dd), int(yyyy)
             except ValueError:
+                i += 1
                 continue
-            if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
+            if (1 <= mm_i <= 12 and 1 <= dd_i <= 31
+                    and 1900 <= yyyy_i <= 2099):
+                run_hits.append({
+                    "lot":       window,
+                    "item_code": window[:4],
+                    "date_iso":  f"{yyyy_i:04d}-{mm_i:02d}-{dd_i:02d}",
+                    "_offset":   run_offset + i,
+                })
+                i += 12     # consume this window so it isn't re-matched
                 continue
-            if not (1900 <= yyyy_i <= 2099):
-                continue
-            run_hits.add(f"{yyyy_i:04d}-{mm_i:02d}-{dd_i:02d}")
-        # Second pass (legacy MMDDYY) ONLY when the 12-digit pass found
-        # nothing in this run — prevents a 12-digit MMDDYYYY lot from
-        # being double-counted as a false 10-digit MMDDYY (e.g.
-        # 115005142026 would otherwise produce both 2026-05-14 AND a
-        # spurious 2020-05-14 by reading positions 0-9).
+            i += 1
+        # 10-digit fallback only if 12-digit found nothing
         if not run_hits:
-            for i in range(0, len(run) - 9):
+            i = 0
+            while i <= len(run) - 10:
                 window = run[i:i+10]
                 mm, dd, yy = window[4:6], window[6:8], window[8:10]
                 try:
                     mm_i, dd_i, yy_i = int(mm), int(dd), int(yy)
                 except ValueError:
+                    i += 1
                     continue
-                if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
+                if 1 <= mm_i <= 12 and 1 <= dd_i <= 31:
+                    year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
+                    run_hits.append({
+                        "lot":       window,
+                        "item_code": window[:4],
+                        "date_iso":  f"{year:04d}-{mm_i:02d}-{dd_i:02d}",
+                        "_offset":   run_offset + i,
+                    })
+                    i += 10
                     continue
-                year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
-                run_hits.add(f"{year:04d}-{mm_i:02d}-{dd_i:02d}")
-        out |= run_hits
+                i += 1
+        out.extend(run_hits)
+    # Final sort: by source text offset so positional pairing works
+    out.sort(key=lambda x: x["_offset"])
     return out
+
+
+def _dates_from_lot_numbers(text: str) -> set:
+    """Convenience wrapper: return the distinct ISO dates encoded in lot
+    numbers. Use _extract_lots when you need the full lot tuples
+    (e.g. for per-line traceability)."""
+    return {lot["date_iso"] for lot in _extract_lots(text)}
 
 
 def _extract_text(pdf_bytes: bytes) -> str:
