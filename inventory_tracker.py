@@ -69,6 +69,24 @@ def save_usage(usage: list):
     _save(USAGE_FILE, usage)
 
 
+# Daily production sheets — separate from inventory because they are a
+# log of what was BAKED for a given PO, not a state of on-hand stock.
+PRODUCTION_FILE = DATA_DIR / "production.json"
+
+
+def load_production() -> list:
+    if PRODUCTION_FILE.exists():
+        with open(PRODUCTION_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_production(records: list):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(PRODUCTION_FILE, "w") as f:
+        json.dump(records, f, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # On-order rollover
 # ---------------------------------------------------------------------------

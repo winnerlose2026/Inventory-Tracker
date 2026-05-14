@@ -281,6 +281,217 @@ def api_admin_remove_po():
 
 
 # ---------------------------------------------------------------------------
+# API – Daily Production
+# ---------------------------------------------------------------------------
+# Production sheets are separate from inventory. Each record describes
+# what was baked for a particular PO on a particular day, parsed from
+# the Daily Production Sheet PDF that the production team emails out.
+
+@app.route("/api/production")
+def api_production_list():
+    """List production records. Optional query params: distributor,
+    warehouse, since (ISO date). Returns newest-first."""
+    from inventory_tracker import load_production
+    records = load_production()
+    dist = (request.args.get("distributor") or "").strip()
+    wh   = (request.args.get("warehouse") or "").strip()
+    since = (request.args.get("since") or "").strip()
+    out = []
+    for r in records:
+        if dist and (r.get("distributor") or "") != dist:
+            continue
+        if wh and (r.get("warehouse") or "") != wh:
+            continue
+        if since and (r.get("production_date") or "") < since:
+            continue
+        out.append(r)
+    out.sort(key=lambda r: (r.get("production_date") or "", r.get("po_number") or ""),
+             reverse=True)
+    return jsonify(out)
+
+
+@app.route("/api/production/summary")
+def api_production_summary():
+    """Roll-up across production records.
+
+    Query params:
+      period  = "day" | "week" | "month"  (default "week")
+
+    Returns:
+      {
+        "period": "week",
+        "buckets": [
+          { "key": "2026-W19", "start": "2026-05-04", "end": "2026-05-10",
+            "total_cs": 1232,
+            "by_distributor": {"Cheney Brothers": 224, "US Foods": 1008, ...},
+            "by_variety": {"Plain": 176, "Everything": 184, ...}
+          }, ...
+        ]
+      }
+    """
+    from datetime import datetime, timedelta
+    from inventory_tracker import load_production
+    records = load_production()
+    period = (request.args.get("period") or "week").lower()
+
+    def bucket_key(iso_date: str) -> tuple:
+        try:
+            dt = datetime.fromisoformat(iso_date)
+        except (TypeError, ValueError):
+            return ("", "", "")
+        if period == "day":
+            return (iso_date, iso_date, iso_date)
+        if period == "month":
+            start = dt.replace(day=1)
+            # Last day of month: jump to next month then back one day
+            if start.month == 12:
+                nxt = start.replace(year=start.year + 1, month=1)
+            else:
+                nxt = start.replace(month=start.month + 1)
+            end = nxt - timedelta(days=1)
+            return (f"{start.year:04d}-{start.month:02d}",
+                    start.date().isoformat(), end.date().isoformat())
+        # default "week" — ISO weeks (Monday-start)
+        iso = dt.isocalendar()
+        start = dt - timedelta(days=dt.weekday())
+        end = start + timedelta(days=6)
+        return (f"{iso.year:04d}-W{iso.week:02d}",
+                start.date().isoformat(), end.date().isoformat())
+
+    buckets: dict = {}
+    for r in records:
+        key, start, end = bucket_key(r.get("production_date") or "")
+        if not key:
+            continue
+        b = buckets.setdefault(key, {
+            "key": key, "start": start, "end": end,
+            "total_cs": 0, "by_distributor": {}, "by_variety": {},
+        })
+        b["total_cs"] += int(r.get("total_cases") or 0)
+        d = r.get("distributor") or "Unassigned"
+        b["by_distributor"][d] = b["by_distributor"].get(d, 0) + int(r.get("total_cases") or 0)
+        for line in (r.get("lines") or []):
+            v = line.get("variety") or "Unknown"
+            b["by_variety"][v] = b["by_variety"].get(v, 0) + int(line.get("cs_count") or 0)
+    return jsonify({
+        "period": period,
+        "buckets": sorted(buckets.values(), key=lambda x: x["start"], reverse=True),
+    })
+
+
+@app.route("/api/production/ingest", methods=["POST"])
+def api_production_ingest():
+    """Parse a Daily Production Sheet PDF and store as a record.
+
+    Body:
+      pdf_b64       base64-encoded PDF bytes (required)
+      subject       email subject (optional, used as a fallback PO source)
+      sender        email From address (optional, kept for audit)
+      message_id    Graph internetMessageId or RFC822 Message-Id (required
+                    for idempotency — re-posting the same message is a no-op)
+      received_at   ISO timestamp (optional)
+
+    Returns 200 with {ok, status: "ingested"|"duplicate"|"parse_error",
+    record, error}. parse_error is surfaced for image-only scan PDFs so
+    the operator can re-request a text PDF.
+    """
+    import base64
+    from datetime import datetime
+    from inventory_tracker import load_production, save_production
+    from integrations.production_pdf_parser import parse_production_pdf
+
+    body = request.json or {}
+    pdf_b64 = body.get("pdf_b64") or ""
+    if not pdf_b64:
+        return jsonify({"ok": False, "error": "pdf_b64 required"}), 400
+    subject    = (body.get("subject") or "").strip()
+    sender     = (body.get("sender") or "").strip()
+    message_id = (body.get("message_id") or "").strip()
+    received_at = (body.get("received_at") or "").strip()
+
+    records = load_production()
+    if message_id:
+        for existing in records:
+            if existing.get("source_message_id") == message_id:
+                return jsonify({
+                    "ok": True,
+                    "status": "duplicate",
+                    "record": existing,
+                })
+
+    try:
+        pdf_bytes = base64.b64decode(pdf_b64)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"bad pdf_b64: {exc}"}), 400
+
+    sheet = parse_production_pdf(pdf_bytes, subject=subject)
+
+    if sheet.error and not sheet.lines:
+        # Persist a stub for the dashboard so the operator can see the
+        # email arrived but needs manual entry, then surface the error.
+        stub = {
+            "production_date": "",
+            "warehouse": "",
+            "warehouse_raw": "",
+            "distributor": "",
+            "po_number": "",
+            "lines": [],
+            "total_cases": 0,
+            "unmapped_varieties": [],
+            "source_message_id": message_id,
+            "source_subject": subject,
+            "source_sender": sender,
+            "received_at": received_at or datetime.now().isoformat(),
+            "ingested_at": datetime.now().isoformat(),
+            "parse_error": sheet.error,
+        }
+        records.append(stub)
+        save_production(records)
+        return jsonify({
+            "ok": True,
+            "status": "parse_error",
+            "record": stub,
+            "error": sheet.error,
+        })
+
+    record = {
+        "production_date":    sheet.production_date,
+        "warehouse":          sheet.warehouse,
+        "warehouse_raw":      sheet.warehouse_raw,
+        "distributor":        sheet.distributor,
+        "po_number":          sheet.po_number,
+        "lines": [
+            {"variety": L.variety, "raw_variety": L.raw_variety,
+             "cs_count": L.cs_count, "lot_number": L.lot_number}
+            for L in sheet.lines
+        ],
+        "total_cases":        sheet.total_cases,
+        "unmapped_varieties": sheet.unmapped_varieties,
+        "source_message_id":  message_id,
+        "source_subject":     subject,
+        "source_sender":      sender,
+        "received_at":        received_at or datetime.now().isoformat(),
+        "ingested_at":        datetime.now().isoformat(),
+        "parse_error":        "",
+    }
+    records.append(record)
+    save_production(records)
+    return jsonify({"ok": True, "status": "ingested", "record": record})
+
+
+@app.route("/api/production/<source_message_id>", methods=["DELETE"])
+def api_production_delete(source_message_id):
+    """Drop a production record by its source_message_id."""
+    from inventory_tracker import load_production, save_production
+    records = load_production()
+    kept = [r for r in records if r.get("source_message_id") != source_message_id]
+    removed = len(records) - len(kept)
+    if removed:
+        save_production(kept)
+    return jsonify({"ok": True, "removed": removed})
+
+
+# ---------------------------------------------------------------------------
 # API – Usage
 # ---------------------------------------------------------------------------
 
