@@ -319,7 +319,8 @@
               <th class="sortable" data-sort="po_number">PO # <span class="sort-ind"></span></th>
               <th class="sortable" data-sort="distributor">Distributor <span class="sort-ind"></span></th>
               <th class="sortable" data-sort="warehouse">Warehouse <span class="sort-ind"></span></th>
-              <th>Items / cs</th>
+              <th>Items</th>
+              <th class="sortable" data-sort="total_cs" style="text-align:right">Total cs <span class="sort-ind"></span></th>
               <th class="sortable" data-sort="ordered_at">Ordered <span class="sort-ind"></span></th>
               <th>Ship Date</th>
               <th>Arrival</th>
@@ -1462,12 +1463,53 @@ async function loadPendingPOs() {
   renderPendingPOs();
 }
 
-function _pendingSortValue(pair, key) {
-  if (key === 'po_number')   return (pair.entry.po_number || '').toLowerCase();
-  if (key === 'distributor') return (pair.item.distributor || '').toLowerCase();
-  if (key === 'warehouse')   return (pair.item.warehouse || '').toLowerCase();
-  if (key === 'ordered_at')  return (pair.entry.ordered_at || '');
-  if (key === 'eta')         return (pair.entry.eta || '');
+// Build a "PO group" from one or more pendingCache pairs sharing a
+// po_number. Aggregates qty across line items and preserves a list of
+// {variety, qty, unit} for the Items column. Each PO has one warehouse,
+// one ordered_at, one ship_date, and one arrival_date in normal use —
+// take those from the first entry but fall back across entries in case
+// of partial data.
+function _buildPoGroups(pairs) {
+  const byPo = new Map();
+  pairs.forEach(p => {
+    const po = p.entry.po_number || '__no_po__';
+    if (!byPo.has(po)) {
+      byPo.set(po, {
+        po_number:   p.entry.po_number || '',
+        distributor: p.item.distributor || '',
+        warehouse:   p.item.warehouse || '',
+        ordered_at:  p.entry.ordered_at || '',
+        eta:         p.entry.eta || '',
+        ship_date:   p.entry.ship_date || '',
+        arrival_date: p.entry.arrival_date || '',
+        total_cs:    0,
+        lines:       [],   // [{variety, qty, unit, name}]
+      });
+    }
+    const g = byPo.get(po);
+    g.total_cs += Number(p.entry.qty) || 0;
+    // Pull variety from the SKU name if not on the entry itself
+    const variety = (p.item.name || '').split('Bagel')[0].trim() || p.item.name;
+    g.lines.push({
+      variety, name: p.item.name,
+      qty: Number(p.entry.qty) || 0,
+      unit: p.entry.unit || 'cs',
+    });
+    // Prefer a non-empty ship_date / arrival from any line (they should
+    // be uniform across the PO since ship_date is set per-PO).
+    if (!g.ship_date    && p.entry.ship_date)    g.ship_date    = p.entry.ship_date;
+    if (!g.arrival_date && p.entry.arrival_date) g.arrival_date = p.entry.arrival_date;
+  });
+  return Array.from(byPo.values());
+}
+
+function _pendingSortValue(group, key) {
+  if (key === 'po_number')   return (group.po_number || '').toLowerCase();
+  if (key === 'distributor') return (group.distributor || '').toLowerCase();
+  if (key === 'warehouse')   return (group.warehouse || '').toLowerCase();
+  if (key === 'ordered_at')  return (group.ordered_at || '');
+  if (key === 'eta')         return (group.eta || '');
+  if (key === 'total_cs')    return Number(group.total_cs) || 0;
   return '';
 }
 
@@ -1476,26 +1518,32 @@ function renderPendingPOs() {
   if (!tbody) return;
   let pairs = pendingCache.slice();
 
-  // Filter UI
+  // Filter the FLAT pair list first so partial-distributor / partial-
+  // warehouse filters work, even if a hypothetical multi-DC PO existed.
   const distF = document.getElementById('pending-filter-distributor').value;
   const whF   = document.getElementById('pending-filter-warehouse').value;
   if (distF) pairs = pairs.filter(p => (p.item.distributor || '') === distF);
   if (whF)   pairs = pairs.filter(p => (p.item.warehouse  || '') === whF);
+
+  // Build groups from the (already-filtered) flat list
+  let groups = _buildPoGroups(pairs);
+
+  // Mode filters operate on the group's effective trigger / ship state
   if (pendingFilterMode === 'overdue') {
     const now = new Date();
-    pairs = pairs.filter(p => {
-      const trigger = p.entry.arrival_date || p.entry.eta;
+    groups = groups.filter(g => {
+      const trigger = g.arrival_date || g.eta;
       return trigger && new Date(trigger) < now;
     });
   } else if (pendingFilterMode === 'noship') {
-    pairs = pairs.filter(p => !p.entry.ship_date);
+    groups = groups.filter(g => !g.ship_date);
   }
 
   // Sort
   if (pendingSortKey && pendingSortDir) {
     const k = pendingSortKey;
     const d = pendingSortDir;
-    pairs.sort((a, b) => {
+    groups.sort((a, b) => {
       const va = _pendingSortValue(a, k);
       const vb = _pendingSortValue(b, k);
       if (va < vb) return -1 * d;
@@ -1504,33 +1552,38 @@ function renderPendingPOs() {
     });
   }
 
-  if (pairs.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">No pending POs match this filter.</td></tr>';
+  if (groups.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">No pending POs match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
     return;
   }
 
-  // Group by po_number for the Items/cs aggregation column
-  tbody.innerHTML = pairs.map(p => {
-    const e = p.entry;
-    const i = p.item;
-    const shipISO = (e.ship_date || '').slice(0, 10);
-    const arrival = e.arrival_date ? formatDate(e.arrival_date) : '<span style="color:var(--muted)">—</span>';
-    const eta = e.eta ? formatDate(e.eta) : '<span style="color:var(--muted)">—</span>';
-    const overdue = (e.arrival_date || e.eta) && new Date(e.arrival_date || e.eta) < new Date();
+  tbody.innerHTML = groups.map(g => {
+    const shipISO = (g.ship_date || '').slice(0, 10);
+    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
+    const eta = g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">—</span>';
+    const overdue = (g.arrival_date || g.eta) && new Date(g.arrival_date || g.eta) < new Date();
+    // Items column: variety · qty list. Up to 4 inline, then "+N more".
+    const sortedLines = g.lines.slice().sort((a, b) => a.variety.localeCompare(b.variety));
+    const head = sortedLines.slice(0, 4).map(L =>
+      `${escHtml(L.variety)}&nbsp;<span style="color:var(--muted)">${L.qty.toFixed(0)}</span>`
+    ).join(' · ');
+    const more = sortedLines.length > 4 ? ` · <span style="color:var(--muted)">+${sortedLines.length - 4} more</span>` : '';
+    const tipText = sortedLines.map(L => `${L.variety}: ${L.qty.toFixed(0)} ${L.unit}`).join('\n');
     return `<tr${overdue ? ' style="background:var(--surface2)"' : ''}>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(e.po_number || '—')}</td>
-      <td>${distributorBadge(i.distributor)}</td>
-      <td>${escHtml(i.warehouse || '')}</td>
-      <td>
-        <div style="font-weight:600;font-size:12px">${escHtml(i.name)}</div>
-        <div style="color:var(--muted);font-size:11px">${(e.qty || 0).toFixed(0)} ${escHtml(e.unit || 'cs')}</div>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td>${distributorBadge(g.distributor)}</td>
+      <td>${escHtml(g.warehouse || '')}</td>
+      <td title="${escAttr(tipText)}" style="font-size:12px">
+        <div>${head}${more}</div>
+        <div style="color:var(--muted);font-size:11px">${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</div>
       </td>
-      <td style="white-space:nowrap">${formatDate(e.ordered_at)}</td>
+      <td style="text-align:right;font-weight:600">${g.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap">${formatDate(g.ordered_at)}</td>
       <td>
         <input type="date" class="ship-date-input"
                value="${escAttr(shipISO)}"
-               onchange="onShipDateChange('${escAttr(e.po_number || '')}', this.value)" />
+               onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value)" />
       </td>
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
