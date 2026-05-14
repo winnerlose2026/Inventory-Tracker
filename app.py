@@ -678,7 +678,24 @@ def api_production_scan():
             next_url = page.get("@odata.nextLink")
 
     if not dry_run:
-        save_production(existing)
+        # Re-load from disk and merge by source_message_id to avoid a
+        # read-modify-write race when two scan calls overlap (a
+        # symptom: the second call would clobber the first's appended
+        # rows). The in-memory `existing` was loaded at the start of
+        # THIS call and may now be stale.
+        from inventory_tracker import load_production
+        current = load_production()
+        by_msg = {r.get("source_message_id"): r for r in current
+                  if r.get("source_message_id")}
+        for r in existing:
+            mid = r.get("source_message_id")
+            if mid and mid not in by_msg:
+                by_msg[mid] = r
+            elif not mid:
+                current.append(r)
+        merged = [r for r in current if not r.get("source_message_id")] \
+                 + list(by_msg.values())
+        save_production(merged)
 
     return jsonify({
         "ok": True, "dry_run": dry_run,
