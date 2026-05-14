@@ -296,6 +296,7 @@
         <div class="btn-group">
           <button class="btn btn-ghost btn-sm" id="pending-filter-overdue" onclick="setPendingFilter('overdue')">Overdue</button>
           <button class="btn btn-ghost btn-sm" id="pending-filter-noship" onclick="setPendingFilter('noship')">No ship date</button>
+          <button class="btn btn-ghost btn-sm" id="pending-filter-pallet" onclick="setPendingFilter('pallet')" title="Total cs not a multiple of 56">Pallet mismatch</button>
           <button class="btn btn-ghost btn-sm active" id="pending-filter-all" onclick="setPendingFilter('all')">All</button>
         </div>
       </div>
@@ -1507,7 +1508,7 @@ let pendingCache = [];          // flat list of {entry, item} pairs
 
 function setPendingFilter(mode) {
   pendingFilterMode = mode;
-  ['all', 'overdue', 'noship'].forEach(m => {
+  ['all', 'overdue', 'noship', 'pallet'].forEach(m => {
     const btn = document.getElementById('pending-filter-' + m);
     if (btn) btn.classList.toggle('active', m === mode);
   });
@@ -1614,6 +1615,9 @@ function renderPendingPOs() {
     });
   } else if (pendingFilterMode === 'noship') {
     groups = groups.filter(g => !g.ship_date);
+  } else if (pendingFilterMode === 'pallet') {
+    // POs whose total cs isn't a multiple of 56 (pallet unit).
+    groups = groups.filter(g => (Number(g.total_cs) % 56) !== 0);
   }
 
   // Sort
@@ -1647,7 +1651,16 @@ function renderPendingPOs() {
     ).join(' · ');
     const more = sortedLines.length > 4 ? ` · <span style="color:var(--muted)">+${sortedLines.length - 4} more</span>` : '';
     const tipText = sortedLines.map(L => `${L.variety}: ${L.qty.toFixed(0)} ${L.unit}`).join('\n');
-    return `<tr${overdue ? ' style="background:var(--surface2)"' : ''}>
+    const palletMismatch = (Number(g.total_cs) % 56) !== 0;
+    const rowStyle = overdue
+      ? ' style="background:var(--surface2)"'
+      : palletMismatch
+        ? ' style="background:rgba(217, 119, 6, 0.08)"'
+        : '';
+    const palletBadge = palletMismatch
+      ? ` <span class="badge badge-yellow" title="Total cs (${g.total_cs}) is not a multiple of 56" style="margin-left:4px;font-size:10px">⚠ not ×56</span>`
+      : '';
+    return `<tr${rowStyle}>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${escHtml(g.warehouse || '')}</td>
@@ -1655,7 +1668,7 @@ function renderPendingPOs() {
         <div>${head}${more}</div>
         <div style="color:var(--muted);font-size:11px">${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</div>
       </td>
-      <td style="text-align:right;font-weight:600">${g.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="text-align:right;font-weight:600">${g.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span>${palletBadge}</td>
       <td style="white-space:nowrap">${formatDate(g.ordered_at)}</td>
       <td>
         <input type="date" class="ship-date-input"
