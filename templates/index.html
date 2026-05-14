@@ -378,6 +378,13 @@
       <!-- Detail table (one row per ingested production sheet) -->
       <div class="card">
         <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group" style="flex:1;min-width:220px">
+            <label>Search</label>
+            <input id="prod-filter-search" type="search"
+                   placeholder="Production date (5/8, 2026-05, etc.) or PO #"
+                   oninput="renderProductionDetail()"
+                   style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
           <div class="filter-group">
             <label>Distributor</label>
             <select id="prod-filter-distributor" onchange="renderProductionDetail()" style="width:180px">
@@ -1859,8 +1866,17 @@ function renderProductionDetail() {
   let rows = prodCache.slice();
   const distF = document.getElementById('prod-filter-distributor').value;
   const whF   = document.getElementById('prod-filter-warehouse').value;
+  const qRaw  = (document.getElementById('prod-filter-search')?.value || '').trim().toLowerCase();
   if (distF) rows = rows.filter(r => (r.distributor || '') === distF);
   if (whF)   rows = rows.filter(r => (r.warehouse  || '') === whF);
+  if (qRaw) {
+    rows = rows.filter(r => {
+      const po = (r.po_number || '').toLowerCase();
+      const dIso = (r.production_date || '').toLowerCase();        // 2026-05-08
+      const dFmt = formatDate(r.production_date || '').toLowerCase(); // 05/08/2026
+      return po.includes(qRaw) || dIso.includes(qRaw) || dFmt.includes(qRaw);
+    });
+  }
 
   if (prodSortKey && prodSortDir) {
     const k = prodSortKey;
