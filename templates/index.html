@@ -172,6 +172,9 @@
       <div class="nav-item" onclick="showPage('pending-pos')">
         <span class="nav-icon">🚛</span> Pending POs
       </div>
+      <div class="nav-item" onclick="showPage('production')">
+        <span class="nav-icon">🥯</span> Daily Production
+      </div>
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
@@ -328,6 +331,79 @@
             </tr>
           </thead>
           <tbody id="pending-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Daily Production -->
+    <div class="page" id="page-production">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Daily Production</h1>
+          <p class="subtitle" style="margin-bottom:0">Cases baked per PO, fed by the production team's Daily Production Sheet emails. Aggregated by production date and rolled up weekly / monthly.</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost btn-sm active" id="prod-period-week" onclick="setProdPeriod('week')">Weekly</button>
+          <button class="btn btn-ghost btn-sm" id="prod-period-month" onclick="setProdPeriod('month')">Monthly</button>
+          <button class="btn btn-ghost btn-sm" id="prod-period-day" onclick="setProdPeriod('day')">Daily</button>
+        </div>
+      </div>
+
+      <!-- Summary cards (current period) -->
+      <div id="prod-summary-cards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px"></div>
+
+      <!-- Bucket roll-ups (one row per week/month/day) -->
+      <div class="card" style="margin-bottom:20px">
+        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+          <strong>Production by period</strong>
+          <span id="prod-period-label" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Period</th>
+              <th>Range</th>
+              <th style="text-align:right">Total cs</th>
+              <th>By distributor</th>
+              <th>Top varieties</th>
+            </tr>
+          </thead>
+          <tbody id="prod-summary-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Detail table (one row per ingested production sheet) -->
+      <div class="card">
+        <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group">
+            <label>Distributor</label>
+            <select id="prod-filter-distributor" onchange="renderProductionDetail()" style="width:180px">
+              <option value="">All</option>
+              <option>Cheney Brothers</option>
+              <option>US Foods</option>
+              <option>Chefs Warehouse</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Warehouse</label>
+            <select id="prod-filter-warehouse" onchange="renderProductionDetail()" style="width:200px">
+              <option value="">All</option>
+            </select>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr id="prod-thead-row">
+              <th class="sortable" data-sort="production_date">Production Date <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="warehouse">Warehouse <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="distributor">Distributor <span class="sort-ind"></span></th>
+              <th>PO #</th>
+              <th>Items</th>
+              <th class="sortable" data-sort="total_cases" style="text-align:right">Total cs <span class="sort-ind"></span></th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody id="prod-tbody"></tbody>
         </table>
       </div>
     </div>
@@ -562,6 +638,7 @@ function refresh(page) {
   else if (page === 'distributors') loadDistributors();
   else if (page === 'report') loadReport();
   else if (page === 'pending-pos') loadPendingPOs();
+  else if (page === 'production') loadProduction();
 }
 
 function distributorBadge(name) {
@@ -1591,6 +1668,210 @@ function renderPendingPOs() {
   }).join('');
   updateSortIndicators('pending-tbody');
 }
+
+// -------------------------------------------------------------------------
+// Daily Production page
+// -------------------------------------------------------------------------
+let prodPeriod = 'week';        // 'day' | 'week' | 'month'
+let prodSortKey = 'production_date';
+let prodSortDir = -1;            // newest first by default
+let prodCache = [];
+
+function setProdPeriod(p) {
+  prodPeriod = p;
+  ['week','month','day'].forEach(m => {
+    const btn = document.getElementById('prod-period-' + m);
+    if (btn) btn.classList.toggle('active', m === p);
+  });
+  loadProductionSummary();
+}
+
+function onProdSortClick(key) {
+  if (prodSortKey !== key) { prodSortKey = key; prodSortDir = 1; }
+  else if (prodSortDir === 1) prodSortDir = -1;
+  else if (prodSortDir === -1) { prodSortKey = null; prodSortDir = 0; }
+  else prodSortDir = 1;
+  renderProductionDetail();
+}
+
+async function loadProduction() {
+  await ensureWarehouses();
+  const records = await api('/api/production');
+  prodCache = records;
+
+  // Populate warehouse filter from the records actually present
+  const wSel = document.getElementById('prod-filter-warehouse');
+  const presentWh = Array.from(new Set(records.map(r => r.warehouse).filter(Boolean))).sort();
+  if (wSel.options.length <= 1 + presentWh.length - 1) {
+    wSel.innerHTML = '<option value="">All</option>' +
+      presentWh.map(w => `<option>${escHtml(w)}</option>`).join('');
+  }
+
+  // Wire sort click handlers once
+  const head = document.getElementById('prod-thead-row');
+  if (head && !head.dataset.sortWired) {
+    head.querySelectorAll('th.sortable').forEach(th => {
+      th.addEventListener('click', () => onProdSortClick(th.dataset.sort));
+    });
+    head.dataset.sortWired = '1';
+  }
+
+  renderProductionDetail();
+  loadProductionSummary();
+}
+
+async function loadProductionSummary() {
+  const data = await api('/api/production/summary?period=' + encodeURIComponent(prodPeriod));
+  renderProductionSummary(data);
+}
+
+function renderProductionSummary(data) {
+  const buckets = data.buckets || [];
+  const periodLabel = { day: 'Daily', week: 'Weekly', month: 'Monthly' }[prodPeriod] || 'Weekly';
+  document.getElementById('prod-period-label').textContent =
+    `Rolled up by ${periodLabel.toLowerCase()}, newest first`;
+
+  // Summary cards — current period totals
+  const current = buckets[0] || { total_cs: 0, by_distributor: {}, by_variety: {} };
+  const cumulative = buckets.reduce((acc, b) => {
+    acc.total_cs += b.total_cs || 0;
+    return acc;
+  }, { total_cs: 0 });
+  const cards = document.getElementById('prod-summary-cards');
+  const topDist = Object.entries(current.by_distributor || {})
+    .sort((a, b) => b[1] - a[1]);
+  const cardHtml = [
+    `<div class="card" style="padding:16px 20px">
+       <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">This ${prodPeriod}</div>
+       <div style="font-size:28px;font-weight:700">${(current.total_cs || 0).toFixed(0)} <span style="color:var(--muted);font-size:14px">cs</span></div>
+       <div style="color:var(--muted);font-size:12px">${current.start ? formatDate(current.start) : ''}${current.end && current.end !== current.start ? ' – ' + formatDate(current.end) : ''}</div>
+     </div>`,
+    `<div class="card" style="padding:16px 20px">
+       <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">Cumulative (${buckets.length} ${prodPeriod}${buckets.length === 1 ? '' : 's'})</div>
+       <div style="font-size:28px;font-weight:700">${cumulative.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:14px">cs</span></div>
+       <div style="color:var(--muted);font-size:12px">all production logged to date</div>
+     </div>`,
+  ];
+  topDist.slice(0, 3).forEach(([name, n]) => {
+    cardHtml.push(
+      `<div class="card" style="padding:16px 20px">
+         <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">This ${prodPeriod} — ${escHtml(name)}</div>
+         <div style="font-size:28px;font-weight:700">${n.toFixed(0)} <span style="color:var(--muted);font-size:14px">cs</span></div>
+       </div>`
+    );
+  });
+  cards.innerHTML = cardHtml.join('');
+
+  // Bucket table
+  const tbody = document.getElementById('prod-summary-tbody');
+  if (buckets.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No production records yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = buckets.map(b => {
+    const dist = Object.entries(b.by_distributor || {})
+      .sort((x, y) => y[1] - x[1])
+      .map(([n, c]) => `${escHtml(n)}&nbsp;<span style="color:var(--muted)">${c}</span>`)
+      .join(' · ');
+    const variety = Object.entries(b.by_variety || {})
+      .sort((x, y) => y[1] - x[1])
+      .slice(0, 5)
+      .map(([n, c]) => `${escHtml(n)}&nbsp;<span style="color:var(--muted)">${c}</span>`)
+      .join(' · ');
+    const rangeLabel = b.start === b.end ? formatDate(b.start) : `${formatDate(b.start)} – ${formatDate(b.end)}`;
+    return `<tr>
+      <td style="font-weight:600">${escHtml(b.key)}</td>
+      <td>${rangeLabel}</td>
+      <td style="text-align:right;font-weight:600">${(b.total_cs || 0).toFixed(0)}</td>
+      <td>${dist || '<span style="color:var(--muted)">—</span>'}</td>
+      <td>${variety || '<span style="color:var(--muted)">—</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function _prodSortValue(r, key) {
+  if (key === 'production_date') return r.production_date || '';
+  if (key === 'warehouse')       return (r.warehouse || '').toLowerCase();
+  if (key === 'distributor')     return (r.distributor || '').toLowerCase();
+  if (key === 'total_cases')     return Number(r.total_cases) || 0;
+  return '';
+}
+
+function renderProductionDetail() {
+  const tbody = document.getElementById('prod-tbody');
+  if (!tbody) return;
+  let rows = prodCache.slice();
+  const distF = document.getElementById('prod-filter-distributor').value;
+  const whF   = document.getElementById('prod-filter-warehouse').value;
+  if (distF) rows = rows.filter(r => (r.distributor || '') === distF);
+  if (whF)   rows = rows.filter(r => (r.warehouse  || '') === whF);
+
+  if (prodSortKey && prodSortDir) {
+    const k = prodSortKey;
+    const d = prodSortDir;
+    rows.sort((a, b) => {
+      const va = _prodSortValue(a, k);
+      const vb = _prodSortValue(b, k);
+      if (va < vb) return -1 * d;
+      if (va > vb) return  1 * d;
+      return 0;
+    });
+  }
+
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No production records match this filter.</td></tr>';
+    updateSortIndicators('pending-tbody');
+    return;
+  }
+
+  tbody.innerHTML = rows.map(r => {
+    const lines = (r.lines || []).slice().sort((a, b) => a.variety.localeCompare(b.variety));
+    const head = lines.slice(0, 4).map(L =>
+      `${escHtml(L.variety)}&nbsp;<span style="color:var(--muted)">${L.cs_count}</span>`
+    ).join(' · ');
+    const more = lines.length > 4 ? ` · <span style="color:var(--muted)">+${lines.length - 4} more</span>` : '';
+    const tipText = lines.map(L => `${L.variety}: ${L.cs_count} cs`).join('\n');
+    const errBadge = r.parse_error
+      ? '<div style="color:var(--warning,#c00);font-size:11px;margin-top:2px">PDF needs re-scan</div>'
+      : '';
+    const srcSubj = (r.source_subject || '').replace(/^Daily [Pp]roduction\s*/, '');
+    const srcSender = (r.source_sender || '').match(/<([^>]+)>/)?.[1] || r.source_sender || '';
+    return `<tr>
+      <td style="white-space:nowrap;font-weight:600">${r.production_date ? formatDate(r.production_date) : '<span style="color:var(--warning,#c00)">—</span>'}</td>
+      <td>${escHtml(r.warehouse || '')}${r.warehouse_raw && r.warehouse_raw !== r.warehouse ? ` <span style="color:var(--muted);font-size:11px">(${escHtml(r.warehouse_raw)})</span>` : ''}</td>
+      <td>${distributorBadge(r.distributor || '')}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(r.po_number || '—')}</td>
+      <td title="${escAttr(tipText)}" style="font-size:12px">
+        <div>${head}${more}${errBadge}</div>
+        <div style="color:var(--muted);font-size:11px">${lines.length} item${lines.length === 1 ? '' : 's'}</div>
+      </td>
+      <td style="text-align:right;font-weight:600">${(r.total_cases || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="font-size:11px;color:var(--muted)">
+        <div>${escHtml(srcSubj || '—')}</div>
+        <div>${escHtml(srcSender)}</div>
+      </td>
+    </tr>`;
+  }).join('');
+  updateSortIndicators('prod-tbody');
+}
+
+// Hook prod-tbody into the shared updateSortIndicators map
+(function _wireProdSortIndicators() {
+  const _old = window.updateSortIndicators;
+  window.updateSortIndicators = function(tbodyId) {
+    if (tbodyId === 'prod-tbody') {
+      const head = document.getElementById('prod-thead-row');
+      if (!head) return;
+      head.querySelectorAll('th.sortable').forEach(th => {
+        th.classList.remove('sort-asc', 'sort-desc');
+        if (th.dataset.sort === prodSortKey && prodSortDir === 1) th.classList.add('sort-asc');
+        else if (th.dataset.sort === prodSortKey && prodSortDir === -1) th.classList.add('sort-desc');
+      });
+      return;
+    }
+    _old(tbodyId);
+  };
+})();
 
 async function onShipDateChange(poNumber, shipDate) {
   if (!poNumber) return;
