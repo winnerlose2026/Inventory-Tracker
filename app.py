@@ -419,7 +419,12 @@ def api_email_scan():
             since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             # Graph wants ISO 8601 with a Z suffix, no microseconds.
             iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            filter_override = f"receivedDateTime ge {iso}"
+            # Mirror cowork_graph_scan: pre-filter to attachment-bearing
+            # messages so the page budget isn't burned on non-PO mail.
+            # Graph rejects hasAttachments + $orderby (InefficientFilter),
+            # so _scan_ms365_mailbox drops orderby when the filter
+            # contains "hasAttachments".
+            filter_override = f"hasAttachments eq true and receivedDateTime ge {iso}"
 
         client = EmailInboxClient()
         try:

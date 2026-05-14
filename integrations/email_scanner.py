@@ -657,6 +657,11 @@ class EmailInboxClient:
         }
         if filt:
             q["$filter"] = filt
+            # Graph errors as InefficientFilter when hasAttachments is in
+            # the filter alongside $orderby on receivedDateTime. Drop the
+            # sort — pages still come back, just not strictly date-ordered.
+            if "hasAttachments" in filt:
+                q.pop("$orderby", None)
         list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
                     f"?{urllib.parse.urlencode(q)}")
 
