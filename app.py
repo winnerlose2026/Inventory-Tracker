@@ -561,7 +561,6 @@ def api_production_scan():
             "$select": ("id,subject,from,toRecipients,receivedDateTime,"
                         "hasAttachments,internetMessageId"),
             "$filter": f"hasAttachments eq true and {date_filter}",
-            "$search": '"Daily Production"',
         })
         next_url = f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages?{qs}"
         pages = 0
