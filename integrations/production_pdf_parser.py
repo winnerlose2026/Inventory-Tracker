@@ -99,6 +99,7 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "CHICAGO":               ("Chicago, IL",            "US Foods"),
     "ALCOA":                 ("Alcoa, TN",              "US Foods"),
     "CWNY":                  ("Chefs Warehouse, NY",    "Chefs Warehouse"),
+    "CWFL":                  ("Chefs Warehouse, FL",    "Chefs Warehouse"),
 }
 
 
@@ -146,7 +147,7 @@ _HEADER_RE = re.compile(
 )
 
 # Date inline in the lot column, e.g. "11890430264/30/2026" -> "4/30/2026"
-_DATE_RE = re.compile(r"(?<!\d)(\d{1,2}/\d{1,2}/\d{4})(?!\d)")
+_DATE_RE = re.compile(r"(?<!\d)((?:0?[1-9]|1[0-2])/\d{1,2}/\d{4})(?!\d)|(?:^|\D)((?:0?[1-9]|1[0-2])/\d{1,2}/\d{4})(?!\d)")
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +186,7 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     # style: lot 1184050726 -> 05/07/26 produced).
     md = _DATE_RE.search(text)
     if md:
-        raw = md.group(1)
+        raw = md.group(1) or md.group(2)
         try:
             mm, dd, yyyy = raw.split("/")
             sheet.production_date = f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
@@ -227,27 +228,36 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     return sheet
 
 
-_LOT_RE = re.compile(r"\b\d{4,6}(\d{2})(\d{2})(\d{2})\b")
+_DIGIT_RUN_RE = re.compile(r"\d{10,}")
 
 
 def _dates_from_lot_numbers(text: str) -> set:
     """Return the set of ISO production dates encoded in lot numbers.
 
-    Lot format observed: ``<item_code><MMDDYY>``, e.g. 1184050726 means
-    item 1184 produced 05/07/26. Only call when the sheet didn't carry
-    an explicit slash-format production date.
+    Lot format observed: ``<4-digit item_code><MMDDYY>``, e.g. 1184050726
+    means item 1184 produced 05/07/26. We can't rely on a single regex
+    because the slash-format production date is sometimes GLUED onto the
+    last lot in the same digit run (CWFL renders as 11580511265/11/2026,
+    where the lot 1158051126 ends at the 10th char and the date "5/11"
+    begins immediately). So instead we scan every digit run of 10+
+    characters and check each 10-digit window for a valid trailing
+    MMDDYY.
     """
     out = set()
-    for m in _LOT_RE.finditer(text):
-        mm, dd, yy = m.group(1), m.group(2), m.group(3)
-        try:
-            mm_i, dd_i, yy_i = int(mm), int(dd), int(yy)
-        except ValueError:
-            continue
-        if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
-            continue
-        year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
-        out.add(f"{year:04d}-{mm_i:02d}-{dd_i:02d}")
+    for m in _DIGIT_RUN_RE.finditer(text):
+        run = m.group(0)
+        # Slide a 10-char window across the run and try each as <item><date>
+        for i in range(0, len(run) - 9):
+            window = run[i:i+10]
+            mm, dd, yy = window[4:6], window[6:8], window[8:10]
+            try:
+                mm_i, dd_i, yy_i = int(mm), int(dd), int(yy)
+            except ValueError:
+                continue
+            if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
+                continue
+            year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
+            out.add(f"{year:04d}-{mm_i:02d}-{dd_i:02d}")
     return out
 
 

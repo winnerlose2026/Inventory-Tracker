@@ -479,6 +479,202 @@ def api_production_ingest():
     return jsonify({"ok": True, "status": "ingested", "record": record})
 
 
+@app.route("/api/production/scan", methods=["POST"])
+def api_production_scan():
+    """Wide-lookback scan of mailbox(es) for Daily Production sheet emails.
+
+    Mirrors the existing /api/email/scan flow but routes recognized
+    Daily Production emails (sender = *@hhbagels.com, subject contains
+    "Daily Production") through the production PDF parser into
+    data/production.json instead of the on_order pipeline.
+
+    Body:
+      lookback_days  int   how far back to look (defaults to 365)
+      max_messages   int   per-mailbox cap on qualified messages
+                           (defaults to 200, hard cap 2000)
+      dry_run        bool  parse but don't persist
+
+    Returns {ok, scanned, ingested, parse_errors, records:[brief]}.
+    """
+    import base64
+    import traceback as _tb
+    from datetime import datetime, timezone, timedelta
+    try:
+        from integrations.email_scanner import (
+            EmailInboxClient, _distributor_from_sender, GRAPH_BASE,
+        )
+        from integrations.production_pdf_parser import parse_production_pdf
+        from inventory_tracker import load_production, save_production
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"import failed: {exc}",
+                        "traceback": _tb.format_exc()[-1500:]}), 500
+
+    body = request.json or {}
+    try:
+        lookback_days = int(body.get("lookback_days") or 365)
+    except (TypeError, ValueError):
+        lookback_days = 365
+    try:
+        max_messages = int(body.get("max_messages") or 200)
+    except (TypeError, ValueError):
+        max_messages = 200
+    max_messages = max(1, min(max_messages, 2000))
+    dry_run = bool(body.get("dry_run", False))
+
+    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    client = EmailInboxClient()
+    try:
+        token = client._ms365_token()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"ms365 token failed: {exc}"}), 500
+
+    import os, json as _json, urllib.parse, urllib.request, urllib.error
+    users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
+    folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
+
+    scanned = 0
+    qualifying_count = 0
+    ingested = 0
+    parse_errors = []
+    brief_records = []
+    existing = load_production()
+    seen_msg_ids = {r.get("source_message_id") for r in existing if r.get("source_message_id")}
+
+    for upn in users:
+        user = urllib.parse.quote(upn)
+        qs = urllib.parse.urlencode({
+            "$top": "100",
+            "$select": ("id,subject,from,toRecipients,receivedDateTime,"
+                        "hasAttachments,internetMessageId"),
+            "$filter": f"hasAttachments eq true and receivedDateTime ge {since_iso}",
+        })
+        next_url = f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages?{qs}"
+        pages = 0
+        per_mailbox = 0
+        while next_url and pages < 40 and per_mailbox < max_messages:
+            pages += 1
+            try:
+                raw, _ = client._graph_get(next_url, token)
+                page = _json.loads(raw.decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                parse_errors.append(f"{upn} page {pages}: {exc}")
+                break
+            for m in page.get("value", []):
+                scanned += 1
+                if per_mailbox >= max_messages:
+                    break
+                subject = m.get("subject") or ""
+                sender = (((m.get("from") or {}).get("emailAddress") or {})
+                          .get("address") or "")
+                # Production emails: sender on hhbagels.com + subject says
+                # "Daily Production" (case-flex)
+                dom = sender.split("@")[-1].lower() if "@" in sender else ""
+                if not (dom == "hhbagels.com" or dom.endswith(".hhbagels.com")):
+                    continue
+                if "daily production" not in subject.lower():
+                    continue
+                qualifying_count += 1
+                msg_id = m.get("internetMessageId") or m.get("id") or ""
+                if msg_id and msg_id in seen_msg_ids:
+                    continue  # already ingested
+                # Pull the attachments list
+                att_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments"
+                try:
+                    araw, _ = client._graph_get(att_url, token)
+                    apage = _json.loads(araw.decode("utf-8"))
+                except Exception as exc:  # noqa: BLE001
+                    parse_errors.append(f"{subject[:60]!r}: list-att failed: {exc}")
+                    continue
+                pdf_atts = [a for a in apage.get("value", [])
+                            if (a.get("name") or "").lower().endswith(".pdf")
+                            or (a.get("contentType") or "").lower() == "application/pdf"]
+                if not pdf_atts:
+                    continue
+                # Fetch + parse the first PDF attachment
+                a = pdf_atts[0]
+                acid = a.get("id")
+                fetch_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments/{acid}"
+                try:
+                    fraw, _ = client._graph_get(fetch_url, token)
+                    apayload = _json.loads(fraw.decode("utf-8"))
+                    pdf_bytes = base64.b64decode(apayload.get("contentBytes") or "")
+                except Exception as exc:  # noqa: BLE001
+                    parse_errors.append(f"{subject[:60]!r}: fetch-att failed: {exc}")
+                    continue
+                sheet = parse_production_pdf(pdf_bytes, subject=subject)
+                if sheet.error and not sheet.lines:
+                    parse_errors.append(f"{subject[:60]!r}: {sheet.error}")
+                    if dry_run:
+                        per_mailbox += 1
+                        continue
+                    # Persist a stub so the operator sees it in the UI
+                    record = {
+                        "production_date": "", "warehouse": "", "warehouse_raw": "",
+                        "distributor": "", "po_number": "", "lines": [],
+                        "total_cases": 0, "unmapped_varieties": [],
+                        "source_message_id": msg_id,
+                        "source_subject": subject, "source_sender": sender,
+                        "received_at": m.get("receivedDateTime") or "",
+                        "ingested_at": datetime.now().isoformat(),
+                        "parse_error": sheet.error,
+                    }
+                    existing.append(record)
+                    seen_msg_ids.add(msg_id)
+                    brief_records.append({"subject": subject, "po_number": "",
+                                          "warehouse": "", "total_cases": 0,
+                                          "parse_error": sheet.error})
+                    per_mailbox += 1
+                    continue
+                if dry_run:
+                    per_mailbox += 1
+                    continue
+                record = {
+                    "production_date":    sheet.production_date,
+                    "warehouse":          sheet.warehouse,
+                    "warehouse_raw":      sheet.warehouse_raw,
+                    "distributor":        sheet.distributor,
+                    "po_number":          sheet.po_number,
+                    "lines": [
+                        {"variety": L.variety, "raw_variety": L.raw_variety,
+                         "cs_count": L.cs_count, "lot_number": L.lot_number}
+                        for L in sheet.lines
+                    ],
+                    "total_cases":        sheet.total_cases,
+                    "unmapped_varieties": sheet.unmapped_varieties,
+                    "source_message_id":  msg_id,
+                    "source_subject":     subject,
+                    "source_sender":      sender,
+                    "received_at":        m.get("receivedDateTime") or "",
+                    "ingested_at":        datetime.now().isoformat(),
+                    "parse_error":        "",
+                }
+                existing.append(record)
+                seen_msg_ids.add(msg_id)
+                ingested += 1
+                brief_records.append({
+                    "subject": subject, "po_number": sheet.po_number,
+                    "warehouse": sheet.warehouse, "production_date": sheet.production_date,
+                    "total_cases": sheet.total_cases,
+                })
+                per_mailbox += 1
+            next_url = page.get("@odata.nextLink")
+
+    if not dry_run:
+        save_production(existing)
+
+    return jsonify({
+        "ok": True, "dry_run": dry_run,
+        "lookback_days": lookback_days, "mailboxes": users,
+        "messages_scanned": scanned,
+        "messages_qualifying": qualifying_count,
+        "ingested": ingested,
+        "parse_errors": parse_errors,
+        "records": brief_records,
+    })
+
+
 @app.route("/api/production/<source_message_id>", methods=["DELETE"])
 def api_production_delete(source_message_id):
     """Drop a production record by its source_message_id."""
