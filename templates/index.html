@@ -38,6 +38,13 @@
   .sidebar-logo { padding: 4px 22px 22px; border-bottom: 1px solid var(--border); margin-bottom: 12px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; }
   .sidebar-logo svg { width: 96px; height: auto; display: block; }
   .sidebar-logo .wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; line-height: 1; }
+    th.sortable { cursor: pointer; user-select: none; position: relative; }
+  th.sortable:hover { color: var(--accent); }
+  th.sortable .sort-ind { display: inline-block; width: 10px; text-align: center; color: var(--muted); font-size: 11px; }
+  th.sortable.sort-asc .sort-ind::after { content: '\25B2'; color: var(--accent); }
+  th.sortable.sort-desc .sort-ind::after { content: '\25BC'; color: var(--accent); }
+  .ship-date-input { width: 140px; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 12px; }
+  .btn-sm.active { background: var(--accent); color: white; }
   .nav-item { display: flex; align-items: center; gap: 10px; padding: 11px 22px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; font-weight: 500; }
   .nav-item:hover { color: var(--text); background: var(--surface2); }
   .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent2); font-weight: 600; }
@@ -162,6 +169,9 @@
       <div class="nav-item" onclick="showPage('inventory')">
         <span class="nav-icon">🗂️</span> Inventory
       </div>
+      <div class="nav-item" onclick="showPage('pending-pos')">
+        <span class="nav-icon">🚛</span> Pending POs
+      </div>
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
@@ -255,15 +265,15 @@
         </div>
         <table>
           <thead>
-            <tr>
-              <th>SKU / Name</th>
-              <th>Category</th>
-              <th>Distributor</th>
-              <th>Warehouse</th>
-              <th>Qty</th>
-              <th>On Order</th>
-              <th>Price</th>
-              <th>Status</th>
+            <tr id="inv-thead-row">
+              <th class="sortable" data-sort="name">SKU / Name <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="category">Category <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="distributor">Distributor <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="warehouse">Warehouse <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="quantity">Qty <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="on_order_qty">On Order <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="price">Price <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="status">Status <span class="sort-ind"></span></th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -273,6 +283,54 @@
     </div>
 
     <!-- Distributors -->
+    <!-- Pending POs -->
+    <div class="page" id="page-pending-pos">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Pending POs</h1>
+          <p class="subtitle" style="margin-bottom:0">Open purchase orders not yet rolled into inventory. Set a Ship Date to lock in arrival = ship + 7 days; that supersedes the default 30-day eta.</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost btn-sm" id="pending-filter-overdue" onclick="setPendingFilter('overdue')">Overdue</button>
+          <button class="btn btn-ghost btn-sm" id="pending-filter-noship" onclick="setPendingFilter('noship')">No ship date</button>
+          <button class="btn btn-ghost btn-sm active" id="pending-filter-all" onclick="setPendingFilter('all')">All</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group">
+            <label>Distributor</label>
+            <select id="pending-filter-distributor" onchange="renderPendingPOs()" style="width:180px">
+              <option value="">All</option>
+              <option>Cheney Brothers</option>
+              <option>US Foods</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Warehouse</label>
+            <select id="pending-filter-warehouse" onchange="renderPendingPOs()" style="width:200px">
+              <option value="">All</option>
+            </select>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr id="pending-thead-row">
+              <th class="sortable" data-sort="po_number">PO # <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="distributor">Distributor <span class="sort-ind"></span></th>
+              <th class="sortable" data-sort="warehouse">Warehouse <span class="sort-ind"></span></th>
+              <th>Items / cs</th>
+              <th class="sortable" data-sort="ordered_at">Ordered <span class="sort-ind"></span></th>
+              <th>Ship Date</th>
+              <th>Arrival</th>
+              <th class="sortable" data-sort="eta">30-day ETA <span class="sort-ind"></span></th>
+            </tr>
+          </thead>
+          <tbody id="pending-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="page" id="page-distributors">
       <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
         <div>
@@ -502,6 +560,7 @@ function refresh(page) {
   else if (page === 'usage') loadUsage();
   else if (page === 'distributors') loadDistributors();
   else if (page === 'report') loadReport();
+  else if (page === 'pending-pos') loadPendingPOs();
 }
 
 function distributorBadge(name) {
@@ -744,6 +803,24 @@ async function loadInventory() {
   }
   if (whFilter) {
     items = items.filter(i => (i.warehouse || '') === whFilter);
+  }
+  items = applyInvSort(items);
+  // Wire sort header clicks (idempotent — once is enough but cheap to repeat)
+  const invHead = document.getElementById('inv-thead-row');
+  if (invHead && !invHead.dataset.sortWired) {
+    invHead.querySelectorAll('th.sortable').forEach(th => {
+      th.addEventListener('click', () => onInvSortClick(th.dataset.sort));
+    });
+    invHead.dataset.sortWired = '1';
+  }
+  updateSortIndicators('inv-tbody');
+  // Same wiring for the pending-POs header (loaded on demand)
+  const pendHead = document.getElementById('pending-thead-row');
+  if (pendHead && !pendHead.dataset.sortWired) {
+    pendHead.querySelectorAll('th.sortable').forEach(th => {
+      th.addEventListener('click', () => onPendingSortClick(th.dataset.sort));
+    });
+    pendHead.dataset.sortWired = '1';
   }
   const tbody = document.getElementById('inv-tbody');
   if (items.length === 0) {
@@ -1285,6 +1362,200 @@ function renderOnOrder(item) {
   const tip = etaFormatted ? `next arrival ${etaFormatted}` : 'pending lead time';
   return `<span class="badge badge-blue" title="${escAttr(tip)}">+${qty.toFixed(0)}</span>`
        + (etaFormatted ? ` <span style="color:var(--muted);font-size:11px">${etaFormatted}</span>` : '');
+}
+
+// -------------------------------------------------------------------------
+// Column sort state for the inventory table.
+// Single source of truth: clicking a header toggles asc -> desc -> none.
+// -------------------------------------------------------------------------
+let invSortKey = null;
+let invSortDir = 0;   // 1 = asc, -1 = desc, 0 = none
+
+function _sortValue(item, key) {
+  if (key === 'status') {
+    if (item.quantity <= item.low_stock_threshold) return 0;
+    if (item.quantity <= item.low_stock_threshold * 1.5) return 1;
+    return 2;
+  }
+  const v = item[key];
+  if (v == null) return '';
+  if (typeof v === 'number') return v;
+  return String(v).toLowerCase();
+}
+
+function applyInvSort(items) {
+  if (!invSortKey || !invSortDir) return items.slice();
+  const key = invSortKey;
+  const dir = invSortDir;
+  return items.slice().sort((a, b) => {
+    const va = _sortValue(a, key);
+    const vb = _sortValue(b, key);
+    if (va < vb) return -1 * dir;
+    if (va > vb) return  1 * dir;
+    return 0;
+  });
+}
+
+function updateSortIndicators(tbodyId) {
+  // Walk the matching thead and set sort-asc / sort-desc classes.
+  const map = { 'inv-tbody': 'inv-thead-row', 'pending-tbody': 'pending-thead-row' };
+  const headRow = document.getElementById(map[tbodyId]);
+  if (!headRow) return;
+  const state = tbodyId === 'inv-tbody'
+    ? { key: invSortKey, dir: invSortDir }
+    : { key: pendingSortKey, dir: pendingSortDir };
+  headRow.querySelectorAll('th.sortable').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sort === state.key && state.dir === 1) th.classList.add('sort-asc');
+    else if (th.dataset.sort === state.key && state.dir === -1) th.classList.add('sort-desc');
+  });
+}
+
+function onInvSortClick(key) {
+  if (invSortKey !== key) { invSortKey = key; invSortDir = 1; }
+  else if (invSortDir === 1) invSortDir = -1;
+  else if (invSortDir === -1) { invSortKey = null; invSortDir = 0; }
+  else invSortDir = 1;
+  loadInventory();
+}
+
+// -------------------------------------------------------------------------
+// Pending POs page
+// -------------------------------------------------------------------------
+let pendingSortKey = 'ordered_at';
+let pendingSortDir = 1;        // earliest first by default
+let pendingFilterMode = 'all'; // 'all' | 'overdue' | 'noship'
+let pendingCache = [];          // flat list of {entry, item} pairs
+
+function setPendingFilter(mode) {
+  pendingFilterMode = mode;
+  ['all', 'overdue', 'noship'].forEach(m => {
+    const btn = document.getElementById('pending-filter-' + m);
+    if (btn) btn.classList.toggle('active', m === mode);
+  });
+  renderPendingPOs();
+}
+
+function onPendingSortClick(key) {
+  if (pendingSortKey !== key) { pendingSortKey = key; pendingSortDir = 1; }
+  else if (pendingSortDir === 1) pendingSortDir = -1;
+  else if (pendingSortDir === -1) { pendingSortKey = null; pendingSortDir = 0; }
+  else pendingSortDir = 1;
+  renderPendingPOs();
+}
+
+async function loadPendingPOs() {
+  await ensureWarehouses();
+  // Populate warehouse filter dropdown
+  const wSel = document.getElementById('pending-filter-warehouse');
+  if (wSel.options.length <= 1) {
+    populateWarehouseSelect(wSel, '', '', true);
+  }
+  const items = await api('/api/inventory');
+  const pairs = [];
+  items.forEach(item => {
+    (item.on_order || []).forEach(entry => {
+      pairs.push({ item, entry });
+    });
+  });
+  pendingCache = pairs;
+  renderPendingPOs();
+}
+
+function _pendingSortValue(pair, key) {
+  if (key === 'po_number')   return (pair.entry.po_number || '').toLowerCase();
+  if (key === 'distributor') return (pair.item.distributor || '').toLowerCase();
+  if (key === 'warehouse')   return (pair.item.warehouse || '').toLowerCase();
+  if (key === 'ordered_at')  return (pair.entry.ordered_at || '');
+  if (key === 'eta')         return (pair.entry.eta || '');
+  return '';
+}
+
+function renderPendingPOs() {
+  const tbody = document.getElementById('pending-tbody');
+  if (!tbody) return;
+  let pairs = pendingCache.slice();
+
+  // Filter UI
+  const distF = document.getElementById('pending-filter-distributor').value;
+  const whF   = document.getElementById('pending-filter-warehouse').value;
+  if (distF) pairs = pairs.filter(p => (p.item.distributor || '') === distF);
+  if (whF)   pairs = pairs.filter(p => (p.item.warehouse  || '') === whF);
+  if (pendingFilterMode === 'overdue') {
+    const now = new Date();
+    pairs = pairs.filter(p => {
+      const trigger = p.entry.arrival_date || p.entry.eta;
+      return trigger && new Date(trigger) < now;
+    });
+  } else if (pendingFilterMode === 'noship') {
+    pairs = pairs.filter(p => !p.entry.ship_date);
+  }
+
+  // Sort
+  if (pendingSortKey && pendingSortDir) {
+    const k = pendingSortKey;
+    const d = pendingSortDir;
+    pairs.sort((a, b) => {
+      const va = _pendingSortValue(a, k);
+      const vb = _pendingSortValue(b, k);
+      if (va < vb) return -1 * d;
+      if (va > vb) return  1 * d;
+      return 0;
+    });
+  }
+
+  if (pairs.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No pending POs match this filter.</td></tr>';
+    updateSortIndicators('pending-tbody');
+    return;
+  }
+
+  // Group by po_number for the Items/cs aggregation column
+  tbody.innerHTML = pairs.map(p => {
+    const e = p.entry;
+    const i = p.item;
+    const shipISO = (e.ship_date || '').slice(0, 10);
+    const arrival = e.arrival_date ? formatDate(e.arrival_date) : '<span style="color:var(--muted)">—</span>';
+    const eta = e.eta ? formatDate(e.eta) : '<span style="color:var(--muted)">—</span>';
+    const overdue = (e.arrival_date || e.eta) && new Date(e.arrival_date || e.eta) < new Date();
+    return `<tr${overdue ? ' style="background:var(--surface2)"' : ''}>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(e.po_number || '—')}</td>
+      <td>${distributorBadge(i.distributor)}</td>
+      <td>${escHtml(i.warehouse || '')}</td>
+      <td>
+        <div style="font-weight:600;font-size:12px">${escHtml(i.name)}</div>
+        <div style="color:var(--muted);font-size:11px">${(e.qty || 0).toFixed(0)} ${escHtml(e.unit || 'cs')}</div>
+      </td>
+      <td style="white-space:nowrap">${formatDate(e.ordered_at)}</td>
+      <td>
+        <input type="date" class="ship-date-input"
+               value="${escAttr(shipISO)}"
+               onchange="onShipDateChange('${escAttr(e.po_number || '')}', this.value)" />
+      </td>
+      <td style="white-space:nowrap">${arrival}</td>
+      <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
+    </tr>`;
+  }).join('');
+  updateSortIndicators('pending-tbody');
+}
+
+async function onShipDateChange(poNumber, shipDate) {
+  if (!poNumber) return;
+  try {
+    const r = await api('/api/on-order/ship-date', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ po_number: poNumber, ship_date: shipDate || null }),
+    });
+    if (r && r.ok) {
+      toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})`);
+      loadPendingPOs();
+    } else {
+      toast('Failed to update ship date', 'error');
+    }
+  } catch (exc) {
+    toast('Error: ' + exc.message, 'error');
+  }
 }
 
 // -------------------------------------------------------------------------
