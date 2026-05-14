@@ -106,6 +106,10 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     # production destined to Cheney's Ocala DC — per JD, route it there.
     "JACKSON VILLE":         ("Ocala, FL",              "Cheney Brothers"),
     "JACKSONVILLE":          ("Ocala, FL",              "Cheney Brothers"),
+    # Common typos seen on hand-keyed sheets — route them like the
+    # correctly-spelled originals so the operator doesn't have to.
+    "MNASSAS":               ("Manassas, VA",           "US Foods"),
+    "CWFLL":                 ("Chefs Warehouse, FL",    "Chefs Warehouse"),
 }
 
 
