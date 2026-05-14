@@ -292,30 +292,60 @@ _DIGIT_RUN_RE = re.compile(r"\d{10,}")
 def _dates_from_lot_numbers(text: str) -> set:
     """Return the set of ISO production dates encoded in lot numbers.
 
-    Lot format observed: ``<4-digit item_code><MMDDYY>``, e.g. 1184050726
-    means item 1184 produced 05/07/26. We can't rely on a single regex
-    because the slash-format production date is sometimes GLUED onto the
-    last lot in the same digit run (CWFL renders as 11580511265/11/2026,
-    where the lot 1158051126 ends at the 10th char and the date "5/11"
-    begins immediately). So instead we scan every digit run of 10+
-    characters and check each 10-digit window for a valid trailing
-    MMDDYY.
+    H&H lot format = ``<4-digit item_code><date>``. The date is rendered
+    one of two ways depending on which template version produced the
+    sheet:
+
+      * Current format: ``MMDDYYYY`` (8 digits) -> total lot is 12 chars.
+        e.g. 115005142026 = item 1150, produced 05/14/2026.
+      * Legacy format:   ``MMDDYY``   (6 digits) -> total lot is 10 chars.
+        e.g. 1184050726 = item 1184, produced 05/07/26.
+
+    Both formats can end up adjacent to other digits in the pypdf text
+    extraction (the slash production_date "5/11/2026" sometimes glues
+    onto the last lot in the same run). So we slide every plausible
+    window over each digit run, prefer the 12-digit interpretation when
+    its year column reads 19xx or 20xx, and fall back to 10-digit when
+    that fails.
     """
     out = set()
     for m in _DIGIT_RUN_RE.finditer(text):
         run = m.group(0)
-        # Slide a 10-char window across the run and try each as <item><date>
-        for i in range(0, len(run) - 9):
-            window = run[i:i+10]
-            mm, dd, yy = window[4:6], window[6:8], window[8:10]
+        run_hits: set[str] = set()
+        # First pass: 12-char windows as <item><MMDDYYYY>. Accept only if
+        # the year column is a plausible 19xx / 20xx so we don't false-
+        # positive on runs that happen to be 12+ digits long for other
+        # reasons.
+        for i in range(0, len(run) - 11):
+            window = run[i:i+12]
+            mm, dd, yyyy = window[4:6], window[6:8], window[8:12]
             try:
-                mm_i, dd_i, yy_i = int(mm), int(dd), int(yy)
+                mm_i, dd_i, yyyy_i = int(mm), int(dd), int(yyyy)
             except ValueError:
                 continue
             if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
                 continue
-            year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
-            out.add(f"{year:04d}-{mm_i:02d}-{dd_i:02d}")
+            if not (1900 <= yyyy_i <= 2099):
+                continue
+            run_hits.add(f"{yyyy_i:04d}-{mm_i:02d}-{dd_i:02d}")
+        # Second pass (legacy MMDDYY) ONLY when the 12-digit pass found
+        # nothing in this run — prevents a 12-digit MMDDYYYY lot from
+        # being double-counted as a false 10-digit MMDDYY (e.g.
+        # 115005142026 would otherwise produce both 2026-05-14 AND a
+        # spurious 2020-05-14 by reading positions 0-9).
+        if not run_hits:
+            for i in range(0, len(run) - 9):
+                window = run[i:i+10]
+                mm, dd, yy = window[4:6], window[6:8], window[8:10]
+                try:
+                    mm_i, dd_i, yy_i = int(mm), int(dd), int(yy)
+                except ValueError:
+                    continue
+                if not (1 <= mm_i <= 12 and 1 <= dd_i <= 31):
+                    continue
+                year = 2000 + yy_i if yy_i < 70 else 1900 + yy_i
+                run_hits.add(f"{year:04d}-{mm_i:02d}-{dd_i:02d}")
+        out |= run_hits
     return out
 
 
