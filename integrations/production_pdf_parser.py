@@ -178,7 +178,15 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
         if canonical:
             sheet.warehouse, sheet.distributor = canonical
         else:
-            sheet.warehouse = sheet.warehouse_raw
+            # Fallback: any "CW<STATE>" code is Chefs Warehouse <STATE>.
+            # Lets us handle new Chefs Warehouse regions (CWDC, CWTX, ...)
+            # without an explicit entry in _WAREHOUSE_TO_CANONICAL.
+            cw_match = re.match(r"^CW([A-Z]{2})$", sheet.warehouse_raw.upper())
+            if cw_match:
+                sheet.warehouse = f"Chefs Warehouse, {cw_match.group(1)}"
+                sheet.distributor = "Chefs Warehouse"
+            else:
+                sheet.warehouse = sheet.warehouse_raw
 
     # Production date — prefer a slash-format MM/DD/YYYY anywhere in the
     # document (Riviera Beach / Punta Gorda / CWNY style). Fall back to
