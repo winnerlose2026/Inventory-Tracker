@@ -687,10 +687,11 @@ class EmailInboxClient:
                 if filt and "hasAttachments" in filt:
                     sender = (((m.get("from") or {}).get("emailAddress") or {})
                               .get("address") or "")
-                    domain = sender.lower().split("@")[-1] if "@" in sender else ""
-                    if domain not in DOMAIN_TO_DISTRIBUTOR:
-                        # Not from a known PO sender — skip the MIME fetch
-                        # entirely. Costs roughly 0.1s vs. ~2-3s per MIME.
+                    # Use the same subdomain-aware match as the rest of
+                    # the scanner — Cheney/USF mail occasionally arrives
+                    # from a subdomain (mail.cheneybrothers.com, etc.) and
+                    # an exact-domain check would silently drop them.
+                    if _distributor_from_sender(f"<{sender}>") is None:
                         continue
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
                 try:
