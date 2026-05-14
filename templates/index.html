@@ -154,6 +154,7 @@
 </style>
 </head>
 <body>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <div class="app">
 
   <!-- Sidebar -->
@@ -491,6 +492,25 @@
           </div>
           <div style="padding:6px 20px 16px 20px" id="chart-restocked"></div>
         </div>
+      </div>
+
+      <!-- Production volume + $PLH ($/labor hour) -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span class="card-title">💵 Production $PLH · revenue per labor hour</span>
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm active" id="plh-grain-week" onclick="setPlhGrain('week')">4 Weeks</button>
+            <button class="btn btn-ghost btn-sm" id="plh-grain-month" onclick="setPlhGrain('month')">Quarter (months)</button>
+            <button class="btn btn-ghost btn-sm" id="plh-grain-quarter" onclick="setPlhGrain('quarter')">Year (quarters)</button>
+          </div>
+        </div>
+        <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
+          Bars = cs produced. Line = $PLH (revenue / labor hours). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
+        </div>
+        <div style="padding:8px 20px 16px 20px">
+          <canvas id="plh-chart" height="260" style="max-height:280px"></canvas>
+        </div>
+        <div id="plh-summary" style="padding:0 20px 16px 20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px"></div>
       </div>
 
       <!-- Variety ranking by location (production-based) -->
@@ -1319,6 +1339,7 @@ async function loadReport() {
   renderRestockedByVarietyLocation();
 
   renderVarietyRanking();
+  loadPlhChart();
 }
 
 // ---- Top Restocked: variety × location, weekly/monthly --------------------
@@ -1346,6 +1367,138 @@ function _restockWindow() {
   const start = new Date(now.getFullYear(), now.getMonth(), 1);
   const end   = new Date(now.getFullYear(), now.getMonth() + 1, 0);
   return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
+}
+
+let plhGrain = 'week';   // 'week' | 'month' | 'quarter'
+let plhChart = null;
+
+function setPlhGrain(g) {
+  plhGrain = g;
+  ['week','month','quarter'].forEach(m => {
+    const btn = document.getElementById('plh-grain-' + m);
+    if (btn) btn.classList.toggle('active', m === g);
+  });
+  loadPlhChart();
+}
+
+async function loadPlhChart() {
+  const data = await api('/api/report/plh?grain=' + encodeURIComponent(plhGrain));
+  renderPlhChart(data);
+  renderPlhSummary(data);
+}
+
+function _fmtUSD(n) {
+  return new Intl.NumberFormat('en-US',
+    { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n || 0);
+}
+function _fmtUSDFine(n) {
+  return new Intl.NumberFormat('en-US',
+    { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n || 0);
+}
+
+function renderPlhChart(data) {
+  const canvas = document.getElementById('plh-chart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const buckets = data.buckets || [];
+  const labels    = buckets.map(b => b.label || b.key);
+  const csSeries  = buckets.map(b => b.total_cs || 0);
+  const plhSeries = buckets.map(b => b.plh == null ? null : Math.round(b.plh * 100) / 100);
+
+  if (plhChart) { plhChart.destroy(); plhChart = null; }
+  plhChart = new Chart(canvas.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'Cases produced',
+          data: csSeries,
+          backgroundColor: 'rgba(34, 197, 94, 0.35)',
+          borderColor:     'rgba(22, 163, 74, 0.9)',
+          borderWidth: 1,
+          yAxisID: 'y',
+        },
+        {
+          type: 'line',
+          label: '$ per labor hour',
+          data: plhSeries,
+          borderColor: 'rgba(220, 38, 38, 0.95)',
+          backgroundColor: 'rgba(220, 38, 38, 0.15)',
+          tension: 0.25,
+          pointRadius: 4,
+          yAxisID: 'y1',
+          spanGaps: true,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: {
+          beginAtZero: true,
+          title: { display: true, text: 'Cases produced' },
+        },
+        y1: {
+          beginAtZero: true,
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: '$ / labor hour' },
+          ticks: {
+            callback: v => '$' + Number(v).toFixed(0),
+          },
+        },
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            afterBody(ctx) {
+              const i = ctx[0].dataIndex;
+              const b = buckets[i] || {};
+              const lines = [];
+              lines.push(`Revenue: ${_fmtUSD(b.revenue_dollars)}`);
+              if (b.labor_hours) {
+                lines.push(`Labor: ${(b.labor_hours).toFixed(1)} hrs · ${_fmtUSD(b.labor_dollars)}` +
+                  (b.labor_dollars_imputed ? ' (imputed @$17/hr)' : ''));
+                lines.push(`$PLH: ${_fmtUSDFine(b.plh)} per labor hour`);
+              } else {
+                lines.push('Labor: no data for this period');
+              }
+              return lines;
+            },
+          },
+        },
+        legend: { position: 'top', labels: { boxWidth: 16 } },
+      },
+    },
+  });
+}
+
+function renderPlhSummary(data) {
+  const wrap = document.getElementById('plh-summary');
+  if (!wrap) return;
+  const buckets = data.buckets || [];
+  const total = buckets.reduce((acc, b) => {
+    acc.cs += (b.total_cs || 0);
+    acc.rev += (b.revenue_dollars || 0);
+    acc.hrs += (b.labor_hours || 0);
+    acc.cost += (b.labor_dollars || 0);
+    return acc;
+  }, { cs: 0, rev: 0, hrs: 0, cost: 0 });
+  const plh = total.hrs ? total.rev / total.hrs : null;
+  const cards = [
+    { label: 'Total cases',    value: total.cs.toLocaleString() },
+    { label: 'Revenue (est.)', value: _fmtUSD(total.rev) },
+    { label: 'Labor hours',    value: total.hrs.toFixed(1) },
+    { label: 'Labor cost',     value: _fmtUSD(total.cost) },
+    { label: '$PLH (avg)',     value: plh == null ? '—' : _fmtUSDFine(plh) },
+  ];
+  wrap.innerHTML = cards.map(c => `
+    <div class="card" style="padding:12px 14px">
+      <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">${escHtml(c.label)}</div>
+      <div style="font-size:22px;font-weight:700">${escHtml(c.value)}</div>
+    </div>`).join('');
 }
 
 function renderRestockedByVarietyLocation() {
