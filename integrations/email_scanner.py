@@ -676,7 +676,6 @@ class EmailInboxClient:
                 mid = m.get("id")
                 if not mid:
                     continue
-                fetched += 1
                 result.messages_seen += 1
                 # When the filter is restricting to a wide attachment-bearing
                 # backfill, pre-qualify by sender domain so we don't burn
@@ -684,6 +683,14 @@ class EmailInboxClient:
                 # attachment in the mailbox (invoices, statements, etc.).
                 # The metadata $select already includes `from`, so this is a
                 # free check against an already-fetched field.
+                #
+                # Crucially: when the pre-qualifier rejects a message we
+                # `continue` BEFORE incrementing `fetched`, so max_messages
+                # bounds the count of QUALIFIED (MIME-fetched) messages
+                # rather than the count of pages scanned. That lets a
+                # wide-lookback backfill page deeper through Graph to find
+                # older PO mail without ballooning gunicorn budget on
+                # non-PO attachments.
                 if filt and "hasAttachments" in filt:
                     sender = (((m.get("from") or {}).get("emailAddress") or {})
                               .get("address") or "")
@@ -693,6 +700,7 @@ class EmailInboxClient:
                     # an exact-domain check would silently drop them.
                     if _distributor_from_sender(f"<{sender}>") is None:
                         continue
+                fetched += 1
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
