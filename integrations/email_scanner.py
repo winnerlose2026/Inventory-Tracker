@@ -678,6 +678,20 @@ class EmailInboxClient:
                     continue
                 fetched += 1
                 result.messages_seen += 1
+                # When the filter is restricting to a wide attachment-bearing
+                # backfill, pre-qualify by sender domain so we don't burn
+                # gunicorn's worker budget downloading MIME for every PDF
+                # attachment in the mailbox (invoices, statements, etc.).
+                # The metadata $select already includes `from`, so this is a
+                # free check against an already-fetched field.
+                if filt and "hasAttachments" in filt:
+                    sender = (((m.get("from") or {}).get("emailAddress") or {})
+                              .get("address") or "")
+                    domain = sender.lower().split("@")[-1] if "@" in sender else ""
+                    if domain not in DOMAIN_TO_DISTRIBUTOR:
+                        # Not from a known PO sender — skip the MIME fetch
+                        # entirely. Costs roughly 0.1s vs. ~2-3s per MIME.
+                        continue
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
