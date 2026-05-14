@@ -482,8 +482,14 @@
           <div style="padding:16px 20px" id="chart-consumed"></div>
         </div>
         <div class="card">
-          <div class="card-header"><span class="card-title">📥 Top Restocked</span></div>
-          <div style="padding:16px 20px" id="chart-restocked"></div>
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <span class="card-title">📥 Top Restocked · by Variety × Location</span>
+            <div class="btn-group">
+              <button class="btn btn-ghost btn-sm active" id="restock-period-week" onclick="setRestockPeriod('week')">Weekly</button>
+              <button class="btn btn-ghost btn-sm" id="restock-period-month" onclick="setRestockPeriod('month')">Monthly</button>
+            </div>
+          </div>
+          <div style="padding:6px 20px 16px 20px" id="chart-restocked"></div>
         </div>
       </div>
 
@@ -1308,9 +1314,98 @@ async function loadReport() {
   }
 
   renderChart('chart-consumed', report.top_consumed, 'var(--red)');
-  renderChart('chart-restocked', report.top_restocked, 'var(--green)');
+  // Top Restocked is now a variety × location view powered by the same
+  // production-records cache as the ranking section below.
+  renderRestockedByVarietyLocation();
 
   renderVarietyRanking();
+}
+
+// ---- Top Restocked: variety × location, weekly/monthly --------------------
+let restockPeriod = 'week';   // 'week' | 'month'
+
+function setRestockPeriod(p) {
+  restockPeriod = p;
+  ['week','month'].forEach(m => {
+    const btn = document.getElementById('restock-period-' + m);
+    if (btn) btn.classList.toggle('active', m === p);
+  });
+  renderRestockedByVarietyLocation();
+}
+
+function _restockWindow() {
+  const now = new Date();
+  if (restockPeriod === 'week') {
+    const day = now.getDay() || 7;
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (day - 1));
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    return [monday.toISOString().slice(0, 10), sunday.toISOString().slice(0, 10)];
+  }
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const end   = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
+}
+
+function renderRestockedByVarietyLocation() {
+  const el = document.getElementById('chart-restocked');
+  if (!el) return;
+
+  const [since, until] = _restockWindow();
+  // Filter production records to the window
+  const records = (vrankProdCache || []).filter(r => {
+    const d = (r.production_date || '').slice(0, 10);
+    if (!d) return false;
+    if (since && d < since) return false;
+    if (until && d > until) return false;
+    return true;
+  });
+
+  if (records.length === 0) {
+    el.innerHTML = '<div class="empty">No restocks logged in this window.</div>';
+    return;
+  }
+
+  // Variety -> { total, byWarehouse: {warehouse: cs} }
+  const byVariety = {};
+  records.forEach(r => {
+    const wh = r.warehouse || r.warehouse_raw || 'Unassigned';
+    (r.lines || []).forEach(L => {
+      const v = L.variety || L.raw_variety || 'Unknown';
+      const cs = Number(L.cs_count) || 0;
+      const slot = byVariety[v] = byVariety[v] || { variety: v, total: 0, byWh: {} };
+      slot.total += cs;
+      slot.byWh[wh] = (slot.byWh[wh] || 0) + cs;
+    });
+  });
+
+  // Sort varieties by total cs descending
+  const sorted = Object.values(byVariety).sort((a, b) => b.total - a.total);
+  const overallMax = sorted.length ? sorted[0].total : 1;
+
+  el.innerHTML = sorted.map(v => {
+    // Top 4 warehouses inline, then "+N more"
+    const sortedWh = Object.entries(v.byWh).sort((a, b) => b[1] - a[1]);
+    const head = sortedWh.slice(0, 4).map(([w, n]) =>
+      `<span style="white-space:nowrap">${escHtml(w)}&nbsp;<span style="color:var(--muted)">${n}</span></span>`
+    ).join(' · ');
+    const more = sortedWh.length > 4 ? ` · <span style="color:var(--muted)">+${sortedWh.length - 4} more</span>` : '';
+    const barPct = Math.round((v.total / overallMax) * 100);
+    return `<div class="chart-bar-row" style="align-items:flex-start;gap:12px;padding:6px 0">
+      <div class="chart-bar-label" title="${escHtml(v.variety)}" style="min-width:140px">
+        <div style="font-weight:600">${escHtml(v.variety)}</div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px">${sortedWh.length} location${sortedWh.length === 1 ? '' : 's'}</div>
+      </div>
+      <div style="flex:1;min-width:120px">
+        <div class="chart-bar-track">
+          <div class="chart-bar-fill" style="width:${barPct}%;background:var(--green)"></div>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">${head}${more}</div>
+      </div>
+      <div class="chart-bar-val">${v.total.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></div>
+    </div>`;
+  }).join('');
 }
 
 function _vrankWindow() {
