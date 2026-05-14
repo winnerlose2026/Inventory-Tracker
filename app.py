@@ -174,6 +174,39 @@ def api_remove(name):
     return jsonify({"ok": True})
 
 
+@app.route("/api/admin/remove-po", methods=["POST"])
+def api_admin_remove_po():
+    """Drop all pending on_order entries matching a po_number.
+
+    Used to manually retire a PO whose source email has been deleted or
+    archived (so the auto-supersede via re-scan can't reach it). The
+    operation does NOT touch already-rolled-over quantity or usage
+    entries — only items still sitting in item["on_order"].
+    """
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    from inventory_tracker import load_inventory, save_inventory
+    inv = load_inventory()
+    removed = 0
+    affected = []
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        kept = [e for e in pending if (e.get("po_number") or "") != po_number]
+        if len(kept) != len(pending):
+            removed += len(pending) - len(kept)
+            affected.append(item.get("name", key))
+        item["on_order"] = kept
+    save_inventory(inv)
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "removed_entries": removed,
+        "affected_items": affected,
+    })
+
+
 # ---------------------------------------------------------------------------
 # API – Usage
 # ---------------------------------------------------------------------------
