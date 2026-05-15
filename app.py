@@ -453,6 +453,10 @@ def api_report_toast_sales():
     except (TypeError, ValueError):
         top_n = 10
     location_q = (args.get("location") or "").strip()
+    # Anchor date — newest bucket returned is the one containing this
+    # date (defaults to today, i.e. "newest bucket overall"). Used by
+    # the Report page Prev/Next + calendar nav.
+    end_date_q = (args.get("end_date") or "").strip()
 
     rows = load_sales() or []
 
@@ -502,9 +506,23 @@ def api_report_toast_sales():
         agg["gross"] += float(r.get("gross") or 0)
         agg["net"]   += float(r.get("net") or 0)
 
-    # Take the newest N buckets, sort items by gross desc, attach mix %.
+    # Take the newest N buckets (anchored to end_date if given), sort
+    # items by gross desc, attach mix %.
+    bucket_keys = sorted(buckets_map.keys(), reverse=True)
+    if end_date_q:
+        # The bucket key for end_date_q is the Monday of its week (or
+        # YYYY-MM for month). Filter to buckets whose key is <= that.
+        try:
+            ed = _dt.strptime(end_date_q, "%Y-%m-%d")
+            if period == "week":
+                anchor = (ed - _td(days=ed.weekday())).strftime("%Y-%m-%d")
+            else:
+                anchor = ed.strftime("%Y-%m")
+            bucket_keys = [k for k in bucket_keys if k <= anchor]
+        except ValueError:
+            pass
     out_buckets = []
-    for bk in sorted(buckets_map.keys(), reverse=True)[:buckets]:
+    for bk in bucket_keys[:buckets]:
         items = list(buckets_map[bk].values())
         items.sort(key=lambda x: x["gross"], reverse=True)
         total = sum(x["gross"] for x in items) or 1

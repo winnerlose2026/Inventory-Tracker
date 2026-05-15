@@ -591,6 +591,10 @@
               <select id="toast-sales-location" onchange="loadToastSales()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
                 <option value="">All locations</option>
               </select>
+              <button class="btn btn-ghost btn-sm" id="toast-sales-prev" onclick="shiftToastSalesOffset(-1)" title="Older period">&laquo;</button>
+              <input type="date" id="toast-sales-date" onchange="onToastSalesDateChange()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px" />
+              <button class="btn btn-ghost btn-sm" id="toast-sales-next" onclick="shiftToastSalesOffset(1)"  title="Newer period">&raquo;</button>
+              <button class="btn btn-ghost btn-sm" id="toast-sales-today" onclick="resetToastSalesOffset()" title="Jump to current period">Today</button>
               <div class="btn-group">
                 <button class="btn btn-ghost btn-sm active" id="toast-sales-period-week" onclick="setToastSalesPeriod('week')">Weekly</button>
                 <button class="btn btn-ghost btn-sm" id="toast-sales-period-month" onclick="setToastSalesPeriod('month')">Monthly</button>
@@ -605,13 +609,20 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-            <span class="card-title">📥 Top Restocked · by Variety × Location</span>
-            <div class="btn-group">
-              <button class="btn btn-ghost btn-sm active" id="restock-period-week" onclick="setRestockPeriod('week')">Weekly</button>
-              <button class="btn btn-ghost btn-sm" id="restock-period-month" onclick="setRestockPeriod('month')">Monthly</button>
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="card-title">📥 Top Reordered &middot; by Variety &times; Location</span>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-ghost btn-sm" id="restock-prev"  onclick="shiftRestockOffset(-1)" title="Previous period">&laquo;</button>
+              <input type="date" id="restock-ref-date" onchange="onRestockRefDateChange()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px" />
+              <button class="btn btn-ghost btn-sm" id="restock-next"  onclick="shiftRestockOffset(1)"  title="Next period">&raquo;</button>
+              <button class="btn btn-ghost btn-sm" id="restock-today" onclick="resetRestockOffset()"   title="Jump to current period">Today</button>
+              <div class="btn-group">
+                <button class="btn btn-ghost btn-sm active" id="restock-period-week" onclick="setRestockPeriod('week')">Weekly</button>
+                <button class="btn btn-ghost btn-sm" id="restock-period-month" onclick="setRestockPeriod('month')">Monthly</button>
+              </div>
             </div>
           </div>
+          <div style="padding:4px 20px;color:var(--muted);font-size:12px" id="restock-range-label"></div>
           <div style="padding:6px 20px 16px 20px" id="chart-restocked"></div>
         </div>
       </div>
@@ -1651,27 +1662,65 @@ async function loadReport() {
 // ---- Top Restocked: variety × location, weekly/monthly --------------------
 let restockPeriod = 'week';   // 'week' | 'month'
 
+let restockRefDate = null;   // anchor date (string YYYY-MM-DD); null = today
+
 function setRestockPeriod(p) {
   restockPeriod = p;
   ['week','month'].forEach(m => {
     const btn = document.getElementById('restock-period-' + m);
     if (btn) btn.classList.toggle('active', m === p);
   });
+  // Snap the date picker to the current window's anchor so the user
+  // sees the active period reflected on the input itself.
+  _restockSyncDateInput();
   renderRestockedByVarietyLocation();
+}
+function _restockRef() {
+  if (restockRefDate) return new Date(restockRefDate + 'T00:00:00');
+  return new Date();
+}
+function _restockSyncDateInput() {
+  const inp = document.getElementById('restock-ref-date');
+  if (!inp) return;
+  const [since] = _restockWindow();
+  inp.value = since;
+}
+function shiftRestockOffset(delta) {
+  const ref = _restockRef();
+  if (restockPeriod === 'week') {
+    ref.setDate(ref.getDate() + 7 * delta);
+  } else {
+    ref.setMonth(ref.getMonth() + delta);
+  }
+  restockRefDate = ref.toISOString().slice(0, 10);
+  _restockSyncDateInput();
+  renderRestockedByVarietyLocation();
+}
+function resetRestockOffset() {
+  restockRefDate = null;
+  _restockSyncDateInput();
+  renderRestockedByVarietyLocation();
+}
+function onRestockRefDateChange() {
+  const v = document.getElementById('restock-ref-date').value;
+  if (v) {
+    restockRefDate = v;
+    renderRestockedByVarietyLocation();
+  }
 }
 
 function _restockWindow() {
-  const now = new Date();
+  const ref = _restockRef();
   if (restockPeriod === 'week') {
-    const day = now.getDay() || 7;
-    const monday = new Date(now);
-    monday.setDate(now.getDate() - (day - 1));
+    const day = ref.getDay() || 7;
+    const monday = new Date(ref);
+    monday.setDate(ref.getDate() - (day - 1));
     const sunday = new Date(monday);
     sunday.setDate(monday.getDate() + 6);
     return [monday.toISOString().slice(0, 10), sunday.toISOString().slice(0, 10)];
   }
-  const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  const end   = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  const start = new Date(ref.getFullYear(), ref.getMonth(), 1);
+  const end   = new Date(ref.getFullYear(), ref.getMonth() + 1, 0);
   return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
 }
 
@@ -1812,6 +1861,12 @@ function renderRestockedByVarietyLocation() {
   if (!el) return;
 
   const [since, until] = _restockWindow();
+  const lbl = document.getElementById('restock-range-label');
+  if (lbl) {
+    lbl.textContent = (restockPeriod === 'month')
+      ? `Showing ${formatDate(since)} \u2013 ${formatDate(until)} (one month)`
+      : `Showing ${formatDate(since)} \u2013 ${formatDate(until)} (one week)`;
+  }
   // Filter production records to the window
   const records = (vrankProdCache || []).filter(r => {
     const d = (r.production_date || '').slice(0, 10);
@@ -3102,6 +3157,7 @@ function renderTraceResults() {
 // -------------------------------------------------------------------------
 let toastSalesPeriod = 'week';
 let _toastSalesLocationsLoaded = false;
+let toastSalesAnchor = null;   // string YYYY-MM-DD, null = today
 function setToastSalesPeriod(p) {
   toastSalesPeriod = p;
   ['week','month'].forEach(m => {
@@ -3109,6 +3165,31 @@ function setToastSalesPeriod(p) {
     if (b) b.classList.toggle('active', m === p);
   });
   loadToastSales();
+}
+function _toastSalesRef() {
+  return toastSalesAnchor ? new Date(toastSalesAnchor + 'T00:00:00') : new Date();
+}
+function shiftToastSalesOffset(delta) {
+  const d = _toastSalesRef();
+  if (toastSalesPeriod === 'week') d.setDate(d.getDate() + 7 * delta);
+  else d.setMonth(d.getMonth() + delta);
+  toastSalesAnchor = d.toISOString().slice(0, 10);
+  const inp = document.getElementById('toast-sales-date');
+  if (inp) inp.value = toastSalesAnchor;
+  loadToastSales();
+}
+function resetToastSalesOffset() {
+  toastSalesAnchor = null;
+  const inp = document.getElementById('toast-sales-date');
+  if (inp) inp.value = new Date().toISOString().slice(0, 10);
+  loadToastSales();
+}
+function onToastSalesDateChange() {
+  const v = document.getElementById('toast-sales-date').value;
+  if (v) {
+    toastSalesAnchor = v;
+    loadToastSales();
+  }
 }
 async function ensureToastLocationDropdown() {
   if (_toastSalesLocationsLoaded) return;
@@ -3130,6 +3211,7 @@ async function loadToastSales() {
   const qs = new URLSearchParams();
   qs.set('period', toastSalesPeriod);
   if (loc) qs.set('location', loc);
+  if (toastSalesAnchor) qs.set('end_date', toastSalesAnchor);
   const subtitle = document.getElementById('toast-sales-subtitle');
   if (subtitle) subtitle.textContent =
     `Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${toastSalesPeriod}.`;
