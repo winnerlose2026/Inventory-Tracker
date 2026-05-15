@@ -97,6 +97,15 @@ _VARIETY_ALIASES: dict[str, str] = {
     "PARB-WW EVERYTHING":        "Whole Wheat Everything",
     "PARB-WHOLEWHEAT":           "Whole Wheat",
     "PARB-WHOLEWHEAT EVERYTHING":"Whole Wheat Everything",
+    "PARB-WW-ET":                "Whole Wheat Everything",
+    "PARB-WW ET":                "Whole Wheat Everything",
+    "WW-ET":                     "Whole Wheat Everything",
+    "WW ET":                     "Whole Wheat Everything",
+    # Common typos
+    "EVERYTTHING":               "Everything",
+    "EVERYTING":                 "Everything",
+    "EVERYTHIING":               "Everything",
+    "BLUBERRY":                  "Blueberry",
     # Other compact tags spotted in the wild.
     "PARB-PLN":                  "Plain",
     "PARB-EVT":                  "Everything",
@@ -117,6 +126,8 @@ _VARIETY_ALIASES: dict[str, str] = {
 _VARIETY_SHORTHAND: dict[str, str] = {
     "WW":     "Whole Wheat",
     "WWET":   "Whole Wheat Everything",
+    "WW-ET":  "Whole Wheat Everything",
+    "WW ET":  "Whole Wheat Everything",
     "PLN":    "Plain",
     "EVT":    "Everything",
     "EVTHG":  "Everything",
