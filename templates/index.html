@@ -446,27 +446,53 @@
     <!-- Usage Log -->
     <div class="page" id="page-usage">
       <h1>Usage Log</h1>
-      <p class="subtitle">All usage and restock events</p>
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">History</span>
-          <div style="display:flex;gap:10px;align-items:center">
-            <select id="filter-item" onchange="loadUsage()" style="width:180px">
+      <p class="subtitle">All inventory movements, grouped by PO. Each PO header shows the total cs that moved; expand to see per-variety detail with lot codes.</p>
+      <div class="card" style="margin-bottom:14px">
+        <div class="filters" style="padding:12px 20px">
+          <div class="filter-group">
+            <label>Item</label>
+            <select id="filter-item" onchange="onUsageFilterChange()" style="width:240px">
               <option value="">All items</option>
             </select>
-            <select id="filter-limit" onchange="loadUsage()" style="width:100px">
-              <option value="50">Last 50</option>
-              <option value="100">Last 100</option>
-              <option value="500">Last 500</option>
+          </div>
+          <div class="filter-group">
+            <label>Type</label>
+            <select id="filter-usage-type" onchange="onUsageFilterChange()" style="width:160px">
+              <option value="">All</option>
+              <option value="restock">Restocks (PO arrivals)</option>
+              <option value="use">Uses</option>
+              <option value="reversal">Reversals</option>
+            </select>
+          </div>
+          <div class="filter-group" style="flex:1;min-width:200px">
+            <label>Lookback</label>
+            <select id="filter-limit" onchange="onUsageFilterChange()" style="width:160px">
+              <option value="100">Last 100 entries</option>
+              <option value="500" selected>Last 500 entries</option>
+              <option value="2000">Last 2,000 entries</option>
+              <option value="10000">All</option>
             </select>
           </div>
         </div>
-        <table>
-          <thead>
-            <tr><th>Timestamp</th><th>Item</th><th>Type</th><th>Amount</th><th>Unit</th><th>Note</th><th>Actions</th></tr>
-          </thead>
-          <tbody id="usage-tbody"></tbody>
-        </table>
+      </div>
+      <div class="card">
+        <div style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+          <div id="usage-pager-info"></div>
+          <div id="usage-pager-controls" style="display:flex;align-items:center;gap:8px">
+            <span>Show</span>
+            <select id="usage-page-size" onchange="onUsagePageSizeChange()" style="padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+              <option value="10" selected>10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+            <span>POs / page</span>
+            <button class="btn btn-ghost btn-sm" id="usage-page-prev" onclick="onUsagePageNav(-1)">&laquo; Prev</button>
+            <span id="usage-page-indicator" style="min-width:80px;text-align:center"></span>
+            <button class="btn btn-ghost btn-sm" id="usage-page-next" onclick="onUsagePageNav(1)">Next &raquo;</button>
+          </div>
+        </div>
+        <div id="usage-container"></div>
       </div>
     </div>
 
@@ -1245,8 +1271,51 @@ async function loadDistributors() { return loadInventory(); }
 // -------------------------------------------------------------------------
 // Usage Log
 // -------------------------------------------------------------------------
+// Usage Log — PO-grouped view with cs / lot # detail and pagination.
+let usagePageSize = 10;
+let usagePage = 0;
+let _usageCache = [];          // last fetched flat list
+let _usageLotMap = {};         // {po_number: {variety: lot_number}}
+function onUsageFilterChange() {
+  usagePage = 0;
+  loadUsage();
+}
+function onUsagePageSizeChange() {
+  const v = parseInt(document.getElementById('usage-page-size').value, 10);
+  usagePageSize = (v > 0 ? v : 10);
+  usagePage = 0;
+  renderUsageGroups();
+}
+function onUsagePageNav(delta) {
+  usagePage = Math.max(0, usagePage + delta);
+  renderUsageGroups();
+}
+function _updateUsagePager(first, last, total) {
+  const info = document.getElementById('usage-pager-info');
+  const ind  = document.getElementById('usage-page-indicator');
+  const prev = document.getElementById('usage-page-prev');
+  const next = document.getElementById('usage-page-next');
+  if (!info || !ind || !prev || !next) return;
+  if (total === 0) {
+    info.textContent = 'No records';
+    ind.textContent = '';
+    prev.disabled = true;
+    next.disabled = true;
+    return;
+  }
+  info.textContent = `Showing PO groups ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`;
+  const totalPages = Math.max(1, Math.ceil(total / usagePageSize));
+  ind.textContent = `Page ${usagePage + 1} of ${totalPages}`;
+  prev.disabled = usagePage <= 0;
+  next.disabled = usagePage >= totalPages - 1;
+}
+
+function _varietyFromItemName(name) {
+  return (name || '').split(' Bagel')[0];
+}
+
 async function loadUsage() {
-  // Populate filter dropdown
+  // Populate item filter dropdown from inventory.
   const inv = await api('/api/inventory');
   const sel = document.getElementById('filter-item');
   const current = sel.value;
@@ -1254,41 +1323,171 @@ async function loadUsage() {
     inv.map(i => `<option value="${escAttr(i.name)}" ${i.name === current ? 'selected' : ''}>${escHtml(i.name)}</option>`).join('');
 
   const name = document.getElementById('filter-item').value;
-  const limit = document.getElementById('filter-limit').value;
-  const url = `/api/usage?limit=${limit}${name ? '&name=' + encodeURIComponent(name) : ''}`;
-  const usage = await api(url);
-  const tbody = document.getElementById('usage-tbody');
-  if (usage.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty">No records found.</td></tr>';
+  const limit = document.getElementById('filter-limit').value || 500;
+  const usageUrl = `/api/usage?limit=${limit}${name ? '&name=' + encodeURIComponent(name) : ''}`;
+
+  // Fetch usage + production in parallel. Production gives us the
+  // {po_number, variety -> lot_number} lookup we need to show lot
+  // codes alongside the cs amounts.
+  const [usage, production] = await Promise.all([
+    api(usageUrl),
+    api('/api/production').catch(() => []),
+  ]);
+  _usageCache = usage || [];
+
+  // Build {po -> {variety -> lot}} from production records.
+  const m = {};
+  (production || []).forEach(r => {
+    const po = (r.po_number || '').trim();
+    if (!po) return;
+    m[po] = m[po] || {};
+    (r.lines || []).forEach(L => {
+      const v = L.variety || '';
+      if (!v) return;
+      // Prefer the first non-empty lot we see; ingest order is
+      // newest-first so this picks the most recent lot for that
+      // PO/variety pair (which is what arrived).
+      if (!m[po][v] && L.lot_number) m[po][v] = L.lot_number;
+    });
+  });
+  _usageLotMap = m;
+
+  renderUsageGroups();
+}
+
+function renderUsageGroups() {
+  const container = document.getElementById('usage-container');
+  if (!container) return;
+
+  // Apply type filter
+  const typeF = document.getElementById('filter-usage-type')?.value || '';
+  let rows = _usageCache.slice();
+  if (typeF === 'restock') rows = rows.filter(e => e.source !== 'reversal' && e.amount < 0 && e.source === 'on_order_rollover');
+  // (Wait: on_order_rollover entries deduct off "on order" while ADDING to qty,
+  // so 'amount < 0' represents +qty in usage feed. We expose them as Restocks.)
+  else if (typeF === 'use') rows = rows.filter(e => e.source !== 'reversal' && e.amount > 0);
+  else if (typeF === 'reversal') rows = rows.filter(e => e.source === 'reversal');
+
+  // Group by po_number (fallback: 'Manual' for entries without a PO).
+  const groups = {};
+  rows.forEach(e => {
+    const key = (e.po_number || '').trim() || '__manual__';
+    (groups[key] = groups[key] || []).push(e);
+  });
+
+  // Convert to array sorted by latest timestamp in group, desc.
+  const list = Object.keys(groups).map(k => {
+    const entries = groups[k];
+    entries.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+    const tsLatest = entries[0]?.timestamp || '';
+    const tsEarliest = entries[entries.length - 1]?.timestamp || '';
+    const totalCs = entries.reduce((s, e) => s + Math.abs(e.amount || 0), 0);
+    return { key: k, entries, tsLatest, tsEarliest, totalCs };
+  }).sort((a, b) => (a.tsLatest < b.tsLatest ? 1 : -1));
+
+  if (list.length === 0) {
+    container.innerHTML = '<div class="empty" style="padding:24px">No records match this filter.</div>';
+    _updateUsagePager(0, 0, 0);
     return;
   }
-  tbody.innerHTML = usage.map(e => {
-    const ts = e.timestamp.replace('T',' ').slice(0,19);
-    const isRestock = e.amount < 0;
-    const isReversal = e.source === 'reversal';
-    const alreadyReversed = !!e.reversed;
-    let typeBadge;
-    if (isReversal) typeBadge = `<span class="badge badge-purple">↶ Reversal</span>`;
-    else if (isRestock) typeBadge = `<span class="badge badge-green">▲ Restock</span>`;
-    else typeBadge = `<span class="badge badge-red">▼ Use</span>`;
-    const noteHtml = escHtml(e.note || '')
-      + (alreadyReversed ? ' <span class="badge badge-yellow" style="margin-left:6px">reversed</span>' : '');
-    let actionHtml = '<span style="color:var(--muted);font-size:11px">—</span>';
-    if (!isReversal && !alreadyReversed) {
-      actionHtml = `<button class="btn btn-ghost btn-sm" onclick="reverseActivity('${escAttr(e.timestamp)}')" title="Undo this entry">↶ Reverse</button>`;
-    }
-    const rowStyle = (alreadyReversed || isReversal) ? ' style="opacity:.7"' : '';
-    return `<tr${rowStyle}>
-      <td style="color:var(--muted);font-size:12px;white-space:nowrap">${ts}</td>
-      <td>${escHtml(e.item_name)}</td>
-      <td>${typeBadge}</td>
-      <td class="${isRestock ? 'type-restock' : 'type-use'}" style="font-weight:600">${isRestock ? '+' : '-'}${Math.abs(e.amount).toFixed(2)}</td>
-      <td>${escHtml(e.unit)}</td>
-      <td style="color:var(--muted)">${noteHtml}</td>
-      <td class="actions-col">${actionHtml}</td>
-    </tr>`;
+
+  // Pagination
+  const totalGroups = list.length;
+  const totalPages = Math.max(1, Math.ceil(totalGroups / usagePageSize));
+  if (usagePage >= totalPages) usagePage = totalPages - 1;
+  if (usagePage < 0) usagePage = 0;
+  const sliceStart = usagePage * usagePageSize;
+  const sliceEnd = Math.min(sliceStart + usagePageSize, totalGroups);
+  const paged = list.slice(sliceStart, sliceEnd);
+  _updateUsagePager(sliceStart + 1, sliceEnd, totalGroups);
+
+  container.innerHTML = paged.map(grp => {
+    const isManual = grp.key === '__manual__';
+    const label = isManual ? 'Manual usage / adjustments' : grp.key;
+    const rowId = 'use-grp-' + Math.random().toString(36).slice(2, 10);
+    const sample = grp.entries[0];
+    const distGuess = (() => {
+      // Best-effort distributor inference from any item_name in the group
+      for (const e of grp.entries) {
+        const n = e.item_name || '';
+        if (n.includes('[CB')) return 'Cheney Brothers';
+        if (n.includes('[USF')) return 'US Foods';
+        if (n.includes('[CW')) return 'Chefs Warehouse';
+        if (n.includes('[DB')) return 'DeliBag';
+        if (n.includes('[CF')) return 'Carmela Foods';
+      }
+      return '';
+    })();
+    const tsRange = grp.tsLatest === grp.tsEarliest
+      ? grp.tsLatest.replace('T', ' ').slice(0, 16)
+      : `${grp.tsEarliest.replace('T',' ').slice(0,16)} → ${grp.tsLatest.replace('T',' ').slice(0,16)}`;
+    // Counts
+    const restockN = grp.entries.filter(e => e.source !== 'reversal' && e.amount < 0).length;
+    const useN     = grp.entries.filter(e => e.source !== 'reversal' && e.amount > 0).length;
+    const revN     = grp.entries.filter(e => e.source === 'reversal').length;
+    const typeBits = [];
+    if (restockN) typeBits.push(`<span class="badge badge-green">▲ ${restockN} restock${restockN===1?'':'s'}</span>`);
+    if (useN)     typeBits.push(`<span class="badge badge-red">▼ ${useN} use${useN===1?'':'s'}</span>`);
+    if (revN)     typeBits.push(`<span class="badge badge-purple">↶ ${revN} reversal${revN===1?'':'s'}</span>`);
+
+    // Per-line detail rows
+    const lotsForPo = !isManual ? (_usageLotMap[grp.key] || {}) : {};
+    const detailRows = grp.entries.map(e => {
+      const ts = e.timestamp.replace('T',' ').slice(0,19);
+      const variety = _varietyFromItemName(e.item_name);
+      const lot = lotsForPo[variety] || '';
+      const isUse = e.amount > 0 && e.source !== 'reversal';
+      const isReversal = e.source === 'reversal';
+      const reversed = !!e.reversed;
+      let typeBadge;
+      if (isReversal) typeBadge = `<span class="badge badge-purple">↶ Reversal</span>`;
+      else if (isUse) typeBadge = `<span class="badge badge-red">▼ Use</span>`;
+      else            typeBadge = `<span class="badge badge-green">▲ Restock</span>`;
+      const amt = `${e.amount < 0 ? '+' : '-'}${Math.abs(e.amount).toFixed(0)} ${escHtml(e.unit || 'cs')}`;
+      let act = '<span style="color:var(--muted);font-size:11px">—</span>';
+      if (!isReversal && !reversed) {
+        act = `<button class="btn btn-ghost btn-sm" onclick="reverseActivity('${escAttr(e.timestamp)}')" title="Undo this entry">↶ Reverse</button>`;
+      }
+      const rowStyle = (reversed || isReversal) ? ' style="opacity:.7"' : '';
+      return `<tr${rowStyle}>
+        <td style="color:var(--muted);font-size:11px;white-space:nowrap">${ts}</td>
+        <td>${escHtml(e.item_name)}</td>
+        <td>${typeBadge}</td>
+        <td style="text-align:right;font-weight:600;${e.amount<0?'color:var(--success,#0a0)':'color:var(--red)'}">${amt}</td>
+        <td style="font-family:ui-monospace,monospace;font-size:12px">${lot ? escHtml(lot) : '<span style="color:var(--muted)">—</span>'}</td>
+        <td style="color:var(--muted);font-size:11px">${escHtml(e.note || '')}${reversed ? ' <span class="badge badge-yellow" style="margin-left:6px">reversed</span>' : ''}</td>
+        <td class="actions-col">${act}</td>
+      </tr>`;
+    }).join('');
+
+    return `<div style="border-top:1px solid var(--border)">
+      <div style="padding:10px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none" onclick="(function(el){const r=el.nextElementSibling; if(r.style.display==='none'){r.style.display='';el.querySelector('.chev').textContent='▾';} else {r.style.display='none';el.querySelector('.chev').textContent='▸';}})(this)">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span class="chev" style="color:var(--muted);width:14px">▸</span>
+          <span style="font-weight:600;font-family:ui-monospace,monospace">${isManual ? '—' : escHtml(grp.key)}</span>
+          ${distGuess ? `<span style="color:var(--muted);font-size:12px">${escHtml(distGuess)}</span>` : ''}
+          ${typeBits.join(' ')}
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;font-size:12px">
+          <span style="color:var(--muted)">${tsRange}</span>
+          <span style="font-weight:600">${grp.totalCs.toFixed(0)} cs</span>
+          <span style="color:var(--muted)">· ${grp.entries.length} line${grp.entries.length===1?'':'s'}</span>
+        </div>
+      </div>
+      <div id="${rowId}" style="display:none;padding:0 16px 12px 32px">
+        <table style="margin:0;font-size:12px">
+          <thead><tr>
+            <th>Timestamp</th><th>Item</th><th>Type</th>
+            <th style="text-align:right">Amount</th>
+            <th>Lot #</th><th>Note</th><th>Actions</th>
+          </tr></thead>
+          <tbody>${detailRows}</tbody>
+        </table>
+      </div>
+    </div>`;
   }).join('');
 }
+
 
 // -------------------------------------------------------------------------
 // Report
