@@ -74,14 +74,98 @@ _VARIETY_ALIASES: dict[str, str] = {
     "EVERYTHING":                "Everything",
     "SESAME":                    "Sesame",
     "POPPY":                     "Poppy Seed",
+    "POPPY SEED":                "Poppy Seed",
     "ONION":                     "Onion",
     "WHOLE WHEAT":               "Whole Wheat",
+    "WHOLEWHEAT":                "Whole Wheat",
     "EGG":                       "Egg",
     "BLUEBERRY":                 "Blueberry",
     "ASIAGO":                    "Asiago",
     "JALAPENO":                  "Jalapeno Cheddar",
+    "JALAPENO CHEDDAR":          "Jalapeno Cheddar",
     "CINN-RAISIN":               "Cinnamon Raisin",
+    "CINNAMON RAISIN":           "Cinnamon Raisin",
+    # Short-hand abbreviations seen on hand-keyed production sheets.
+    "WW":                        "Whole Wheat",
+    "WWET":                      "Whole Wheat Everything",
+    "WW EVERYTHING":             "Whole Wheat Everything",
+    "WHOLE WHEAT EVERYTHING":    "Whole Wheat Everything",
+    "WHOLEWHEAT EVERYTHING":     "Whole Wheat Everything",
+    # PARB- prefix variants of the abbreviations.
+    "PARB-WW":                   "Whole Wheat",
+    "PARB-WWET":                 "Whole Wheat Everything",
+    "PARB-WW EVERYTHING":        "Whole Wheat Everything",
+    "PARB-WHOLEWHEAT":           "Whole Wheat",
+    "PARB-WHOLEWHEAT EVERYTHING":"Whole Wheat Everything",
+    # Other compact tags spotted in the wild.
+    "PARB-PLN":                  "Plain",
+    "PARB-EVT":                  "Everything",
+    "PARB-EVTHG":                "Everything",
+    "PARB-SES":                  "Sesame",
+    "PARB-PPY":                  "Poppy Seed",
+    "PARB-ON":                   "Onion",
+    "PARB-CINN":                 "Cinnamon Raisin",
+    "PARB-BB":                   "Blueberry",
+    "PARB-JC":                   "Jalapeno Cheddar",
+    "PARB-JLP":                  "Jalapeno Cheddar",
+    "PARB-AS":                   "Asiago",
 }
+
+# Map of compact abbreviations applied AFTER stripping a "PARB-" prefix.
+# Lets us treat the bare form and the parbaked form the same way without
+# bloating _VARIETY_ALIASES with every cross-product.
+_VARIETY_SHORTHAND: dict[str, str] = {
+    "WW":     "Whole Wheat",
+    "WWET":   "Whole Wheat Everything",
+    "PLN":    "Plain",
+    "EVT":    "Everything",
+    "EVTHG":  "Everything",
+    "SES":    "Sesame",
+    "PPY":    "Poppy Seed",
+    "ON":     "Onion",
+    "CINN":   "Cinnamon Raisin",
+    "BB":     "Blueberry",
+    "JC":     "Jalapeno Cheddar",
+    "JLP":    "Jalapeno Cheddar",
+    "AS":     "Asiago",
+}
+
+
+def _normalize_variety(raw: str) -> tuple[str, bool]:
+    """Resolve a raw variety string from a production sheet to a
+    canonical variety name.
+
+    Returns ``(canonical, recognized)``. If the raw value can't be
+    mapped to anything we know about, the canonical is set to
+    ``"In-House Inventory"`` so the ranking aggregates the noise
+    into a single bucket instead of fragmenting it into one-off
+    entries per typo.
+
+    Resolution order:
+      1. Exact match against ``_VARIETY_ALIASES`` (upper-cased).
+      2. Strip a leading ``PARB``/``PARB-``/``PARB ``/``PRBKD`` prefix
+         and re-try ``_VARIETY_ALIASES``.
+      3. Look up the stripped form in ``_VARIETY_SHORTHAND``.
+      4. Fall back to ``"In-House Inventory"``.
+    """
+    if not raw:
+        return ("In-House Inventory", False)
+    key = raw.strip().upper()
+    if key in _VARIETY_ALIASES:
+        return (_VARIETY_ALIASES[key], True)
+    # Strip Parb-* / Parbaked / PRBKD prefixes
+    stripped = key
+    for pre in ("PARB-", "PARB ", "PARB.", "PARBAKED ", "PARBAKED-",
+                "PRBKD-", "PRBKD "):
+        if stripped.startswith(pre):
+            stripped = stripped[len(pre):].strip()
+            break
+    if stripped != key:
+        if stripped in _VARIETY_ALIASES:
+            return (_VARIETY_ALIASES[stripped], True)
+    if stripped in _VARIETY_SHORTHAND:
+        return (_VARIETY_SHORTHAND[stripped], True)
+    return ("In-House Inventory", False)
 
 # Warehouse normalization. The production sheet uses an UPPERCASE
 # city-only label; map to the "<City>, <ST>" form we already use on
@@ -100,6 +184,7 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "ALCOA":                 ("Alcoa, TN",              "US Foods"),
     "CWNY":                  ("Chefs Warehouse, NY",    "Chefs Warehouse"),
     "CWFL":                  ("Chefs Warehouse, FL",    "Chefs Warehouse"),
+    "CWF":                   ("Chefs Warehouse, FL",    "Chefs Warehouse"),
     "CWC":                   ("Chefs Warehouse, Chicago",      "Chefs Warehouse"),
     "CWMID":                 ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
     # H&H's production sheet uses "JACKSON VILLE" (two words) for the
@@ -268,10 +353,9 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     for match in _LINE_RE.finditer(text):
         cs = int(match.group(1))
         raw_v = match.group(2).strip()
-        canonical = _VARIETY_ALIASES.get(raw_v.upper())
-        if not canonical:
+        canonical, recognized = _normalize_variety(raw_v)
+        if not recognized:
             seen_unknown.add(raw_v)
-            canonical = raw_v.title()  # best-effort display fallback
         sheet.lines.append(ProductionLine(
             variety=canonical, raw_variety=raw_v, cs_count=cs,
         ))

@@ -963,6 +963,59 @@ def api_production_scan():
     })
 
 
+@app.route("/api/admin/production/renormalize-varieties", methods=["POST"])
+def api_admin_production_renormalize_varieties():
+    """Re-run _normalize_variety on every stored production line.
+
+    Useful after extending _VARIETY_ALIASES or _VARIETY_SHORTHAND so
+    historical records (which kept their original best-effort variety
+    label) get aggregated into the canonical buckets. Lines whose
+    canonical changes also have their lot_number re-paired against
+    the updated variety so the Distributors / Traceability tabs stay
+    consistent.
+
+    Body: { dry_run: bool }
+    """
+    from inventory_tracker import load_production, save_production
+    from integrations.production_pdf_parser import _normalize_variety
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run", False))
+    records = load_production()
+    changed_lines = 0
+    changed_records = 0
+    samples = []
+    for r in records:
+        any_changed = False
+        for L in r.get("lines") or []:
+            raw_v = L.get("raw_variety") or L.get("variety") or ""
+            old_can = L.get("variety") or ""
+            new_can, _recognized = _normalize_variety(raw_v)
+            if new_can != old_can:
+                if len(samples) < 25:
+                    samples.append({
+                        "raw": raw_v,
+                        "old": old_can,
+                        "new": new_can,
+                        "po":  r.get("po_number") or "",
+                        "date": r.get("production_date") or "",
+                    })
+                L["variety"] = new_can
+                changed_lines += 1
+                any_changed = True
+        if any_changed:
+            changed_records += 1
+    if not dry_run:
+        save_production(records)
+    return jsonify({
+        "ok": True,
+        "dry_run": dry_run,
+        "records_scanned": len(records),
+        "records_changed": changed_records,
+        "lines_changed": changed_lines,
+        "samples": samples,
+    })
+
+
 @app.route("/api/admin/production/reclassify", methods=["POST"])
 def api_admin_production_reclassify():
     """Re-run the warehouse classifier on every stored production record.
