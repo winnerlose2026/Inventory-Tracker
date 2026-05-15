@@ -258,9 +258,13 @@ def api_admin_remove_po():
     """
     body = request.json or {}
     po_number = (body.get("po_number") or "").strip()
+    reason = (body.get("reason") or "canceled by distributor").strip()
     if not po_number:
         return jsonify({"ok": False, "error": "po_number required"}), 400
-    from inventory_tracker import load_inventory, save_inventory
+    from inventory_tracker import (
+        load_inventory, save_inventory,
+        load_canceled_pos, save_canceled_pos,
+    )
     inv = load_inventory()
     removed = 0
     affected = []
@@ -272,11 +276,22 @@ def api_admin_remove_po():
             affected.append(item.get("name", key))
         item["on_order"] = kept
     save_inventory(inv)
+    # Record the PO in the ignore list so the email scanner won't
+    # re-ingest it from a still-sitting source email.
+    canceled = load_canceled_pos()
+    canceled[po_number] = {
+        "canceled_at": datetime.now().isoformat(timespec="seconds"),
+        "reason":      reason,
+        "removed_entries": removed,
+        "affected_items":  affected,
+    }
+    save_canceled_pos(canceled)
     return jsonify({
         "ok": True,
         "po_number": po_number,
         "removed_entries": removed,
         "affected_items": affected,
+        "added_to_ignore_list": True,
     })
 
 
@@ -1581,6 +1596,22 @@ def api_email_ingest_events():
     if not isinstance(raw_events, list):
         return jsonify({"ok": False, "error": "events must be a list"}), 400
 
+    # Filter out events for POs that were canceled by the operator. The
+    # source emails may still live in the inbox so the scanner keeps
+    # surfacing them — we silently drop them here so the cancel sticks.
+    from inventory_tracker import load_canceled_pos
+    canceled = load_canceled_pos()
+    canceled_skipped = 0
+    if canceled:
+        kept_events = []
+        for ev in raw_events:
+            po = str((ev or {}).get("po_number") or "").strip()
+            if po and po in canceled:
+                canceled_skipped += 1
+                continue
+            kept_events.append(ev)
+        raw_events = kept_events
+
     built: list[EmailEvent] = []
     build_errors: list[str] = []
     for idx, e in enumerate(raw_events):
@@ -1622,11 +1653,14 @@ def api_email_ingest_events():
             build_errors.append(f"events[{idx}]: {exc}")
 
     try:
+        all_errors = errors + build_errors
+        if canceled_skipped:
+            all_errors.append(f"skipped {canceled_skipped} event(s) for canceled POs")
         report = _apply_events(
             events=built,
             messages_seen=messages_seen,
             messages_parsed=messages_parsed,
-            errors=errors + build_errors,
+            errors=all_errors,
             dry_run=dry_run,
             source=source,
         )

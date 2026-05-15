@@ -1487,14 +1487,26 @@ function renderUsageGroups() {
     const rowId = 'use-grp-' + Math.random().toString(36).slice(2, 10);
     const sample = grp.entries[0];
     const distGuess = (() => {
-      // Best-effort distributor inference from any item_name in the group
+      // Best-effort distributor + location inference from any item_name
+      // in the group. Item names look like "Plain Bagel 4oz [CB - Ocala]".
+      const map = {
+        CB: 'Cheney Brothers', USF: 'US Foods', CW: 'Chefs Warehouse',
+        DB: 'DeliBag', CF: 'Carmela Foods', HH: 'H&H Bagels',
+      };
       for (const e of grp.entries) {
+        const m = /\[([A-Z]+)\s*-\s*([^\]]+)\]/.exec(e.item_name || '');
+        if (m) {
+          const full = map[m[1]] || m[1];
+          const loc  = (m[2] || '').trim();
+          return loc ? `${full} - ${loc}` : full;
+        }
+        // Fall-back: no bracket present (older entries)
         const n = e.item_name || '';
-        if (n.includes('[CB')) return 'Cheney Brothers';
+        if (n.includes('[CB'))  return 'Cheney Brothers';
         if (n.includes('[USF')) return 'US Foods';
-        if (n.includes('[CW')) return 'Chefs Warehouse';
-        if (n.includes('[DB')) return 'DeliBag';
-        if (n.includes('[CF')) return 'Carmela Foods';
+        if (n.includes('[CW'))  return 'Chefs Warehouse';
+        if (n.includes('[DB'))  return 'DeliBag';
+        if (n.includes('[CF'))  return 'Carmela Foods';
       }
       return '';
     })();
