@@ -551,15 +551,28 @@ def api_report_toast_sales():
 
 @app.route("/api/sales/locations")
 def api_sales_locations():
-    """List distinct locations present in the sales store, with row
-    counts and date ranges. Drives the location selector on the
-    Report page.
+    """List every retail Toast location in the registry, with row
+    counts and date ranges from the sales store. Locations with no
+    ingested data return rows=0 — they still show in the dropdown so
+    the user can pick any location for comparison.
     """
-    from inventory_tracker import load_sales
+    from inventory_tracker import load_sales, TOAST_RETAIL_LOCATIONS
     rows = load_sales() or []
+    # Start with the registry — every retail location guaranteed.
     by_loc: dict = {}
+    for L in TOAST_RETAIL_LOCATIONS:
+        by_loc[L["restaurant_guid"]] = {
+            "restaurant_guid": L["restaurant_guid"],
+            "location":        L["location"],
+            "rows":            0,
+            "min_date":        "",
+            "max_date":        "",
+        }
+    # Layer in any ingested data — increment counts + date range.
     for r in rows:
         guid = r.get("restaurant_guid") or ""
+        if not guid:
+            continue
         slot = by_loc.setdefault(guid, {
             "restaurant_guid": guid,
             "location":        r.get("location") or "",
@@ -569,10 +582,11 @@ def api_sales_locations():
         })
         slot["rows"] += 1
         d = r.get("business_date") or ""
-        if d and (not slot["min_date"] or d < slot["min_date"]):
-            slot["min_date"] = d
-        if d and (not slot["max_date"] or d > slot["max_date"]):
-            slot["max_date"] = d
+        if d:
+            if not slot["min_date"] or d < slot["min_date"]:
+                slot["min_date"] = d
+            if not slot["max_date"] or d > slot["max_date"]:
+                slot["max_date"] = d
     return jsonify({"ok": True,
                     "locations": sorted(by_loc.values(),
                                         key=lambda x: x["location"])})

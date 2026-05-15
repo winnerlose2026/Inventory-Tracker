@@ -3198,9 +3198,13 @@ async function ensureToastLocationDropdown() {
     const r = await api('/api/sales/locations');
     const sel = document.getElementById('toast-sales-location');
     if (sel && r.locations) {
-      const opts = r.locations.map(L =>
-        `<option value="${escAttr(L.restaurant_guid)}">${escHtml(L.location || L.restaurant_guid)} <span>(${L.rows} rows)</span></option>`
-      );
+      const opts = r.locations.map(L => {
+        const label = escHtml(L.location || L.restaurant_guid);
+        const tag = L.rows > 0
+          ? `(${L.rows} rows, ${L.min_date} \u2013 ${L.max_date})`
+          : '(no data yet)';
+        return `<option value="${escAttr(L.restaurant_guid)}">${label} \u2014 ${tag}</option>`;
+      });
       sel.innerHTML = '<option value="">All locations</option>' + opts.join('');
     }
   } catch (e) { /* fallthrough */ }
