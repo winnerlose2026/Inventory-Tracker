@@ -352,6 +352,174 @@ def api_production_lots_by_pair():
     return jsonify(out)
 
 
+@app.route("/api/traceability/search")
+def api_traceability_search():
+    """Cross-source traceability search.
+
+    Query params:
+      ``from``        ISO date — only include records on/after this date.
+      ``to``          ISO date — only include records on/before this date.
+      ``lot``         Substring match on lot_number (case-insensitive).
+      ``mfg_code``    4-digit item code (matches the first 4 digits of
+                      any lot OR the variety via HH_MFG_CODE_TO_VARIETY).
+      ``warehouse``   Exact warehouse name.
+      ``distributor`` Exact distributor name.
+
+    Returns a list of matching production records, each with these
+    downstream fields populated for the requesting line:
+      ``po_status``      pending | arrived | canceled | unknown
+      ``ship_date``      from the on_order entry, if pending.
+      ``arrival_date``   from the on_order entry, if pending.
+      ``eta``            from the on_order entry, if pending.
+      ``lines[].on_hand_now``  current cs on hand for that variety at
+                                that warehouse (live inventory).
+      ``lines[].usage_total_cs`` total cs moved on usage log for this
+                                PO + variety (from usage.json).
+      ``lines[].usage_event_count``  count of usage events.
+    """
+    from inventory_tracker import (
+        load_production, load_inventory, load_usage,
+        load_canceled_pos,
+    )
+    try:
+        from integrations.hh_mfg_codes import HH_MFG_CODE_TO_VARIETY
+    except Exception:
+        HH_MFG_CODE_TO_VARIETY = {}
+
+    args = request.args
+    q_from = (args.get("from") or "").strip()
+    q_to   = (args.get("to") or "").strip()
+    q_lot  = (args.get("lot") or "").strip().lower()
+    q_code = (args.get("mfg_code") or "").strip()
+    q_wh   = (args.get("warehouse") or "").strip()
+    q_dist = (args.get("distributor") or "").strip()
+
+    records = load_production()
+
+    # Apply filters.
+    out = []
+    code_variety = HH_MFG_CODE_TO_VARIETY.get(q_code) if q_code else None
+    for r in records:
+        if q_from and (r.get("production_date") or "") < q_from:
+            continue
+        if q_to and (r.get("production_date") or "") > q_to:
+            continue
+        if q_wh and (r.get("warehouse") or "") != q_wh:
+            continue
+        if q_dist and (r.get("distributor") or "") != q_dist:
+            continue
+        # Lot / mfg-code filter only keeps the record if at least one
+        # line matches. We do NOT prune the other lines from the record
+        # — operators usually want to see the full sheet for context.
+        if q_lot or q_code:
+            matched_any = False
+            for L in r.get("lines", []):
+                lot = (L.get("lot_number") or "")
+                if q_lot and q_lot in lot.lower():
+                    matched_any = True
+                    break
+                if q_code:
+                    # Match either the first 4 digits of the lot, or the
+                    # variety mapped from the code.
+                    if lot.startswith(q_code):
+                        matched_any = True
+                        break
+                    if code_variety and (L.get("variety") or "") == code_variety:
+                        matched_any = True
+                        break
+            if not matched_any:
+                continue
+        out.append(r)
+
+    # Build downstream lookups.
+    inv = load_inventory()
+    # {(warehouse, variety) -> on_hand_qty} for currently-on-hand snapshot
+    on_hand = {}
+    for item in inv.values():
+        wh = item.get("warehouse") or ""
+        name = item.get("name") or ""
+        variety = name.split(" Bagel")[0] if " Bagel" in name else name
+        on_hand[(wh, variety)] = (on_hand.get((wh, variety), 0)
+                                  + float(item.get("quantity") or 0))
+
+    # Pending-PO lookup keyed by po_number — first non-empty wins.
+    po_pending = {}
+    for item in inv.values():
+        for e in item.get("on_order") or []:
+            po = (e.get("po_number") or "").strip()
+            if not po:
+                continue
+            slot = po_pending.setdefault(po, {})
+            for k in ("ship_date", "arrival_date", "eta"):
+                if not slot.get(k) and e.get(k):
+                    slot[k] = e[k]
+
+    try:
+        canceled = load_canceled_pos()
+    except Exception:
+        canceled = {}
+
+    # Usage rollup keyed by (po_number, variety).
+    usage_log = load_usage() or []
+    usage_roll: dict = {}  # {(po, variety): {cs, n}}
+    for e in usage_log:
+        po = (e.get("po_number") or "").strip()
+        if not po:
+            continue
+        name = e.get("item_name") or ""
+        variety = name.split(" Bagel")[0] if " Bagel" in name else name
+        slot = usage_roll.setdefault((po, variety), {"cs": 0.0, "n": 0})
+        slot["cs"] += abs(float(e.get("amount") or 0))
+        slot["n"] += 1
+
+    # Enrich each record.
+    enriched = []
+    for r in out:
+        rcopy = dict(r)
+        po = (r.get("po_number") or "").strip()
+        wh = r.get("warehouse") or ""
+        pend = po_pending.get(po) if po else None
+        if po and po in canceled:
+            rcopy["po_status"] = "canceled"
+        elif pend:
+            rcopy["po_status"]    = "pending"
+            rcopy["ship_date"]    = pend.get("ship_date") or ""
+            rcopy["arrival_date"] = pend.get("arrival_date") or ""
+            rcopy["eta"]          = pend.get("eta") or ""
+        elif po:
+            # PO existed but isn't in on_order anymore -> rolled over.
+            rcopy["po_status"] = "arrived"
+        else:
+            rcopy["po_status"] = "unknown"
+
+        enriched_lines = []
+        for L in r.get("lines") or []:
+            v = L.get("variety") or ""
+            lcopy = dict(L)
+            lcopy["on_hand_now"] = round(on_hand.get((wh, v), 0), 2)
+            ur = usage_roll.get((po, v)) if po else None
+            lcopy["usage_total_cs"]    = round(ur["cs"], 2) if ur else 0
+            lcopy["usage_event_count"] = ur["n"] if ur else 0
+            enriched_lines.append(lcopy)
+        rcopy["lines"] = enriched_lines
+        enriched.append(rcopy)
+
+    # Sort newest-first by production date for stable grouping.
+    enriched.sort(key=lambda r: (r.get("production_date") or "",
+                                  r.get("po_number") or ""),
+                  reverse=True)
+    return jsonify({
+        "ok": True,
+        "filters": {
+            "from": q_from, "to": q_to, "lot": q_lot, "mfg_code": q_code,
+            "warehouse": q_wh, "distributor": q_dist,
+        },
+        "count": len(enriched),
+        "records": enriched,
+        "mfg_code_map": HH_MFG_CODE_TO_VARIETY,
+    })
+
+
 @app.route("/api/production/summary")
 def api_production_summary():
     """Roll-up across production records.

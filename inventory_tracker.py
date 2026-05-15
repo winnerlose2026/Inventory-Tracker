@@ -107,6 +107,37 @@ def save_labor(entries: list):
         json.dump(entries, f, indent=2)
 
 
+# Canceled POs — when a distributor cancels an order, we record the PO
+# number here so the email scanner skips it on future runs (instead of
+# re-ingesting from a still-sitting source email and re-creating
+# on_order entries we just removed).
+CANCELED_POS_FILE = DATA_DIR / "canceled_pos.json"
+
+
+def load_canceled_pos() -> dict:
+    """Return {po_number: {canceled_at, reason, note}}."""
+    if CANCELED_POS_FILE.exists():
+        with open(CANCELED_POS_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
+    return {}
+
+
+def save_canceled_pos(data: dict):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(CANCELED_POS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def is_po_canceled(po_number: str) -> bool:
+    if not po_number:
+        return False
+    return po_number.strip() in load_canceled_pos()
+
+
+
 # ---------------------------------------------------------------------------
 # On-order rollover
 # ---------------------------------------------------------------------------

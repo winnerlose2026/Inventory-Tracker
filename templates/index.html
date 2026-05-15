@@ -176,6 +176,9 @@
       <div class="nav-item" onclick="showPage('production')">
         <span class="nav-icon">🥯</span> Daily Production
       </div>
+      <div class="nav-item" onclick="showPage('traceability')">
+        <span class="nav-icon">🔎</span> Traceability
+      </div>
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
@@ -497,6 +500,81 @@
       </div>
     </div>
 
+    <!-- Traceability -->
+    <div class="page" id="page-traceability">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Traceability</h1>
+          <p class="subtitle" style="margin-bottom:0">Look up production by date range, lot #, or mfg code &mdash; results grouped by production date with downstream PO status, usage activity, and current on-hand at the destination DC.</p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="filters" style="padding:14px 20px">
+          <div class="filter-group">
+            <label>Date from</label>
+            <input id="trace-filter-from" type="date" style="padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+          <div class="filter-group">
+            <label>Date to</label>
+            <input id="trace-filter-to" type="date" style="padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+          <div class="filter-group">
+            <label>Lot #</label>
+            <input id="trace-filter-lot" type="search" placeholder="full or partial, e.g. 1150030516" oninput="onTraceFilterChange()" style="width:200px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+          <div class="filter-group">
+            <label>Mfg code</label>
+            <select id="trace-filter-mfg" onchange="onTraceFilterChange()" style="width:200px">
+              <option value="">All varieties</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Warehouse</label>
+            <select id="trace-filter-warehouse" onchange="onTraceFilterChange()" style="width:200px">
+              <option value="">All</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Distributor</label>
+            <select id="trace-filter-distributor" onchange="onTraceFilterChange()" style="width:180px">
+              <option value="">All</option>
+              <option>Cheney Brothers</option>
+              <option>US Foods</option>
+              <option>Chefs Warehouse</option>
+              <option>DeliBag</option>
+              <option>Carmela Foods</option>
+              <option>H&amp;H Bagels</option>
+            </select>
+          </div>
+          <div class="filter-group" style="align-self:flex-end">
+            <button class="btn btn-primary" onclick="runTraceabilitySearch()">Search</button>
+            <button class="btn btn-ghost" onclick="resetTraceabilityFilters()" style="margin-left:6px">Reset</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+          <div id="trace-pager-info">Run a search to see results.</div>
+          <div id="trace-pager-controls" style="display:flex;align-items:center;gap:8px">
+            <span>Show</span>
+            <select id="trace-page-size" onchange="onTracePageSizeChange()" style="padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+              <option value="10" selected>10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+            <span>dates / page</span>
+            <button class="btn btn-ghost btn-sm" id="trace-page-prev" onclick="onTracePageNav(-1)">&laquo; Prev</button>
+            <span id="trace-page-indicator" style="min-width:80px;text-align:center"></span>
+            <button class="btn btn-ghost btn-sm" id="trace-page-next" onclick="onTracePageNav(1)">Next &raquo;</button>
+          </div>
+        </div>
+        <div id="trace-results-container"></div>
+      </div>
+    </div>
+
     <!-- Report -->
     <div class="page" id="page-report">
       <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
@@ -724,6 +802,7 @@ function refresh(page) {
   else if (page === 'report') loadReport();
   else if (page === 'pending-pos') loadPendingPOs();
   else if (page === 'production') loadProduction();
+  else if (page === 'traceability') initTraceability();
 }
 
 function distributorBadge(name) {
@@ -2782,6 +2861,211 @@ refreshAuthStatus().then(() => {
   }
 });
 loadDashboard();
+// -------------------------------------------------------------------------
+// Traceability tab
+// -------------------------------------------------------------------------
+let _traceLastResults = [];      // raw API records cached for paging
+let tracePageSize = 10;
+let tracePage = 0;
+let _traceMfgCodeMap = {};       // {"1150": "Plain", ...}
+let _traceInitialized = false;
+
+async function initTraceability() {
+  if (_traceInitialized) return;
+  _traceInitialized = true;
+  // Populate mfg-code dropdown.
+  try {
+    const r = await api('/api/traceability/search?to=1900-01-01');  // empty result, just to read mfg_code_map
+    _traceMfgCodeMap = r.mfg_code_map || {};
+  } catch (e) { /* fall through */ }
+  const mfgSel = document.getElementById('trace-filter-mfg');
+  if (mfgSel && Object.keys(_traceMfgCodeMap).length) {
+    const opts = Object.keys(_traceMfgCodeMap).sort().map(code =>
+      `<option value="${escAttr(code)}">${escHtml(code)} &mdash; ${escHtml(_traceMfgCodeMap[code])}</option>`
+    );
+    mfgSel.innerHTML = '<option value="">All varieties</option>' + opts.join('');
+  }
+  // Populate warehouse dropdown from production records (only DCs that
+  // have ever shown up — keeps the picker tight).
+  try {
+    const recs = await api('/api/production');
+    const whs = Array.from(new Set(recs.map(r => r.warehouse).filter(Boolean))).sort();
+    const sel = document.getElementById('trace-filter-warehouse');
+    if (sel) {
+      sel.innerHTML = '<option value="">All</option>' +
+        whs.map(w => `<option>${escHtml(w)}</option>`).join('');
+    }
+  } catch (e) { /* ignore */ }
+}
+function onTraceFilterChange() {
+  tracePage = 0;
+  // Debounce a search for typed input fields.
+  clearTimeout(window._traceDebounce);
+  window._traceDebounce = setTimeout(runTraceabilitySearch, 200);
+}
+function onTracePageSizeChange() {
+  const v = parseInt(document.getElementById('trace-page-size').value, 10);
+  tracePageSize = (v > 0 ? v : 10);
+  tracePage = 0;
+  renderTraceResults();
+}
+function onTracePageNav(delta) {
+  tracePage = Math.max(0, tracePage + delta);
+  renderTraceResults();
+}
+function _updateTracePager(first, last, total) {
+  const info = document.getElementById('trace-pager-info');
+  const ind  = document.getElementById('trace-page-indicator');
+  const prev = document.getElementById('trace-page-prev');
+  const next = document.getElementById('trace-page-next');
+  if (!info || !ind || !prev || !next) return;
+  if (total === 0) {
+    info.textContent = 'No production records match the current filters.';
+    ind.textContent = '';
+    prev.disabled = true;
+    next.disabled = true;
+    return;
+  }
+  info.textContent = `Showing dates ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`;
+  const totalPages = Math.max(1, Math.ceil(total / tracePageSize));
+  ind.textContent = `Page ${tracePage + 1} of ${totalPages}`;
+  prev.disabled = tracePage <= 0;
+  next.disabled = tracePage >= totalPages - 1;
+}
+function resetTraceabilityFilters() {
+  document.getElementById('trace-filter-from').value = '';
+  document.getElementById('trace-filter-to').value = '';
+  document.getElementById('trace-filter-lot').value = '';
+  document.getElementById('trace-filter-mfg').value = '';
+  document.getElementById('trace-filter-warehouse').value = '';
+  document.getElementById('trace-filter-distributor').value = '';
+  runTraceabilitySearch();
+}
+async function runTraceabilitySearch() {
+  const qs = new URLSearchParams();
+  const from = document.getElementById('trace-filter-from').value;
+  const to   = document.getElementById('trace-filter-to').value;
+  const lot  = document.getElementById('trace-filter-lot').value.trim();
+  const mfg  = document.getElementById('trace-filter-mfg').value;
+  const wh   = document.getElementById('trace-filter-warehouse').value;
+  const dist = document.getElementById('trace-filter-distributor').value;
+  if (from) qs.set('from', from);
+  if (to)   qs.set('to', to);
+  if (lot)  qs.set('lot', lot);
+  if (mfg)  qs.set('mfg_code', mfg);
+  if (wh)   qs.set('warehouse', wh);
+  if (dist) qs.set('distributor', dist);
+  let res;
+  try {
+    res = await api('/api/traceability/search?' + qs.toString());
+  } catch (e) {
+    document.getElementById('trace-results-container').innerHTML =
+      `<div class="empty" style="padding:24px;color:var(--red)">Search failed: ${escHtml(String(e))}</div>`;
+    return;
+  }
+  _traceLastResults = res.records || [];
+  tracePage = 0;
+  renderTraceResults();
+}
+
+function _poStatusBadge(status, ship, arrival, eta) {
+  if (status === 'canceled') return '<span class="badge badge-red">canceled</span>';
+  if (status === 'arrived')  return '<span class="badge badge-green">arrived</span>';
+  if (status === 'pending') {
+    const trig = arrival || eta;
+    const overdue = trig && new Date(trig) < new Date();
+    if (overdue) return '<span class="badge badge-red">overdue</span>';
+    if (ship)    return '<span class="badge badge-blue">in transit</span>';
+    return '<span class="badge badge-yellow">open</span>';
+  }
+  return '<span class="badge" style="color:var(--muted)">—</span>';
+}
+
+function renderTraceResults() {
+  const container = document.getElementById('trace-results-container');
+  if (!container) return;
+  const recs = _traceLastResults || [];
+  if (recs.length === 0) {
+    container.innerHTML = '<div class="empty" style="padding:24px">No production records match the current filters.</div>';
+    _updateTracePager(0, 0, 0);
+    return;
+  }
+  // Group by production_date.
+  const byDate = {};
+  recs.forEach(r => {
+    const d = (r.production_date || '').slice(0, 10) || '__unknown__';
+    (byDate[d] = byDate[d] || []).push(r);
+  });
+  const dateKeys = Object.keys(byDate).sort((a,b) => a < b ? 1 : -1);  // newest first
+  const totalDates = dateKeys.length;
+  const totalPages = Math.max(1, Math.ceil(totalDates / tracePageSize));
+  if (tracePage >= totalPages) tracePage = totalPages - 1;
+  if (tracePage < 0) tracePage = 0;
+  const sliceStart = tracePage * tracePageSize;
+  const sliceEnd = Math.min(sliceStart + tracePageSize, totalDates);
+  const pageDates = dateKeys.slice(sliceStart, sliceEnd);
+  _updateTracePager(sliceStart + 1, sliceEnd, totalDates);
+
+  container.innerHTML = pageDates.map(d => {
+    const records = byDate[d];
+    const dayCs = records.reduce((s, r) => s + (r.total_cases || 0), 0);
+    const dayLabel = (d === '__unknown__') ? 'Unknown date' : formatDate(d);
+    const cards = records.map(r => {
+      const ship    = r.ship_date    ? formatDate(r.ship_date)    : '<span style="color:var(--muted)">—</span>';
+      const arrival = r.arrival_date ? formatDate(r.arrival_date) : '<span style="color:var(--muted)">—</span>';
+      const eta     = r.eta          ? formatDate(r.eta)          : '<span style="color:var(--muted)">—</span>';
+      const badge   = _poStatusBadge(r.po_status, r.ship_date, r.arrival_date, r.eta);
+      const lineRows = (r.lines || []).map(L => {
+        const usage = L.usage_total_cs > 0
+          ? `${(L.usage_total_cs).toFixed(0)} cs <span style="color:var(--muted);font-size:11px">(${L.usage_event_count})</span>`
+          : '<span style="color:var(--muted)">—</span>';
+        const onHand = L.on_hand_now > 0
+          ? `${(L.on_hand_now).toFixed(0)} cs`
+          : '<span style="color:var(--muted)">—</span>';
+        return `<tr>
+          <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(L.lot_number || '')}</td>
+          <td style="font-family:ui-monospace,monospace;font-size:12px;color:var(--muted)">${escHtml((L.lot_number || '').slice(0,4))}</td>
+          <td>${escHtml(L.variety || '')}</td>
+          <td style="text-align:right;font-weight:600">${(L.cs_count || 0).toFixed(0)} cs</td>
+          <td style="text-align:right">${onHand}</td>
+          <td style="text-align:right">${usage}</td>
+        </tr>`;
+      }).join('');
+      return `<div style="padding:14px 16px;border-top:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+          <div>
+            <span style="font-weight:600">${escHtml(r.warehouse || '—')}</span>
+            <span style="color:var(--muted);font-size:12px;margin-left:8px">${distributorBadge(r.distributor || '')} ${escHtml(r.distributor || '')}</span>
+            <span style="color:var(--muted);font-size:12px;margin-left:8px">PO <span style="font-family:ui-monospace,monospace">${escHtml(r.po_number || '—')}</span></span>
+          </div>
+          <div style="font-size:12px;color:var(--muted)">
+            Status ${badge}
+            &middot; Ship ${ship} &middot; Arrival ${arrival} &middot; ETA ${eta}
+          </div>
+        </div>
+        <table style="margin:0;font-size:12px">
+          <thead><tr>
+            <th>Lot #</th>
+            <th>Mfg code</th>
+            <th>Variety</th>
+            <th style="text-align:right">Cases produced</th>
+            <th style="text-align:right">On hand now</th>
+            <th style="text-align:right">Usage cs (events)</th>
+          </tr></thead>
+          <tbody>${lineRows}</tbody>
+        </table>
+      </div>`;
+    }).join('');
+    return `<div style="border-top:2px solid var(--border)">
+      <div style="padding:10px 16px;background:var(--surface-alt,#f7f7f9);display:flex;justify-content:space-between;align-items:center">
+        <div style="font-weight:600">${dayLabel}</div>
+        <div style="font-size:12px;color:var(--muted)">${records.length} record${records.length===1?'':'s'} &middot; ${dayCs.toFixed(0)} cs</div>
+      </div>
+      ${cards}
+    </div>`;
+  }).join('');
+}
+
 </script>
 </body>
 </html>
