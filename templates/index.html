@@ -312,6 +312,7 @@
               <th>Ship Date</th>
               <th>Arrival</th>
               <th class="sortable" data-sort="eta">30-day ETA <span class="sort-ind"></span></th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="pending-tbody"></tbody>
@@ -2222,7 +2223,7 @@ function renderPendingPOs() {
   }
 
   if (groups.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">No pending POs match this filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">No pending POs match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
     return;
   }
@@ -2265,9 +2266,33 @@ function renderPendingPOs() {
       </td>
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
+      <td class="actions-col" style="white-space:nowrap">
+        <button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${g.lines.length}, ${g.total_cs.toFixed(0)})" title="Remove this PO entirely (distributor canceled)">Cancel</button>
+      </td>
     </tr>`;
   }).join('');
   updateSortIndicators('pending-tbody');
+}
+
+async function cancelPendingPO(poNumber, lineCount, totalCs) {
+  if (!poNumber) return;
+  const msg = `Cancel PO ${poNumber}?\n\nThis removes ${lineCount} on-order line${lineCount===1?'':'s'} (${totalCs} cs) and the PO will disappear from Pending POs.\n\nAlready-arrived quantity in inventory is NOT affected.`;
+  if (!confirm(msg)) return;
+  let result;
+  try {
+    result = await api('/api/admin/remove-po', 'POST', { po_number: poNumber });
+  } catch (e) {
+    toast('Cancel failed: ' + String(e));
+    return;
+  }
+  if (!result.ok) {
+    toast('Cancel failed: ' + (result.error || 'unknown'));
+    return;
+  }
+  toast(`Canceled PO ${poNumber} (${result.removed_entries} entries removed from ${result.affected_items.length} item${result.affected_items.length===1?'':'s'})`);
+  // Refresh both the Pending POs view and the Inventory cache.
+  await loadPendingPOs();
+  loadDashboard();
 }
 
 // -------------------------------------------------------------------------
