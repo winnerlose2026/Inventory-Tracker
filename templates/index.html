@@ -179,9 +179,6 @@
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
-      <div class="nav-item" onclick="showPage('distributors')">
-        <span class="nav-icon">🚚</span> Distributors
-      </div>
       <div class="nav-item" onclick="showPage('report')">
         <span class="nav-icon">📈</span> Report
       </div>
@@ -249,44 +246,26 @@
 
     <!-- Inventory -->
     <div class="page" id="page-inventory">
-      <h1>Inventory</h1>
-      <p class="subtitle">Unified list across all distributors and warehouses</p>
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">All Items</span>
-          <div style="display:flex;gap:10px;align-items:center">
-            <select id="inv-filter-distributor" onchange="onDistributorFilterChange()" style="width:180px">
-              <option value="">All distributors</option>
-              <option value="Cheney Brothers">Cheney Brothers</option>
-              <option value="US Foods">US Foods</option>
-              <option value="Unassigned">Unassigned</option>
-            </select>
-            <select id="inv-filter-warehouse" onchange="loadInventory()" style="width:200px">
-              <option value="">All warehouses</option>
-            </select>
-            <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
-          </div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+        <div>
+          <h1 style="margin-bottom:6px">Inventory</h1>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU.</p>
         </div>
-        <table>
-          <thead>
-            <tr id="inv-thead-row">
-              <th class="sortable" data-sort="name">SKU / Name <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="category">Category <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="distributor">Distributor <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="warehouse">Warehouse <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="quantity">Qty <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="on_order_qty">On Order <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="price">Price <span class="sort-ind"></span></th>
-              <th class="sortable" data-sort="status">Status <span class="sort-ind"></span></th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="inv-tbody"></tbody>
-        </table>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+          <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
+          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
+          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
+          <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
+          <button class="btn btn-success" onclick="runEmailScan(false)">Scan Email</button>
+          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
+        </div>
       </div>
+      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
+      <div id="inventory-container"></div>
     </div>
 
-    <!-- Distributors -->
+    <!-- Distributors (merged into Inventory) -->
     <!-- Pending POs -->
     <div class="page" id="page-pending-pos">
       <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
@@ -462,25 +441,7 @@
       </div>
     </div>
 
-    <div class="page" id="page-distributors">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
-        <div>
-          <h1 style="margin-bottom:6px">Distributors</h1>
-          <p class="subtitle" style="margin-bottom:0">Bagels grouped by Cheney Brothers &amp; US Foods</p>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
-          <button class="btn btn-ghost" onclick="runMigrateUnits()">Convert to Cases</button>
-          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
-          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
-          <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
-          <button class="btn btn-success" onclick="runEmailScan(false)">Scan Email</button>
-          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
-        </div>
-      </div>
-      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
-      <div id="distributors-container"></div>
-    </div>
+<!-- Distributors page merged into Inventory -->
 
     <!-- Usage Log -->
     <div class="page" id="page-usage">
@@ -732,7 +693,7 @@ function refresh(page) {
   if (page === 'dashboard') loadDashboard();
   else if (page === 'inventory') loadInventory();
   else if (page === 'usage') loadUsage();
-  else if (page === 'distributors') loadDistributors();
+  else if (page === 'distributors') showPage('inventory');
   else if (page === 'report') loadReport();
   else if (page === 'pending-pos') loadPendingPOs();
   else if (page === 'production') loadProduction();
@@ -952,86 +913,146 @@ async function reverseActivity(timestamp) {
   loadDashboard();
   if (currentPage === 'usage') loadUsage();
   if (currentPage === 'inventory') loadInventory();
-  if (currentPage === 'distributors') loadDistributors();
+  if (currentPage === 'distributors') loadInventory();
 }
 
 // -------------------------------------------------------------------------
 // Inventory
 // -------------------------------------------------------------------------
 async function loadInventory() {
-  await ensureWarehouses();
-  // Ensure warehouse filter dropdown is populated on first load
-  if (document.getElementById('inv-filter-warehouse').options.length <= 1) {
-    populateWarehouseSelect(
-      document.getElementById('inv-filter-warehouse'),
-      document.getElementById('inv-filter-distributor').value,
-      '',
-      true
-    );
-  }
-  let items = await api('/api/inventory');
-  inventoryCache = items;  // refresh cache for Edit/Use/Restock lookups
-  const distFilter = document.getElementById('inv-filter-distributor').value;
-  const whFilter = document.getElementById('inv-filter-warehouse').value;
-  if (distFilter) {
-    items = items.filter(i => (i.distributor || 'Unassigned') === distFilter);
-  }
-  if (whFilter) {
-    items = items.filter(i => (i.warehouse || '') === whFilter);
-  }
-  items = applyInvSort(items);
-  // Wire sort header clicks (idempotent — once is enough but cheap to repeat)
-  const invHead = document.getElementById('inv-thead-row');
-  if (invHead && !invHead.dataset.sortWired) {
-    invHead.querySelectorAll('th.sortable').forEach(th => {
-      th.addEventListener('click', () => onInvSortClick(th.dataset.sort));
-    });
-    invHead.dataset.sortWired = '1';
-  }
-  updateSortIndicators('inv-tbody');
-  // Same wiring for the pending-POs header (loaded on demand)
-  const pendHead = document.getElementById('pending-thead-row');
-  if (pendHead && !pendHead.dataset.sortWired) {
-    pendHead.querySelectorAll('th.sortable').forEach(th => {
-      th.addEventListener('click', () => onPendingSortClick(th.dataset.sort));
-    });
-    pendHead.dataset.sortWired = '1';
-  }
-  const tbody = document.getElementById('inv-tbody');
-  if (items.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">No items match this filter.</td></tr>';
+  // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
+  // that used to live on the Distributors tab. It also pulls the lot map
+  // so each row can expand a lot-history sub-table.
+  const [groups, lotMap] = await Promise.all([
+    api('/api/distributors'),
+    api('/api/production/lots-by-pair').catch(() => ({})),
+  ]);
+  window._lotMapByPair = lotMap || {};
+
+  // Cache flat items for Edit/Use/Restock modal lookups.
+  inventoryCache = [];
+  groups.forEach(g => g.warehouses.forEach(w => w.items.forEach(it => inventoryCache.push(it))));
+
+  const container = document.getElementById('inventory-container');
+  if (!container) return;
+  if (!groups.length) {
+    container.innerHTML = '<div class="empty">No inventory yet.</div>';
     return;
   }
-  tbody.innerHTML = items.map(item => {
-    const status = item.quantity <= item.low_stock_threshold
-      ? '<span class="badge badge-red">Low Stock</span>'
-      : item.quantity <= item.low_stock_threshold * 1.5
-        ? '<span class="badge badge-yellow">Watch</span>'
-        : '<span class="badge badge-green">OK</span>';
-    const sku = item.name.toUpperCase().replace(/\s+/g,'').slice(0,8);
-    return `<tr>
-      <td>
-        <div style="font-weight:600">${escHtml(item.name)}</div>
-        <div class="sku">${sku}</div>
-      </td>
-      <td><span class="badge badge-purple">${escHtml(item.category)}</span></td>
-      <td>${distributorBadge(item.distributor)}</td>
-      <td>${item.warehouse ? escHtml(item.warehouse) : '<span style="color:var(--muted)">—</span>'}</td>
-      <td style="font-weight:600">${item.quantity.toFixed(0)} <span style="color:var(--muted);font-size:12px">${escHtml(item.unit)}</span></td>
-      <td>${renderOnOrder(item)}</td>
-      <td>${item.price > 0 ? '$' + item.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
-      <td>${status}</td>
-      <td class="actions-col">
-        <div class="btn-group">
-          <button class="btn btn-danger btn-sm" onclick="openUseModal('${escAttr(item.name)}')">Use</button>
-          <button class="btn btn-success btn-sm" onclick="openRestockModal('${escAttr(item.name)}')">Restock</button>
-          <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escAttr(item.name)}')">Edit</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteItem('${escAttr(item.name)}')">✕</button>
-        </div>
-      </td>
-    </tr>`;
-  }).join('');
+  container.innerHTML = groups.map(g => {
+    const costs = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_cost || 0)).filter(c => c > 0)
+    );
+    const caseCost = costs.size === 1 ? [...costs][0] : null;
+    const caseSizes = new Set(
+      g.warehouses.flatMap(w => w.items.map(i => i.case_size || 0)).filter(c => c > 0)
+    );
+    const caseSize = caseSizes.size === 1 ? [...caseSizes][0] : null;
+    const weeklyTotal = g.warehouses.reduce(
+      (s, w) => s + w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0), 0);
+    const shortCount = g.warehouses.reduce(
+      (s, w) => s + w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length, 0);
+
+    return `
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)} ${g.distributor}</span>
+        <span style="color:var(--muted);font-size:12px">
+          ${g.warehouses.length} warehouse(s) &middot; ${g.item_count} SKU(s) &middot; ${g.total_quantity.toFixed(0)} units &middot; $${g.total_value.toFixed(2)}
+          ${caseCost !== null ? ` &middot; case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
+          &middot; ${weeklyTotal.toFixed(0)}/wk
+          ${(g.total_on_order || 0) > 0 ? ` &middot; <span style="color:var(--accent)">${g.total_on_order.toFixed(0)} on order</span>` : ''}
+          ${shortCount > 0 ? ` &middot; <span style="color:var(--red)">${shortCount} under 4 wk</span>` : ''}
+          ${g.low_stock_count > 0 ? ` &middot; <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
+        </span>
+      </div>
+      <div style="padding:0 4px 8px">
+        ${g.warehouses.map(w => {
+          const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
+          const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
+          return `
+          <div style="padding:14px 16px 4px">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+              <div style="font-weight:600">${escHtml(w.warehouse)}</div>
+              <div style="color:var(--muted);font-size:12px">
+                ${w.item_count} SKU(s) &middot; ${w.total_quantity.toFixed(0)} units &middot; $${w.total_value.toFixed(2)}
+                &middot; ${whWeekly.toFixed(0)}/wk
+                ${whShort > 0 ? ` &middot; <span style="color:var(--red)">${whShort} under 4 wk</span>` : ''}
+                ${w.low_stock_count > 0 ? ` &middot; <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
+              </div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
+                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th><th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${w.items.map(i => {
+                  const low = i.quantity <= i.low_stock_threshold;
+                  const weekly = i.weekly_usage || 0;
+                  const weeks = weekly > 0 ? (i.quantity / weekly) : null;
+                  const short = weeks !== null && weeks < 4;
+                  const weeksColor = weeks === null ? 'color:var(--muted)'
+                    : weeks < 2 ? 'color:var(--red);font-weight:600'
+                    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
+                    : '';
+                  const variety = (i.name || '').split(' Bagel')[0];
+                  const pairKey = `${w.warehouse}|${variety}`;
+                  const lots = (window._lotMapByPair && window._lotMapByPair[pairKey]) || [];
+                  const lotCs = lots.reduce((s, L) => s + (L.cs || 0), 0);
+                  const hasLots = lots.length > 0;
+                  const rowId = 'lots-' + Math.random().toString(36).slice(2, 10);
+                  const chevron = hasLots
+                    ? `<span style="cursor:pointer;display:inline-block;width:14px;color:var(--muted);user-select:none" onclick="toggleLotRow('${rowId}', this)">&#9656;</span>`
+                    : '<span style="display:inline-block;width:14px"></span>';
+                  return `<tr>
+                    <td style="font-weight:600">${chevron} ${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td>${renderOnOrder(i)}</td>
+                    <td>${escHtml(i.unit)}</td>
+                    <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
+                    <td class="actions-col" style="white-space:nowrap">
+                      <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escAttr(i.name)}')">Edit</button>
+                      <button class="btn btn-success btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button>
+                      <button class="btn btn-danger btn-sm" onclick="openUseModal('${escAttr(i.name)}')">Use</button>
+                    </td>
+                  </tr>
+                  ${hasLots ? `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
+                    <td colspan="9" style="padding:8px 16px 12px 30px">
+                      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Lot history (${lots.length} lot${lots.length === 1 ? '' : 's'}, ${lotCs} cs total across all production):</div>
+                      <table style="margin:0;font-size:12px;width:auto;min-width:60%">
+                        <thead><tr>
+                          <th style="text-align:left">Lot #</th>
+                          <th style="text-align:right">cs</th>
+                          <th>Production date</th>
+                          <th>PO #</th>
+                        </tr></thead>
+                        <tbody>
+                          ${lots.map(L => `<tr>
+                            <td style="font-family:monospace">${escHtml(L.lot)}</td>
+                            <td style="text-align:right;font-weight:600">${L.cs}</td>
+                            <td>${fmtProdDate(L.production_date)}</td>
+                            <td>${escHtml(L.po_number || '')}</td>
+                          </tr>`).join('')}
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>` : ''}`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        `;}).join('')}
+      </div>
+    </div>
+  `;}).join('');
 }
+
 
 // -------------------------------------------------------------------------
 // Distributor sync
@@ -1049,7 +1070,7 @@ async function runSync(dryRun) {
   }
   box.innerHTML = renderSyncReport(result);
   toast(dryRun ? 'Preview complete.' : 'Sync complete.');
-  if (!dryRun) loadDistributors();
+  if (!dryRun) loadInventory();
 }
 
 async function runSeed() {
@@ -1075,7 +1096,7 @@ async function runSeed() {
     </div>
   </div>`;
   toast('Bagel catalog seeded.');
-  loadDistributors();
+  loadInventory();
   loadDashboard();
 }
 
@@ -1105,7 +1126,7 @@ async function runMigrateUnits() {
     </div>
   </div>`;
   toast(`Converted ${result.converted} SKU(s) to case units.`);
-  loadDistributors();
+  loadInventory();
   loadInventory();
   loadDashboard();
 }
@@ -1123,7 +1144,7 @@ async function runEmailScan(dryRun) {
   }
   box.innerHTML = renderSyncReport(result);
   toast(dryRun ? 'Email preview complete.' : 'Email scan complete.');
-  if (!dryRun) { loadDistributors(); loadDashboard(); }
+  if (!dryRun) { loadInventory(); loadDashboard(); }
 }
 
 function renderSyncReport(result) {
@@ -1217,127 +1238,9 @@ function fmtProdDate(iso) {
 // -------------------------------------------------------------------------
 // Distributors (unified view)
 // -------------------------------------------------------------------------
-async function loadDistributors() {
-  const [groups, lotMap] = await Promise.all([
-    api('/api/distributors'),
-    api('/api/production/lots-by-pair').catch(() => ({})),
-  ]);
-  window._lotMapByPair = lotMap || {};
-  const container = document.getElementById('distributors-container');
-  if (!groups.length) {
-    container.innerHTML = '<div class="empty">No inventory yet.</div>';
-    return;
-  }
-  container.innerHTML = groups.map(g => {
-    // A distributor has one flat case cost across all its SKUs.
-    const costs = new Set(
-      g.warehouses.flatMap(w => w.items.map(i => i.case_cost || 0)).filter(c => c > 0)
-    );
-    const caseCost = costs.size === 1 ? [...costs][0] : null;
-    const caseSizes = new Set(
-      g.warehouses.flatMap(w => w.items.map(i => i.case_size || 0)).filter(c => c > 0)
-    );
-    const caseSize = caseSizes.size === 1 ? [...caseSizes][0] : null;
-    const weeklyTotal = g.warehouses.reduce(
-      (s, w) => s + w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0), 0);
-    const shortCount = g.warehouses.reduce(
-      (s, w) => s + w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length, 0);
+// loadDistributors() now aliases to loadInventory() (tabs merged 2026-05-14)
+async function loadDistributors() { return loadInventory(); }
 
-    return `
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)} ${g.distributor}</span>
-        <span style="color:var(--muted);font-size:12px">
-          ${g.warehouses.length} warehouse(s) · ${g.item_count} SKU(s) · ${g.total_quantity.toFixed(0)} units · $${g.total_value.toFixed(2)}
-          ${caseCost !== null ? ` · case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
-          · ${weeklyTotal.toFixed(0)}/wk
-          ${(g.total_on_order || 0) > 0 ? ` · <span style="color:var(--accent)">${g.total_on_order.toFixed(0)} on order</span>` : ''}
-          ${shortCount > 0 ? ` · <span style="color:var(--red)">${shortCount} under 4 wk</span>` : ''}
-          ${g.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${g.low_stock_count} low</span>` : ''}
-        </span>
-      </div>
-      <div style="padding:0 4px 8px">
-        ${g.warehouses.map(w => {
-          const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
-          const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
-          return `
-          <div style="padding:14px 16px 4px">
-            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-              <div style="font-weight:600">${escHtml(w.warehouse)}</div>
-              <div style="color:var(--muted);font-size:12px">
-                ${w.item_count} SKU(s) · ${w.total_quantity.toFixed(0)} units · $${w.total_value.toFixed(2)}
-                · ${whWeekly.toFixed(0)}/wk
-                ${whShort > 0 ? ` · <span style="color:var(--red)">${whShort} under 4 wk</span>` : ''}
-                ${w.low_stock_count > 0 ? ` · <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
-              </div>
-            </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
-                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${w.items.map(i => {
-                  const low = i.quantity <= i.low_stock_threshold;
-                  const weekly = i.weekly_usage || 0;
-                  const weeks = weekly > 0 ? (i.quantity / weekly) : null;
-                  const short = weeks !== null && weeks < 4;
-                  const weeksColor = weeks === null ? 'color:var(--muted)'
-                    : weeks < 2 ? 'color:var(--red);font-weight:600'
-                    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
-                    : '';
-                  // Extract variety from item name (everything before " Bagel")
-                  const variety = (i.name || '').split(' Bagel')[0];
-                  const pairKey = `${w.warehouse}|${variety}`;
-                  const lots = (window._lotMapByPair && window._lotMapByPair[pairKey]) || [];
-                  const lotCs = lots.reduce((s, L) => s + (L.cs || 0), 0);
-                  const hasLots = lots.length > 0;
-                  const rowId = 'lots-' + Math.random().toString(36).slice(2, 10);
-                  const chevron = hasLots
-                    ? `<span style="cursor:pointer;display:inline-block;width:14px;color:var(--muted);user-select:none" onclick="toggleLotRow('${rowId}', this)">▸</span>`
-                    : '<span style="display:inline-block;width:14px"></span>';
-                  return `<tr>
-                    <td style="font-weight:600">${chevron} ${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
-                    <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
-                    <td>${renderOnOrder(i)}</td>
-                    <td>${escHtml(i.unit)}</td>
-                    <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">—</span>'}</td>
-                    <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
-                    <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">—</span>'}</td>
-                    <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
-                  </tr>
-                  ${hasLots ? `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
-                    <td colspan="8" style="padding:8px 16px 12px 30px">
-                      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Lot history (${lots.length} lot${lots.length === 1 ? '' : 's'}, ${lotCs} cs total across all production):</div>
-                      <table style="margin:0;font-size:12px;width:auto;min-width:60%">
-                        <thead><tr>
-                          <th style="text-align:left">Lot #</th>
-                          <th style="text-align:right">cs</th>
-                          <th>Production date</th>
-                          <th>PO #</th>
-                        </tr></thead>
-                        <tbody>
-                          ${lots.map(L => `<tr>
-                            <td style="font-family:monospace">${escHtml(L.lot)}</td>
-                            <td style="text-align:right;font-weight:600">${L.cs}</td>
-                            <td>${fmtProdDate(L.production_date)}</td>
-                            <td>${escHtml(L.po_number || '')}</td>
-                          </tr>`).join('')}
-                        </tbody>
-                      </table>
-                    </td>
-                  </tr>` : ''}`;
-                }).join('')}
-              </tbody>
-            </table>
-          </div>
-        `;}).join('')}
-      </div>
-    </div>
-  `;}).join('');
-}
 
 // -------------------------------------------------------------------------
 // Usage Log
