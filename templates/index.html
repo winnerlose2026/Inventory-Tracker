@@ -1162,10 +1162,33 @@ function renderSyncReport(result) {
 }
 
 // -------------------------------------------------------------------------
+// Lot-row helpers used by the Distributors expandable rows.
+function toggleLotRow(rowId, chev) {
+  const row = document.getElementById(rowId);
+  if (!row) return;
+  if (row.style.display === 'none') {
+    row.style.display = '';
+    chev.textContent = '▾';
+  } else {
+    row.style.display = 'none';
+    chev.textContent = '▸';
+  }
+}
+function fmtProdDate(iso) {
+  if (!iso) return '<span style="color:var(--muted)">—</span>';
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso);
+  return m ? `${m[2]}/${m[3]}/${m[1]}` : iso;
+}
+
+// -------------------------------------------------------------------------
 // Distributors (unified view)
 // -------------------------------------------------------------------------
 async function loadDistributors() {
-  const groups = await api('/api/distributors');
+  const [groups, lotMap] = await Promise.all([
+    api('/api/distributors'),
+    api('/api/production/lots-by-pair').catch(() => ({})),
+  ]);
+  window._lotMapByPair = lotMap || {};
   const container = document.getElementById('distributors-container');
   if (!groups.length) {
     container.innerHTML = '<div class="empty">No inventory yet.</div>';
@@ -1231,8 +1254,18 @@ async function loadDistributors() {
                     : weeks < 2 ? 'color:var(--red);font-weight:600'
                     : weeks < 4 ? 'color:var(--yellow);font-weight:600'
                     : '';
+                  // Extract variety from item name (everything before " Bagel")
+                  const variety = (i.name || '').split(' Bagel')[0];
+                  const pairKey = `${w.warehouse}|${variety}`;
+                  const lots = (window._lotMapByPair && window._lotMapByPair[pairKey]) || [];
+                  const lotCs = lots.reduce((s, L) => s + (L.cs || 0), 0);
+                  const hasLots = lots.length > 0;
+                  const rowId = 'lots-' + Math.random().toString(36).slice(2, 10);
+                  const chevron = hasLots
+                    ? `<span style="cursor:pointer;display:inline-block;width:14px;color:var(--muted);user-select:none" onclick="toggleLotRow('${rowId}', this)">▸</span>`
+                    : '<span style="display:inline-block;width:14px"></span>';
                   return `<tr>
-                    <td style="font-weight:600">${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}</td>
+                    <td style="font-weight:600">${chevron} ${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${renderOnOrder(i)}</td>
                     <td>${escHtml(i.unit)}</td>
@@ -1240,7 +1273,28 @@ async function loadDistributors() {
                     <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">—</span>'}</td>
                     <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">—</span>'}</td>
                     <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
-                  </tr>`;
+                  </tr>
+                  ${hasLots ? `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
+                    <td colspan="8" style="padding:8px 16px 12px 30px">
+                      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Lot history (${lots.length} lot${lots.length === 1 ? '' : 's'}, ${lotCs} cs total across all production):</div>
+                      <table style="margin:0;font-size:12px;width:auto;min-width:60%">
+                        <thead><tr>
+                          <th style="text-align:left">Lot #</th>
+                          <th style="text-align:right">cs</th>
+                          <th>Production date</th>
+                          <th>PO #</th>
+                        </tr></thead>
+                        <tbody>
+                          ${lots.map(L => `<tr>
+                            <td style="font-family:monospace">${escHtml(L.lot)}</td>
+                            <td style="text-align:right;font-weight:600">${L.cs}</td>
+                            <td>${fmtProdDate(L.production_date)}</td>
+                            <td>${escHtml(L.po_number || '')}</td>
+                          </tr>`).join('')}
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>` : ''}`;
                 }).join('')}
               </tbody>
             </table>

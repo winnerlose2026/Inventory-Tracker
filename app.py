@@ -310,6 +310,48 @@ def api_production_list():
     return jsonify(out)
 
 
+@app.route("/api/production/lots-by-pair")
+def api_production_lots_by_pair():
+    """Lot-level breakdown grouped by (warehouse, variety).
+
+    Returns a dict keyed by ``"<warehouse>|<variety>"`` whose values are
+    lists of ``{lot, cs, production_date, po_number, received_at}``
+    sorted newest first. The Distributors tab uses this to render an
+    expand-on-click lot breakdown beneath each SKU row.
+    """
+    from inventory_tracker import load_production
+    records = load_production()
+    out: dict = {}
+    for r in records:
+        wh = r.get("warehouse") or ""
+        if not wh:
+            continue
+        pd = r.get("production_date") or ""
+        po = r.get("po_number") or ""
+        recv = r.get("received_at") or ""
+        for L in r.get("lines", []):
+            lot = (L.get("lot_number") or "").strip()
+            if not lot:
+                continue
+            variety = L.get("variety") or ""
+            if not variety:
+                continue
+            key = f"{wh}|{variety}"
+            out.setdefault(key, []).append({
+                "lot":             lot,
+                "cs":              L.get("cs_count") or 0,
+                "production_date": pd,
+                "po_number":       po,
+                "received_at":     recv,
+            })
+    # Sort each pair newest-first by production_date, then received_at.
+    for k in out:
+        out[k].sort(key=lambda e: (e.get("production_date") or "",
+                                    e.get("received_at") or ""),
+                    reverse=True)
+    return jsonify(out)
+
+
 @app.route("/api/production/summary")
 def api_production_summary():
     """Roll-up across production records.
