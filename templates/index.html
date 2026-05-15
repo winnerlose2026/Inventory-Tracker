@@ -354,6 +354,37 @@
         </div>
       </div>
 
+      <!-- Search / filter bar (top of page) -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="filters" style="padding:12px 20px">
+          <div class="filter-group" style="flex:1;min-width:240px">
+            <label>Search</label>
+            <input id="prod-filter-search" type="search"
+                   placeholder="Production date (5/8, 2026-05, ...), PO #, or lot code"
+                   oninput="onProdSearchInput()"
+                   style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+          <div class="filter-group">
+            <label>Distributor</label>
+            <select id="prod-filter-distributor" onchange="onProdSearchInput()" style="width:180px">
+              <option value="">All</option>
+              <option>Cheney Brothers</option>
+              <option>US Foods</option>
+              <option>Chefs Warehouse</option>
+              <option>DeliBag</option>
+              <option>Carmela Foods</option>
+              <option>H&amp;H Bagels</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Warehouse</label>
+            <select id="prod-filter-warehouse" onchange="onProdSearchInput()" style="width:200px">
+              <option value="">All</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <!-- Summary cards (current period) -->
       <div id="prod-summary-cards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px"></div>
 
@@ -381,31 +412,19 @@
 
       <!-- Detail table (one row per ingested production sheet) -->
       <div class="card">
-        <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
-          <div class="filter-group" style="flex:1;min-width:220px">
-            <label>Search</label>
-            <input id="prod-filter-search" type="search"
-                   placeholder="Production date (5/8, 2026-05, etc.) or PO #"
-                   oninput="renderProductionDetail()"
-                   style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
-          </div>
-          <div class="filter-group">
-            <label>Distributor</label>
-            <select id="prod-filter-distributor" onchange="renderProductionDetail()" style="width:180px">
-              <option value="">All</option>
-              <option>Cheney Brothers</option>
-              <option>US Foods</option>
-              <option>Chefs Warehouse</option>
-              <option>DeliBag</option>
-              <option>Carmela Foods</option>
-              <option>H&amp;H Bagels</option>
+        <div id="prod-pager-top" style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+          <div id="prod-pager-info"></div>
+          <div id="prod-pager-controls" style="display:flex;align-items:center;gap:8px">
+            <span>Show</span>
+            <select id="prod-page-size" onchange="onProdPageSizeChange()" style="padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+              <option value="10" selected>10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
             </select>
-          </div>
-          <div class="filter-group">
-            <label>Warehouse</label>
-            <select id="prod-filter-warehouse" onchange="renderProductionDetail()" style="width:200px">
-              <option value="">All</option>
-            </select>
+            <button class="btn btn-ghost btn-sm" id="prod-page-prev" onclick="onProdPageNav(-1)">&laquo; Prev</button>
+            <span id="prod-page-indicator" style="min-width:80px;text-align:center"></span>
+            <button class="btn btn-ghost btn-sm" id="prod-page-next" onclick="onProdPageNav(1)">Next &raquo;</button>
           </div>
         </div>
         <table>
@@ -2172,6 +2191,23 @@ let prodPeriod = 'week';        // 'day' | 'week' | 'month'
 let prodSortKey = 'production_date';
 let prodSortDir = -1;            // newest first by default
 let prodCache = [];
+let prodPageSize = 10;           // rows per page
+let prodPage = 0;                // 0-indexed current page
+
+function onProdSearchInput() {
+  prodPage = 0;                  // any filter change snaps back to page 1
+  renderProductionDetail();
+}
+function onProdPageSizeChange() {
+  const v = parseInt(document.getElementById('prod-page-size').value, 10);
+  prodPageSize = (v > 0 ? v : 10);
+  prodPage = 0;
+  renderProductionDetail();
+}
+function onProdPageNav(delta) {
+  prodPage = Math.max(0, prodPage + delta);
+  renderProductionDetail();
+}
 
 function setProdPeriod(p) {
   prodPeriod = p;
@@ -2188,6 +2224,26 @@ function onProdSortClick(key) {
   else if (prodSortDir === -1) { prodSortKey = null; prodSortDir = 0; }
   else prodSortDir = 1;
   renderProductionDetail();
+}
+
+function _updateProdPager(first, last, total) {
+  const info = document.getElementById('prod-pager-info');
+  const ind  = document.getElementById('prod-page-indicator');
+  const prev = document.getElementById('prod-page-prev');
+  const next = document.getElementById('prod-page-next');
+  if (!info || !ind || !prev || !next) return;
+  if (total === 0) {
+    info.textContent = 'No records';
+    ind.textContent  = '';
+    prev.disabled = true;
+    next.disabled = true;
+    return;
+  }
+  info.textContent = `Showing ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`;
+  const totalPages = Math.max(1, Math.ceil(total / prodPageSize));
+  ind.textContent  = `Page ${prodPage + 1} of ${totalPages}`;
+  prev.disabled = prodPage <= 0;
+  next.disabled = prodPage >= totalPages - 1;
 }
 
 let prodPoLookup = {};  // po_number -> aggregated on_order info
@@ -2357,7 +2413,14 @@ function renderProductionDetail() {
       const po = (r.po_number || '').toLowerCase();
       const dIso = (r.production_date || '').toLowerCase();        // 2026-05-08
       const dFmt = formatDate(r.production_date || '').toLowerCase(); // 05/08/2026
-      return po.includes(qRaw) || dIso.includes(qRaw) || dFmt.includes(qRaw);
+      if (po.includes(qRaw) || dIso.includes(qRaw) || dFmt.includes(qRaw)) return true;
+      // Also match any lot code on a line of this record (case-insensitive)
+      const lines = r.lines || [];
+      for (const L of lines) {
+        const lot = (L.lot_number || '').toLowerCase();
+        if (lot && lot.includes(qRaw)) return true;
+      }
+      return false;
     });
   }
 
@@ -2376,8 +2439,19 @@ function renderProductionDetail() {
   if (rows.length === 0) {
     tbody.innerHTML = '<tr><td colspan="10" class="empty">No production records match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
+    _updateProdPager(0, 0, 0);
     return;
   }
+
+  // Pagination — slice to the current page.
+  const totalRows = rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / prodPageSize));
+  if (prodPage >= totalPages) prodPage = totalPages - 1;
+  if (prodPage < 0) prodPage = 0;
+  const sliceStart = prodPage * prodPageSize;
+  const sliceEnd = Math.min(sliceStart + prodPageSize, totalRows);
+  rows = rows.slice(sliceStart, sliceEnd);
+  _updateProdPager(sliceStart + 1, sliceEnd, totalRows);
 
   tbody.innerHTML = rows.map(r => {
     const lines = (r.lines || []).slice().sort((a, b) => a.variety.localeCompare(b.variety));
