@@ -367,6 +367,199 @@ def api_production_lots_by_pair():
     return jsonify(out)
 
 
+@app.route("/api/sales/ingest", methods=["POST"])
+def api_sales_ingest():
+    """Accept Toast product-mix rows pushed by an external aggregator.
+
+    Body: {
+      "rows": [
+        {"restaurant_guid": "...", "location": "UES",
+         "business_date": "2026-05-12",
+         "item_guid": "...", "item": "Plain Bagel",
+         "menu_group": "Bagels",          # optional
+         "qty": 124, "gross": 372.00, "net": 369.50}
+      ],
+      "replace_dates": false   # if true, wipe existing rows for the
+                               # (location, date) pairs in this batch
+                               # before appending. Useful to refresh a
+                               # day without orphaning items removed
+                               # from the catalog.
+    }
+
+    Dedupe key: (restaurant_guid, business_date, item_guid). Posting the
+    same item for the same day overwrites the prior row.
+    """
+    from inventory_tracker import load_sales, save_sales
+    body = request.json or {}
+    rows = body.get("rows") or []
+    if not isinstance(rows, list):
+        return jsonify({"ok": False, "error": "rows must be a list"}), 400
+    replace_dates = bool(body.get("replace_dates", False))
+
+    existing = load_sales()
+    # Key existing rows.
+    by_key = {(r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid")): i
+              for i, r in enumerate(existing)}
+
+    if replace_dates:
+        seed = set((r.get("restaurant_guid"), r.get("business_date")) for r in rows)
+        existing = [r for r in existing
+                    if (r.get("restaurant_guid"), r.get("business_date")) not in seed]
+        by_key = {(r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid")): i
+                  for i, r in enumerate(existing)}
+
+    added, updated = 0, 0
+    for r in rows:
+        if not r.get("restaurant_guid") or not r.get("business_date") or not r.get("item_guid"):
+            continue
+        key = (r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid"))
+        if key in by_key:
+            existing[by_key[key]] = r
+            updated += 1
+        else:
+            existing.append(r)
+            by_key[key] = len(existing) - 1
+            added += 1
+    save_sales(existing)
+    return jsonify({"ok": True, "added": added, "updated": updated,
+                    "total_rows": len(existing)})
+
+
+@app.route("/api/report/toast-sales")
+def api_report_toast_sales():
+    """Top-selling items aggregated by week or month, optionally by
+    location. Output is the data behind the Report -> Top Consumed
+    section.
+
+    Query params:
+      period        'week' | 'month' (default 'week')
+      buckets       int, default 8 (weeks) / 6 (months)
+      location      restaurant_guid OR location string, optional
+      top_n         int, default 10
+    """
+    from inventory_tracker import load_sales
+    from datetime import datetime as _dt, timedelta as _td
+
+    args = request.args
+    period = (args.get("period") or "week").lower()
+    if period not in ("week", "month"):
+        return jsonify({"ok": False, "error": "period must be week|month"}), 400
+    try:
+        buckets = int(args.get("buckets") or (8 if period == "week" else 6))
+    except (TypeError, ValueError):
+        buckets = 8 if period == "week" else 6
+    try:
+        top_n = int(args.get("top_n") or 10)
+    except (TypeError, ValueError):
+        top_n = 10
+    location_q = (args.get("location") or "").strip()
+
+    rows = load_sales() or []
+
+    # Optional location filter — match either restaurant_guid or
+    # location name (case-insensitive substring).
+    if location_q:
+        if "-" in location_q or len(location_q) == 36:
+            rows = [r for r in rows if r.get("restaurant_guid") == location_q]
+        else:
+            q = location_q.lower()
+            rows = [r for r in rows if q in (r.get("location") or "").lower()]
+
+    if not rows:
+        return jsonify({"ok": True, "period": period, "buckets": [],
+                        "total_rows": 0})
+
+    # Bucket each row.
+    def _bucket_key(date_iso: str) -> str:
+        try:
+            d = _dt.strptime(date_iso, "%Y-%m-%d")
+        except ValueError:
+            return ""
+        if period == "week":
+            # ISO week, Monday-start. Anchor on the Monday of that week.
+            mon = d - _td(days=d.weekday())
+            return mon.strftime("%Y-%m-%d")
+        return d.strftime("%Y-%m")
+
+    buckets_map: dict = {}
+    for r in rows:
+        bk = _bucket_key(r.get("business_date") or "")
+        if not bk:
+            continue
+        slot = buckets_map.setdefault(bk, {})
+        item_key = r.get("item_guid")
+        if not item_key:
+            continue
+        agg = slot.setdefault(item_key, {
+            "item_guid": item_key,
+            "item":      r.get("item") or "",
+            "menu_group": r.get("menu_group") or "",
+            "qty":       0,
+            "gross":     0.0,
+            "net":       0.0,
+        })
+        agg["qty"]   += int(r.get("qty") or 0)
+        agg["gross"] += float(r.get("gross") or 0)
+        agg["net"]   += float(r.get("net") or 0)
+
+    # Take the newest N buckets, sort items by gross desc, attach mix %.
+    out_buckets = []
+    for bk in sorted(buckets_map.keys(), reverse=True)[:buckets]:
+        items = list(buckets_map[bk].values())
+        items.sort(key=lambda x: x["gross"], reverse=True)
+        total = sum(x["gross"] for x in items) or 1
+        for it in items:
+            it["mix_pct"] = round(100 * it["gross"] / total, 2)
+            it["gross"]   = round(it["gross"], 2)
+            it["net"]     = round(it["net"], 2)
+        if period == "week":
+            d = _dt.strptime(bk, "%Y-%m-%d")
+            label = f"{d.strftime('%b %-d')} \u2013 {(d + _td(days=6)).strftime('%b %-d, %Y')}"
+        else:
+            d = _dt.strptime(bk, "%Y-%m")
+            label = d.strftime("%B %Y")
+        out_buckets.append({
+            "key":      bk,
+            "label":    label,
+            "total_gross": round(total, 2),
+            "items":    items[:top_n],
+            "item_count": len(items),
+        })
+
+    return jsonify({"ok": True, "period": period,
+                    "buckets": out_buckets,
+                    "total_rows": len(rows)})
+
+
+@app.route("/api/sales/locations")
+def api_sales_locations():
+    """List distinct locations present in the sales store, with row
+    counts and date ranges. Drives the location selector on the
+    Report page.
+    """
+    from inventory_tracker import load_sales
+    rows = load_sales() or []
+    by_loc: dict = {}
+    for r in rows:
+        guid = r.get("restaurant_guid") or ""
+        slot = by_loc.setdefault(guid, {
+            "restaurant_guid": guid,
+            "location":        r.get("location") or "",
+            "rows":            0,
+            "min_date":        r.get("business_date") or "",
+            "max_date":        r.get("business_date") or "",
+        })
+        slot["rows"] += 1
+        d = r.get("business_date") or ""
+        if d and (not slot["min_date"] or d < slot["min_date"]):
+            slot["min_date"] = d
+        if d and (not slot["max_date"] or d > slot["max_date"]):
+            slot["max_date"] = d
+    return jsonify({"ok": True,
+                    "locations": sorted(by_loc.values(),
+                                        key=lambda x: x["location"])})
+
+
 @app.route("/api/traceability/search")
 def api_traceability_search():
     """Cross-source traceability search.

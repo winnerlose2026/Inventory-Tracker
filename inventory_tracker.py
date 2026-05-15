@@ -113,6 +113,28 @@ def save_labor(entries: list):
 # on_order entries we just removed).
 CANCELED_POS_FILE = DATA_DIR / "canceled_pos.json"
 
+# Toast POS sales — per-location, per-day, per-item product mix.
+# One entry per (restaurant_guid, business_date, item_guid).
+# Used by the Report page Top Consumed section.
+SALES_FILE = DATA_DIR / "sales.json"
+
+
+def load_sales() -> list:
+    if SALES_FILE.exists():
+        with open(SALES_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
+
+
+def save_sales(entries: list):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(SALES_FILE, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
 
 def load_canceled_pos() -> dict:
     """Return {po_number: {canceled_at, reason, note}}."""

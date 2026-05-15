@@ -585,8 +585,24 @@
       </div>
       <div class="report-grid">
         <div class="card">
-          <div class="card-header"><span class="card-title">🔥 Top Consumed</span></div>
-          <div style="padding:16px 20px" id="chart-consumed"></div>
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="card-title">🔥 Top Consumed &middot; Toast retail sales</span>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <select id="toast-sales-location" onchange="loadToastSales()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+                <option value="">All locations</option>
+              </select>
+              <div class="btn-group">
+                <button class="btn btn-ghost btn-sm active" id="toast-sales-period-week" onclick="setToastSalesPeriod('week')">Weekly</button>
+                <button class="btn btn-ghost btn-sm" id="toast-sales-period-month" onclick="setToastSalesPeriod('month')">Monthly</button>
+              </div>
+            </div>
+          </div>
+          <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="toast-sales-subtitle">
+            Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${period}.
+          </div>
+          <div style="padding:6px 20px 16px 20px" id="toast-sales-container">
+            <div class="empty" style="padding:18px;color:var(--muted)">Loading Toast sales…</div>
+          </div>
         </div>
         <div class="card">
           <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
@@ -1601,6 +1617,8 @@ function setVarietyRankingPeriod(p) {
 }
 
 async function loadReport() {
+  // Toast sales feed (Top Consumed card)
+  loadToastSales();
   const [report, prod] = await Promise.all([
     api('/api/report'),
     api('/api/production'),
@@ -3074,6 +3092,84 @@ function renderTraceResults() {
         <div style="font-size:12px;color:var(--muted)">${records.length} record${records.length===1?'':'s'} &middot; ${dayCs.toFixed(0)} cs</div>
       </div>
       ${cards}
+    </div>`;
+  }).join('');
+}
+
+
+// -------------------------------------------------------------------------
+// Report -> Top Consumed (Toast sales)
+// -------------------------------------------------------------------------
+let toastSalesPeriod = 'week';
+let _toastSalesLocationsLoaded = false;
+function setToastSalesPeriod(p) {
+  toastSalesPeriod = p;
+  ['week','month'].forEach(m => {
+    const b = document.getElementById('toast-sales-period-' + m);
+    if (b) b.classList.toggle('active', m === p);
+  });
+  loadToastSales();
+}
+async function ensureToastLocationDropdown() {
+  if (_toastSalesLocationsLoaded) return;
+  _toastSalesLocationsLoaded = true;
+  try {
+    const r = await api('/api/sales/locations');
+    const sel = document.getElementById('toast-sales-location');
+    if (sel && r.locations) {
+      const opts = r.locations.map(L =>
+        `<option value="${escAttr(L.restaurant_guid)}">${escHtml(L.location || L.restaurant_guid)} <span>(${L.rows} rows)</span></option>`
+      );
+      sel.innerHTML = '<option value="">All locations</option>' + opts.join('');
+    }
+  } catch (e) { /* fallthrough */ }
+}
+async function loadToastSales() {
+  await ensureToastLocationDropdown();
+  const loc = document.getElementById('toast-sales-location').value;
+  const qs = new URLSearchParams();
+  qs.set('period', toastSalesPeriod);
+  if (loc) qs.set('location', loc);
+  const subtitle = document.getElementById('toast-sales-subtitle');
+  if (subtitle) subtitle.textContent =
+    `Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${toastSalesPeriod}.`;
+  let res;
+  try {
+    res = await api('/api/report/toast-sales?' + qs.toString());
+  } catch (e) {
+    document.getElementById('toast-sales-container').innerHTML =
+      `<div class="empty" style="padding:18px;color:var(--red)">Failed: ${escHtml(String(e))}</div>`;
+    return;
+  }
+  const buckets = (res && res.buckets) || [];
+  const container = document.getElementById('toast-sales-container');
+  if (!buckets.length) {
+    container.innerHTML = '<div class="empty" style="padding:18px">No Toast sales rows ingested yet. Run the Toast sync from a Cowork session to populate.</div>';
+    return;
+  }
+  container.innerHTML = buckets.map(b => {
+    const headerLabel = b.label || b.key;
+    const itemsHtml = (b.items || []).map((it, idx) => `<tr>
+      <td style="color:var(--muted);width:28px;text-align:right">${idx + 1}.</td>
+      <td>${escHtml(it.item)}${it.menu_group ? ` <span style="color:var(--muted);font-size:11px">[${escHtml(it.menu_group)}]</span>` : ''}</td>
+      <td style="text-align:right;font-weight:600">$${it.gross.toFixed(2)}</td>
+      <td style="text-align:right;color:var(--muted)">${it.qty.toLocaleString()}</td>
+      <td style="text-align:right;font-weight:600">${it.mix_pct.toFixed(1)}%</td>
+    </tr>`).join('');
+    return `<div style="border-top:1px solid var(--border);padding:10px 0">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+        <div style="font-weight:600">${escHtml(headerLabel)}</div>
+        <div style="color:var(--muted);font-size:12px">$${b.total_gross.toFixed(2)} gross &middot; ${b.item_count} items</div>
+      </div>
+      <table style="margin:0;font-size:12px">
+        <thead><tr>
+          <th></th><th>Item</th>
+          <th style="text-align:right">Gross $</th>
+          <th style="text-align:right">Qty</th>
+          <th style="text-align:right">Mix %</th>
+        </tr></thead>
+        <tbody>${itemsHtml}</tbody>
+      </table>
     </div>`;
   }).join('');
 }
