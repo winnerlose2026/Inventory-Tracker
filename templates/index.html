@@ -390,9 +390,24 @@
 
       <!-- Bucket roll-ups (one row per week/month/day) -->
       <div class="card" style="margin-bottom:20px">
-        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
-          <strong>Production by period</strong>
-          <span id="prod-period-label" style="color:var(--muted);font-size:12px"></span>
+        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <strong>Production by period</strong>
+            <span id="prod-period-label" style="color:var(--muted);font-size:12px"></span>
+            <span id="prod-summary-pager-info" style="color:var(--muted);font-size:12px;margin-left:8px"></span>
+          </div>
+          <div id="prod-summary-pager-controls" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
+            <span>Show</span>
+            <select id="prod-summary-page-size" onchange="onProdSummaryPageSizeChange()" style="padding:3px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+              <option value="10" selected>10</option>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" id="prod-summary-page-prev" onclick="onProdSummaryPageNav(-1)">&laquo; Prev</button>
+            <span id="prod-summary-page-indicator" style="min-width:80px;text-align:center"></span>
+            <button class="btn btn-ghost btn-sm" id="prod-summary-page-next" onclick="onProdSummaryPageNav(1)">Next &raquo;</button>
+          </div>
         </div>
         <table>
           <thead>
@@ -2209,8 +2224,44 @@ function onProdPageNav(delta) {
   renderProductionDetail();
 }
 
+// Pagination state for the Production-by-period (summary) table.
+let prodSummaryPageSize = 10;
+let prodSummaryPage = 0;
+let _prodSummaryBuckets = [];   // cache of last-rendered buckets, for pager-only re-renders
+
+function onProdSummaryPageSizeChange() {
+  const v = parseInt(document.getElementById('prod-summary-page-size').value, 10);
+  prodSummaryPageSize = (v > 0 ? v : 10);
+  prodSummaryPage = 0;
+  if (_prodSummaryBuckets.length) renderProductionSummary({ buckets: _prodSummaryBuckets });
+}
+function onProdSummaryPageNav(delta) {
+  prodSummaryPage = Math.max(0, prodSummaryPage + delta);
+  if (_prodSummaryBuckets.length) renderProductionSummary({ buckets: _prodSummaryBuckets });
+}
+function _updateProdSummaryPager(first, last, total) {
+  const info = document.getElementById('prod-summary-pager-info');
+  const ind  = document.getElementById('prod-summary-page-indicator');
+  const prev = document.getElementById('prod-summary-page-prev');
+  const next = document.getElementById('prod-summary-page-next');
+  if (!info || !ind || !prev || !next) return;
+  if (total === 0) {
+    info.textContent = '';
+    ind.textContent  = '';
+    prev.disabled = true;
+    next.disabled = true;
+    return;
+  }
+  info.textContent = `\u00b7 Showing ${first.toLocaleString()}\u2013${last.toLocaleString()} of ${total.toLocaleString()}`;
+  const totalPages = Math.max(1, Math.ceil(total / prodSummaryPageSize));
+  ind.textContent  = `Page ${prodSummaryPage + 1} of ${totalPages}`;
+  prev.disabled = prodSummaryPage <= 0;
+  next.disabled = prodSummaryPage >= totalPages - 1;
+}
+
 function setProdPeriod(p) {
   prodPeriod = p;
+  prodSummaryPage = 0;
   ['week','month','day'].forEach(m => {
     const btn = document.getElementById('prod-period-' + m);
     if (btn) btn.classList.toggle('active', m === p);
@@ -2333,14 +2384,30 @@ function renderProductionSummary(data) {
     (recordsByDate[d] = recordsByDate[d] || []).push(r);
   });
 
+  // Cache the buckets so the pager handlers can re-render without
+  // re-fetching the summary endpoint.
+  _prodSummaryBuckets = buckets.slice();
+
   // Bucket table
   const tbody = document.getElementById('prod-summary-tbody');
   if (buckets.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty">No production records yet.</td></tr>';
+    _updateProdSummaryPager(0, 0, 0);
     return;
   }
+
+  // Pagination — slice to the current page.
+  const _totalBuckets = buckets.length;
+  const _totalPages = Math.max(1, Math.ceil(_totalBuckets / prodSummaryPageSize));
+  if (prodSummaryPage >= _totalPages) prodSummaryPage = _totalPages - 1;
+  if (prodSummaryPage < 0) prodSummaryPage = 0;
+  const _sliceStart = prodSummaryPage * prodSummaryPageSize;
+  const _sliceEnd = Math.min(_sliceStart + prodSummaryPageSize, _totalBuckets);
+  const _pagedBuckets = buckets.slice(_sliceStart, _sliceEnd);
+  _updateProdSummaryPager(_sliceStart + 1, _sliceEnd, _totalBuckets);
+
   const todayISO = new Date().toISOString().slice(0, 10);
-  tbody.innerHTML = buckets.map(b => {
+  tbody.innerHTML = _pagedBuckets.map(b => {
     const dist = Object.entries(b.by_distributor || {})
       .sort((x, y) => y[1] - x[1])
       .map(([n, c]) => `${escHtml(n)}&nbsp;<span style="color:var(--muted)">${c}</span>`)
