@@ -127,9 +127,18 @@ SALES_FILE = DATA_DIR / "sales.json"
 #   "active"           — has retrievable per-day product mix
 #   "pre_launch"       — $0 lifetime sales (location not yet operating)
 #   "data_unavailable" — chain rollup shows revenue but ordersBulk returns
-#                        $0 per day (likely a Toast partner-integration
-#                        migration; per-day item mix can not be pulled
-#                        with current credentials)
+#                        0 orders across all sampled dates. Verified
+#                        2026-05-15 via toast_list_orders (returned 0
+#                        for Chapel Hill across Q1 2025) and via
+#                        toast_backfill_cache --force (claimed cached
+#                        in 0.1s, but product_mix still 0). Conclusion:
+#                        the chain_revenue aggregate is a phantom cache
+#                        entry from a prior Toast partner integration;
+#                        the current credentials have no order-level
+#                        access to these locations. Action: ask Toast
+#                        support whether the current partner_id covers
+#                        these GUIDs, or migrate the cache via a fresh
+#                        integration that does.
 TOAST_RETAIL_LOCATIONS: list[dict] = [
     {"restaurant_guid": "0d5af5fb-c12a-4f47-ac4e-fd1110b91dcb", "location": "Palm Beach Gardens - Avenir Center", "status": "pre_launch"},
     {"restaurant_guid": "12b6706d-bf0f-4405-a493-51929a4e9dcd", "location": "Pinecrest",                            "status": "active"},
