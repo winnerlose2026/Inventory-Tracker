@@ -123,30 +123,37 @@ SALES_FILE = DATA_DIR / "sales.json"
 # Top Consumed location dropdown even before sales rows have been
 # ingested for a location, so the user can pick any location for
 # comparison. Source: `toast_list_restaurants` (snapshot 2026-05-15).
+# status values:
+#   "active"           — has retrievable per-day product mix
+#   "pre_launch"       — $0 lifetime sales (location not yet operating)
+#   "data_unavailable" — chain rollup shows revenue but ordersBulk returns
+#                        $0 per day (likely a Toast partner-integration
+#                        migration; per-day item mix can not be pulled
+#                        with current credentials)
 TOAST_RETAIL_LOCATIONS: list[dict] = [
-    {"restaurant_guid": "0d5af5fb-c12a-4f47-ac4e-fd1110b91dcb", "location": "Palm Beach Gardens - Avenir Center"},
-    {"restaurant_guid": "12b6706d-bf0f-4405-a493-51929a4e9dcd", "location": "Pinecrest"},
-    {"restaurant_guid": "13339585-284c-40cd-8a9b-01789ea875e6", "location": "UES"},
-    {"restaurant_guid": "25192c92-06ef-4c13-8805-e434a9cd7fa8", "location": "Penn Station"},
-    {"restaurant_guid": "26642447-d72b-4ea2-8811-1da88cc463d0", "location": "Knoxville"},
-    {"restaurant_guid": "386b0bcc-869a-4b29-8837-14d14b4c65c7", "location": "Altamonte Springs"},
-    {"restaurant_guid": "5167cd50-baaa-4bd4-8cda-8c9b52724b61", "location": "UWS"},
-    {"restaurant_guid": "51e1cd33-2102-4795-8557-004f41c5d9c9", "location": "West Palm Beach - Nora District"},
-    {"restaurant_guid": "6775f38e-0dda-4edd-b2ff-926783059edc", "location": "Santa Monica"},
-    {"restaurant_guid": "69c78fdf-e35c-403a-931f-e29568fefa83", "location": "Westlake"},
-    {"restaurant_guid": "83239e6c-3d1b-44b9-8ad3-124492636812", "location": "Palm Desert"},
-    {"restaurant_guid": "990a7e59-34f9-406f-bbc1-bd8594174000", "location": "Mandarin"},
-    {"restaurant_guid": "99e38e88-9268-4e29-9c9e-05b99cad8e23", "location": "Irvine"},
-    {"restaurant_guid": "9a5f428b-16db-43ab-9237-6dff70516a74", "location": "River Oaks"},
-    {"restaurant_guid": "9da7193b-1720-4f83-949a-4124a544a92a", "location": "Fulton Market"},
-    {"restaurant_guid": "ab100b40-c9e0-4831-9f94-31020a66e6bc", "location": "St Johns Jacksonville"},
-    {"restaurant_guid": "bfd2363b-47b9-4299-b150-720c81ff65f4", "location": "Fort Lauderdale - Flagler Village"},
-    {"restaurant_guid": "c1432aac-3a03-4693-acf2-55b8d116a80a", "location": "South Tampa"},
-    {"restaurant_guid": "d725bcfd-8cd5-4800-a3ab-31a50b29173a", "location": "Kips Bay"},
-    {"restaurant_guid": "dc9a30b0-6ebb-4c8c-9578-16a23cee2e99", "location": "Boca Raton - Glades Plaza"},
-    {"restaurant_guid": "dd987834-83cf-4960-b161-5482ee99e8e1", "location": "MTH"},
-    {"restaurant_guid": "fba3457a-1b45-4b81-af83-7b5674fd0d8f", "location": "Echo Park"},
-    {"restaurant_guid": "fc57f65c-7746-44c4-b1e9-15a022e34dfc", "location": "Chapel Hill"},
+    {"restaurant_guid": "0d5af5fb-c12a-4f47-ac4e-fd1110b91dcb", "location": "Palm Beach Gardens - Avenir Center", "status": "pre_launch"},
+    {"restaurant_guid": "12b6706d-bf0f-4405-a493-51929a4e9dcd", "location": "Pinecrest",                            "status": "active"},
+    {"restaurant_guid": "13339585-284c-40cd-8a9b-01789ea875e6", "location": "UES",                                  "status": "active"},
+    {"restaurant_guid": "25192c92-06ef-4c13-8805-e434a9cd7fa8", "location": "Penn Station",                         "status": "active"},
+    {"restaurant_guid": "26642447-d72b-4ea2-8811-1da88cc463d0", "location": "Knoxville",                            "status": "active"},
+    {"restaurant_guid": "386b0bcc-869a-4b29-8837-14d14b4c65c7", "location": "Altamonte Springs",                    "status": "active"},
+    {"restaurant_guid": "5167cd50-baaa-4bd4-8cda-8c9b52724b61", "location": "UWS",                                  "status": "active"},
+    {"restaurant_guid": "51e1cd33-2102-4795-8557-004f41c5d9c9", "location": "West Palm Beach - Nora District",      "status": "active"},
+    {"restaurant_guid": "6775f38e-0dda-4edd-b2ff-926783059edc", "location": "Santa Monica",                         "status": "active"},
+    {"restaurant_guid": "69c78fdf-e35c-403a-931f-e29568fefa83", "location": "Westlake",                             "status": "pre_launch"},
+    {"restaurant_guid": "83239e6c-3d1b-44b9-8ad3-124492636812", "location": "Palm Desert",                          "status": "active"},
+    {"restaurant_guid": "990a7e59-34f9-406f-bbc1-bd8594174000", "location": "Mandarin",                             "status": "active"},
+    {"restaurant_guid": "99e38e88-9268-4e29-9c9e-05b99cad8e23", "location": "Irvine",                               "status": "pre_launch"},
+    {"restaurant_guid": "9a5f428b-16db-43ab-9237-6dff70516a74", "location": "River Oaks",                           "status": "pre_launch"},
+    {"restaurant_guid": "9da7193b-1720-4f83-949a-4124a544a92a", "location": "Fulton Market",                        "status": "pre_launch"},
+    {"restaurant_guid": "ab100b40-c9e0-4831-9f94-31020a66e6bc", "location": "St Johns Jacksonville",                "status": "active"},
+    {"restaurant_guid": "bfd2363b-47b9-4299-b150-720c81ff65f4", "location": "Fort Lauderdale - Flagler Village",    "status": "pre_launch"},
+    {"restaurant_guid": "c1432aac-3a03-4693-acf2-55b8d116a80a", "location": "South Tampa",                          "status": "active"},
+    {"restaurant_guid": "d725bcfd-8cd5-4800-a3ab-31a50b29173a", "location": "Kips Bay",                             "status": "active"},
+    {"restaurant_guid": "dc9a30b0-6ebb-4c8c-9578-16a23cee2e99", "location": "Boca Raton - Glades Plaza",            "status": "active"},
+    {"restaurant_guid": "dd987834-83cf-4960-b161-5482ee99e8e1", "location": "MTH",                                  "status": "active"},
+    {"restaurant_guid": "fba3457a-1b45-4b81-af83-7b5674fd0d8f", "location": "Echo Park",                            "status": "data_unavailable"},
+    {"restaurant_guid": "fc57f65c-7746-44c4-b1e9-15a022e34dfc", "location": "Chapel Hill",                          "status": "data_unavailable"},
 ]
 
 

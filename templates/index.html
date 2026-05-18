@@ -3200,9 +3200,11 @@ async function ensureToastLocationDropdown() {
     if (sel && r.locations) {
       const opts = r.locations.map(L => {
         const label = escHtml(L.location || L.restaurant_guid);
-        const tag = L.rows > 0
-          ? `(${L.rows} rows, ${L.min_date} \u2013 ${L.max_date})`
-          : '(no data yet)';
+        let tag;
+        if (L.rows > 0) tag = `(${L.rows} rows, ${L.min_date} \u2013 ${L.max_date})`;
+        else if (L.status === 'pre_launch')       tag = '(pre-launch, no sales)';
+        else if (L.status === 'data_unavailable') tag = '(data unavailable)';
+        else                                       tag = '(no data yet)';
         return `<option value="${escAttr(L.restaurant_guid)}">${label} \u2014 ${tag}</option>`;
       });
       sel.innerHTML = '<option value="">All locations</option>' + opts.join('');

@@ -564,6 +564,7 @@ def api_sales_locations():
         by_loc[L["restaurant_guid"]] = {
             "restaurant_guid": L["restaurant_guid"],
             "location":        L["location"],
+            "status":          L.get("status") or "active",
             "rows":            0,
             "min_date":        "",
             "max_date":        "",
