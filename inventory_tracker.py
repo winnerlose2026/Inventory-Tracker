@@ -161,8 +161,8 @@ TOAST_RETAIL_LOCATIONS: list[dict] = [
     {"restaurant_guid": "d725bcfd-8cd5-4800-a3ab-31a50b29173a", "location": "Kips Bay",                             "status": "active"},
     {"restaurant_guid": "dc9a30b0-6ebb-4c8c-9578-16a23cee2e99", "location": "Boca Raton - Glades Plaza",            "status": "active"},
     {"restaurant_guid": "dd987834-83cf-4960-b161-5482ee99e8e1", "location": "MTH",                                  "status": "active"},
-    {"restaurant_guid": "fba3457a-1b45-4b81-af83-7b5674fd0d8f", "location": "Echo Park",                            "status": "data_unavailable"},
-    {"restaurant_guid": "fc57f65c-7746-44c4-b1e9-15a022e34dfc", "location": "Chapel Hill",                          "status": "data_unavailable"},
+    {"restaurant_guid": "fba3457a-1b45-4b81-af83-7b5674fd0d8f", "location": "Echo Park",                            "status": "active"},
+    {"restaurant_guid": "fc57f65c-7746-44c4-b1e9-15a022e34dfc", "location": "Chapel Hill",                          "status": "active"},
 ]
 
 
