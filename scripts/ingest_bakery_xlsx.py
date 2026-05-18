@@ -244,7 +244,7 @@ def _post(url: str, body: dict, token):
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if token:
-        headers["Authorization"] = "Bearer " + token
+        headers["X-Inventory-Token"] = token
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -276,7 +276,7 @@ def main() -> int:
     p.add_argument("--api-base", default=DEFAULT_API,
                    help="Base URL of the inventory tracker API")
     p.add_argument("--token", default=os.environ.get("INVENTORY_API_TOKEN"),
-                   help="Bearer token (or set INVENTORY_API_TOKEN)")
+                   help="API token (or set INVENTORY_API_TOKEN) -- sent as X-Inventory-Token")
     p.add_argument("--dry-run", action="store_true",
                    help="Parse and print a summary; don't POST")
     args = p.parse_args()
