@@ -1499,6 +1499,114 @@ def api_admin_labor_ingest():
                     "added_or_updated": len(incoming)})
 
 
+# ---------------------------------------------------------------------------
+# API -- Bakery weekly sales (used while Toast is not connected for the
+# production bakery). Source is the "Bakery Model - Sales v. Labor"
+# spreadsheet JD updates weekly.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/admin/bakery-sales/ingest", methods=["POST"])
+def api_admin_bakery_sales_ingest():
+    """Append or replace bakery weekly sales entries.
+
+    Body:
+      entries:  [
+        {
+          week_start:  "YYYY-MM-DD",   # Monday -- required, used as the key
+          week_end:    "YYYY-MM-DD",
+          channels:    {channel: dollars, ...},
+          total:       float,
+          splh:        float | null,
+          source:      str,            # default "bakery-xlsx"
+        }, ...
+      ]
+      replace:  bool -- when true, REPLACE all entries that share a source
+                with the incoming set; when false (default), dedupe by
+                (week_start, source) keeping the new entry.
+    """
+    from inventory_tracker import load_bakery_sales, save_bakery_sales
+    body = request.json or {}
+    incoming = body.get("entries") or []
+    replace = bool(body.get("replace", False))
+    if not incoming:
+        return jsonify({"ok": False, "error": "entries required"}), 400
+
+    existing = load_bakery_sales()
+    sources_in_incoming = {(e.get("source") or "bakery-xlsx") for e in incoming}
+    if replace:
+        existing = [e for e in existing
+                    if (e.get("source") or "bakery-xlsx")
+                    not in sources_in_incoming]
+
+    by_key = {}
+    for e in existing:
+        by_key[(e.get("week_start"), e.get("source") or "bakery-xlsx")] = e
+    added = 0
+    for e in incoming:
+        ws_ = (e.get("week_start") or "").strip()
+        if not ws_:
+            continue
+        rec = {
+            "week_start": ws_,
+            "week_end":   (e.get("week_end") or "").strip() or None,
+            "location":   e.get("location") or "Bakery",
+            "channels":   {k: float(v or 0) for k, v in
+                           (e.get("channels") or {}).items()},
+            "total":      float(e.get("total") or 0),
+            "splh":       (float(e["splh"]) if e.get("splh") not in
+                           (None, "", "#DIV/0!") else None),
+            "source":     e.get("source") or "bakery-xlsx",
+            "ingested_at": datetime_now_iso(),
+        }
+        by_key[(rec["week_start"], rec["source"])] = rec
+        added += 1
+    merged = sorted(by_key.values(), key=lambda r: r.get("week_start") or "")
+    save_bakery_sales(merged)
+    return jsonify({"ok": True, "total_entries": len(merged),
+                    "added_or_updated": added})
+
+
+@app.route("/api/report/bakery-sales")
+def api_report_bakery_sales():
+    """Return bakery weekly sales rows, optionally filtered by date range.
+
+    Query params:
+      start  YYYY-MM-DD  (inclusive -- compared against week_start)
+      end    YYYY-MM-DD  (inclusive -- compared against week_start)
+      limit  int         (default 26 -- most recent N weeks)
+    """
+    from inventory_tracker import load_bakery_sales
+    rows = load_bakery_sales() or []
+    args = request.args
+    start = (args.get("start") or "").strip()
+    end   = (args.get("end") or "").strip()
+    if start:
+        rows = [r for r in rows if (r.get("week_start") or "") >= start]
+    if end:
+        rows = [r for r in rows if (r.get("week_start") or "") <= end]
+    try:
+        limit = int(args.get("limit") or 26)
+    except (TypeError, ValueError):
+        limit = 26
+    rows = sorted(rows, key=lambda r: r.get("week_start") or "")
+    if limit and limit > 0:
+        rows = rows[-limit:]
+    channel_totals: dict[str, float] = {}
+    grand_total = 0.0
+    for r in rows:
+        grand_total += float(r.get("total") or 0)
+        for ch, v in (r.get("channels") or {}).items():
+            channel_totals[ch] = channel_totals.get(ch, 0.0) + float(v or 0)
+    return jsonify({
+        "rows": rows,
+        "summary": {
+            "weeks":          len(rows),
+            "total":          grand_total,
+            "channel_totals": channel_totals,
+        },
+    })
+
+
 def datetime_now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat()

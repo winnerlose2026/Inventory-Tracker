@@ -183,6 +183,31 @@ def save_sales(entries: list):
         json.dump(entries, f, indent=2)
 
 
+# Bakery weekly sales -- fed from the weekly "Bakery Model - Sales v. Labor"
+# spreadsheet while the production bakery is not yet wired up to Toast.
+# One entry per ISO week (Mon-Sun) carrying the weekly channel split and
+# the total. Daily granularity is intentionally NOT stored here because
+# the source spreadsheet only carries weekly truth for sales (daily cells
+# are weekly_total / 7).
+BAKERY_SALES_FILE = DATA_DIR / "bakery_sales.json"
+
+
+def load_bakery_sales() -> list:
+    if BAKERY_SALES_FILE.exists():
+        with open(BAKERY_SALES_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
+
+
+def save_bakery_sales(entries: list):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(BAKERY_SALES_FILE, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
 
 def load_canceled_pos() -> dict:
     """Return {po_number: {canceled_at, reason, note}}."""
