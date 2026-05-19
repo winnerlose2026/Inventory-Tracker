@@ -638,7 +638,7 @@
           </div>
         </div>
         <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
-          Bars = cs produced. Line = $PLH (revenue / labor hours). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
+          Bars = cases produced. Line = $SPLH (bakery sales $ / labor hours, from the weekly bakery model). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
           <div class="btn-group">
@@ -1803,9 +1803,12 @@ function renderPlhChart(data) {
   const canvas = document.getElementById('plh-chart');
   if (!canvas || typeof Chart === 'undefined') return;
   const buckets = data.buckets || [];
-  const labels    = buckets.map(b => b.label || b.key);
-  const csSeries  = buckets.map(b => b.total_cs || 0);
-  const plhSeries = buckets.map(b => b.plh == null ? null : Math.round(b.plh * 100) / 100);
+  const labels     = buckets.map(b => b.label || b.key);
+  const csSeries   = buckets.map(b => b.total_cs || 0);
+  // Sales-side $ per labor hour, computed from the bakery model spreadsheet.
+  // Falls back to null (gap) for buckets with no bakery sales yet.
+  const splhSeries = buckets.map(b =>
+    b.splh == null ? null : Math.round(b.splh * 100) / 100);
 
   if (plhChart) { plhChart.destroy(); plhChart = null; }
   plhChart = new Chart(canvas.getContext('2d'), {
@@ -1824,8 +1827,8 @@ function renderPlhChart(data) {
         },
         {
           type: 'line',
-          label: '$ per labor hour',
-          data: plhSeries,
+          label: '$ sales per labor hour',
+          data: splhSeries,
           borderColor: 'rgba(220, 38, 38, 0.95)',
           backgroundColor: 'rgba(220, 38, 38, 0.15)',
           tension: 0.25,
@@ -1847,7 +1850,7 @@ function renderPlhChart(data) {
           beginAtZero: true,
           position: 'right',
           grid: { drawOnChartArea: false },
-          title: { display: true, text: '$ / labor hour' },
+          title: { display: true, text: '$ sales / labor hour' },
           ticks: {
             callback: v => '$' + Number(v).toFixed(0),
           },
@@ -1860,13 +1863,26 @@ function renderPlhChart(data) {
               const i = ctx[0].dataIndex;
               const b = buckets[i] || {};
               const lines = [];
-              lines.push(`Revenue: ${_fmtUSD(b.revenue_dollars)}`);
+              if (b.bakery_sales_dollars) {
+                lines.push(`Bakery sales: ${_fmtUSD(b.bakery_sales_dollars)}`);
+              } else {
+                lines.push('Bakery sales: no data for this period');
+              }
               if (b.labor_hours) {
                 lines.push(`Labor: ${(b.labor_hours).toFixed(1)} hrs · ${_fmtUSD(b.labor_dollars)}` +
                   (b.labor_dollars_imputed ? ' (imputed @$17/hr)' : ''));
-                lines.push(`$PLH: ${_fmtUSDFine(b.plh)} per labor hour`);
+                if (b.splh != null) {
+                  lines.push(`$SPLH: ${_fmtUSDFine(b.splh)} per labor hour`);
+                }
+                if (b.labor_pct_of_sales != null) {
+                  lines.push(`Labor % of sales: ${(b.labor_pct_of_sales * 100).toFixed(1)}%`);
+                }
               } else {
                 lines.push('Labor: no data for this period');
+              }
+              // Keep the production-side number in the tooltip for context.
+              if (b.total_cs) {
+                lines.push(`Production revenue (cs × case price): ${_fmtUSD(b.revenue_dollars)}`);
               }
               return lines;
             },
@@ -1883,25 +1899,56 @@ function renderPlhSummary(data) {
   if (!wrap) return;
   const buckets = data.buckets || [];
   const total = buckets.reduce((acc, b) => {
-    acc.cs += (b.total_cs || 0);
-    acc.rev += (b.revenue_dollars || 0);
-    acc.hrs += (b.labor_hours || 0);
-    acc.cost += (b.labor_dollars || 0);
+    acc.cs    += (b.total_cs || 0);
+    acc.hrs   += (b.labor_hours || 0);
+    acc.cost  += (b.labor_dollars || 0);
+    acc.sales += (b.bakery_sales_dollars || 0);
+    for (const [ch, v] of Object.entries(b.bakery_sales_by_channel || {})) {
+      acc.byCh[ch] = (acc.byCh[ch] || 0) + (Number(v) || 0);
+    }
     return acc;
-  }, { cs: 0, rev: 0, hrs: 0, cost: 0 });
-  const plh = total.hrs ? total.rev / total.hrs : null;
+  }, { cs: 0, hrs: 0, cost: 0, sales: 0, byCh: {} });
+  const splh    = total.hrs   ? total.sales / total.hrs : null;
+  const laborPc = total.sales ? total.cost  / total.sales : null;
+
   const cards = [
-    { label: 'Total cases',    value: total.cs.toLocaleString() },
-    { label: 'Revenue (est.)', value: _fmtUSD(total.rev) },
-    { label: 'Labor hours',    value: total.hrs.toFixed(1) },
-    { label: 'Labor cost',     value: _fmtUSD(total.cost) },
-    { label: '$PLH (avg)',     value: plh == null ? '—' : _fmtUSDFine(plh) },
+    { label: 'Bakery sales (window)', value: total.sales ? _fmtUSD(total.sales) : '—' },
+    { label: '$SPLH (sales/hr)',      value: splh == null ? '—' : _fmtUSDFine(splh) },
+    { label: 'Labor % of sales',      value: laborPc == null ? '—' :
+        (laborPc * 100).toFixed(1) + '%' },
+    { label: 'Labor cost',            value: _fmtUSD(total.cost) },
+    { label: 'Labor hours',           value: total.hrs ? total.hrs.toFixed(1) : '—' },
+    { label: 'Total cases (produced)',value: total.cs.toLocaleString() },
   ];
+
+  // Channel breakdown card -- spans full row, lists each channel + $.
+  const chEntries = Object.entries(total.byCh)
+    .sort((a, b) => b[1] - a[1]);
+  const channelHtml = chEntries.length
+    ? `
+      <div class="card" style="padding:12px 14px;grid-column:1 / -1">
+        <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">
+          Bakery sales by channel (window)
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:18px;font-size:14px">
+          ${chEntries.map(([ch, v]) => `
+            <div>
+              <div style="color:var(--muted);font-size:11px">${escHtml(ch)}</div>
+              <div style="font-weight:600">${escHtml(_fmtUSD(v))}
+                <span style="color:var(--muted);font-weight:400;font-size:12px">
+                  (${total.sales ? ((v / total.sales) * 100).toFixed(1) : '0.0'}%)
+                </span>
+              </div>
+            </div>`).join('')}
+        </div>
+      </div>`
+    : '';
+
   wrap.innerHTML = cards.map(c => `
     <div class="card" style="padding:12px 14px">
       <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">${escHtml(c.label)}</div>
       <div style="font-size:22px;font-weight:700">${escHtml(c.value)}</div>
-    </div>`).join('');
+    </div>`).join('') + channelHtml;
 }
 
 function renderRestockedByVarietyLocation() {

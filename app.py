@@ -1443,26 +1443,32 @@ def api_report_plh():
       offset  int >= 0. 0 = current window. Each step shifts back one
               full window: 4 weeks / 1 quarter / 1 year.
     """
-    from inventory_tracker import load_production, load_labor
+    from inventory_tracker import load_production, load_labor, load_bakery_sales
     grain = (request.args.get("grain") or "week").lower()
     try:
         offset = max(0, int(request.args.get("offset") or 0))
     except (TypeError, ValueError):
         offset = 0
     buckets = _plh_bucket_keys(grain, offset=offset)
-    prod = load_production()
+    prod  = load_production()
     labor = load_labor()
+    bsales = load_bakery_sales()
 
     out = []
     for key, start, end, label in buckets:
         bucket = {
             "key": key, "label": label, "start": start, "end": end,
             "total_cs": 0,
-            "revenue_dollars": 0.0,
+            "revenue_dollars": 0.0,            # cs * case price (production-side)
             "by_distributor": {},
             "labor_hours": 0.0,
             "labor_dollars": 0.0,
-            "plh": None,
+            "bakery_sales_dollars": 0.0,        # true sales from bakery_sales.json
+            "bakery_sales_by_channel": {},
+            "bakery_sales_weeks": 0,            # how many weekly rows landed here
+            "splh": None,                       # sales per labor hour
+            "labor_pct_of_sales": None,         # labor $ / sales $
+            "plh": None,                        # legacy: revenue / hours
         }
         for r in prod:
             if not _date_in_range(r.get("production_date") or "", start, end):
@@ -1482,6 +1488,21 @@ def api_report_plh():
                 continue
             bucket["labor_hours"]   += float(e.get("hours") or 0)
             bucket["labor_dollars"] += float(e.get("dollars") or 0)
+        # Aggregate bakery weekly sales whose week_start falls in this
+        # bucket. A week is counted toward whichever bucket its Monday
+        # lands in -- accepting the small straddle effect at month/
+        # quarter boundaries in exchange for clean, deterministic math.
+        for w in bsales:
+            ws = (w.get("week_start") or "")
+            if not _date_in_range(ws, start, end):
+                continue
+            bucket["bakery_sales_dollars"] += float(w.get("total") or 0)
+            bucket["bakery_sales_weeks"]   += 1
+            for ch, amt in (w.get("channels") or {}).items():
+                bucket["bakery_sales_by_channel"][ch] = (
+                    bucket["bakery_sales_by_channel"].get(ch, 0.0)
+                    + float(amt or 0)
+                )
         # If we have hours but no dollars on any entry, impute via the default
         # rate so the cost picture is at least directionally right.
         if bucket["labor_hours"] and not bucket["labor_dollars"]:
@@ -1489,6 +1510,14 @@ def api_report_plh():
             bucket["labor_dollars_imputed"] = True
         if bucket["labor_hours"]:
             bucket["plh"] = bucket["revenue_dollars"] / bucket["labor_hours"]
+            if bucket["bakery_sales_dollars"]:
+                bucket["splh"] = (
+                    bucket["bakery_sales_dollars"] / bucket["labor_hours"]
+                )
+        if bucket["bakery_sales_dollars"]:
+            bucket["labor_pct_of_sales"] = (
+                bucket["labor_dollars"] / bucket["bakery_sales_dollars"]
+            )
         out.append(bucket)
 
     return jsonify({
