@@ -1332,12 +1332,12 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
     """Return [(key, start_iso, end_iso, label)] for the buckets in scope.
 
     grain = "week"     -> 4 ISO weeks ending this week (Mon-Sun)
-    grain = "month"    -> the 3 months of a calendar quarter
+    grain = "month"    -> 4 trailing calendar months ending this month
     grain = "quarter"  -> the 4 quarters of a calendar year
 
     offset shifts the window backward by one full window-length per step:
       week   -> 4 weeks per step
-      month  -> 1 quarter (3 months) per step
+      month  -> 4 months per step
       quarter-> 1 year (4 quarters) per step
     offset = 0 is the current window. Negative offsets are clamped to 0
     (no "future" windows past now).
@@ -1348,17 +1348,15 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
         offset = 0
 
     if grain == "month":
-        # Pick the quarter offset back from the one today belongs to.
-        # Use integer math on month index 0..11 to step backward by 3.
-        cur_q_start_month = ((today.month - 1) // 3) * 3 + 1
-        # Convert to absolute month index (year * 12 + month - 1)
-        cur_abs = today.year * 12 + (cur_q_start_month - 1)
-        target_abs = cur_abs - 3 * offset
-        anchor_year  = target_abs // 12
-        anchor_month = (target_abs % 12) + 1
+        # 4 trailing calendar months ending with the current month. Offset
+        # steps back by one full window (4 months) at a time.
+        cur_abs = today.year * 12 + (today.month - 1)
+        # The newest month in this window:
+        newest_abs = cur_abs - 4 * offset
+        # Build oldest -> newest so the chart reads left to right naturally.
         out = []
-        for i in range(3):
-            abs_i = anchor_year * 12 + (anchor_month - 1) + i
+        for i in range(3, -1, -1):
+            abs_i = newest_abs - i
             yy = abs_i // 12
             mm = (abs_i % 12) + 1
             start = datetime(yy, mm, 1).date()

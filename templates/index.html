@@ -782,6 +782,33 @@
           <p class="subtitle" style="margin-bottom:0">Consumption, restock, and variety ranking by location</p>
         </div>
       </div>
+      <!-- Bakery Sales vs. Labor (top of the Report page) -->
+      <div class="card">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span class="card-title">💵 Bakery Sales vs. Labor</span>
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm active" id="plh-grain-week" onclick="setPlhGrain('week')">Weeks</button>
+            <button class="btn btn-ghost btn-sm" id="plh-grain-month" onclick="setPlhGrain('month')">Months</button>
+            <button class="btn btn-ghost btn-sm" id="plh-grain-quarter" onclick="setPlhGrain('quarter')">Years</button>
+          </div>
+        </div>
+        <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
+          Bars = Bakery Sales $ (I3). Red line = $SPLH (sales ÷ labor hours). Amber line = Labor % of sales. All metrics from the weekly Bakery Model spreadsheet.
+        </div>
+        <div class="plh-nav-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm" id="plh-prev" onclick="shiftPlh(1)" title="Older window">◀</button>
+            <button class="btn btn-ghost btn-sm" id="plh-next" onclick="shiftPlh(-1)" title="Newer window">▶</button>
+            <button class="btn btn-ghost btn-sm" id="plh-today" onclick="resetPlh()" title="Jump to current window">Today</button>
+          </div>
+          <div id="plh-window-label" style="font-weight:600;color:var(--text);font-size:13px;text-align:right">&nbsp;</div>
+        </div>
+        <div style="padding:8px 20px 16px 20px">
+          <canvas id="plh-chart" height="260" style="max-height:280px"></canvas>
+        </div>
+        <div id="plh-summary" style="padding:0 20px 16px 20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px"></div>
+      </div>
+
       <div class="report-grid">
         <div class="card">
           <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
@@ -824,33 +851,6 @@
           <div style="padding:4px 20px;color:var(--muted);font-size:12px" id="restock-range-label"></div>
           <div style="padding:6px 20px 16px 20px" id="chart-restocked"></div>
         </div>
-      </div>
-
-      <!-- Production volume + $PLH ($/labor hour) -->
-      <div class="card" style="margin-top:20px">
-        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-          <span class="card-title">💵 Bakery Sales vs. Labor</span>
-          <div class="btn-group">
-            <button class="btn btn-ghost btn-sm active" id="plh-grain-week" onclick="setPlhGrain('week')">4 Weeks</button>
-            <button class="btn btn-ghost btn-sm" id="plh-grain-month" onclick="setPlhGrain('month')">Quarter (months)</button>
-            <button class="btn btn-ghost btn-sm" id="plh-grain-quarter" onclick="setPlhGrain('quarter')">Year (quarters)</button>
-          </div>
-        </div>
-        <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
-          Bars = Bakery Sales $ (I3). Red line = $SPLH (sales ÷ labor hours). Amber line = Labor % of sales. All metrics from the weekly Bakery Model spreadsheet.
-        </div>
-        <div class="plh-nav-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
-          <div class="btn-group">
-            <button class="btn btn-ghost btn-sm" id="plh-prev" onclick="shiftPlh(1)" title="Older window">◀</button>
-            <button class="btn btn-ghost btn-sm" id="plh-next" onclick="shiftPlh(-1)" title="Newer window">▶</button>
-            <button class="btn btn-ghost btn-sm" id="plh-today" onclick="resetPlh()" title="Jump to current window">Today</button>
-          </div>
-          <div id="plh-window-label" style="font-weight:600;color:var(--text);font-size:13px;text-align:right">&nbsp;</div>
-        </div>
-        <div style="padding:8px 20px 16px 20px">
-          <canvas id="plh-chart" height="260" style="max-height:280px"></canvas>
-        </div>
-        <div id="plh-summary" style="padding:0 20px 16px 20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px"></div>
       </div>
 
       <!-- Variety ranking by location (production-based) -->
@@ -1835,6 +1835,9 @@ function setVarietyRankingPeriod(p) {
 }
 
 async function loadReport() {
+  // Bakery Sales vs. Labor sits at the top of the page now -- kick it off
+  // first so it has data on screen by the time the lower cards finish.
+  loadPlhChart();
   // Toast sales feed (Top Consumed card)
   loadToastSales();
   const [report, prod] = await Promise.all([
@@ -1863,7 +1866,6 @@ async function loadReport() {
   renderRestockedByVarietyLocation();
 
   renderVarietyRanking();
-  loadPlhChart();
 }
 
 // ---- Top Restocked: variety × location, weekly/monthly --------------------
@@ -1948,9 +1950,28 @@ function setPlhGrain(g) {
 async function loadPlhChart() {
   const data = await api('/api/report/plh?grain=' + encodeURIComponent(plhGrain) +
                        '&offset=' + encodeURIComponent(plhOffset));
-  renderPlhChart(data);
-  renderPlhSummary(data);
-  renderPlhWindowNav(data);
+  // Defer paint to the next frame so the canvas has real dimensions if the
+  // page just transitioned from display:none. Without this, the first
+  // chart paint after opening the Report page can render to a 0x0 canvas
+  // and show nothing until the user clicks a button.
+  const paint = () => {
+    const canvas = document.getElementById('plh-chart');
+    if (!canvas || typeof Chart === 'undefined') {
+      // Try again shortly if Chart.js or the canvas isn't ready yet.
+      setTimeout(paint, 60);
+      return;
+    }
+    const w = canvas.clientWidth || canvas.offsetWidth || 0;
+    if (w < 10) {
+      // Canvas not laid out yet -- come back next frame.
+      requestAnimationFrame(paint);
+      return;
+    }
+    renderPlhChart(data);
+    renderPlhSummary(data);
+    renderPlhWindowNav(data);
+  };
+  requestAnimationFrame(paint);
 }
 
 function renderPlhWindowNav(data) {
