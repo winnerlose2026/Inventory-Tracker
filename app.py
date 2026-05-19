@@ -2204,6 +2204,118 @@ def api_email_ingest_events():
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
+# ---------------------------------------------------------------------------
+# Microsoft Graph change-notification subscriptions for Daily Production.
+#
+# These three routes turn the Daily Production pipeline into a push model:
+#   - /webhooks/graph/notifications   Graph -> us. New-message pings; we
+#                                     fetch + parse + ingest within seconds
+#                                     of the email landing in the inbox.
+#   - /api/graph/subscriptions        POST = create subs for every mailbox
+#                                     in MS365_USER. GET = list local state.
+#   - /api/graph/subscriptions/renew  POST = PATCH each sub to push its
+#                                     expiration out ~68h. Mail subs cap at
+#                                     71h; a daily Render cron calls this.
+#
+# The webhook deliberately lives OUTSIDE /api/ so the _gate_writes middleware
+# doesn't reject it — Graph won't send our INVENTORY_API_TOKEN header.
+# Instead, every notification carries a clientState (set via
+# GRAPH_SUB_CLIENT_STATE) which the handler verifies.
+# ---------------------------------------------------------------------------
+
+@app.route("/webhooks/graph/notifications", methods=["POST"])
+def graph_webhook_notifications():
+    """Microsoft Graph -> us. Either a validation handshake or a real
+    notification batch.
+
+    Graph requires:
+      - The validation handshake (a one-time GET-or-POST with
+        ``?validationToken=…``) returns the token verbatim as
+        ``text/plain``. Anything else fails the subscription create.
+      - A regular notification POST returns 2xx within 10 seconds, or
+        Graph backs off and eventually disables the subscription.
+    """
+    # 1. Validation handshake — Graph sends this once when a subscription
+    #    is created. The body is empty; the token comes via query string.
+    validation_token = request.args.get("validationToken")
+    if validation_token:
+        resp = make_response(validation_token, 200)
+        resp.headers["Content-Type"] = "text/plain"
+        return resp
+
+    # 2. Real notification batch.
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception:  # noqa: BLE001
+        payload = {}
+
+    try:
+        from integrations.graph_subscriptions import handle_notification
+        result = handle_notification(payload)
+    except Exception as exc:  # noqa: BLE001
+        # Don't 500 — that makes Graph back off and eventually disable the
+        # sub. Log via the response body and return 202 so Graph stays happy.
+        import traceback as _tb
+        return jsonify({
+            "ok": False,
+            "error": f"webhook handler crashed: {exc}",
+            "traceback": _tb.format_exc()[-1500:],
+        }), 202
+
+    return jsonify(result), 202
+
+
+@app.route("/api/graph/subscriptions", methods=["GET", "POST"])
+def api_graph_subscriptions():
+    """GET = list locally-tracked subscriptions.
+    POST = create a subscription per mailbox in MS365_USER.
+
+    POST returns the Graph response (id + expirationDateTime per mailbox).
+    Run this once after deploying or if you ever delete the sub list.
+    """
+    import traceback as _tb
+    try:
+        from integrations.graph_subscriptions import (
+            create_subscriptions, list_subscriptions,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+
+    if request.method == "GET":
+        return jsonify({"ok": True, "subscriptions": list_subscriptions()})
+
+    try:
+        result = create_subscriptions()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False, "error": str(exc),
+            "traceback": _tb.format_exc()[-1500:],
+        }), 500
+    return jsonify(result)
+
+
+@app.route("/api/graph/subscriptions/renew", methods=["POST"])
+def api_graph_subscriptions_renew():
+    """Renew every tracked subscription. Called daily by a Render cron.
+
+    If a subscription is missing on Graph's side (404), this recreates it
+    so coverage doesn't silently lapse.
+    """
+    import traceback as _tb
+    try:
+        from integrations.graph_subscriptions import renew_subscriptions
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+    try:
+        result = renew_subscriptions()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False, "error": str(exc),
+            "traceback": _tb.format_exc()[-1500:],
+        }), 500
+    return jsonify(result)
+
+
 @app.route("/api/export.xlsx")
 def api_export_xlsx():
     from openpyxl import Workbook

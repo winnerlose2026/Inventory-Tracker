@@ -50,6 +50,15 @@ services:
         value: Inbox
       - key: PO_LEAD_DAYS
         value: "30"
+      # Real-time Daily Production via Microsoft Graph change notifications.
+      # GRAPH_WEBHOOK_BASE is the public HTTPS root of THIS service — Graph
+      # POSTs new-message pings to <base>/webhooks/graph/notifications. The
+      # client state is an arbitrary secret that Graph echoes back on every
+      # call so the webhook can confirm the request is genuine.
+      - key: GRAPH_WEBHOOK_BASE
+        sync: false  # e.g. https://bagel-inventory.onrender.com
+      - key: GRAPH_SUB_CLIENT_STATE
+        sync: false  # any long random string; treat like a token
 
   - type: cron
     name: bagel-inventory-6h-scan
@@ -127,3 +136,22 @@ services:
         value: incoming
       - key: SFTP_PROCESSED_DIR
         value: processed
+
+  - type: cron
+    name: bagel-inventory-graph-sub-renew
+    runtime: python
+    plan: starter
+    branch: main
+    # Mail change-notification subscriptions cap at ~71 hours. Renew daily
+    # at 09:00 UTC (~04:00 ET) so we always have well over a day of
+    # headroom even if a renewal fails. The renew endpoint also recreates
+    # any subscription Graph has already dropped, so this is the recovery
+    # path if the webhook ever goes silent.
+    schedule: "0 9 * * *"
+    buildCommand: "true"
+    startCommand: python scripts/renew_graph_subscriptions.py
+    envVars:
+      - key: APP_URL
+        sync: false  # https://bagel-inventory.onrender.com
+      - key: INVENTORY_API_TOKEN
+        sync: false
