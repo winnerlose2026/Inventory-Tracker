@@ -151,6 +151,133 @@
   .token-dot.missing { background: var(--red); }
   .token-actions { display: flex; gap: 6px; }
   .token-actions .btn { flex: 1; padding: 5px 10px; font-size: 10px; }
+
+  /* =========================================================================
+     Responsive -- tablet and phone. Two breakpoints:
+        <=1023px  tablet/large phone landscape: collapse sidebar to a top
+                   nav strip, drop multi-col grids to 2-up.
+        <=640px   phone portrait: everything stacks 1-col, smaller paddings,
+                   smaller display type, tables scroll horizontally, modals
+                   go full-width.
+     ========================================================================= */
+
+  /* Long tables -- always allow horizontal scroll on overflow. Doing this on
+     .card means every card with a table inside gets a graceful scroll. */
+  .card { -webkit-overflow-scrolling: touch; }
+  .card > .table-scroll,
+  .card > table { width: 100%; }
+  .card > div:has(> table) { overflow-x: auto; }
+
+  @media (max-width: 1023px) {
+    /* Sidebar becomes a top strip; main fills the rest. */
+    .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .sidebar {
+      flex-direction: column;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: 14px 0 4px;
+    }
+    .sidebar-logo {
+      padding: 0 16px 12px;
+      flex-direction: row;
+      gap: 12px;
+      justify-content: flex-start;
+    }
+    .sidebar-logo svg { width: 44px; height: auto; }
+    .sidebar-logo .wordmark { font-size: 13px; }
+    .sidebar nav {
+      display: flex;
+      flex-direction: row;
+      overflow-x: auto;
+      gap: 4px;
+      padding: 0 12px 8px;
+      scrollbar-width: thin;
+    }
+    .sidebar nav::-webkit-scrollbar { height: 6px; }
+    .sidebar nav::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .nav-item {
+      border-left: none;
+      border-bottom: 3px solid transparent;
+      white-space: nowrap;
+      padding: 8px 14px;
+      flex-shrink: 0;
+    }
+    .nav-item.active {
+      border-left-color: transparent;
+      border-bottom-color: var(--accent2);
+    }
+    .sidebar-footer {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 16px 12px;
+      border-top: 1px solid var(--border);
+    }
+    .main { padding: 20px 16px; }
+
+    /* Grid collapses */
+    .stat-grid    { grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px; }
+    .form-grid    { grid-template-columns: 1fr; }
+    .report-grid  { grid-template-columns: 1fr; }
+
+    /* Card header wraps so titles + button groups stack cleanly */
+    .card-header { flex-wrap: wrap; gap: 10px; }
+    .btn-group   { flex-wrap: wrap; }
+
+    /* Smaller display type on tablets */
+    h1 { font-size: 26px; }
+    .stat-value { font-size: 26px; }
+  }
+
+  @media (max-width: 640px) {
+    body { font-size: 13px; }
+    .main { padding: 14px 10px; }
+
+    /* Headings */
+    h1 { font-size: 22px; line-height: 1.15; }
+    .subtitle { margin-bottom: 16px; font-size: 12px; }
+
+    /* Stat tiles: full-width, less padding */
+    .stat-grid { grid-template-columns: 1fr; gap: 10px; margin-bottom: 16px; }
+    .stat-card { padding: 14px 16px; }
+    .stat-value { font-size: 22px; }
+    .stat-label { font-size: 10px; }
+
+    /* Card chrome */
+    .card { border-radius: 10px; margin-bottom: 16px; }
+    .card-header { padding: 12px 14px; }
+    .card-title { font-size: 14px; }
+
+    /* Tables -- scroll horizontally when too wide instead of overflowing. */
+    .card > table,
+    .card > div > table { display: block; overflow-x: auto; white-space: nowrap; }
+    th, td { padding: 8px 10px; font-size: 12px; }
+
+    /* Buttons shrink slightly */
+    .btn       { padding: 8px 14px; font-size: 12px; }
+    .btn-sm    { padding: 4px 9px;  font-size: 10px; }
+    .btn-group { gap: 6px; }
+
+    /* Forms / modal */
+    .modal { width: 100%; max-width: calc(100vw - 24px); padding: 18px; border-radius: 12px; }
+    .form-grid { gap: 10px; }
+    input, select, textarea { font-size: 14px; padding: 10px 12px; } /* 14px stops iOS zoom on focus */
+
+    /* PLH nav row: wrap so the window label drops below the buttons */
+    .plh-nav-row { flex-wrap: wrap; }
+    #plh-window-label { text-align: left !important; width: 100%; }
+
+    /* PLH KPI summary -- single column, tighter */
+    #plh-summary { grid-template-columns: 1fr !important; padding: 0 14px 14px !important; gap: 10px !important; }
+
+    /* Chart heights -- a little shorter so the page still scrolls clean */
+    canvas { max-height: 240px !important; }
+
+    /* Toast slides up from the bottom and spans full width */
+    #toast { left: 12px; right: 12px; bottom: 12px; }
+    .toast-msg { max-width: none; }
+  }
 </style>
 </head>
 <body>
@@ -640,7 +767,7 @@
         <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
           Bars = cases produced. Line = $SPLH (bakery sales $ / labor hours, from the weekly bakery model). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
         </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
+        <div class="plh-nav-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
           <div class="btn-group">
             <button class="btn btn-ghost btn-sm" id="plh-prev" onclick="shiftPlh(1)" title="Older window">◀</button>
             <button class="btn btn-ghost btn-sm" id="plh-next" onclick="shiftPlh(-1)" title="Newer window">▶</button>
