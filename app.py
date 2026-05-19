@@ -1483,11 +1483,25 @@ def api_report_plh():
                     dist or "Other", {"cs": 0, "revenue_dollars": 0.0})
                 bdist["cs"] += cs
                 bdist["revenue_dollars"] += cs * price
+        # Track bakery-xlsx labor separately so the sales-vs-labor metrics
+        # (SPLH, labor % of sales) reconcile to the workbook's I11/O10
+        # numbers exactly. The "all labor" pool still drives total labor
+        # hours/cost and the production-side $PLH, since those reflect the
+        # full picture of what the bakery actually paid out.
+        bx_hours = 0.0
+        bx_dollars = 0.0
         for e in labor:
             if not _date_in_range(e.get("date") or "", start, end):
                 continue
-            bucket["labor_hours"]   += float(e.get("hours") or 0)
-            bucket["labor_dollars"] += float(e.get("dollars") or 0)
+            hrs = float(e.get("hours") or 0)
+            dol = float(e.get("dollars") or 0)
+            bucket["labor_hours"]   += hrs
+            bucket["labor_dollars"] += dol
+            if (e.get("source") or "") == "bakery-xlsx":
+                bx_hours   += hrs
+                bx_dollars += dol
+        bucket["bakery_xlsx_labor_hours"]   = round(bx_hours, 4)
+        bucket["bakery_xlsx_labor_dollars"] = round(bx_dollars, 2)
         # Aggregate bakery weekly sales whose week_start falls in this
         # bucket. A week is counted toward whichever bucket its Monday
         # lands in -- accepting the small straddle effect at month/
@@ -1510,13 +1524,13 @@ def api_report_plh():
             bucket["labor_dollars_imputed"] = True
         if bucket["labor_hours"]:
             bucket["plh"] = bucket["revenue_dollars"] / bucket["labor_hours"]
-            if bucket["bakery_sales_dollars"]:
-                bucket["splh"] = (
-                    bucket["bakery_sales_dollars"] / bucket["labor_hours"]
-                )
-        if bucket["bakery_sales_dollars"]:
+        # Sales-vs-labor metrics ALWAYS use the bakery-xlsx labor pool so
+        # the chart matches the workbook the user updates each week.
+        if bx_hours and bucket["bakery_sales_dollars"]:
+            bucket["splh"] = bucket["bakery_sales_dollars"] / bx_hours
+        if bx_dollars and bucket["bakery_sales_dollars"]:
             bucket["labor_pct_of_sales"] = (
-                bucket["labor_dollars"] / bucket["bakery_sales_dollars"]
+                bx_dollars / bucket["bakery_sales_dollars"]
             )
         out.append(bucket)
 

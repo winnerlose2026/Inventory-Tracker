@@ -152,6 +152,53 @@
   .token-actions { display: flex; gap: 6px; }
   .token-actions .btn { flex: 1; padding: 5px 10px; font-size: 10px; }
 
+  .pager-row {
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* Page header pattern -- title block on the left, action buttons on the
+     right. Wraps cleanly when there's not enough horizontal room. */
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 16px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+  .page-header > div:first-child { min-width: 0; flex: 1 1 auto; }
+
+  /* Filter bars inside cards: lay out as a wrap-flex strip with label/control
+     stacks. Default desktop look matches the inline styles that used to be
+     repeated across pages. */
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 16px;
+    align-items: flex-end;
+  }
+  .filter-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 140px;
+  }
+  .filter-group label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+
   /* =========================================================================
      Responsive -- tablet and phone. Two breakpoints:
         <=1023px  tablet/large phone landscape: collapse sidebar to a top
@@ -228,6 +275,16 @@
     /* Smaller display type on tablets */
     h1 { font-size: 26px; }
     .stat-value { font-size: 26px; }
+
+    /* Page header stacks: title on top, button row underneath but full-width. */
+    .page-header { align-items: stretch; }
+    .page-header .btn-group { width: 100%; justify-content: flex-start; }
+
+    /* Filter bars: every control should be free to use the full row width
+       instead of clinging to an inline px width that was sized for desktop. */
+    .filter-group { flex: 1 1 200px; min-width: 0; }
+    .filter-group select,
+    .filter-group input { width: 100% !important; }
   }
 
   @media (max-width: 640px) {
@@ -277,6 +334,21 @@
     /* Toast slides up from the bottom and spans full width */
     #toast { left: 12px; right: 12px; bottom: 12px; }
     .toast-msg { max-width: none; }
+
+    /* Page header: full-width buttons in a column on phones */
+    .page-header .btn-group { flex-direction: column; align-items: stretch; }
+    .page-header .btn-group .btn { width: 100%; justify-content: center; }
+    .page-header h1 { margin-bottom: 4px; }
+
+    /* Filter bars: every control is its own row */
+    .filters { gap: 10px; padding: 10px 14px !important; }
+    .filter-group { flex: 1 1 100%; }
+    .filter-group select,
+    .filter-group input { width: 100% !important; padding: 9px 12px; font-size: 14px; }
+
+    /* Pager rows: stack the page-count text above the control buttons */
+    .pager-row { padding: 10px 14px; }
+    .pager-row > div { width: 100%; justify-content: flex-start; }
   }
 </style>
 </head>
@@ -376,7 +448,7 @@
 
     <!-- Inventory -->
     <div class="page" id="page-inventory">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+      <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Inventory</h1>
           <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU.</p>
@@ -398,7 +470,7 @@
     <!-- Distributors (merged into Inventory) -->
     <!-- Pending POs -->
     <div class="page" id="page-pending-pos">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+      <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Pending POs</h1>
           <p class="subtitle" style="margin-bottom:0">Open purchase orders not yet rolled into inventory. Set a Ship Date to lock in arrival = ship + 7 days; that supersedes the default 30-day eta.</p>
@@ -452,7 +524,7 @@
 
     <!-- Daily Production -->
     <div class="page" id="page-production">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+      <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Daily Production</h1>
           <p class="subtitle" style="margin-bottom:0">Cases baked per PO, fed by the production team's Daily Production Sheet emails. Aggregated by production date and rolled up weekly / monthly.</p>
@@ -537,7 +609,7 @@
 
       <!-- Detail table (one row per ingested production sheet) -->
       <div class="card">
-        <div id="prod-pager-top" style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+        <div class="pager-row" id="prod-pager-top">
           <div id="prod-pager-info"></div>
           <div id="prod-pager-controls" style="display:flex;align-items:center;gap:8px">
             <span>Show</span>
@@ -607,7 +679,7 @@
         </div>
       </div>
       <div class="card">
-        <div style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+        <div class="pager-row">
           <div id="usage-pager-info"></div>
           <div id="usage-pager-controls" style="display:flex;align-items:center;gap:8px">
             <span>Show</span>
@@ -629,7 +701,7 @@
 
     <!-- Traceability -->
     <div class="page" id="page-traceability">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+      <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Traceability</h1>
           <p class="subtitle" style="margin-bottom:0">Look up production by date range, lot #, or mfg code &mdash; results grouped by production date with downstream PO status, usage activity, and current on-hand at the destination DC.</p>
@@ -682,7 +754,7 @@
       </div>
 
       <div class="card">
-        <div style="padding:10px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+        <div class="pager-row">
           <div id="trace-pager-info">Run a search to see results.</div>
           <div id="trace-pager-controls" style="display:flex;align-items:center;gap:8px">
             <span>Show</span>
@@ -704,7 +776,7 @@
 
     <!-- Report -->
     <div class="page" id="page-report">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px">
+      <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Report</h1>
           <p class="subtitle" style="margin-bottom:0">Consumption, restock, and variety ranking by location</p>
@@ -765,7 +837,7 @@
           </div>
         </div>
         <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
-          Bars = cases produced. Line = $SPLH (bakery sales $ / labor hours, from the weekly bakery model). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
+          Bars = cases produced. Line = $SPLH (bakery sales $ ÷ labor hours, both from the weekly bakery model — I3, I11). Production case prices: USF $27 · Cheney $26.50 · other $29.50.
         </div>
         <div class="plh-nav-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
           <div class="btn-group">
@@ -1995,15 +2067,19 @@ function renderPlhChart(data) {
               } else {
                 lines.push('Bakery sales: no data for this period');
               }
-              if (b.labor_hours) {
-                lines.push(`Labor: ${(b.labor_hours).toFixed(1)} hrs · ${_fmtUSD(b.labor_dollars)}` +
-                  (b.labor_dollars_imputed ? ' (imputed @$17/hr)' : ''));
+              // Bakery-model labor (matches the workbook I11/I10).
+              const bxH = b.bakery_xlsx_labor_hours || 0;
+              const bxD = b.bakery_xlsx_labor_dollars || 0;
+              if (bxH || bxD) {
+                lines.push(`Labor (bakery model): ${bxH.toFixed(1)} hrs · ${_fmtUSD(bxD)}`);
                 if (b.splh != null) {
                   lines.push(`$SPLH: ${_fmtUSDFine(b.splh)} per labor hour`);
                 }
                 if (b.labor_pct_of_sales != null) {
                   lines.push(`Labor % of sales: ${(b.labor_pct_of_sales * 100).toFixed(1)}%`);
                 }
+              } else if (b.labor_hours) {
+                lines.push(`Labor (other sources): ${(b.labor_hours).toFixed(1)} hrs · ${_fmtUSD(b.labor_dollars)}`);
               } else {
                 lines.push('Labor: no data for this period');
               }
@@ -2027,14 +2103,16 @@ function renderPlhSummary(data) {
   const buckets = data.buckets || [];
   const total = buckets.reduce((acc, b) => {
     acc.cs    += (b.total_cs || 0);
-    acc.hrs   += (b.labor_hours || 0);
-    acc.cost  += (b.labor_dollars || 0);
+    acc.hrs   += (b.bakery_xlsx_labor_hours   || 0);
+    acc.cost  += (b.bakery_xlsx_labor_dollars || 0);
     acc.sales += (b.bakery_sales_dollars || 0);
     for (const [ch, v] of Object.entries(b.bakery_sales_by_channel || {})) {
       acc.byCh[ch] = (acc.byCh[ch] || 0) + (Number(v) || 0);
     }
     return acc;
   }, { cs: 0, hrs: 0, cost: 0, sales: 0, byCh: {} });
+  // SPLH + labor % use bakery-model labor only, matching the workbook
+  // (I11 hours, O10 SPLH).
   const splh    = total.hrs   ? total.sales / total.hrs : null;
   const laborPc = total.sales ? total.cost  / total.sales : null;
 
