@@ -198,6 +198,17 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "CWF":                   ("Chefs Warehouse, FL",    "Chefs Warehouse"),
     "CWC":                   ("Chefs Warehouse, Chicago",      "Chefs Warehouse"),
     "CWMID":                 ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
+    # Chefs Warehouse PDF header sometimes prints hyphenated codes.
+    # Subject format is "CW-MID-ATLANTIC", but pypdf occasionally extracts
+    # a truncated "CW-MID-ATL" or "CW-MID" from the header — alias them
+    # all to the same canonical destination so warehouse + distributor
+    # populate correctly regardless of which form the layout produced.
+    "CW-MID-ATLANTIC":       ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
+    "CW-MID-ATL":            ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
+    "CW-MID":                ("Chefs Warehouse, Mid-Atlantic", "Chefs Warehouse"),
+    "CW-NY":                 ("Chefs Warehouse, NY",            "Chefs Warehouse"),
+    "CW-FL":                 ("Chefs Warehouse, FL",            "Chefs Warehouse"),
+    "CW-C":                  ("Chefs Warehouse, Chicago",       "Chefs Warehouse"),
     # H&H's production sheet uses "JACKSON VILLE" (two words) for the
     # production destined to Cheney's Ocala DC — per JD, route it there.
     "JACKSON VILLE":         ("Ocala, FL",              "Cheney Brothers"),
@@ -255,8 +266,25 @@ _HEADER_RE = re.compile(
     # "<total> Total Cases [<lot_digits>] <WAREHOUSE>.PO.<po_number>"
     # La Mirada renders an extra lot # between "Cases" and the warehouse
     # because of how pypdf merges adjacent text runs; absorb optional
-    # leading digits before the warehouse name.
-    r"(\d+)\s+Total\s+Cases\s*\d*\s*([A-Z][A-Z 0-9]*?)\s*\.\s*PO\s*\.\s*([A-Z0-9]+)",
+    # leading digits before the warehouse name. Warehouse may contain
+    # hyphens (e.g. "CW-MID-ATL", "CW-NY") — Chefs Warehouse routes use
+    # them on the PDF header even though the subject uses other forms.
+    r"(\d+)\s+Total\s+Cases\s*\d*\s*([A-Z][A-Z 0-9\-]*?)\s*\.\s*PO\s*\.\s*([A-Z0-9]+)",
+    re.IGNORECASE,
+)
+
+# Fallback: extract the warehouse from a Daily Production subject line.
+# Subjects observed in the wild:
+#   "Daily Production OCALA.PO.054511694374"
+#   "Daily Production US FOODS ZEBULON.PO.5210265G"
+#   "Daily Production CW-MID-ATLANTIC PO.1095389"        (space, no dot)
+#   "Daily production US FOODS MANASSAS PO.4363705O"     (lowercase 'p')
+# Captures everything between "Daily Production " and the trailing
+# "[. ]PO." token. The PDF header is still the source of truth when
+# present; this fallback only fires when the body header didn't yield a
+# warehouse.
+_SUBJECT_WAREHOUSE_RE = re.compile(
+    r"daily\s+production\s+(.+?)\s*[.\s]\s*PO\s*[.\s]\s*[A-Z0-9]+",
     re.IGNORECASE,
 )
 
@@ -400,12 +428,21 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     if not sheet.total_cases and sheet.lines:
         sheet.total_cases = sum(L.cs_count for L in sheet.lines)
 
-    # Subject is informational — log it for debugging if the body lacked
-    # a header but the subject carried the PO.
+    # Subject fallback — pull PO and/or warehouse out of the subject when
+    # the PDF body header didn't yield them. Common cases: image-only
+    # scan PDFs (no extractable text) and layouts where pypdf splits the
+    # header line in a way the regex above misses.
     if not sheet.po_number and subject:
-        sm = re.search(r"PO[._]\s*([A-Z0-9]+)", subject, re.IGNORECASE)
+        sm = re.search(r"PO[._\s]\s*([A-Z0-9]+)", subject, re.IGNORECASE)
         if sm:
             sheet.po_number = sm.group(1).strip()
+    if not sheet.warehouse_raw and subject:
+        sm = _SUBJECT_WAREHOUSE_RE.search(subject)
+        if sm:
+            sheet.warehouse_raw = sm.group(1).strip()
+            sheet.warehouse, sheet.distributor = _classify_warehouse(
+                sheet.warehouse_raw,
+            )
 
     if not sheet.lines:
         sheet.error = (sheet.error or "") + " no line items detected".strip()
