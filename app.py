@@ -1328,62 +1328,103 @@ def _case_price_for(distributor: str) -> float:
                                          CASE_PRICE_DEFAULT)
 
 
-def _plh_bucket_keys(grain: str):
+def _plh_bucket_keys(grain: str, offset: int = 0):
     """Return [(key, start_iso, end_iso, label)] for the buckets in scope.
 
-    grain = "week"     -> last 4 ISO weeks ending this week (Mon-Sun)
-    grain = "month"    -> the 3 months of the current calendar quarter
-    grain = "quarter"  -> the 4 quarters of the current calendar year
+    grain = "week"     -> 4 ISO weeks ending this week (Mon-Sun)
+    grain = "month"    -> the 3 months of a calendar quarter
+    grain = "quarter"  -> the 4 quarters of a calendar year
+
+    offset shifts the window backward by one full window-length per step:
+      week   -> 4 weeks per step
+      month  -> 1 quarter (3 months) per step
+      quarter-> 1 year (4 quarters) per step
+    offset = 0 is the current window. Negative offsets are clamped to 0
+    (no "future" windows past now).
     """
     from datetime import datetime, timedelta
     today = datetime.now().date()
+    if offset < 0:
+        offset = 0
 
     if grain == "month":
-        # Quarter the current month belongs to (1-3, 4-6, 7-9, 10-12)
-        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        # Pick the quarter offset back from the one today belongs to.
+        # Use integer math on month index 0..11 to step backward by 3.
+        cur_q_start_month = ((today.month - 1) // 3) * 3 + 1
+        # Convert to absolute month index (year * 12 + month - 1)
+        cur_abs = today.year * 12 + (cur_q_start_month - 1)
+        target_abs = cur_abs - 3 * offset
+        anchor_year  = target_abs // 12
+        anchor_month = (target_abs % 12) + 1
         out = []
         for i in range(3):
-            mm = q_start_month + i
-            start = datetime(today.year, mm, 1).date()
-            nxt_mm = mm + 1
-            nxt_yy = today.year
-            if nxt_mm > 12:
-                nxt_mm = 1
-                nxt_yy = today.year + 1
-            end = (datetime(nxt_yy, nxt_mm, 1).date() - timedelta(days=1))
+            abs_i = anchor_year * 12 + (anchor_month - 1) + i
+            yy = abs_i // 12
+            mm = (abs_i % 12) + 1
+            start = datetime(yy, mm, 1).date()
+            nxt_abs = abs_i + 1
+            n_yy = nxt_abs // 12
+            n_mm = (nxt_abs % 12) + 1
+            end = (datetime(n_yy, n_mm, 1).date() - timedelta(days=1))
             key   = start.strftime("%Y-%m")
             label = start.strftime("%b %Y")
             out.append((key, start.isoformat(), end.isoformat(), label))
         return out
 
     if grain == "quarter":
+        anchor_year = today.year - offset
         out = []
         for q in range(1, 5):
             start_mm = (q - 1) * 3 + 1
-            start = datetime(today.year, start_mm, 1).date()
+            start = datetime(anchor_year, start_mm, 1).date()
             end_mm = start_mm + 3
-            end_yy = today.year
+            end_yy = anchor_year
             if end_mm > 12:
                 end_mm = 1
-                end_yy = today.year + 1
+                end_yy = anchor_year + 1
             end = (datetime(end_yy, end_mm, 1).date() - timedelta(days=1))
-            key   = f"{today.year}-Q{q}"
-            label = f"Q{q} {today.year}"
+            key   = f"{anchor_year}-Q{q}"
+            label = f"Q{q} {anchor_year}"
             out.append((key, start.isoformat(), end.isoformat(), label))
         return out
 
-    # default: weekly. 4 ISO weeks ending this week (Mon-Sun)
+    # default: weekly. 4 ISO weeks anchored on the Monday 4*offset weeks
+    # back from this week.
     day = today.weekday()        # Mon=0..Sun=6
     this_monday = today - timedelta(days=day)
+    anchor_monday = this_monday - timedelta(days=7 * 4 * offset)
     out = []
-    for i in range(3, -1, -1):    # 3 weeks ago -> this week
-        wk_start = this_monday - timedelta(days=7 * i)
+    for i in range(3, -1, -1):    # 3 windows ago -> latest
+        wk_start = anchor_monday - timedelta(days=7 * i)
         wk_end   = wk_start + timedelta(days=6)
         iso = wk_start.isocalendar()
         key   = f"{iso.year:04d}-W{iso.week:02d}"
         label = f"Week of {wk_start.strftime('%b %d')}"
         out.append((key, wk_start.isoformat(), wk_end.isoformat(), label))
     return out
+
+
+def _plh_window_label(grain: str, buckets: list) -> str:
+    """Human label for the chart header — e.g. 'Apr 20 – May 17, 2026',
+    'Apr – Jun 2026', or 'Q1 – Q4 2026'."""
+    if not buckets:
+        return ""
+    first_start = buckets[0][1]
+    last_end    = buckets[-1][2]
+    from datetime import date
+    fs = date.fromisoformat(first_start)
+    le = date.fromisoformat(last_end)
+    if grain == "quarter":
+        # Always within one year for this view.
+        return f"Q1 – Q4 {fs.year}"
+    if grain == "month":
+        if fs.year == le.year:
+            return f"{fs.strftime('%b')} – {le.strftime('%b')} {fs.year}"
+        return f"{fs.strftime('%b %Y')} – {le.strftime('%b %Y')}"
+    # week
+    if fs.year == le.year:
+        return f"{fs.strftime('%b %d')} – {le.strftime('%b %d, %Y')}"
+    return f"{fs.strftime('%b %d, %Y')} – {le.strftime('%b %d, %Y')}"
 
 
 def _date_in_range(d: str, start: str, end: str) -> bool:
@@ -1395,10 +1436,20 @@ def _date_in_range(d: str, start: str, end: str) -> bool:
 
 @app.route("/api/report/plh")
 def api_report_plh():
-    """Production revenue, labor hours, and $PLH per time bucket."""
+    """Production revenue, labor hours, and $PLH per time bucket.
+
+    Query params:
+      grain   "week" (default) | "month" | "quarter"
+      offset  int >= 0. 0 = current window. Each step shifts back one
+              full window: 4 weeks / 1 quarter / 1 year.
+    """
     from inventory_tracker import load_production, load_labor
     grain = (request.args.get("grain") or "week").lower()
-    buckets = _plh_bucket_keys(grain)
+    try:
+        offset = max(0, int(request.args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    buckets = _plh_bucket_keys(grain, offset=offset)
     prod = load_production()
     labor = load_labor()
 
@@ -1441,12 +1492,14 @@ def api_report_plh():
         out.append(bucket)
 
     return jsonify({
-        "grain": grain,
+        "grain":        grain,
+        "offset":       offset,
+        "window_label": _plh_window_label(grain, buckets),
         "case_prices": {
             "US Foods": 27.00, "Cheney Brothers": 26.50, "default": 29.50,
         },
         "labor_rate_default": LABOR_RATE_DEFAULT,
-        "buckets": out,
+        "buckets":      out,
     })
 
 

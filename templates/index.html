@@ -640,6 +640,14 @@
         <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="plh-subtitle">
           Bars = cs produced. Line = $PLH (revenue / labor hours). Prices: USF $27 · Cheney $26.50 · other $29.50. Default labor rate $17/hr.
         </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 20px 0 20px">
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm" id="plh-prev" onclick="shiftPlh(1)" title="Older window">◀</button>
+            <button class="btn btn-ghost btn-sm" id="plh-next" onclick="shiftPlh(-1)" title="Newer window">▶</button>
+            <button class="btn btn-ghost btn-sm" id="plh-today" onclick="resetPlh()" title="Jump to current window">Today</button>
+          </div>
+          <div id="plh-window-label" style="font-weight:600;color:var(--text);font-size:13px;text-align:right">&nbsp;</div>
+        </div>
         <div style="padding:8px 20px 16px 20px">
           <canvas id="plh-chart" height="260" style="max-height:280px"></canvas>
         </div>
@@ -1725,10 +1733,12 @@ function _restockWindow() {
 }
 
 let plhGrain = 'week';   // 'week' | 'month' | 'quarter'
+let plhOffset = 0;       // 0 = current window; each step = 4 weeks / 1 quarter / 1 year
 let plhChart = null;
 
 function setPlhGrain(g) {
   plhGrain = g;
+  plhOffset = 0;
   ['week','month','quarter'].forEach(m => {
     const btn = document.getElementById('plh-grain-' + m);
     if (btn) btn.classList.toggle('active', m === g);
@@ -1737,9 +1747,47 @@ function setPlhGrain(g) {
 }
 
 async function loadPlhChart() {
-  const data = await api('/api/report/plh?grain=' + encodeURIComponent(plhGrain));
+  const data = await api('/api/report/plh?grain=' + encodeURIComponent(plhGrain) +
+                       '&offset=' + encodeURIComponent(plhOffset));
   renderPlhChart(data);
   renderPlhSummary(data);
+  renderPlhWindowNav(data);
+}
+
+function renderPlhWindowNav(data) {
+  const lbl = document.getElementById('plh-window-label');
+  if (lbl) lbl.textContent = data && data.window_label ? data.window_label : '';
+  const nextBtn = document.getElementById('plh-next');
+  if (nextBtn) {
+    if (plhOffset <= 0) {
+      nextBtn.disabled = true;
+      nextBtn.classList.add('disabled');
+    } else {
+      nextBtn.disabled = false;
+      nextBtn.classList.remove('disabled');
+    }
+  }
+  const todayBtn = document.getElementById('plh-today');
+  if (todayBtn) {
+    if (plhOffset === 0) {
+      todayBtn.disabled = true;
+      todayBtn.classList.add('disabled');
+    } else {
+      todayBtn.disabled = false;
+      todayBtn.classList.remove('disabled');
+    }
+  }
+}
+
+function shiftPlh(delta) {
+  plhOffset = Math.max(0, plhOffset + delta);
+  loadPlhChart();
+}
+
+function resetPlh() {
+  if (plhOffset === 0) return;
+  plhOffset = 0;
+  loadPlhChart();
 }
 
 function _fmtUSD(n) {
