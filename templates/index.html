@@ -1933,13 +1933,16 @@ function _restockWindow() {
   return [start.toISOString().slice(0, 10), end.toISOString().slice(0, 10)];
 }
 
-let plhGrain = 'week';   // 'week' | 'month' | 'quarter'
-let plhOffset = 0;       // 0 = current window; each step = 4 weeks / 1 quarter / 1 year
+let plhGrain = 'week';        // 'week' | 'month' | 'quarter'
+let plhOffset = 0;            // 0 = current window; step is 1 week / 1 month / 1 year
+let plhSelectedIndex = null;  // null = window totals; int = drill into that bucket
+let _lastPlhData = null;      // cached response so we can re-render KPIs on click
 let plhChart = null;
 
 function setPlhGrain(g) {
   plhGrain = g;
   plhOffset = 0;
+  plhSelectedIndex = null;
   ['week','month','quarter'].forEach(m => {
     const btn = document.getElementById('plh-grain-' + m);
     if (btn) btn.classList.toggle('active', m === g);
@@ -1966,6 +1969,12 @@ async function loadPlhChart() {
       // Canvas not laid out yet -- come back next frame.
       requestAnimationFrame(paint);
       return;
+    }
+    _lastPlhData = data;
+    // If the trimmed/changed window shrank past the selected index, drop it.
+    if (plhSelectedIndex != null) {
+      const n = (data.buckets || []).length;
+      if (plhSelectedIndex < 0 || plhSelectedIndex >= n) plhSelectedIndex = null;
     }
     renderPlhChart(data);
     renderPlhSummary(data);
@@ -2001,13 +2010,34 @@ function renderPlhWindowNav(data) {
 
 function shiftPlh(delta) {
   plhOffset = Math.max(0, plhOffset + delta);
+  plhSelectedIndex = null;
   loadPlhChart();
 }
 
 function resetPlh() {
-  if (plhOffset === 0) return;
+  if (plhOffset === 0 && plhSelectedIndex == null) return;
   plhOffset = 0;
+  plhSelectedIndex = null;
   loadPlhChart();
+}
+
+// Toggle bucket selection from a chart click or a programmatic source.
+function selectPlhBucket(idx) {
+  plhSelectedIndex = (plhSelectedIndex === idx) ? null : idx;
+  if (_lastPlhData) {
+    // Re-render the bars (so the highlight updates) and the summary
+    // (so it switches between window totals and bucket detail).
+    renderPlhChart(_lastPlhData);
+    renderPlhSummary(_lastPlhData);
+  }
+}
+function clearPlhSelection() {
+  if (plhSelectedIndex == null) return;
+  plhSelectedIndex = null;
+  if (_lastPlhData) {
+    renderPlhChart(_lastPlhData);
+    renderPlhSummary(_lastPlhData);
+  }
 }
 
 function _fmtUSD(n) {
@@ -2044,9 +2074,13 @@ function renderPlhChart(data) {
           type: 'bar',
           label: 'Bakery sales',
           data: salesSeries,
-          backgroundColor: 'rgba(5, 23, 71, 0.78)',     // brand navy
-          borderColor:     'rgba(5, 23, 71, 0.95)',
-          borderWidth: 1,
+          backgroundColor: buckets.map((_, i) =>
+            i === plhSelectedIndex ? 'rgba(236, 80, 57, 0.85)'   // accent red
+                                   : 'rgba(5, 23, 71, 0.78)'),   // brand navy
+          borderColor: buckets.map((_, i) =>
+            i === plhSelectedIndex ? 'rgba(236, 80, 57, 1)'
+                                   : 'rgba(5, 23, 71, 0.95)'),
+          borderWidth: buckets.map((_, i) => i === plhSelectedIndex ? 2.5 : 1),
           yAxisID: 'ySales',
           order: 3,
         },
@@ -2079,6 +2113,17 @@ function renderPlhChart(data) {
     options: {
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
+      onHover: (event, elements, chart) => {
+        // Show a pointer on bars so the user knows they're clickable.
+        chart.canvas.style.cursor = elements.length ? 'pointer' : '';
+      },
+      onClick: (event, elements) => {
+        // Use Chart.js's hit-test rather than just the first element so a
+        // click anywhere along the index (lines + bars stack on top of
+        // each other) selects the correct bucket.
+        const hit = (elements && elements.length) ? elements[0].index : null;
+        if (hit != null) selectPlhBucket(hit);
+      },
       scales: {
         ySales: {
           beginAtZero: true,
@@ -2153,18 +2198,54 @@ function renderPlhSummary(data) {
   const wrap = document.getElementById('plh-summary');
   if (!wrap) return;
   const buckets = data.buckets || [];
-  const total = buckets.reduce((acc, b) => {
-    acc.cs    += (b.total_cs || 0);
-    acc.hrs   += (b.bakery_xlsx_labor_hours   || 0);
-    acc.cost  += (b.bakery_xlsx_labor_dollars || 0);
-    acc.sales += (b.bakery_sales_dollars || 0);
-    for (const [ch, v] of Object.entries(b.bakery_sales_by_channel || {})) {
-      acc.byCh[ch] = (acc.byCh[ch] || 0) + (Number(v) || 0);
-    }
-    return acc;
-  }, { cs: 0, hrs: 0, cost: 0, sales: 0, byCh: {} });
-  // SPLH + labor % use bakery-model labor only, matching the workbook
-  // (I11 hours, O10 SPLH).
+
+  // Build a "totals" object scoped either to the whole window (default)
+  // or to the single bucket the user clicked on. SPLH + labor % use
+  // bakery-model labor only, matching the workbook (I11 hours, O10 SPLH).
+  const selected = (plhSelectedIndex != null && buckets[plhSelectedIndex])
+    ? buckets[plhSelectedIndex]
+    : null;
+
+  let total, scopeLabel, headerHtml;
+  if (selected) {
+    total = {
+      cs:    selected.total_cs || 0,
+      hrs:   selected.bakery_xlsx_labor_hours   || 0,
+      cost:  selected.bakery_xlsx_labor_dollars || 0,
+      sales: selected.bakery_sales_dollars || 0,
+      byCh:  Object.assign({}, selected.bakery_sales_by_channel || {}),
+    };
+    scopeLabel = selected.label || selected.key || 'Selected period';
+    headerHtml = `
+      <div style="grid-column:1 / -1;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+        <div style="font-size:13px;color:var(--muted)">
+          Showing detail for <strong style="color:var(--text)">${escHtml(scopeLabel)}</strong>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="clearPlhSelection()">
+          Show window total
+        </button>
+      </div>`;
+  } else {
+    total = buckets.reduce((acc, b) => {
+      acc.cs    += (b.total_cs || 0);
+      acc.hrs   += (b.bakery_xlsx_labor_hours   || 0);
+      acc.cost  += (b.bakery_xlsx_labor_dollars || 0);
+      acc.sales += (b.bakery_sales_dollars || 0);
+      for (const [ch, v] of Object.entries(b.bakery_sales_by_channel || {})) {
+        acc.byCh[ch] = (acc.byCh[ch] || 0) + (Number(v) || 0);
+      }
+      return acc;
+    }, { cs: 0, hrs: 0, cost: 0, sales: 0, byCh: {} });
+    scopeLabel = data.window_label || 'Window';
+    headerHtml = `
+      <div style="grid-column:1 / -1;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+        <div style="font-size:13px;color:var(--muted)">
+          Window total &middot; <strong style="color:var(--text)">${escHtml(scopeLabel)}</strong>
+          ${buckets.length > 1 ? '&nbsp;&nbsp;<span style="font-size:12px">Click a bar to drill into a single period.</span>' : ''}
+        </div>
+        <div></div>
+      </div>`;
+  }
   const splh    = total.hrs   ? total.sales / total.hrs : null;
   const laborPc = total.sales ? total.cost  / total.sales : null;
 
@@ -2203,7 +2284,7 @@ function renderPlhSummary(data) {
       </div>`
     : '';
 
-  wrap.innerHTML = cards.map(c => {
+  wrap.innerHTML = headerHtml + cards.map(c => {
     const heroStyle = c.hero
       ? 'padding:14px 16px;background:var(--surface);border:1px solid var(--border);box-shadow:0 1px 2px rgba(5,23,71,0.04)'
       : 'padding:12px 14px';

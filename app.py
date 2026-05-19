@@ -1335,10 +1335,10 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
     grain = "month"    -> 4 trailing calendar months ending this month
     grain = "quarter"  -> the 4 quarters of a calendar year
 
-    offset shifts the window backward by one full window-length per step:
-      week   -> 4 weeks per step
-      month  -> 4 months per step
-      quarter-> 1 year (4 quarters) per step
+    offset shifts the window backward by:
+      week   -> 1 week per step  (4-week window slides one week at a time)
+      month  -> 1 month per step (4-month window slides one month at a time)
+      quarter-> 1 year per step  (4-quarter window jumps a full year)
     offset = 0 is the current window. Negative offsets are clamped to 0
     (no "future" windows past now).
     """
@@ -1348,11 +1348,12 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
         offset = 0
 
     if grain == "month":
-        # 4 trailing calendar months ending with the current month. Offset
-        # steps back by one full window (4 months) at a time.
+        # 4 trailing calendar months ending with the current month. Each
+        # prev/next click steps the window back by 1 month (overlapping
+        # navigation rather than jumping the whole window at once).
         cur_abs = today.year * 12 + (today.month - 1)
         # The newest month in this window:
-        newest_abs = cur_abs - 4 * offset
+        newest_abs = cur_abs - offset
         # Build oldest -> newest so the chart reads left to right naturally.
         out = []
         for i in range(3, -1, -1):
@@ -1386,11 +1387,13 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
             out.append((key, start.isoformat(), end.isoformat(), label))
         return out
 
-    # default: weekly. 4 ISO weeks anchored on the Monday 4*offset weeks
-    # back from this week.
+    # default: weekly. 4 ISO weeks anchored on the Monday `offset` weeks
+    # back from this week (each prev/next click shifts the window by 1 week,
+    # so navigation is smooth and overlapping rather than jumping a full
+    # 4-week window at a time).
     day = today.weekday()        # Mon=0..Sun=6
     this_monday = today - timedelta(days=day)
-    anchor_monday = this_monday - timedelta(days=7 * 4 * offset)
+    anchor_monday = this_monday - timedelta(days=7 * offset)
     out = []
     for i in range(3, -1, -1):    # 3 windows ago -> latest
         wk_start = anchor_monday - timedelta(days=7 * i)
@@ -1532,10 +1535,31 @@ def api_report_plh():
             )
         out.append(bucket)
 
+    # When looking at the current window (offset 0) for week/month grain,
+    # drop trailing buckets that have no data yet. Keeps an incomplete
+    # current week/month from appearing as an empty bar on the right edge
+    # of the chart. Past windows (offset > 0) keep their gaps visible --
+    # those represent real missing-data periods, not "we haven't gotten
+    # there yet."
+    if offset == 0 and grain in ("week", "month"):
+        def _is_empty(b):
+            return (
+                (b.get("total_cs") or 0) == 0
+                and (b.get("labor_hours") or 0) == 0
+                and (b.get("bakery_sales_dollars") or 0) == 0
+            )
+        while out and _is_empty(out[-1]):
+            out.pop()
+        # Recompute window_label against the surviving buckets so the
+        # header reflects the trimmed range.
+        trimmed = [(b["key"], b["start"], b["end"], b["label"]) for b in out]
+    else:
+        trimmed = buckets
+
     return jsonify({
         "grain":        grain,
         "offset":       offset,
-        "window_label": _plh_window_label(grain, buckets),
+        "window_label": _plh_window_label(grain, trimmed),
         "case_prices": {
             "US Foods": 27.00, "Cheney Brothers": 26.50, "default": 29.50,
         },
