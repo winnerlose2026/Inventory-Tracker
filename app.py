@@ -1435,6 +1435,24 @@ def _date_in_range(d: str, start: str, end: str) -> bool:
     return start <= d <= end
 
 
+def _bucket_is_empty(start: str, end: str, prod, labor, bsales) -> bool:
+    """Cheap check: does any production / labor / bakery-sales row fall in
+    the [start, end] window? Used to skip 'we have not gotten there yet'
+    periods when anchoring the chart's default view."""
+    for r in prod:
+        if _date_in_range(r.get("production_date") or "", start, end):
+            return False
+    for e in labor:
+        if _date_in_range(e.get("date") or "", start, end):
+            if (e.get("hours") or 0) > 0 or (e.get("dollars") or 0) > 0:
+                return False
+    for w in bsales:
+        if _date_in_range(w.get("week_start") or "", start, end):
+            if (w.get("total") or 0) > 0:
+                return False
+    return True
+
+
 @app.route("/api/report/plh")
 def api_report_plh():
     """Production revenue, labor hours, and $PLH per time bucket.
@@ -1450,10 +1468,27 @@ def api_report_plh():
         offset = max(0, int(request.args.get("offset") or 0))
     except (TypeError, ValueError):
         offset = 0
-    buckets = _plh_bucket_keys(grain, offset=offset)
     prod  = load_production()
     labor = load_labor()
     bsales = load_bakery_sales()
+
+    # For week/month grain, anchor the view at the most recent POPULATED
+    # period instead of "today." If the current week or month hasn't been
+    # filled in yet (the bakery model spreadsheet is updated weekly), the
+    # auto_shift slides the window back so we still show four populated
+    # bars instead of three + a blank.
+    auto_shift = 0
+    if grain in ("week", "month"):
+        # Probe up to 4 periods back; if everything is empty, stop shifting
+        # and just render the empties so the user can see the gap.
+        for probe in range(0, 5):
+            pb = _plh_bucket_keys(grain, offset=probe)
+            ls, le = pb[-1][1], pb[-1][2]
+            if not _bucket_is_empty(ls, le, prod, labor, bsales):
+                auto_shift = probe
+                break
+    effective_offset = offset + auto_shift
+    buckets = _plh_bucket_keys(grain, offset=effective_offset)
 
     out = []
     for key, start, end, label in buckets:
@@ -1535,36 +1570,17 @@ def api_report_plh():
             )
         out.append(bucket)
 
-    # When looking at the current window (offset 0) for week/month grain,
-    # drop trailing buckets that have no data yet. Keeps an incomplete
-    # current week/month from appearing as an empty bar on the right edge
-    # of the chart. Past windows (offset > 0) keep their gaps visible --
-    # those represent real missing-data periods, not "we haven't gotten
-    # there yet."
-    if offset == 0 and grain in ("week", "month"):
-        def _is_empty(b):
-            return (
-                (b.get("total_cs") or 0) == 0
-                and (b.get("labor_hours") or 0) == 0
-                and (b.get("bakery_sales_dollars") or 0) == 0
-            )
-        while out and _is_empty(out[-1]):
-            out.pop()
-        # Recompute window_label against the surviving buckets so the
-        # header reflects the trimmed range.
-        trimmed = [(b["key"], b["start"], b["end"], b["label"]) for b in out]
-    else:
-        trimmed = buckets
-
     return jsonify({
-        "grain":        grain,
-        "offset":       offset,
-        "window_label": _plh_window_label(grain, trimmed),
+        "grain":            grain,
+        "offset":           offset,
+        "effective_offset": effective_offset,
+        "auto_shift":       auto_shift,
+        "window_label":     _plh_window_label(grain, buckets),
         "case_prices": {
             "US Foods": 27.00, "Cheney Brothers": 26.50, "default": 29.50,
         },
         "labor_rate_default": LABOR_RATE_DEFAULT,
-        "buckets":      out,
+        "buckets":          out,
     })
 
 
