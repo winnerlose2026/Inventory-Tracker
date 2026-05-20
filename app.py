@@ -94,6 +94,14 @@ def api_auth_check():
 # Pages
 # ---------------------------------------------------------------------------
 
+@app.route("/favicon.ico")
+def favicon_ico():
+    """Direct /favicon.ico requests bypass the template's <link> tag.
+    Send the static file straight from /static/favicon.ico so the tab
+    icon shows up even when the browser doesn't read the head first."""
+    return app.send_static_file("favicon.ico")
+
+
 @app.route("/")
 def index():
     # When INVENTORY_AUTO_AUTH is on, hand the admin token to the page so the
