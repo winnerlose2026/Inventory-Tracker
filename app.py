@@ -689,12 +689,15 @@ def api_sales_locations():
     """
     from inventory_tracker import load_sales, TOAST_RETAIL_LOCATIONS
     rows = load_sales() or []
-    # Start with the registry — every retail location guaranteed.
+    # Start with the registry — every retail location guaranteed, with
+    # state abbreviation so the UI can render "Penn Station, NY" without
+    # any per-location lookup.
     by_loc: dict = {}
     for L in TOAST_RETAIL_LOCATIONS:
         by_loc[L["restaurant_guid"]] = {
             "restaurant_guid": L["restaurant_guid"],
             "location":        L["location"],
+            "state":           L.get("state") or "",
             "status":          L.get("status") or "active",
             "rows":            0,
             "min_date":        "",
@@ -708,6 +711,7 @@ def api_sales_locations():
         slot = by_loc.setdefault(guid, {
             "restaurant_guid": guid,
             "location":        r.get("location") or "",
+            "state":           "",
             "rows":            0,
             "min_date":        r.get("business_date") or "",
             "max_date":        r.get("business_date") or "",

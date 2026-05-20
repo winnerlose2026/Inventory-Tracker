@@ -818,14 +818,17 @@
         <div class="card">
           <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
             <span class="card-title">🔥 Top Consumed &middot; Toast retail sales</span>
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-              <select id="toast-sales-location" onchange="loadToastSales()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px">
+            <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+              <select id="toast-sales-location" onchange="loadToastSales()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;min-width:180px">
                 <option value="">All locations</option>
               </select>
-              <button class="btn btn-ghost btn-sm" id="toast-sales-prev" onclick="shiftToastSalesOffset(-1)" title="Older period">&laquo;</button>
-              <input type="date" id="toast-sales-date" onchange="onToastSalesDateChange()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px" />
-              <button class="btn btn-ghost btn-sm" id="toast-sales-next" onclick="shiftToastSalesOffset(1)"  title="Newer period">&raquo;</button>
-              <button class="btn btn-ghost btn-sm" id="toast-sales-today" onclick="resetToastSalesOffset()" title="Jump to current period">Today</button>
+              <div style="display:flex;align-items:center;gap:4px;padding:2px;border:1px solid var(--border);border-radius:8px;background:var(--surface)">
+                <button class="btn btn-ghost btn-sm" id="toast-sales-prev" onclick="shiftToastSalesOffset(-1)" title="Previous period" style="padding:2px 8px">&laquo;</button>
+                <input type="date" id="toast-sales-date" onchange="onToastSalesDateChange()" style="padding:2px 6px;border:0;background:transparent;color:var(--text);font-size:12px" />
+                <button class="btn btn-ghost btn-sm" id="toast-sales-next" onclick="shiftToastSalesOffset(1)" title="Next period" style="padding:2px 8px">&raquo;</button>
+                <span style="width:1px;height:18px;background:var(--border);margin:0 2px"></span>
+                <button class="btn btn-ghost btn-sm" id="toast-sales-today" onclick="resetToastSalesOffset()" title="Jump to today's period" style="padding:2px 8px">Today</button>
+              </div>
               <div class="btn-group">
                 <button class="btn btn-ghost btn-sm active" id="toast-sales-period-week" onclick="setToastSalesPeriod('week')">Weekly</button>
                 <button class="btn btn-ghost btn-sm" id="toast-sales-period-month" onclick="setToastSalesPeriod('month')">Monthly</button>
@@ -3610,7 +3613,11 @@ function renderTraceResults() {
 // -------------------------------------------------------------------------
 let toastSalesPeriod = 'week';
 let _toastSalesLocationsLoaded = false;
-let toastSalesAnchor = null;   // string YYYY-MM-DD, null = today
+// Always a YYYY-MM-DD - the report now shows exactly the bucket
+// containing this date. Seeded to today's date on first declaration so
+// the initial page load renders one bucket (the current week/month)
+// rather than the most-recent-N-with-data view.
+let toastSalesAnchor = new Date().toISOString().slice(0, 10);
 function setToastSalesPeriod(p) {
   toastSalesPeriod = p;
   ['week','month'].forEach(m => {
@@ -3632,9 +3639,13 @@ function shiftToastSalesOffset(delta) {
   loadToastSales();
 }
 function resetToastSalesOffset() {
-  toastSalesAnchor = null;
+  // Today = explicitly select today's date so the report shows the
+  // bucket containing today (one week or month, not the historical
+  // tail). Previously this cleared the anchor and showed multiple
+  // buckets.
+  toastSalesAnchor = new Date().toISOString().slice(0, 10);
   const inp = document.getElementById('toast-sales-date');
-  if (inp) inp.value = new Date().toISOString().slice(0, 10);
+  if (inp) inp.value = toastSalesAnchor;
   loadToastSales();
 }
 function onToastSalesDateChange() {
@@ -3652,17 +3663,18 @@ async function ensureToastLocationDropdown() {
     const sel = document.getElementById('toast-sales-location');
     if (sel && r.locations) {
       const opts = r.locations.map(L => {
-        const label = escHtml(L.location || L.restaurant_guid);
-        let tag;
-        if (L.rows > 0) tag = `(${L.rows} rows, ${L.min_date} \u2013 ${L.max_date})`;
-        else if (L.status === 'pre_launch')       tag = '(pre-launch, no sales)';
-        else if (L.status === 'data_unavailable') tag = '(data unavailable)';
-        else                                       tag = '(no data yet)';
-        return `<option value="${escAttr(L.restaurant_guid)}">${label} \u2014 ${tag}</option>`;
+        const name  = L.location || L.restaurant_guid;
+        const state = L.state || '';
+        const label = escHtml(state ? `${name}, ${state}` : name);
+        return `<option value="${escAttr(L.restaurant_guid)}">${label}</option>`;
       });
       sel.innerHTML = '<option value="">All locations</option>' + opts.join('');
     }
   } catch (e) { /* fallthrough */ }
+  // Pre-fill the date picker with the active anchor so the user can
+  // see what period they're looking at.
+  const inp = document.getElementById('toast-sales-date');
+  if (inp && !inp.value) inp.value = toastSalesAnchor;
 }
 async function loadToastSales() {
   await ensureToastLocationDropdown();
