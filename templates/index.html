@@ -3689,19 +3689,16 @@ async function loadToastSales() {
   }
   container.innerHTML = buckets.map(b => {
     const headerLabel = b.label || b.key;
-    const itemsHtml = (b.items || []).map((it, idx) => `<tr>
+    const items = b.items || [];
+    const itemsHtml = items.map((it, idx) => `<tr>
       <td style="color:var(--muted);width:28px;text-align:right">${idx + 1}.</td>
       <td>${escHtml(it.item)}${it.menu_group ? ` <span style="color:var(--muted);font-size:11px">[${escHtml(it.menu_group)}]</span>` : ''}</td>
       <td style="text-align:right;font-weight:600">$${it.gross.toFixed(2)}</td>
       <td style="text-align:right;color:var(--muted)">${it.qty.toLocaleString()}</td>
       <td style="text-align:right;font-weight:600">${it.mix_pct.toFixed(1)}%</td>
     </tr>`).join('');
-    return `<div style="border-top:1px solid var(--border);padding:10px 0">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-        <div style="font-weight:600">${escHtml(headerLabel)}</div>
-        <div style="color:var(--muted);font-size:12px">$${b.total_gross.toFixed(2)} gross &middot; ${b.item_count} items</div>
-      </div>
-      <table style="margin:0;font-size:12px">
+    const body = items.length
+      ? `<table style="margin:0;font-size:12px">
         <thead><tr>
           <th></th><th>Item</th>
           <th style="text-align:right">Gross $</th>
@@ -3709,7 +3706,14 @@ async function loadToastSales() {
           <th style="text-align:right">Mix %</th>
         </tr></thead>
         <tbody>${itemsHtml}</tbody>
-      </table>
+      </table>`
+      : `<div class="empty" style="padding:12px;color:var(--muted);font-size:12px">No Toast sales ingested for this ${toastSalesPeriod}${loc ? ' at this location' : ''}. Run the Toast sync from a Cowork session to backfill.</div>`;
+    return `<div style="border-top:1px solid var(--border);padding:10px 0">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+        <div style="font-weight:600">${escHtml(headerLabel)}</div>
+        <div style="color:var(--muted);font-size:12px">$${(b.total_gross || 0).toFixed(2)} gross &middot; ${b.item_count} items</div>
+      </div>
+      ${body}
     </div>`;
   }).join('');
 }

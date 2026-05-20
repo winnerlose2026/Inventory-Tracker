@@ -453,9 +453,12 @@ def api_report_toast_sales():
     except (TypeError, ValueError):
         top_n = 10
     location_q = (args.get("location") or "").strip()
-    # Anchor date — newest bucket returned is the one containing this
-    # date (defaults to today, i.e. "newest bucket overall"). Used by
-    # the Report page Prev/Next + calendar nav.
+    # Anchor date — the Report page's Prev/Next/Today buttons and the
+    # date picker all set this to a single YYYY-MM-DD. When present we
+    # return the SINGLE week/month bucket containing that date so the
+    # user sees the period they picked (matching the Restock card's
+    # one-window-at-a-time semantics). When absent we fall back to
+    # returning the most recent N buckets that have data.
     end_date_q = (args.get("end_date") or "").strip()
 
     rows = load_sales() or []
@@ -506,43 +509,50 @@ def api_report_toast_sales():
         agg["gross"] += float(r.get("gross") or 0)
         agg["net"]   += float(r.get("net") or 0)
 
-    # Take the newest N buckets (anchored to end_date if given), sort
-    # items by gross desc, attach mix %.
-    bucket_keys = sorted(buckets_map.keys(), reverse=True)
-    if end_date_q:
-        # The bucket key for end_date_q is the Monday of its week (or
-        # YYYY-MM for month). Filter to buckets whose key is <= that.
-        try:
-            ed = _dt.strptime(end_date_q, "%Y-%m-%d")
-            if period == "week":
-                anchor = (ed - _td(days=ed.weekday())).strftime("%Y-%m-%d")
-            else:
-                anchor = ed.strftime("%Y-%m")
-            bucket_keys = [k for k in bucket_keys if k <= anchor]
-        except ValueError:
-            pass
-    out_buckets = []
-    for bk in bucket_keys[:buckets]:
-        items = list(buckets_map[bk].values())
+    def _label_for(bk: str) -> str:
+        if period == "week":
+            d = _dt.strptime(bk, "%Y-%m-%d")
+            return f"{d.strftime('%b %-d')} \u2013 {(d + _td(days=6)).strftime('%b %-d, %Y')}"
+        d = _dt.strptime(bk, "%Y-%m")
+        return d.strftime("%B %Y")
+
+    def _serialize(bk: str) -> dict:
+        items = list(buckets_map.get(bk, {}).values())
         items.sort(key=lambda x: x["gross"], reverse=True)
         total = sum(x["gross"] for x in items) or 1
         for it in items:
             it["mix_pct"] = round(100 * it["gross"] / total, 2)
             it["gross"]   = round(it["gross"], 2)
             it["net"]     = round(it["net"], 2)
-        if period == "week":
-            d = _dt.strptime(bk, "%Y-%m-%d")
-            label = f"{d.strftime('%b %-d')} \u2013 {(d + _td(days=6)).strftime('%b %-d, %Y')}"
-        else:
-            d = _dt.strptime(bk, "%Y-%m")
-            label = d.strftime("%B %Y")
-        out_buckets.append({
-            "key":      bk,
-            "label":    label,
-            "total_gross": round(total, 2),
-            "items":    items[:top_n],
-            "item_count": len(items),
-        })
+        return {
+            "key":         bk,
+            "label":       _label_for(bk),
+            "total_gross": round(total, 2) if items else 0.0,
+            "items":       items[:top_n],
+            "item_count":  len(items),
+        }
+
+    # When a specific date is picked, return ONLY the bucket containing
+    # that date \u2014 even if it has no rows, so the UI can render a clear
+    # "no data for week of X" state instead of falling silently empty.
+    if end_date_q:
+        try:
+            ed = _dt.strptime(end_date_q, "%Y-%m-%d")
+            if period == "week":
+                anchor = (ed - _td(days=ed.weekday())).strftime("%Y-%m-%d")
+            else:
+                anchor = ed.strftime("%Y-%m")
+            return jsonify({"ok": True, "period": period,
+                            "buckets":     [_serialize(anchor)],
+                            "anchor":      anchor,
+                            "anchor_date": end_date_q,
+                            "total_rows":  len(rows)})
+        except ValueError:
+            pass
+
+    # No anchor date \u2014 fall back to the most recent N buckets with data.
+    bucket_keys = sorted(buckets_map.keys(), reverse=True)
+    out_buckets = [_serialize(bk) for bk in bucket_keys[:buckets]]
 
     return jsonify({"ok": True, "period": period,
                     "buckets": out_buckets,
