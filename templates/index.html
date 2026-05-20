@@ -2362,6 +2362,60 @@ function _normalizeWarehouseName(raw) {
   return _RESTOCK_WAREHOUSE_ALIASES[t.toUpperCase()] || t;
 }
 
+// Map raw_variety patterns (PARB-EVERYTHING, PLAIN SLICED, CINN RAISIN,
+// JALAPENO-CHEDDAR, etc.) back to a canonical flavor name. Used when
+// the structured variety field is missing or set to a non-flavor
+// sentinel like "In-House Inventory" — the parser sometimes leaves
+// that placeholder when it can't classify a line.
+const _VARIETY_PATTERNS = [
+  // order matters: more specific first
+  { rx: /JALAPENO[\s\-]*CHEDDAR/i, name: 'Jalapeno Cheddar' },
+  { rx: /WHOLE[\s\-]*WHEAT[\s\-]*EVERYTHING/i, name: 'Whole Wheat Everything' },
+  { rx: /WHOLE[\s\-]*WHEAT/i, name: 'Whole Wheat' },
+  { rx: /CINN[\.\s\-]*RAISIN/i, name: 'Cinnamon Raisin' },
+  { rx: /CINNAMON[\s\-]*RAISIN/i, name: 'Cinnamon Raisin' },
+  { rx: /CINNAMON/i, name: 'Cinnamon' },
+  { rx: /BLUEBERRY/i, name: 'Blueberry' },
+  { rx: /POPPY/i, name: 'Poppy Seed' },
+  { rx: /SESAME/i, name: 'Sesame' },
+  { rx: /ASIAGO/i, name: 'Asiago' },
+  { rx: /PUMPERNICKEL/i, name: 'Pumpernickel' },
+  { rx: /ONION/i, name: 'Onion' },
+  { rx: /EVERYTHING/i, name: 'Everything' },
+  { rx: /\bEGG\b/i, name: 'Egg' },
+  { rx: /\bPLAIN\b/i, name: 'Plain' },
+];
+
+// Variety strings that aren't real flavors. Anything matching these
+// gets routed through raw_variety pattern matching; if that fails we
+// bucket as "Other" so the chart never shows them as a top variety.
+const _VARIETY_BLOCKLIST = new Set([
+  'in-house inventory',
+  'in house inventory',
+  'unknown',
+  'total',
+  'assorted',
+  'asst',
+  'mini asst',
+  '',
+]);
+
+function _normalizeVarietyName(variety, raw_variety) {
+  const cooked = String(variety || '').trim();
+  const cookedLower = cooked.toLowerCase();
+  const isBadCooked = _VARIETY_BLOCKLIST.has(cookedLower);
+  // If the structured variety is a real flavor (not blocklisted), use it.
+  if (cooked && !isBadCooked) return cooked;
+  // Try to extract a known flavor from the raw_variety string.
+  const raw = String(raw_variety || '').trim();
+  if (raw) {
+    for (const p of _VARIETY_PATTERNS) {
+      if (p.rx.test(raw)) return p.name;
+    }
+  }
+  return 'Other';
+}
+
 function _populateRestockWarehouseDropdown() {
   const sel = document.getElementById('restock-warehouse');
   if (!sel) return;
@@ -2411,16 +2465,22 @@ function renderRestockedByVarietyLocation() {
     return;
   }
 
-  // Variety -> { total, byWarehouse: {warehouse: cs} }
+  // Variety -> { total, byWarehouse: {warehouse: cs} }. variety is the
+  // canonical flavor name; "In-House Inventory" and other placeholder
+  // values get re-mapped from raw_variety so they don't appear as
+  // their own row.
   const byVariety = {};
+  let grandTotal = 0;
   records.forEach(r => {
     const wh = _normalizeWarehouseName(r.warehouse || r.warehouse_raw || '') || 'Unassigned';
     (r.lines || []).forEach(L => {
-      const v = L.variety || L.raw_variety || 'Unknown';
+      const v = _normalizeVarietyName(L.variety, L.raw_variety);
       const cs = Number(L.cs_count) || 0;
+      if (cs <= 0) return;
       const slot = byVariety[v] = byVariety[v] || { variety: v, total: 0, byWh: {} };
       slot.total += cs;
       slot.byWh[wh] = (slot.byWh[wh] || 0) + cs;
+      grandTotal += cs;
     });
   });
 
@@ -2447,7 +2507,7 @@ function renderRestockedByVarietyLocation() {
         </div>
         <div style="font-size:11px;color:var(--muted);margin-top:4px">${head}${more}</div>
       </div>
-      <div class="chart-bar-val">${v.total.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></div>
+      <div class="chart-bar-val">${v.total.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs &middot; ${grandTotal ? ((v.total / grandTotal) * 100).toFixed(1) : '0.0'}%</span></div>
     </div>`;
   }).join('');
 }
