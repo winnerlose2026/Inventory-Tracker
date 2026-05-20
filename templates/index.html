@@ -2512,8 +2512,12 @@ function renderRestockedByVarietyLocation() {
   // reflect real-flavor scale, not a possibly outsized Other bucket.
   const overallMax = (sorted.find(v => v.variety !== 'Other') || sorted[0] || { total: 1 }).total || 1;
 
-  el.innerHTML = sorted.map(v => {
+  el.innerHTML = sorted.map((v, i) => {
     const barPct = Math.round((v.total / overallMax) * 100);
+    // Stack rank position. The "Other" bucket is intentionally pinned
+    // below the ranking, so it gets a dash instead of a number to keep
+    // the rank sequence honest (real flavors number 1..N).
+    const rankLabel = (v.variety === 'Other') ? '—' : `${i + 1}.`;
 
     // Breakdown line: quarter view in 'year' mode, warehouse list otherwise.
     let breakdown, subtitle;
@@ -2555,8 +2559,11 @@ function renderRestockedByVarietyLocation() {
       : subtitle;
     return `<div class="chart-bar-row" style="align-items:flex-start;gap:12px;padding:6px 0${isOther ? ';opacity:0.75' : ''}">
       <div class="chart-bar-label" title="${escHtml(labelTitle)}" style="min-width:140px">
-        <div style="font-weight:600">${escHtml(v.variety)}</div>
-        <div style="color:var(--muted);font-size:11px;margin-top:2px">${labelSubtitle}</div>
+        <div style="font-weight:600;display:flex;align-items:baseline;gap:6px">
+          <span style="color:var(--muted);font-weight:500;min-width:22px;text-align:right;font-variant-numeric:tabular-nums">${rankLabel}</span>
+          <span>${escHtml(v.variety)}</span>
+        </div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px;padding-left:28px">${labelSubtitle}</div>
       </div>
       <div style="flex:1;min-width:120px">
         <div class="chart-bar-track">
