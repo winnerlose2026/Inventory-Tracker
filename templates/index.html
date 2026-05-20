@@ -1861,10 +1861,21 @@ async function loadReport() {
   ]);
   vrankProdCache = prod || [];
 
+  // Populate the Top Variety warehouse dropdown immediately after
+  // production data loads. Run it BEFORE any other render so a later
+  // error can't block it.
+  try { _populateRestockWarehouseDropdown(); } catch (e) { console.warn('warehouse dropdown:', e); }
+
+  // Sync date input + render Top Variety chart up front, again with a
+  // try/catch so renderChart issues below don't prevent it.
+  try { _restockSyncDateInput(); renderRestockedByVarietyLocation(); }
+  catch (e) { console.warn('renderRestockedByVarietyLocation:', e); }
+
   function renderChart(containerId, data, color) {
     const el = document.getElementById(containerId);
-    if (!data.length) { el.innerHTML = '<div class="empty">No data yet.</div>'; return; }
-    const max = data[0].total;
+    if (!el) return;
+    if (!data || !data.length) { el.innerHTML = '<div class="empty">No data yet.</div>'; return; }
+    const max = data[0].total || 1;
     el.innerHTML = data.map(d => `
       <div class="chart-bar-row">
         <div class="chart-bar-label" title="${escHtml(d.name)}">${escHtml(d.name)}</div>
@@ -1875,12 +1886,10 @@ async function loadReport() {
       </div>`).join('');
   }
 
-  renderChart('chart-consumed', report.top_consumed, 'var(--red)');
-  // Top Restocked is now a variety × location view powered by the same
-  // production-records cache as the ranking section below.
-  renderRestockedByVarietyLocation();
+  try { renderChart('chart-consumed', report.top_consumed || [], 'var(--red)'); }
+  catch (e) { console.warn('chart-consumed:', e); }
 
-  renderVarietyRanking();
+  try { renderVarietyRanking(); } catch (e) { console.warn('renderVarietyRanking:', e); }
 }
 
 // ---- Top Variety by Location: variety × location, weekly/monthly ----------
@@ -2337,14 +2346,31 @@ function renderPlhSummary(data) {
   }).join('') + channelHtml;
 }
 
+// Collapse warehouse aliases so the dropdown and chart don't show
+// duplicate buckets for the same physical location. Add to this map
+// whenever a new shorthand appears in production data.
+const _RESTOCK_WAREHOUSE_ALIASES = {
+  'CWF':   'Chefs Warehouse, FL',
+  'CWFL':  'Chefs Warehouse, FL',
+  'CWNY':  'Chefs Warehouse, NY',
+  'CWC':   'Chefs Warehouse, Chicago',
+  'CWMID': 'Chefs Warehouse, Mid-Atlantic',
+};
+function _normalizeWarehouseName(raw) {
+  if (!raw) return '';
+  const t = String(raw).trim();
+  return _RESTOCK_WAREHOUSE_ALIASES[t.toUpperCase()] || t;
+}
+
 function _populateRestockWarehouseDropdown() {
   const sel = document.getElementById('restock-warehouse');
   if (!sel) return;
-  // Collect unique warehouses across the full production cache so the
-  // user can pick any one even if it had no rows in the current window.
+  // Collect unique normalized warehouses across the full production
+  // cache so the user can pick any one even if it had no rows in the
+  // current window.
   const names = new Set();
   (vrankProdCache || []).forEach(r => {
-    const wh = r.warehouse || r.warehouse_raw || '';
+    const wh = _normalizeWarehouseName(r.warehouse || r.warehouse_raw || '');
     if (wh) names.add(wh);
   });
   const sorted = [...names].sort((a, b) => a.localeCompare(b));
@@ -2373,7 +2399,7 @@ function renderRestockedByVarietyLocation() {
     if (since && d < since) return false;
     if (until && d > until) return false;
     if (restockWarehouse) {
-      const wh = r.warehouse || r.warehouse_raw || '';
+      const wh = _normalizeWarehouseName(r.warehouse || r.warehouse_raw || '');
       if (wh !== restockWarehouse) return false;
     }
     return true;
@@ -2388,7 +2414,7 @@ function renderRestockedByVarietyLocation() {
   // Variety -> { total, byWarehouse: {warehouse: cs} }
   const byVariety = {};
   records.forEach(r => {
-    const wh = r.warehouse || r.warehouse_raw || 'Unassigned';
+    const wh = _normalizeWarehouseName(r.warehouse || r.warehouse_raw || '') || 'Unassigned';
     (r.lines || []).forEach(L => {
       const v = L.variety || L.raw_variety || 'Unknown';
       const cs = Number(L.cs_count) || 0;
