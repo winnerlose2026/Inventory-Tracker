@@ -608,26 +608,44 @@ def api_report_toast_sales():
         return jsonify({"ok": True, "period": period, "buckets": [],
                         "total_rows": 0, "fetch": fetch_meta})
 
+    # Aggregate by NORMALIZED display name (+ menu group) rather than
+    # item_guid. Toast issues a fresh item_guid every time a menu item
+    # is re-published (price change, name tweak, modifier shuffle), so
+    # the same user-visible product can appear under several guids in
+    # a single week. Keying on guid surfaces these as duplicate rows;
+    # keying on name collapses them. The underlying sales.json still
+    # keeps the raw guid for traceability.
+    def _norm(s: str) -> str:
+        return " ".join((s or "").lower().split())
+
     buckets_map: dict = {}
     for r in rows:
         bk = _bucket_key(r.get("business_date") or "")
         if not bk:
             continue
         slot = buckets_map.setdefault(bk, {})
-        item_key = r.get("item_guid")
-        if not item_key:
+        name      = (r.get("item") or "").strip()
+        menu_grp  = (r.get("menu_group") or "").strip()
+        if not name and not r.get("item_guid"):
             continue
+        item_key  = (_norm(name), _norm(menu_grp))
         agg = slot.setdefault(item_key, {
-            "item_guid": item_key,
-            "item":      r.get("item") or "",
-            "menu_group": r.get("menu_group") or "",
-            "qty":       0,
-            "gross":     0.0,
-            "net":       0.0,
+            "item":       name,
+            "menu_group": menu_grp,
+            "qty":        0,
+            "gross":      0.0,
+            "net":        0.0,
+            "guid_count": 0,
         })
-        agg["qty"]   += int(r.get("qty") or 0)
-        agg["gross"] += float(r.get("gross") or 0)
-        agg["net"]   += float(r.get("net") or 0)
+        agg["qty"]        += int(r.get("qty") or 0)
+        agg["gross"]      += float(r.get("gross") or 0)
+        agg["net"]        += float(r.get("net") or 0)
+        agg["guid_count"] += 1  # informational; not used in render
+        # Prefer the longest/non-empty observed values for display.
+        if name and len(name) > len(agg["item"]):
+            agg["item"] = name
+        if menu_grp and not agg["menu_group"]:
+            agg["menu_group"] = menu_grp
 
     def _label_for(bk: str) -> str:
         if period == "week":
