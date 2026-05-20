@@ -460,21 +460,10 @@ def api_report_toast_sales():
     # one-window-at-a-time semantics). When absent we fall back to
     # returning the most recent N buckets that have data.
     end_date_q = (args.get("end_date") or "").strip()
-
-    rows = load_sales() or []
-
-    # Optional location filter — match either restaurant_guid or
-    # location name (case-insensitive substring).
-    if location_q:
-        if "-" in location_q or len(location_q) == 36:
-            rows = [r for r in rows if r.get("restaurant_guid") == location_q]
-        else:
-            q = location_q.lower()
-            rows = [r for r in rows if q in (r.get("location") or "").lower()]
-
-    if not rows:
-        return jsonify({"ok": True, "period": period, "buckets": [],
-                        "total_rows": 0})
+    # When True (default) a cache miss for the picked bucket triggers a
+    # live Toast pull. The client can pass live=0 to force cache-only
+    # behavior (e.g. for fast retries while a fetch is in flight).
+    live_q = (args.get("live") or "1").strip() not in ("0", "false", "no")
 
     # Bucket each row.
     def _bucket_key(date_iso: str) -> str:
@@ -487,6 +476,137 @@ def api_report_toast_sales():
             mon = d - _td(days=d.weekday())
             return mon.strftime("%Y-%m-%d")
         return d.strftime("%Y-%m")
+
+    def _bucket_range(anchor_iso: str):
+        """Return (start_date_iso, end_date_iso) inclusive for the
+        bucket containing anchor_iso. Caps end at today — we never
+        ask Toast for future dates."""
+        ed = _dt.strptime(anchor_iso, "%Y-%m-%d")
+        if period == "week":
+            start = ed - _td(days=ed.weekday())
+            end   = start + _td(days=6)
+        else:
+            start = ed.replace(day=1)
+            if ed.month == 12:
+                end = ed.replace(day=31)
+            else:
+                end = ed.replace(month=ed.month + 1, day=1) - _td(days=1)
+        today = _dt.now().date()
+        if end.date() > today:
+            end = _dt.combine(today, _dt.min.time())
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    def _target_locations(loc_q: str):
+        """Return [(restaurant_guid, location_name), ...] for the live
+        fetch. If a specific location is selected, returns just that
+        one. Otherwise returns every active retail location."""
+        from inventory_tracker import TOAST_RETAIL_LOCATIONS
+        if loc_q:
+            if "-" in loc_q or len(loc_q) == 36:
+                for L in TOAST_RETAIL_LOCATIONS:
+                    if L["restaurant_guid"] == loc_q:
+                        return [(L["restaurant_guid"], L["location"])]
+                return [(loc_q, "")]
+            q = loc_q.lower()
+            return [(L["restaurant_guid"], L["location"])
+                    for L in TOAST_RETAIL_LOCATIONS
+                    if q in (L.get("location") or "").lower()]
+        return [(L["restaurant_guid"], L["location"])
+                for L in TOAST_RETAIL_LOCATIONS
+                if (L.get("status") or "active") == "active"]
+
+    def _ensure_bucket_cached(all_rows: list, anchor_iso: str, loc_q: str):
+        """If the bucket containing anchor_iso has no rows for the
+        target locations, pull from Toast and append to sales.json.
+        Returns (updated_rows, meta dict) where meta carries fetch info
+        for the client (rows_fetched, fetch_error, fetched_at)."""
+        meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None}
+        if not live_q:
+            return all_rows, meta
+        try:
+            start_iso, end_iso = _bucket_range(anchor_iso)
+        except ValueError:
+            return all_rows, meta
+        targets = _target_locations(loc_q)
+        if not targets:
+            return all_rows, meta
+        # Which (guid, date) pairs already have at least 1 row?
+        cached_keys = set()
+        for r in all_rows:
+            d = (r.get("business_date") or "").strip()
+            if start_iso <= d <= end_iso:
+                cached_keys.add((r.get("restaurant_guid") or "", d))
+        # Enumerate every (target_location, date) pair in the bucket
+        # range; anything not in cached_keys is a fetch candidate.
+        missing = []
+        s = _dt.strptime(start_iso, "%Y-%m-%d")
+        e = _dt.strptime(end_iso,   "%Y-%m-%d")
+        d_cursor = s
+        while d_cursor <= e:
+            d_iso = d_cursor.strftime("%Y-%m-%d")
+            for (guid, name) in targets:
+                if (guid, d_iso) not in cached_keys:
+                    missing.append((guid, d_iso, name))
+            d_cursor += _td(days=1)
+        if not missing:
+            return all_rows, meta
+        try:
+            from integrations import toast_api
+            if not toast_api.is_configured():
+                meta["fetch_error"] = "toast_not_configured"
+                return all_rows, meta
+            new_rows = toast_api.fetch_product_mix_batch(
+                missing, max_workers=6, timeout_s=28.0)
+        except Exception as ex:
+            meta["fetch_error"] = f"{type(ex).__name__}: {ex}"
+            return all_rows, meta
+        if not new_rows:
+            # No orders for any of the missing (guid, date) pairs is a
+            # legitimate response — still record the attempt so the UI
+            # knows a fetch ran.
+            meta["fetched_at"] = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            return all_rows, meta
+        from inventory_tracker import save_sales
+        # Dedupe on (restaurant_guid, business_date, item_guid) — if a
+        # date was partially cached, prefer the fresh row.
+        by_key: dict = {}
+        for r in all_rows:
+            k = (r.get("restaurant_guid"), r.get("business_date"),
+                 r.get("item_guid"))
+            by_key[k] = r
+        for r in new_rows:
+            k = (r.get("restaurant_guid"), r.get("business_date"),
+                 r.get("item_guid"))
+            by_key[k] = r
+        merged = list(by_key.values())
+        save_sales(merged)
+        meta["rows_fetched"] = len(new_rows)
+        meta["fetched_at"]   = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        return merged, meta
+
+    # Load the full row set ONCE. If an anchor date is set we may
+    # mutate this with a Toast fetch before bucketing.
+    rows = load_sales() or []
+    fetch_meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None}
+    if end_date_q:
+        try:
+            rows, fetch_meta = _ensure_bucket_cached(rows, end_date_q,
+                                                    location_q)
+        except Exception as ex:
+            fetch_meta["fetch_error"] = f"{type(ex).__name__}: {ex}"
+
+    # Apply the location filter (after the live fetch so newly-pulled
+    # rows are visible).
+    if location_q:
+        if "-" in location_q or len(location_q) == 36:
+            rows = [r for r in rows if r.get("restaurant_guid") == location_q]
+        else:
+            q = location_q.lower()
+            rows = [r for r in rows if q in (r.get("location") or "").lower()]
+
+    if not rows and not end_date_q:
+        return jsonify({"ok": True, "period": period, "buckets": [],
+                        "total_rows": 0, "fetch": fetch_meta})
 
     buckets_map: dict = {}
     for r in rows:
@@ -546,7 +666,8 @@ def api_report_toast_sales():
                             "buckets":     [_serialize(anchor)],
                             "anchor":      anchor,
                             "anchor_date": end_date_q,
-                            "total_rows":  len(rows)})
+                            "total_rows":  len(rows),
+                            "fetch":       fetch_meta})
         except ValueError:
             pass
 

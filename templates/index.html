@@ -354,7 +354,8 @@
     .pager-row { padding: 10px 14px; }
     .pager-row > div { width: 100%; justify-content: flex-start; }
   }
-</style>
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
 </head>
 <body>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -3673,19 +3674,51 @@ async function loadToastSales() {
   const subtitle = document.getElementById('toast-sales-subtitle');
   if (subtitle) subtitle.textContent =
     `Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${toastSalesPeriod}.`;
+
+  // When the user picks a specific date the backend may fetch live
+  // from Toast - that can take up to ~30s. Show an explicit loading
+  // state instead of leaving the previous render on screen.
+  const container = document.getElementById('toast-sales-container');
+  if (toastSalesAnchor) {
+    container.innerHTML = `<div class="empty" style="padding:18px;color:var(--muted)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="spinner" style="width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--text);border-radius:50%;animation:spin 0.8s linear infinite"></div>
+        <span>Checking cache${loc ? ' for the selected location' : ' for all retail locations'}, fetching from Toast if needed (up to 30s)...</span>
+      </div>
+    </div>`;
+  }
+
   let res;
   try {
     res = await api('/api/report/toast-sales?' + qs.toString());
   } catch (e) {
-    document.getElementById('toast-sales-container').innerHTML =
+    container.innerHTML =
       `<div class="empty" style="padding:18px;color:var(--red)">Failed: ${escHtml(String(e))}</div>`;
     return;
   }
   const buckets = (res && res.buckets) || [];
-  const container = document.getElementById('toast-sales-container');
+  const fetchMeta = (res && res.fetch) || {};
   if (!buckets.length) {
     container.innerHTML = '<div class="empty" style="padding:18px">No Toast sales rows ingested yet. Run the Toast sync from a Cowork session to populate.</div>';
     return;
+  }
+  // Surface the fetch result in the subtitle so the user knows whether
+  // they got cached data or a fresh Toast pull, and any auth issues.
+  if (subtitle && toastSalesAnchor) {
+    let tag = '';
+    if (fetchMeta.fetch_error === 'toast_not_configured') {
+      tag = ' · cache only (set TOAST_CLIENT_ID/SECRET/HOSTNAME on Render to enable live fetch)';
+    } else if (fetchMeta.fetch_error) {
+      tag = ` · live fetch failed: ${escHtml(fetchMeta.fetch_error)}`;
+    } else if (fetchMeta.rows_fetched > 0) {
+      tag = ` · pulled ${fetchMeta.rows_fetched} fresh rows from Toast`;
+    } else if (fetchMeta.fetched_at) {
+      tag = ' · fetched from Toast (no new orders found)';
+    } else {
+      tag = ' · served from cache';
+    }
+    subtitle.textContent =
+      `Top-selling items by retail $ from Toast POS with sales mix %, aggregated by ${toastSalesPeriod}.${tag}`;
   }
   container.innerHTML = buckets.map(b => {
     const headerLabel = b.label || b.key;
@@ -3697,6 +3730,9 @@ async function loadToastSales() {
       <td style="text-align:right;color:var(--muted)">${it.qty.toLocaleString()}</td>
       <td style="text-align:right;font-weight:600">${it.mix_pct.toFixed(1)}%</td>
     </tr>`).join('');
+    const emptyHelp = fetchMeta.fetch_error
+      ? `Live Toast pull failed (${escHtml(fetchMeta.fetch_error)}). Falling back to cached data, which has no rows for this ${toastSalesPeriod}.`
+      : `No Toast sales found for this ${toastSalesPeriod}${loc ? ' at this location' : ''}. Either the restaurant had no orders that ${toastSalesPeriod === 'week' ? 'week' : 'month'}, or the data hasn't been ingested yet.`;
     const body = items.length
       ? `<table style="margin:0;font-size:12px">
         <thead><tr>
@@ -3707,7 +3743,7 @@ async function loadToastSales() {
         </tr></thead>
         <tbody>${itemsHtml}</tbody>
       </table>`
-      : `<div class="empty" style="padding:12px;color:var(--muted);font-size:12px">No Toast sales ingested for this ${toastSalesPeriod}${loc ? ' at this location' : ''}. Run the Toast sync from a Cowork session to backfill.</div>`;
+      : `<div class="empty" style="padding:12px;color:var(--muted);font-size:12px">${emptyHelp}</div>`;
     return `<div style="border-top:1px solid var(--border);padding:10px 0">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
         <div style="font-weight:600">${escHtml(headerLabel)}</div>
