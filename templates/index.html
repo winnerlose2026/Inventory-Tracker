@@ -2362,7 +2362,10 @@ const _VARIETY_PATTERNS = [
   { rx: /WHOLE[\s\-]*WHEAT/i, name: 'Whole Wheat' },
   { rx: /CINN[\.\s\-]*RAISIN/i, name: 'Cinnamon Raisin' },
   { rx: /CINNAMON[\s\-]*RAISIN/i, name: 'Cinnamon Raisin' },
-  { rx: /CINNAMON/i, name: 'Cinnamon' },
+  // Bare "CINNAMON" (e.g. PARB-CINNAMON) collapses into Cinnamon
+  // Raisin - that's the only cinnamon-bearing bagel variety on the
+  // H&H menu, and the parser sometimes drops the "RAISIN" suffix.
+  { rx: /CINNAMON/i, name: 'Cinnamon Raisin' },
   { rx: /BLUEBERRY/i, name: 'Blueberry' },
   { rx: /POPPY/i, name: 'Poppy Seed' },
   { rx: /SESAME/i, name: 'Sesame' },
@@ -2388,17 +2391,31 @@ const _VARIETY_BLOCKLIST = new Set([
   '',
 ]);
 
+// Canonical aliases applied to the final variety name after pattern
+// matching - lets us consolidate real-flavor strings that should map
+// onto a parent variety. (e.g. "Cinnamon" on its own means Cinnamon
+// Raisin in the H&H menu - there is no plain Cinnamon bagel.)
+const _VARIETY_ALIASES = {
+  'cinnamon': 'Cinnamon Raisin',
+};
+
 function _normalizeVarietyName(variety, raw_variety) {
   const cooked = String(variety || '').trim();
   const cookedLower = cooked.toLowerCase();
   const isBadCooked = _VARIETY_BLOCKLIST.has(cookedLower);
-  // If the structured variety is a real flavor (not blocklisted), use it.
-  if (cooked && !isBadCooked) return cooked;
+  // If the structured variety is a real flavor (not blocklisted), use
+  // it - but still pass through the alias map in case it's a synonym
+  // of another variety.
+  if (cooked && !isBadCooked) {
+    return _VARIETY_ALIASES[cookedLower] || cooked;
+  }
   // Try to extract a known flavor from the raw_variety string.
   const raw = String(raw_variety || '').trim();
   if (raw) {
     for (const p of _VARIETY_PATTERNS) {
-      if (p.rx.test(raw)) return p.name;
+      if (p.rx.test(raw)) {
+        return _VARIETY_ALIASES[p.name.toLowerCase()] || p.name;
+      }
     }
   }
   return 'Other';
@@ -2481,9 +2498,19 @@ function renderRestockedByVarietyLocation() {
     });
   });
 
-  // Sort varieties by total cs descending
-  const sorted = Object.values(byVariety).sort((a, b) => b.total - a.total);
-  const overallMax = sorted.length ? sorted[0].total : 1;
+  // Sort varieties by total cs descending, but always pin the
+  // "Other" bucket to the very bottom - it's an aggregation of rows
+  // we couldn't classify, not a true bagel variety. The user wanted
+  // it visible (for transparency) but not competing with real
+  // flavors in the ranking.
+  const sorted = Object.values(byVariety).sort((a, b) => {
+    if (a.variety === 'Other' && b.variety !== 'Other') return  1;
+    if (b.variety === 'Other' && a.variety !== 'Other') return -1;
+    return b.total - a.total;
+  });
+  // overallMax uses the largest non-"Other" total so the bar widths
+  // reflect real-flavor scale, not a possibly outsized Other bucket.
+  const overallMax = (sorted.find(v => v.variety !== 'Other') || sorted[0] || { total: 1 }).total || 1;
 
   el.innerHTML = sorted.map(v => {
     const barPct = Math.round((v.total / overallMax) * 100);
@@ -2519,10 +2546,17 @@ function renderRestockedByVarietyLocation() {
       subtitle = `${sortedWh.length} location${sortedWh.length === 1 ? '' : 's'}`;
     }
 
-    return `<div class="chart-bar-row" style="align-items:flex-start;gap:12px;padding:6px 0">
-      <div class="chart-bar-label" title="${escHtml(v.variety)}" style="min-width:140px">
+    const isOther = v.variety === 'Other';
+    const labelTitle = isOther
+      ? 'Production rows whose variety couldn\'t be classified (ASSORTED, MINI ASST, TOTAL, sliced totals, or blank lines). Working to resolve the underlying parser ambiguity so these get attributed to a real bagel variety.'
+      : v.variety;
+    const labelSubtitle = isOther
+      ? '<span style="font-style:italic">unclassified rows</span>'
+      : subtitle;
+    return `<div class="chart-bar-row" style="align-items:flex-start;gap:12px;padding:6px 0${isOther ? ';opacity:0.75' : ''}">
+      <div class="chart-bar-label" title="${escHtml(labelTitle)}" style="min-width:140px">
         <div style="font-weight:600">${escHtml(v.variety)}</div>
-        <div style="color:var(--muted);font-size:11px;margin-top:2px">${subtitle}</div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px">${labelSubtitle}</div>
       </div>
       <div style="flex:1;min-width:120px">
         <div class="chart-bar-track">
