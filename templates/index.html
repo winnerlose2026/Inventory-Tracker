@@ -844,12 +844,18 @@
         </div>
         <div class="card">
           <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-            <span class="card-title">📥 Top Reordered &middot; by Variety &times; Location</span>
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-ghost btn-sm" id="restock-prev"  onclick="shiftRestockOffset(-1)" title="Previous period">&laquo;</button>
-              <input type="date" id="restock-ref-date" onchange="onRestockRefDateChange()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px" />
-              <button class="btn btn-ghost btn-sm" id="restock-next"  onclick="shiftRestockOffset(1)"  title="Next period">&raquo;</button>
-              <button class="btn btn-ghost btn-sm" id="restock-today" onclick="resetRestockOffset()"   title="Jump to current period">Today</button>
+            <span class="card-title">📥 Top Variety by Location</span>
+            <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+              <select id="restock-warehouse" onchange="onRestockWarehouseChange()" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;min-width:180px">
+                <option value="">All warehouses</option>
+              </select>
+              <div style="display:flex;align-items:center;gap:4px;padding:2px;border:1px solid var(--border);border-radius:8px;background:var(--surface)">
+                <button class="btn btn-ghost btn-sm" id="restock-prev" onclick="shiftRestockOffset(-1)" title="Previous period" style="padding:2px 8px">&laquo;</button>
+                <input type="date" id="restock-ref-date" onchange="onRestockRefDateChange()" style="padding:2px 6px;border:0;background:transparent;color:var(--text);font-size:12px" />
+                <button class="btn btn-ghost btn-sm" id="restock-next" onclick="shiftRestockOffset(1)" title="Next period" style="padding:2px 8px">&raquo;</button>
+                <span style="width:1px;height:18px;background:var(--border);margin:0 2px"></span>
+                <button class="btn btn-ghost btn-sm" id="restock-today" onclick="resetRestockOffset()" title="Jump to today's period" style="padding:2px 8px">Today</button>
+              </div>
               <div class="btn-group">
                 <button class="btn btn-ghost btn-sm active" id="restock-period-week" onclick="setRestockPeriod('week')">Weekly</button>
                 <button class="btn btn-ghost btn-sm" id="restock-period-month" onclick="setRestockPeriod('month')">Monthly</button>
@@ -1877,10 +1883,22 @@ async function loadReport() {
   renderVarietyRanking();
 }
 
-// ---- Top Restocked: variety × location, weekly/monthly --------------------
+// ---- Top Variety by Location: variety × location, weekly/monthly ----------
 let restockPeriod = 'week';   // 'week' | 'month'
 
-let restockRefDate = null;   // anchor date (string YYYY-MM-DD); null = today
+// Anchor date drives which window is shown. Default = a date inside
+// the LAST COMPLETED week (= 7 days ago), so the first render lands on
+// the most recent Mon-Sun window with full data, not the current
+// partial week.
+function _restockDefaultAnchor() {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  return d.toISOString().slice(0, 10);
+}
+let restockRefDate = _restockDefaultAnchor();
+
+// Optional warehouse filter. Empty string = show all warehouses.
+let restockWarehouse = '';
 
 function setRestockPeriod(p) {
   restockPeriod = p;
@@ -1915,8 +1933,15 @@ function shiftRestockOffset(delta) {
   renderRestockedByVarietyLocation();
 }
 function resetRestockOffset() {
-  restockRefDate = null;
+  // Today = the period containing today (current week or month).
+  restockRefDate = new Date().toISOString().slice(0, 10);
   _restockSyncDateInput();
+  renderRestockedByVarietyLocation();
+}
+
+function onRestockWarehouseChange() {
+  const sel = document.getElementById('restock-warehouse');
+  restockWarehouse = sel ? sel.value : '';
   renderRestockedByVarietyLocation();
 }
 function onRestockRefDateChange() {
@@ -2312,28 +2337,51 @@ function renderPlhSummary(data) {
   }).join('') + channelHtml;
 }
 
+function _populateRestockWarehouseDropdown() {
+  const sel = document.getElementById('restock-warehouse');
+  if (!sel) return;
+  // Collect unique warehouses across the full production cache so the
+  // user can pick any one even if it had no rows in the current window.
+  const names = new Set();
+  (vrankProdCache || []).forEach(r => {
+    const wh = r.warehouse || r.warehouse_raw || '';
+    if (wh) names.add(wh);
+  });
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  const current = restockWarehouse;
+  sel.innerHTML = '<option value="">All warehouses</option>' +
+    sorted.map(n => `<option value="${escAttr(n)}"${n === current ? ' selected' : ''}>${escHtml(n)}</option>`).join('');
+}
+
 function renderRestockedByVarietyLocation() {
   const el = document.getElementById('chart-restocked');
   if (!el) return;
 
+  _populateRestockWarehouseDropdown();
+
   const [since, until] = _restockWindow();
   const lbl = document.getElementById('restock-range-label');
   if (lbl) {
-    lbl.textContent = (restockPeriod === 'month')
-      ? `Showing ${formatDate(since)} \u2013 ${formatDate(until)} (one month)`
-      : `Showing ${formatDate(since)} \u2013 ${formatDate(until)} (one week)`;
+    const whNote = restockWarehouse ? ` · ${escHtml(restockWarehouse)}` : ' · all warehouses';
+    const periodWord = restockPeriod === 'month' ? 'one month' : 'one week';
+    lbl.innerHTML = `Showing ${formatDate(since)} \u2013 ${formatDate(until)} (${periodWord})${whNote}`;
   }
-  // Filter production records to the window
+  // Filter production records to the window (and warehouse if set)
   const records = (vrankProdCache || []).filter(r => {
     const d = (r.production_date || '').slice(0, 10);
     if (!d) return false;
     if (since && d < since) return false;
     if (until && d > until) return false;
+    if (restockWarehouse) {
+      const wh = r.warehouse || r.warehouse_raw || '';
+      if (wh !== restockWarehouse) return false;
+    }
     return true;
   });
 
   if (records.length === 0) {
-    el.innerHTML = '<div class="empty">No restocks logged in this window.</div>';
+    const where = restockWarehouse ? ` at ${escHtml(restockWarehouse)}` : '';
+    el.innerHTML = `<div class="empty">No production logged in this window${where}.</div>`;
     return;
   }
 
