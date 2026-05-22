@@ -2257,9 +2257,13 @@ WAREHOUSES = {
     ],
     # Chefs Warehouse DCs receive their own POs but DO NOT appear in
     # the Inventory tab -- they're surfaced only on the Pending POs
-    # tab via /api/chefs-warehouse/pos. CW operates four receiving
-    # DCs: Bronx (NY), Chicago (CHI standard), Hanover (MD + occasional
-    # CHI consolidation), and Opa Locka (FL).
+    # tab via /api/chefs-warehouse/pos. CW operates four FULLY SEPARATE
+    # receiving DCs (no consolidation between them; each issues its own
+    # PO#s):
+    #   - Bronx, NY      a.k.a. "CW NY" (Dairyland)
+    #   - Chicago, IL    a.k.a. "CW Midwest"
+    #   - Hanover, MD    a.k.a. "CW Mid-Atlantic"
+    #   - Opa Locka, FL  a.k.a. "CW Florida"
     "Chefs Warehouse": [
         "Bronx, NY",
         "Chicago, IL",

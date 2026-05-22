@@ -86,22 +86,35 @@ import pypdf
 # ---------------------------------------------------------------------------
 
 # Ship-to ID -> "<City>, <ST>" surfaced as ``warehouse``. CW operates
-# four receiving DCs in our route plan:
-#   200001 -> Dairyland USA Corporation, Bronx, NY            (NY DC)
-#   133001 -> The Chefs' Warehouse Midwest, Chicago, IL       (CHI DC)
-#   400001 -> The Chefs' Warehouse Mid-Atlantic, Hanover, MD  (MD + occasional
-#                                                              CHI consolidation)
-#   600001 -> The Chefs' Warehouse Florida, Opa Locka, FL     (FLA DC)
+# four FULLY SEPARATE receiving DCs in our route plan -- a PO shipped
+# to one DC is NEVER transferred to another:
+#   200001 -> Dairyland USA Corporation, Bronx, NY        (a.k.a. "CW NY")
+#   133001 -> The Chefs' Warehouse Midwest, Chicago, IL   (a.k.a. "CW Midwest" / CHI)
+#   400001 -> The Chefs' Warehouse Mid-Atlantic,
+#             Hanover, MD                                 (a.k.a. "CW Mid-Atlantic" / MD)
+#   600001 -> The Chefs' Warehouse Florida,
+#             Opa Locka, FL                               (a.k.a. "CW Florida" / FLA)
 #
-# Most CHI POs ship to 133001 (direct Chicago receiving). A handful
-# route through 400001/Hanover for consolidation before transfer; the
-# email subject still tags those "CHI". Both are valid -- the PDF is
-# the source of truth for the actual receiving DC.
+# Subject-line DC tags (NY/MD/FLA/CHI) are an operational hint, but the
+# PDF's Ship To: header is the source of truth. The same PO# is never
+# shared across DCs; each DC's buyer issues its own PO.
 CW_SHIP_TO_TO_WAREHOUSE: dict[str, str] = {
     "133001": "Chicago, IL",
     "200001": "Bronx, NY",
     "400001": "Hanover, MD",
     "600001": "Opa Locka, FL",
+}
+
+# Friendly DC labels operators use in conversation -- surfaced as
+# ``ship_to_name`` on each parsed PO so the Pending POs tab can show
+# both the city ("Hanover, MD") and the conversational label
+# ("CW Mid-Atlantic"). Keyed on ship-to id so the lookup matches the
+# warehouse map above 1:1.
+CW_SHIP_TO_TO_DC_NAME: dict[str, str] = {
+    "133001": "CW Midwest",
+    "200001": "CW NY (Dairyland)",
+    "400001": "CW Mid-Atlantic",
+    "600001": "CW Florida",
 }
 
 # Fallback for unknown ship-to IDs -- match on the city extracted from
