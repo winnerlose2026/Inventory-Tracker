@@ -2257,11 +2257,12 @@ WAREHOUSES = {
     ],
     # Chefs Warehouse DCs receive their own POs but DO NOT appear in
     # the Inventory tab -- they're surfaced only on the Pending POs
-    # tab via /api/chefs-warehouse/pos. The 400001 ship-to in CW's
-    # PDF covers both MD and CHI deliveries (CHI POs ship to Hanover
-    # MD for consolidation).
+    # tab via /api/chefs-warehouse/pos. CW operates four receiving
+    # DCs: Bronx (NY), Chicago (CHI standard), Hanover (MD + occasional
+    # CHI consolidation), and Opa Locka (FL).
     "Chefs Warehouse": [
         "Bronx, NY",
+        "Chicago, IL",
         "Hanover, MD",
         "Opa Locka, FL",
     ],

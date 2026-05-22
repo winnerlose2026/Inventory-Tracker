@@ -85,10 +85,20 @@ import pypdf
 # Reference data
 # ---------------------------------------------------------------------------
 
-# Ship-to ID -> "<City>, <ST>" surfaced as ``warehouse``. CW Chicago
-# DC ships into Hanover MD per the PO layout (subject says "CHI" but
-# the PDF ships to Mid-Atlantic), so 400001 covers both MD and CHI.
+# Ship-to ID -> "<City>, <ST>" surfaced as ``warehouse``. CW operates
+# four receiving DCs in our route plan:
+#   200001 -> Dairyland USA Corporation, Bronx, NY            (NY DC)
+#   133001 -> The Chefs' Warehouse Midwest, Chicago, IL       (CHI DC)
+#   400001 -> The Chefs' Warehouse Mid-Atlantic, Hanover, MD  (MD + occasional
+#                                                              CHI consolidation)
+#   600001 -> The Chefs' Warehouse Florida, Opa Locka, FL     (FLA DC)
+#
+# Most CHI POs ship to 133001 (direct Chicago receiving). A handful
+# route through 400001/Hanover for consolidation before transfer; the
+# email subject still tags those "CHI". Both are valid -- the PDF is
+# the source of truth for the actual receiving DC.
 CW_SHIP_TO_TO_WAREHOUSE: dict[str, str] = {
+    "133001": "Chicago, IL",
     "200001": "Bronx, NY",
     "400001": "Hanover, MD",
     "600001": "Opa Locka, FL",
@@ -98,6 +108,7 @@ CW_SHIP_TO_TO_WAREHOUSE: dict[str, str] = {
 # the PDF address block.
 CW_DC_CITY_TO_WAREHOUSE: dict[str, str] = {
     "BRONX":     "Bronx, NY",
+    "CHICAGO":   "Chicago, IL",
     "HANOVER":   "Hanover, MD",
     "OPA LOCKA": "Opa Locka, FL",
 }
