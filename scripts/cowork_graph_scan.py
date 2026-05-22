@@ -59,6 +59,7 @@ sys.path.insert(0, str(REPO))
 from integrations.email_scanner import (  # noqa: E402
     _usfoods_po_to_events,
     _cheney_po_to_events,
+    _chefs_warehouse_po_to_record,
 )
 
 
@@ -70,14 +71,9 @@ DEFAULT_MAILBOXES = "JD@ms.hhbagels.com,info@ms.hhbagels.com"
 
 # Keys we treat as PO-bearing senders. Other senders are ignored even if
 # the subject contains "Purchase Order".
-USF_DOMAINS = {"usfoods.com", "usfood.com"}
+USF_DOMAINS    = {"usfoods.com", "usfood.com"}
 CHENEY_DOMAINS = {"cheneybrothers.com", "cheney.com"}
-# H&H's own domain — used to recognize internal Daily Production sheet
-# emails. The production team sends them between hhbagels.com addresses
-# (typically gabo@ -> isaiah@, with JD@ on cc/bcc), so neither
-# sender nor recipient looks like a distributor.
-HH_DOMAINS = {"hhbagels.com", "ms.hhbagels.com"}
-PRODUCTION_SUBJECT_RE = re.compile(r"\bDaily\s+[Pp]roduction\b")
+CHEFS_DOMAINS  = {"chefswarehouse.com"}
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +99,7 @@ def _domain_of(addr: str) -> str:
 
 
 def _classify(sender: str, subject: str) -> str | None:
-    """Return 'US Foods' | 'Cheney Brothers' | None."""
+    """Return 'US Foods' | 'Cheney Brothers' | 'Chefs Warehouse' | None."""
     dom = _domain_of(sender)
     for d in USF_DOMAINS:
         if dom == d or dom.endswith("." + d):
@@ -111,24 +107,13 @@ def _classify(sender: str, subject: str) -> str | None:
     for d in CHENEY_DOMAINS:
         if dom == d or dom.endswith("." + d):
             return "Cheney Brothers"
+    for d in CHEFS_DOMAINS:
+        if dom == d or dom.endswith("." + d):
+            return "Chefs Warehouse"
     # Some PO confirmations get forwarded by internal staff. We do NOT
     # accept those automatically — the original PDF is the source of truth
     # and will arrive in the original distributor message too.
     return None
-
-
-def _is_production_email(sender: str, subject: str) -> bool:
-    """Return True for H&H internal "Daily Production Sheet" emails.
-
-    These don't go through the PO ingest path — they describe what was
-    BAKED for a PO, not the PO itself. They're sent within H&H from the
-    production team. Sender + subject pattern; safer than relying on
-    either alone.
-    """
-    dom = _domain_of(sender)
-    if dom not in HH_DOMAINS and not any(dom.endswith("." + d) for d in HH_DOMAINS):
-        return False
-    return bool(PRODUCTION_SUBJECT_RE.search(subject or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -198,28 +183,30 @@ def _graph_get_bytes(token: str, path: str, *, verbose: bool = False) -> bytes:
 
 def _list_recent_messages(token: str, mailbox: str, since_dt: datetime,
                           *, verbose: bool = False) -> list[dict]:
-    """Return attachment-bearing messages received since `since_dt`.
+    """Return list of recent messages with attachments for one mailbox.
 
-    `hasAttachments eq true and receivedDateTime ge X` is valid without
-    `$orderby` — the combination errors as `InefficientFilter` when paired
-    with an explicit sort. Without orderby Graph still returns every match;
-    paging just isn't strictly date-ordered. Filtering server-side keeps a
-    high-volume mailbox from burning the page budget on non-PO mail.
+    Graph rejects (`hasAttachments eq true and receivedDateTime ge X`) +
+    `$orderby receivedDateTime` as `InefficientFilter`. We work around that
+    by filtering on receivedDateTime alone (Graph returns most-recent-first
+    by default) and screening `hasAttachments` client-side. That keeps the
+    result set bounded by the lookback window and avoids the Graph hint.
     """
     since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     qs = urllib.parse.urlencode({
         "$select": ("id,subject,from,toRecipients,receivedDateTime,"
                     "hasAttachments,internetMessageId"),
-        "$filter": f"hasAttachments eq true and receivedDateTime ge {since_iso}",
+        "$filter": f"receivedDateTime ge {since_iso}",
         "$top": "100",
     })
     out: list[dict] = []
     next_url = (f"/users/{urllib.parse.quote(mailbox)}/messages?{qs}")
     pages = 0
-    while next_url and pages < 20:
+    while next_url and pages < 5:
         pages += 1
         page = _graph_get(token, next_url, verbose=verbose)
-        out.extend(page.get("value") or [])
+        for m in page.get("value") or []:
+            if m.get("hasAttachments"):
+                out.append(m)
         nxt = page.get("@odata.nextLink")
         next_url = nxt if nxt else None
     return out
@@ -304,8 +291,9 @@ def _write_seen_state(path: Path, ids: list[str], *, max_lines: int = 500) -> No
 # ---------------------------------------------------------------------------
 
 def _post_ingest(app_url: str, token: str, payload: dict,
-                 *, verbose: bool = False) -> tuple[int, dict | str]:
-    url = f"{app_url.rstrip('/')}/api/email/ingest-events"
+                 *, path: str = "/api/email/ingest-events",
+                 verbose: bool = False) -> tuple[int, dict | str]:
+    url = f"{app_url.rstrip('/')}{path}"
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
@@ -406,14 +394,7 @@ def run(argv: list[str] | None = None) -> int:
     since = datetime.now(timezone.utc) - timedelta(hours=args.lookback_hours)
 
     # ---- discover qualifying messages
-    #
-    # A message qualifies only if (a) the sender is Cheney/USF and (b) at least
-    # one attachment is a PDF. Non-PDF attachments (calendar invites, images,
-    # docx forwards from buyer threads) are skipped silently — we only parse
-    # PO PDFs here.
-    error_strs: list[str] = []
-    qualifying: list[dict] = []   # PO emails {mailbox, id, subject, sender, distributor, pdf_atts}
-    production_qualifying: list[dict] = []  # Daily Production emails
+    qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
     for mb in mailboxes:
         try:
             msgs = _list_recent_messages(token, mb, since, verbose=args.verbose)
@@ -428,52 +409,43 @@ def run(argv: list[str] | None = None) -> int:
                 continue
             sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""
             subject = m.get("subject") or ""
-            received = m.get("receivedDateTime") or ""
             dist = _classify(sender, subject)
-            is_prod = _is_production_email(sender, subject)
-            if not dist and not is_prod:
+            if not dist:
                 continue
-            try:
-                atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
-            except Exception as exc:
-                msg = _redact(str(exc), secrets_to_redact)
-                error_strs.append(f"{mid[:12]}.. [list-att]: {msg}")
-                continue
-            pdf_atts = [
-                a for a in atts
-                if (a.get("name") or "").lower().endswith(".pdf")
-                or (a.get("contentType") or "").lower() == "application/pdf"
-            ]
-            if not pdf_atts:
-                continue
-            entry = {
+            qualifying.append({
                 "mailbox": mb,
                 "id": mid,
                 "subject": subject,
                 "sender": sender,
-                "received_at": received,
-                "pdf_atts": pdf_atts,
-            }
-            if dist:
-                entry["distributor"] = dist
-                qualifying.append(entry)
-            if is_prod:
-                # Production emails are processed via a separate path;
-                # collect them in a sibling list. Both paths share the
-                # same seen-IDs set so we never re-process the same msg.
-                production_qualifying.append(entry)
+                "distributor": dist,
+            })
 
-    if not qualifying and not production_qualifying:
+    if not qualifying:
         print(f"nothing new; seen-set size = {len(seen_ids)}")
         return 0
 
     # ---- fetch attachments + parse
-    events_out: list[dict] = []
+    events_out: list[dict] = []     # USF + Cheney -> /api/email/ingest-events
+    cw_pos_out: list[dict] = []     # Chefs Warehouse -> /api/chefs-warehouse/ingest-pos
+    error_strs: list[str] = []
     msgs_parsed = 0
 
     for q in qualifying:
         mb, mid, subject, dist = q["mailbox"], q["id"], q["subject"], q["distributor"]
-        for a in q["pdf_atts"]:
+        try:
+            atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
+        except Exception as exc:
+            msg = _redact(str(exc), secrets_to_redact)
+            error_strs.append(f"{mid[:12]}.. [list-att]: {msg}")
+            continue
+
+        any_pdf = False
+        for a in atts:
+            name = (a.get("name") or "").lower()
+            ctype = (a.get("contentType") or "").lower()
+            if not (name.endswith(".pdf") or ctype == "application/pdf"):
+                continue
+            any_pdf = True
             try:
                 pdf_bytes = _fetch_attachment_bytes(
                     token, mb, mid, a.get("id") or "", verbose=args.verbose,
@@ -482,109 +454,130 @@ def run(argv: list[str] | None = None) -> int:
                 msg = _redact(str(exc), secrets_to_redact)
                 error_strs.append(f"{mid[:12]}.. [fetch-att]: {msg}")
                 continue
-            fn = _usfoods_po_to_events if dist == "US Foods" else _cheney_po_to_events
             try:
-                events, errors = fn(pdf_bytes, dist, mid, subject)
+                if dist == "US Foods":
+                    events, errors = _usfoods_po_to_events(
+                        pdf_bytes, dist, mid, subject)
+                    for e in events:
+                        events_out.append(asdict(e))
+                    for er in errors:
+                        error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                elif dist == "Cheney Brothers":
+                    events, errors = _cheney_po_to_events(
+                        pdf_bytes, dist, mid, subject)
+                    for e in events:
+                        events_out.append(asdict(e))
+                    for er in errors:
+                        error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                elif dist == "Chefs Warehouse":
+                    record, errors = _chefs_warehouse_po_to_record(
+                        pdf_bytes, mid, subject)
+                    if record is not None:
+                        cw_pos_out.append(record)
+                    for er in errors:
+                        error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                else:
+                    error_strs.append(
+                        f"{mid[:12]}.. [{dist}]: no parser for distributor")
             except Exception as exc:
                 msg = _redact(str(exc), secrets_to_redact)
                 error_strs.append(f"{mid[:12]}.. [parse]: {msg}")
                 continue
-            for e in events:
-                events_out.append(asdict(e))
-            for er in errors:
-                error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
-        msgs_parsed += 1
+        if any_pdf:
+            msgs_parsed += 1
+        else:
+            error_strs.append(f"{mid[:12]}.. [{dist}]: no PDF attachment found")
 
-    payload = {
-        "dry_run": bool(args.dry_run),
-        "source": "cowork-routine/graph-direct",
-        "messages_seen": len(qualifying),
-        "messages_parsed": msgs_parsed,
-        "errors": error_strs,
-        "events": events_out,
-    }
+    # ---- POST events (USF + Cheney) to /api/email/ingest-events
+    rep0: dict = {}
+    rep_status = "ok"
+    rep_updated = 0
+    rep_errors = 0
 
-    # ---- POST to ingest-events
-    try:
-        status, body = _post_ingest(args.app_url, args.api_token, payload,
-                                    verbose=args.verbose)
-    except Exception as exc:
-        msg = _redact(str(exc), secrets_to_redact)
-        print(f"ERROR: POST failed: {msg}", file=sys.stderr)
-        return 1
+    if events_out or not cw_pos_out:
+        # Always POST events when we have any; also POST an empty batch
+        # when there were no events AND no CW POs so the upstream "no
+        # new mail" path stays unchanged.
+        payload = {
+            "dry_run": bool(args.dry_run),
+            "source": "cowork-routine/graph-direct",
+            "messages_seen": len(qualifying),
+            "messages_parsed": msgs_parsed,
+            "errors": error_strs,
+            "events": events_out,
+        }
+        try:
+            status, body = _post_ingest(args.app_url, args.api_token, payload,
+                                        verbose=args.verbose)
+        except Exception as exc:
+            msg = _redact(str(exc), secrets_to_redact)
+            print(f"ERROR: POST failed: {msg}", file=sys.stderr)
+            return 1
+        if status != 200 or not isinstance(body, dict):
+            body_text = body if isinstance(body, str) else json.dumps(body)[:400]
+            body_text = _redact(body_text, secrets_to_redact)
+            print(f"ERROR: ingest-events HTTP {status}: {body_text}", file=sys.stderr)
+            return 1
+        reports = body.get("reports") or []
+        rep0 = reports[0] if reports else {}
+        rep_status = rep0.get("status") or "unknown"
+        rep_updated = rep0.get("updated") or 0
+        rep_errors  = len(rep0.get("error") and [rep0["error"]] or []) + len(error_strs)
 
-    if status != 200 or not isinstance(body, dict):
-        body_text = body if isinstance(body, str) else json.dumps(body)[:400]
-        body_text = _redact(body_text, secrets_to_redact)
-        print(f"ERROR: ingest-events HTTP {status}: {body_text}", file=sys.stderr)
-        return 1
-
-    reports = body.get("reports") or []
-    rep0 = reports[0] if reports else {}
-    rep_status = rep0.get("status") or "unknown"
-    rep_updated = rep0.get("updated") or 0
-    rep_errors = len(rep0.get("error") and [rep0["error"]] or []) + len(error_strs)
-
-    # ---- production POSTs (independent of PO ingest)
-    prod_posted = 0
-    prod_errors: list[str] = []
-    for q in production_qualifying:
-        mb, mid, subject, sender = q["mailbox"], q["id"], q["subject"], q["sender"]
-        received_at = q.get("received_at", "")
-        for a in q["pdf_atts"]:
-            try:
-                pdf_bytes = _fetch_attachment_bytes(
-                    token, mb, mid, a.get("id") or "", verbose=args.verbose,
-                )
-            except Exception as exc:
-                msg = _redact(str(exc), secrets_to_redact)
-                prod_errors.append(f"{mid[:12]}.. [prod-fetch]: {msg}")
-                continue
-            import base64
-            prod_payload = {
-                "pdf_b64":     base64.b64encode(pdf_bytes).decode(),
-                "subject":     subject,
-                "sender":      sender,
-                "message_id":  mid,
-                "received_at": received_at,
-            }
-            try:
-                url = f"{args.app_url.rstrip('/')}/api/production/ingest"
-                req = urllib.request.Request(
-                    url, data=json.dumps(prod_payload).encode(),
-                    headers={"Content-Type": "application/json",
-                             "X-Inventory-Token": args.api_token},
-                    method="POST")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    d = json.loads(resp.read().decode())
-                if d.get("status") == "ingested":
-                    prod_posted += 1
-                elif d.get("status") == "parse_error":
-                    prod_errors.append(f"{mid[:12]}.. [prod-parse]: {d.get('error','')}")
-            except Exception as exc:
-                msg = _redact(str(exc), secrets_to_redact)
-                prod_errors.append(f"{mid[:12]}.. [prod-post]: {msg}")
+    # ---- POST CW POs to /api/chefs-warehouse/ingest-pos
+    cw_report: dict = {}
+    if cw_pos_out:
+        cw_payload = {
+            "dry_run": bool(args.dry_run),
+            "source": "cowork-routine/graph-direct",
+            "cw_pos": cw_pos_out,
+        }
+        try:
+            cw_status, cw_body = _post_ingest(
+                args.app_url, args.api_token, cw_payload,
+                path="/api/chefs-warehouse/ingest-pos",
+                verbose=args.verbose,
+            )
+        except Exception as exc:
+            msg = _redact(str(exc), secrets_to_redact)
+            print(f"ERROR: CW POST failed: {msg}", file=sys.stderr)
+            return 1
+        if cw_status != 200 or not isinstance(cw_body, dict):
+            body_text = (cw_body if isinstance(cw_body, str)
+                         else json.dumps(cw_body)[:400])
+            body_text = _redact(body_text, secrets_to_redact)
+            print(f"ERROR: chefs-warehouse/ingest-pos HTTP {cw_status}: {body_text}",
+                  file=sys.stderr)
+            return 1
+        cw_report = (cw_body or {}).get("report") or {}
 
     # ---- update seen-IDs only on real success (skip on dry-run)
-    if not args.dry_run and status == 200 and rep_status in ("ok", "not_configured"):
+    if not args.dry_run and rep_status in ("ok", "not_configured"):
         try:
-            _write_seen_state(state_path,
-                               [q["id"] for q in qualifying]
-                               + [q["id"] for q in production_qualifying])
+            _write_seen_state(state_path, [q["id"] for q in qualifying])
         except OSError as exc:
             _vlog(args.verbose, f"failed to update seen-state: {exc}")
 
     new_seen_size = len(_read_seen_state(state_path))
+    cw_summary = (
+        f"; CW: {cw_report.get('fetched', 0)} fetched / "
+        f"{cw_report.get('added', 0)} added / "
+        f"{cw_report.get('updated', 0)} updated"
+        if cw_pos_out else ""
+    )
     print(
         f"ingest-events {'DRY ' if args.dry_run else ''}OK: "
         f"{msgs_parsed} parsed, {len(events_out)} events, "
+        f"{len(cw_pos_out)} cw_pos, "
         f"{rep_errors} errors; status={rep_status}; updated={rep_updated}; "
-        f"seen-set now {new_seen_size}; "
-        f"prod-ingested {prod_posted}, prod-errors {len(prod_errors)}"
+        f"seen-set now {new_seen_size}{cw_summary}"
     )
     if args.verbose:
         _vlog(True, "report (full):")
         _vlog(True, json.dumps(rep0, indent=2))
+        if cw_report:
+            _vlog(True, "CW report:")
+            _vlog(True, json.dumps(cw_report, indent=2))
     return 0
 
 

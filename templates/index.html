@@ -2838,6 +2838,12 @@ function onPendingSortClick(key) {
   renderPendingPOs();
 }
 
+// Stash of Chefs Warehouse PO groups, kept separate from `pendingCache`
+// (which is built from inventory `on_order` pairs). CW POs don't live
+// in inventory.json by design — they're merged into the Pending POs
+// page render only, never the Inventory tab.
+let cwPendingGroups = [];
+
 async function loadPendingPOs() {
   await ensureWarehouses();
   // Populate warehouse filter dropdown
@@ -2853,6 +2859,19 @@ async function loadPendingPOs() {
     });
   });
   pendingCache = pairs;
+
+  // Pull Chefs Warehouse POs from the parallel data store. They're
+  // distinct from the inventory-backed pairs because CW POs never
+  // appear in /api/inventory. A network failure here must not break
+  // the rest of the page — just log it and render without CW rows.
+  try {
+    const cwResp = await api('/api/chefs-warehouse/pos?status=pending');
+    cwPendingGroups = (cwResp && cwResp.pos) ? cwResp.pos : [];
+  } catch (e) {
+    console.warn('Failed to load Chefs Warehouse POs:', e);
+    cwPendingGroups = [];
+  }
+
   renderPendingPOs();
 }
 
@@ -2921,6 +2940,35 @@ function renderPendingPOs() {
   // Build groups from the (already-filtered) flat list
   let groups = _buildPoGroups(pairs);
 
+  // Merge in Chefs Warehouse POs from the parallel data store. They
+  // arrive pre-grouped (one record per PO) and follow the same shape
+  // produced by _buildPoGroups, plus the distributor flag so the cancel
+  // / ship-date handlers can route to the CW API endpoints.
+  let cwGroups = cwPendingGroups.map(g => ({
+    po_number:    g.po_number || '',
+    po_revision:  g.po_revision || '',
+    distributor:  'Chefs Warehouse',
+    warehouse:    g.warehouse || '',
+    dc_code:      g.dc_code || '',
+    ordered_at:   g.ordered_at || '',
+    eta:          g.eta || '',
+    ship_date:    g.ship_date || '',
+    arrival_date: g.arrival_date || '',
+    total_cs:     Number(g.total_cs) || 0,
+    lines:        (g.lines || []).map(L => ({
+      variety: L.variety || '',
+      qty:     Number(L.qty) || 0,
+      unit:    L.unit || 'cs',
+      name:    L.name || '',
+    })),
+    _source: 'chefs_warehouse',   // routes cancel / ship-date below
+  }));
+  // Apply distributor / warehouse filters to CW too. The CW data has no
+  // pair structure, so we filter the groups directly.
+  if (distF) cwGroups = cwGroups.filter(g => (g.distributor || '') === distF);
+  if (whF)   cwGroups = cwGroups.filter(g => (g.warehouse  || '') === whF);
+  groups = groups.concat(cwGroups);
+
   // Mode filters operate on the group's effective trigger / ship state
   if (pendingFilterMode === 'overdue') {
     const now = new Date();
@@ -2975,10 +3023,17 @@ function renderPendingPOs() {
     const palletBadge = palletMismatch
       ? ` <span class="badge badge-yellow" title="Total cs (${g.total_cs}) is not a multiple of 56" style="margin-left:4px;font-size:10px">⚠ not ×56</span>`
       : '';
+    // CW POs route their actions to /api/chefs-warehouse/* instead of
+    // the inventory-on-order endpoints. The `_source` flag is set in
+    // renderPendingPOs() during the merge.
+    const source = g._source || 'inventory';
+    const warehouseLabel = (source === 'chefs_warehouse' && g.dc_code)
+      ? `${escHtml(g.warehouse || '')} <span style="color:var(--muted);font-size:11px">(${escHtml(g.dc_code)})</span>`
+      : escHtml(g.warehouse || '');
     return `<tr${rowStyle}>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
-      <td>${escHtml(g.warehouse || '')}</td>
+      <td>${warehouseLabel}</td>
       <td title="${escAttr(tipText)}" style="font-size:12px">
         <div>${head}${more}</div>
         <div style="color:var(--muted);font-size:11px">${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</div>
@@ -2988,25 +3043,30 @@ function renderPendingPOs() {
       <td>
         <input type="date" class="ship-date-input"
                value="${escAttr(shipISO)}"
-               onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value)" />
+               onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />
       </td>
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
       <td class="actions-col" style="white-space:nowrap">
-        <button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${g.lines.length}, ${g.total_cs.toFixed(0)})" title="Remove this PO entirely (distributor canceled)">Cancel</button>
+        <button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${g.lines.length}, ${g.total_cs.toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>
       </td>
     </tr>`;
   }).join('');
   updateSortIndicators('pending-tbody');
 }
 
-async function cancelPendingPO(poNumber, lineCount, totalCs) {
+async function cancelPendingPO(poNumber, lineCount, totalCs, source) {
   if (!poNumber) return;
-  const msg = `Cancel PO ${poNumber}?\n\nThis removes ${lineCount} on-order line${lineCount===1?'':'s'} (${totalCs} cs) and the PO will disappear from Pending POs.\n\nAlready-arrived quantity in inventory is NOT affected.`;
+  source = source || 'inventory';
+  const isCW = source === 'chefs_warehouse';
+  const msg = isCW
+    ? `Cancel Chefs Warehouse PO ${poNumber}?\n\nThis removes ${lineCount} line${lineCount===1?'':'s'} (${totalCs} cs) from the Pending POs tab. Inventory is not affected (Chefs Warehouse POs never enter the Inventory tab).`
+    : `Cancel PO ${poNumber}?\n\nThis removes ${lineCount} on-order line${lineCount===1?'':'s'} (${totalCs} cs) and the PO will disappear from Pending POs.\n\nAlready-arrived quantity in inventory is NOT affected.`;
   if (!confirm(msg)) return;
   let result;
   try {
-    result = await api('/api/admin/remove-po', 'POST', { po_number: poNumber });
+    const endpoint = isCW ? '/api/chefs-warehouse/cancel' : '/api/admin/remove-po';
+    result = await api(endpoint, 'POST', { po_number: poNumber });
   } catch (e) {
     toast('Cancel failed: ' + String(e));
     return;
@@ -3015,7 +3075,11 @@ async function cancelPendingPO(poNumber, lineCount, totalCs) {
     toast('Cancel failed: ' + (result.error || 'unknown'));
     return;
   }
-  toast(`Canceled PO ${poNumber} (${result.removed_entries} entries removed from ${result.affected_items.length} item${result.affected_items.length===1?'':'s'})`);
+  if (isCW) {
+    toast(`Canceled CW PO ${poNumber}`);
+  } else {
+    toast(`Canceled PO ${poNumber} (${result.removed_entries} entries removed from ${result.affected_items.length} item${result.affected_items.length===1?'':'s'})`);
+  }
   // Refresh both the Pending POs view and the Inventory cache.
   await loadPendingPOs();
   loadDashboard();
@@ -3460,15 +3524,24 @@ function renderProductionDetail() {
   };
 })();
 
-async function onShipDateChange(poNumber, shipDate) {
+async function onShipDateChange(poNumber, shipDate, source) {
   if (!poNumber) return;
+  source = source || 'inventory';
+  const isCW = source === 'chefs_warehouse';
   try {
-    const r = await api('/api/on-order/ship-date', 'POST', {
-      po_number: poNumber,
-      ship_date: shipDate || null,
-    });
+    const endpoint = isCW
+      ? '/api/chefs-warehouse/ship-date'
+      : '/api/on-order/ship-date';
+    const payload = isCW
+      ? { po_number: poNumber, ship_date: shipDate || '' }
+      : { po_number: poNumber, ship_date: shipDate || null };
+    const r = await api(endpoint, 'POST', payload);
     if (r && r.ok) {
-      toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})`);
+      if (isCW) {
+        toast(`Ship date ${shipDate || 'cleared'} for CW PO ${poNumber}`);
+      } else {
+        toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})`);
+      }
       loadPendingPOs();
     } else {
       toast('Failed to update ship date', 'error');

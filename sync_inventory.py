@@ -23,7 +23,10 @@ from integrations import (
     CheneyBrothersClient, USFoodsClient,
     DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
 )
-from inventory_tracker import load_inventory, save_inventory, load_usage, save_usage
+from inventory_tracker import (
+    load_inventory, save_inventory, load_usage, save_usage,
+    load_chefs_warehouse_pos, save_chefs_warehouse_pos,
+)
 
 
 # Must match the naming convention in seed_bagels.py
@@ -463,6 +466,155 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     usage.append(entry)
 
 
+def _apply_cw_pos(cw_pos: list,
+                  dry_run: bool = False,
+                  source: str = "Email Inbox") -> dict:
+    """Apply a list of parsed Chefs Warehouse PO records.
+
+    CW POs live in their own file (data/chefs_warehouse_pos.json) and
+    never touch inventory.json. This function:
+      - Normalizes each record (ordered_at, eta, ingested_at fields)
+      - Replaces any prior record with the same po_number (idempotent)
+      - Drops records whose PO# is in the canceled-POs list
+      - Returns a per-PO change summary
+
+    Returns a dict with the same shape as _apply_events for symmetry,
+    but the counters refer to CW PO records rather than EmailEvents.
+    """
+    from inventory_tracker import load_canceled_pos
+
+    report = {
+        "distributor": "Chefs Warehouse",
+        "source": source,
+        "status": "ok",
+        "fetched": len(cw_pos),
+        "added": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped_canceled": 0,
+        "skipped_invalid":  0,
+        "changes": [],
+        "error": None,
+    }
+
+    if not cw_pos:
+        return report
+
+    try:
+        existing = load_chefs_warehouse_pos()
+    except Exception as exc:  # noqa: BLE001
+        report["status"] = "error"
+        report["error"]  = f"load_chefs_warehouse_pos failed: {exc}"
+        return report
+
+    by_po = {str(r.get("po_number") or "").strip(): r
+             for r in existing if r.get("po_number")}
+
+    try:
+        canceled = load_canceled_pos()
+    except Exception:
+        canceled = {}
+
+    lead_days = _po_lead_days()
+    now_iso = datetime.now().isoformat()
+
+    def _parse_cw_date(s: str):
+        """Accept MM-DD-YYYY or YYYY-MM-DD."""
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%m-%d-%Y")
+        except ValueError:
+            try:
+                return datetime.fromisoformat(s)
+            except ValueError:
+                return None
+
+    for record in cw_pos:
+        po_num = str(record.get("po_number") or "").strip()
+        if not po_num:
+            report["skipped_invalid"] += 1
+            continue
+        if po_num in canceled:
+            report["skipped_canceled"] += 1
+            continue
+
+        # Derive ordered_at and eta from the PO dates. ordered_at falls
+        # back to today if the parser didn't pick up an order_date.
+        order_dt = _parse_cw_date(record.get("order_date"))
+        deliv_dt = _parse_cw_date(record.get("delivery_date"))
+        ordered_at = (order_dt or datetime.now()).isoformat()
+        # ETA = the delivery date printed on the PO when present;
+        # otherwise ordered_at + lead-time as a fallback.
+        eta = (deliv_dt.isoformat() if deliv_dt
+               else (order_dt + timedelta(days=lead_days)).isoformat()
+               if order_dt else "")
+
+        existing_rec = by_po.get(po_num)
+        # Preserve operator-set fields on re-ingest: ship_date,
+        # arrival_date, and the ingested_at of the first booking.
+        ship_date    = ""
+        arrival_date = ""
+        first_ingest = now_iso
+        if existing_rec:
+            ship_date    = existing_rec.get("ship_date") or ""
+            arrival_date = existing_rec.get("arrival_date") or ""
+            first_ingest = existing_rec.get("ingested_at") or now_iso
+
+        normalized = {
+            **record,
+            "po_number":    po_num,
+            "distributor":  record.get("distributor") or "Chefs Warehouse",
+            "ordered_at":   ordered_at,
+            "eta":          eta,
+            "ship_date":    ship_date,
+            "arrival_date": arrival_date,
+            "ingested_at":  first_ingest,
+            "last_synced":  now_iso,
+            "last_synced_from": source,
+        }
+
+        if existing_rec is None:
+            report["added"] += 1
+            change_kind = "added"
+        else:
+            same = (
+                round(float(existing_rec.get("total_cs") or 0), 2)
+                    == round(float(normalized.get("total_cs") or 0), 2)
+                and len(existing_rec.get("lines") or [])
+                    == len(normalized.get("lines") or [])
+            )
+            if same:
+                report["unchanged"] += 1
+                change_kind = "unchanged"
+            else:
+                report["updated"] += 1
+                change_kind = "updated"
+
+        report["changes"].append({
+            "po_number":   po_num,
+            "warehouse":   normalized.get("warehouse", ""),
+            "dc_code":     normalized.get("dc_code", ""),
+            "total_cs":    normalized.get("total_cs"),
+            "total_usd":   normalized.get("total_usd"),
+            "event_type":  f"cw_po_{change_kind}",
+            "ordered_at":  ordered_at,
+            "eta":         eta,
+        })
+
+        by_po[po_num] = normalized
+
+    if not dry_run:
+        try:
+            save_chefs_warehouse_pos(list(by_po.values()))
+        except Exception as exc:  # noqa: BLE001
+            report["status"] = "error"
+            report["error"]  = f"save_chefs_warehouse_pos failed: {exc}"
+
+    return report
+
+
 def _apply_events(events: list,
                   messages_seen: int = 0,
                   messages_parsed: int = 0,
@@ -633,6 +785,13 @@ def scan_email(dry_run: bool = False,
         dry_run=dry_run,
         source=client.source(),
     )
+    # Chefs Warehouse POs ride alongside events but land in their own
+    # data file. Surface the summary on the same report so the UI can
+    # show "N CW POs ingested" without a second round-trip.
+    cw_pos = list(getattr(scan, "cw_pos", None) or [])
+    if cw_pos:
+        cw_report = _apply_cw_pos(cw_pos, dry_run=dry_run, source=client.source())
+        report["chefs_warehouse"] = cw_report
     return report
 
 

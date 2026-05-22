@@ -304,6 +304,230 @@ def api_admin_remove_po():
 
 
 # ---------------------------------------------------------------------------
+# API – Chefs Warehouse POs
+# ---------------------------------------------------------------------------
+# CW POs live in their own JSON file (data/chefs_warehouse_pos.json) so
+# they never touch inventory.json. The Pending POs tab merges them in
+# for display via /api/chefs-warehouse/pos; the Inventory tab never
+# shows them.
+
+def _cw_po_summary(record: dict) -> dict:
+    """Shape a stored CW PO record into the same group dict the
+    Pending POs frontend uses for on_order groups (so the merge in
+    loadPendingPOs is shape-compatible)."""
+    lines = record.get("lines") or []
+    def _ln(L):
+        return {
+            "variety": L.get("variety") or "",
+            "qty":     float(L.get("qty") or 0),
+            "unit":    L.get("unit") or "cs",
+            "name":    (L.get("description") or "").title(),
+            "sliced":  bool(L.get("sliced")),
+            "cw_item": L.get("cw_item") or "",
+        }
+    total_cs = float(record.get("total_cs")
+                     or sum(float(L.get("qty") or 0) for L in lines))
+    return {
+        "po_number":    record.get("po_number") or "",
+        "po_revision":  record.get("po_revision") or "",
+        "distributor":  "Chefs Warehouse",
+        "warehouse":    record.get("warehouse") or "",
+        "dc_code":      record.get("dc_code") or "",
+        "ordered_at":   record.get("ordered_at") or "",
+        "eta":          record.get("eta") or "",
+        "ship_date":    record.get("ship_date") or "",
+        "arrival_date": record.get("arrival_date") or "",
+        "buyer_name":   record.get("buyer_name") or "",
+        "ship_to_name": record.get("ship_to_name") or "",
+        "total_cs":     round(total_cs, 2),
+        "total_usd":    record.get("total_usd"),
+        "lines":        [_ln(L) for L in lines],
+        "source":       record.get("source") or "",
+        "source_subject": record.get("source_subject") or "",
+    }
+
+
+@app.route("/api/chefs-warehouse/pos")
+def api_chefs_warehouse_pos():
+    """List all Chefs Warehouse POs (active + arrived).
+
+    Query params:
+      ``status``  filter to "pending" (default), "arrived", "canceled",
+                  or "all".
+
+    A CW PO is "pending" until an operator sets a ship_date or
+    arrival_date that's in the past, or marks it canceled. The Pending
+    POs tab fetches the default (pending only).
+    """
+    from inventory_tracker import load_chefs_warehouse_pos, load_canceled_pos
+    records = load_chefs_warehouse_pos()
+    canceled = load_canceled_pos()
+
+    status_filter = (request.args.get("status") or "pending").lower()
+
+    out = []
+    now = datetime.now()
+    for r in records:
+        po_num = (r.get("po_number") or "").strip()
+        if r.get("canceled") or po_num in canceled:
+            status = "canceled"
+        else:
+            arrival_str = (r.get("arrival_date") or r.get("eta") or "").strip()
+            arrival_dt = None
+            if arrival_str:
+                try:
+                    arrival_dt = datetime.fromisoformat(arrival_str)
+                except ValueError:
+                    arrival_dt = None
+            if arrival_dt and arrival_dt <= now:
+                status = "arrived"
+            else:
+                status = "pending"
+
+        if status_filter != "all" and status != status_filter:
+            continue
+
+        item = _cw_po_summary(r)
+        item["status"] = status
+        out.append(item)
+
+    out.sort(key=lambda x: (x.get("ordered_at") or "", x.get("po_number") or ""))
+    return jsonify({"ok": True, "count": len(out), "pos": out})
+
+
+@app.route("/api/chefs-warehouse/ingest-pos", methods=["POST"])
+def api_chefs_warehouse_ingest_pos():
+    """Accept externally-parsed CW PO records and apply them.
+
+    Used by the Cowork scheduled routine that fetches Graph mail
+    directly: it pulls CW PDFs, parses them with the same parser, and
+    POSTs the dict-form records here. Mirrors /api/email/ingest-events
+    but for the CW-only channel.
+
+    Request body:
+        {
+          "dry_run": false,
+          "source":  "cowork-routine",
+          "cw_pos":  [ <ChefsWarehousePO as dict>, ... ]
+        }
+    """
+    import traceback as _tb
+    try:
+        from sync_inventory import _apply_cw_pos
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False,
+                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run", False))
+    source = str(body.get("source") or "external").strip() or "external"
+    cw_pos_raw = body.get("cw_pos") or []
+    if not isinstance(cw_pos_raw, list):
+        return jsonify({"ok": False, "error": "cw_pos must be a list"}), 400
+    try:
+        report = _apply_cw_pos(cw_pos_raw, dry_run=dry_run, source=source)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": _tb.format_exc()[-2000:],
+        }), 500
+    return jsonify({"ok": True, "dry_run": dry_run, "report": report})
+
+
+@app.route("/api/chefs-warehouse/ship-date", methods=["POST"])
+def api_chefs_warehouse_ship_date():
+    """Set / clear ship_date (and the derived arrival_date) on a CW PO.
+
+    Body: ``{"po_number": "...", "ship_date": "YYYY-MM-DD" | ""}``.
+    arrival_date is set to ship_date + 7 days (CW transit lead) to
+    match the on_order convention; clearing ship_date also clears it.
+    """
+    from datetime import timedelta
+    from inventory_tracker import (
+        load_chefs_warehouse_pos, save_chefs_warehouse_pos,
+    )
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    ship_iso = (body.get("ship_date") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+
+    if ship_iso:
+        try:
+            ship_dt = datetime.fromisoformat(ship_iso)
+        except ValueError:
+            return jsonify({"ok": False,
+                            "error": "ship_date must be YYYY-MM-DD"}), 400
+        arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+    else:
+        ship_iso = ""
+        arrival_iso = ""
+
+    records = load_chefs_warehouse_pos()
+    found = False
+    for r in records:
+        if (r.get("po_number") or "").strip() != po_number:
+            continue
+        r["ship_date"]    = ship_iso
+        r["arrival_date"] = arrival_iso
+        r["updated_at"]   = datetime.now().isoformat()
+        found = True
+    if not found:
+        return jsonify({"ok": False,
+                        "error": f"PO {po_number} not found in CW POs"}), 404
+    save_chefs_warehouse_pos(records)
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "ship_date": ship_iso,
+        "arrival_date": arrival_iso,
+    })
+
+
+@app.route("/api/chefs-warehouse/cancel", methods=["POST"])
+def api_chefs_warehouse_cancel():
+    """Mark a CW PO canceled. Removes it from the default Pending POs
+    list and adds the PO# to the shared canceled-POs ignore list so a
+    re-scan of the same source email doesn't re-add it.
+    """
+    from inventory_tracker import (
+        load_chefs_warehouse_pos, save_chefs_warehouse_pos,
+        load_canceled_pos, save_canceled_pos,
+    )
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    reason = (body.get("reason") or "canceled by distributor").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+
+    records = load_chefs_warehouse_pos()
+    found = False
+    for r in records:
+        if (r.get("po_number") or "").strip() != po_number:
+            continue
+        r["canceled"]        = True
+        r["canceled_at"]     = datetime.now().isoformat(timespec="seconds")
+        r["canceled_reason"] = reason
+        found = True
+    save_chefs_warehouse_pos(records)
+
+    canceled = load_canceled_pos()
+    canceled[po_number] = {
+        "canceled_at": datetime.now().isoformat(timespec="seconds"),
+        "reason":      reason,
+        "distributor": "Chefs Warehouse",
+    }
+    save_canceled_pos(canceled)
+
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "found_in_cw_file": found,
+        "added_to_ignore_list": True,
+    })
+
+
+# ---------------------------------------------------------------------------
 # API – Daily Production
 # ---------------------------------------------------------------------------
 # Production sheets are separate from inventory. Each record describes
@@ -845,6 +1069,11 @@ def api_traceability_search():
                                   + float(item.get("quantity") or 0))
 
     # Pending-PO lookup keyed by po_number — first non-empty wins.
+    # Inventory on_order is checked first (USF + Cheney); then Chefs
+    # Warehouse POs (which live in their own file because they don't
+    # touch inventory). A Daily Production sheet stamped with a CW PO#
+    # therefore still resolves to "pending" with the right ship/arrival
+    # data.
     po_pending = {}
     for item in inv.values():
         for e in item.get("on_order") or []:
@@ -855,6 +1084,19 @@ def api_traceability_search():
             for k in ("ship_date", "arrival_date", "eta"):
                 if not slot.get(k) and e.get(k):
                     slot[k] = e[k]
+    try:
+        from inventory_tracker import load_chefs_warehouse_pos
+        for cw in load_chefs_warehouse_pos():
+            po = (cw.get("po_number") or "").strip()
+            if not po or cw.get("canceled"):
+                continue
+            slot = po_pending.setdefault(po, {})
+            for k in ("ship_date", "arrival_date", "eta"):
+                if not slot.get(k) and cw.get(k):
+                    slot[k] = cw[k]
+    except Exception:  # noqa: BLE001
+        # CW POs are auxiliary; failure here must not break traceability.
+        pass
 
     try:
         canceled = load_canceled_pos()
@@ -2012,6 +2254,16 @@ WAREHOUSES = {
         "La Mirada, CA",
         "Chicago, IL",
         "Alcoa, TN",
+    ],
+    # Chefs Warehouse DCs receive their own POs but DO NOT appear in
+    # the Inventory tab -- they're surfaced only on the Pending POs
+    # tab via /api/chefs-warehouse/pos. The 400001 ship-to in CW's
+    # PDF covers both MD and CHI deliveries (CHI POs ship to Hanover
+    # MD for consolidation).
+    "Chefs Warehouse": [
+        "Bronx, NY",
+        "Hanover, MD",
+        "Opa Locka, FL",
     ],
 }
 

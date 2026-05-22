@@ -113,6 +113,44 @@ def save_labor(entries: list):
 # on_order entries we just removed).
 CANCELED_POS_FILE = DATA_DIR / "canceled_pos.json"
 
+# Chefs Warehouse POs live in their own file so they never touch the
+# Inventory tab. The Pending POs tab merges them in for display, but
+# inventory.json never carries a "Chefs Warehouse" item. One entry
+# per PO; the scanner replaces by po_number on re-ingest.
+CHEFS_WAREHOUSE_POS_FILE = DATA_DIR / "chefs_warehouse_pos.json"
+
+
+def load_chefs_warehouse_pos() -> list:
+    """Return the list of Chefs Warehouse POs (empty list if none).
+
+    Schema (one dict per PO):
+        po_number, po_revision, distributor (always "Chefs Warehouse"),
+        warehouse ("<City>, <ST>"), dc_code (NY/MD/FLA/CHI),
+        ship_to_id, ship_to_name, ship_to_city, ship_to_state,
+        ship_to_zip, order_date, delivery_date, buyer_id, buyer_name,
+        total_usd, total_cs,
+        lines: [{line_no, vendor_item, cw_item, description, variety,
+                 sliced, pack, pack_um, case_size, qty, unit,
+                 unit_cost, ext_cost}],
+        ordered_at, eta, ship_date, arrival_date,    # PO lifecycle
+        source, source_subject, source_message_id,    # provenance
+        ingested_at,
+        canceled (optional bool), canceled_at, canceled_reason
+    """
+    if CHEFS_WAREHOUSE_POS_FILE.exists():
+        with open(CHEFS_WAREHOUSE_POS_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
+
+
+def save_chefs_warehouse_pos(records: list) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(CHEFS_WAREHOUSE_POS_FILE, "w") as f:
+        json.dump(records, f, indent=2)
+
 # Toast POS sales — per-location, per-day, per-item product mix.
 # One entry per (restaurant_guid, business_date, item_guid).
 # Used by the Report page Top Consumed section.

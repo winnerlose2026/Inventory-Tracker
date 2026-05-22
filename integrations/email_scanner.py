@@ -94,6 +94,11 @@ from .cheney_po_parser import (
     CheneyPOLine,
     parse_po_pdf as _cheney_parse_po_pdf,
 )
+from .chefs_warehouse_po_parser import (
+    ChefsWarehousePO,
+    parse_po_pdf as _cw_parse_po_pdf,
+    dc_code_from_subject as _cw_dc_code_from_subject,
+)
 
 
 EventType = Literal["on_hand", "restock", "usage"]
@@ -104,6 +109,7 @@ DOMAIN_TO_DISTRIBUTOR = {
     "cheney.com": "Cheney Brothers",
     "usfoods.com": "US Foods",
     "usfood.com": "US Foods",
+    "chefswarehouse.com": "Chefs Warehouse",
 }
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -165,6 +171,12 @@ class ScanResult:
     messages_parsed: int = 0
     events: list[EmailEvent] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Parallel channel for Chefs Warehouse POs. CW POs are routed to a
+    # separate data store (data/chefs_warehouse_pos.json) and never
+    # touch on-hand inventory, so they ride alongside `events` rather
+    # than being modeled as EmailEvents. Each entry is the dict form
+    # of a ChefsWarehousePO (see chefs_warehouse_po_parser).
+    cw_pos: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -415,18 +427,103 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject):
     return events, errors
 
 
+def _chefs_warehouse_po_to_record(pdf_bytes, msg_id, subject):
+    """Parse a Chefs Warehouse PO PDF into a serializable record.
+
+    Returns (record_or_none, errors). The record is a plain dict (so it
+    can ride alongside EmailEvent serializations through
+    /api/email/ingest-events without dataclass-asdict in the caller).
+    CW POs are NOT converted to EmailEvent objects because they do not
+    feed the inventory tab -- see chefs_warehouse_po_parser for the full
+    rationale.
+    """
+    errors = []
+    try:
+        dc_code = _cw_dc_code_from_subject(subject)
+        po = _cw_parse_po_pdf(pdf_bytes, dc_code=dc_code)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"chefs-warehouse PO PDF parse failed ({subject!r}): {exc}")
+        return None, errors
+
+    if not po.po_number:
+        errors.append(
+            f"chefs-warehouse PO ({subject!r}): no PO# found in PDF -- "
+            "skipped."
+        )
+        return None, errors
+
+    if po.unmapped_descriptions:
+        errors.append(
+            f"chefs-warehouse PO {po.po_number}: unmapped descriptions "
+            f"{sorted(set(po.unmapped_descriptions))} -- add them to "
+            "chefs_warehouse_po_parser.CW_DESCRIPTION_TO_VARIETY"
+        )
+    if po.ship_to_id and not po.warehouse:
+        errors.append(
+            f"chefs-warehouse PO {po.po_number}: unknown ship-to id "
+            f"{po.ship_to_id!r} ({po.ship_to_city!r}) -- add it to "
+            "chefs_warehouse_po_parser.CW_SHIP_TO_TO_WAREHOUSE"
+        )
+
+    total_cs = sum(l.quantity for l in po.lines
+                   if (l.quantity_um or "").upper() == "CS")
+    record = {
+        "po_number":    po.po_number,
+        "po_revision":  po.po_revision or "",
+        "distributor":  "Chefs Warehouse",
+        "warehouse":    po.warehouse or "",
+        "dc_code":      po.dc_code or "",
+        "ship_to_id":   po.ship_to_id or "",
+        "ship_to_name": po.ship_to_name or "",
+        "ship_to_city": po.ship_to_city or "",
+        "ship_to_state":po.ship_to_state or "",
+        "ship_to_zip":  po.ship_to_zip or "",
+        "order_date":   po.order_date or "",
+        "delivery_date":po.delivery_date or "",
+        "buyer_id":     po.buyer_id or "",
+        "buyer_name":   po.buyer_name or "",
+        "total_usd":    po.total_usd,
+        "total_cs":     round(total_cs, 2),
+        "lines": [
+            {
+                "line_no":     L.line_no,
+                "vendor_item": L.vendor_item or "",
+                "cw_item":     L.cw_item or "",
+                "description": L.description or "",
+                "variety":     L.variety or "",
+                "sliced":      bool(L.sliced),
+                "pack":        L.pack or "",
+                "pack_um":     L.pack_um or "",
+                "case_size":   L.case_size,
+                "qty":         L.quantity,
+                "unit":        (L.quantity_um or "cs").lower(),
+                "unit_cost":   L.unit_cost,
+                "ext_cost":    L.ext_cost,
+            }
+            for L in po.lines
+        ],
+        "source":            "Email Inbox",
+        "source_subject":    subject[:200],
+        "source_message_id": msg_id,
+    }
+    return record, errors
+
+
 def parse_message_with_errors(msg):
-    """Extract events from an email message and surface non-fatal issues.
+    """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
     Attachment precedence:
-      1. Distributor PO PDF attachment -> per-line ``restock`` events.
-         Currently routed: US Foods (usfoods.com), Cheney Brothers
-         (cheneybrothers.com).
+      1. Distributor PO PDF attachment routed by sender domain:
+           - US Foods (usfoods.com)        -> per-line ``restock`` events
+           - Cheney Brothers (cheneybrothers.com) -> per-line ``restock`` events
+           - Chefs Warehouse (chefswarehouse.com) -> CW PO record (NOT
+             an EmailEvent; written to data/chefs_warehouse_pos.json)
       2. Any .csv attachment -> event type inferred from filename.
       3. Structured text body (tag lines) -> fallback if no attachments
          produced events.
 
-    Returns (events, errors).
+    Returns (events, errors, cw_pos). ``cw_pos`` is a list of CW PO
+    dicts; empty for non-CW messages.
     """
     subject = str(msg.get("Subject", ""))
     msg_id = str(msg.get("Message-ID", ""))
@@ -441,6 +538,7 @@ def parse_message_with_errors(msg):
 
     events = []
     errors = []
+    cw_pos: list[dict] = []
 
     # 1) Distributor PO PDF attachments (real POs arrive as PDFs, not CSVs).
     for fname, payload in _attachments(msg):
@@ -450,14 +548,23 @@ def parse_message_with_errors(msg):
             d_events, d_errs = _usfoods_po_to_events(
                 payload, distributor, msg_id, subject,
             )
+            events.extend(d_events)
+            errors.extend(d_errs)
         elif distributor == "Cheney Brothers":
             d_events, d_errs = _cheney_po_to_events(
                 payload, distributor, msg_id, subject,
             )
+            events.extend(d_events)
+            errors.extend(d_errs)
+        elif distributor == "Chefs Warehouse":
+            record, d_errs = _chefs_warehouse_po_to_record(
+                payload, msg_id, subject,
+            )
+            if record is not None:
+                cw_pos.append(record)
+            errors.extend(d_errs)
         else:
             continue
-        events.extend(d_events)
-        errors.extend(d_errs)
 
     # 2) CSV attachments
     for fname, payload in _attachments(msg):
@@ -477,8 +584,8 @@ def parse_message_with_errors(msg):
         finally:
             tmp.unlink(missing_ok=True)
 
-    # 3) Structured body (only if no attachment produced events)
-    if body and not events:
+    # 3) Structured body (only if no attachment produced events or CW POs)
+    if body and not events and not cw_pos:
         event_type, _, items = _parse_body_items(body, distributor, "on_hand")
         for it in items:
             events.append(EmailEvent(
@@ -488,12 +595,16 @@ def parse_message_with_errors(msg):
                 source_subject=subject,
             ))
 
-    return events, errors
+    return events, errors, cw_pos
 
 
 def parse_message(msg):
-    """Thin wrapper over parse_message_with_errors that discards diagnostics."""
-    events, _ = parse_message_with_errors(msg)
+    """Thin wrapper over parse_message_with_errors that discards diagnostics.
+
+    Returns events only -- callers that need CW POs should use
+    ``parse_message_with_errors`` directly.
+    """
+    events, _, _ = parse_message_with_errors(msg)
     return events
 
 
@@ -716,16 +827,17 @@ class EmailInboxClient:
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
                     msg = email.message_from_bytes(mime_bytes)
-                    events, errs = parse_message_with_errors(msg)
+                    events, errs, cw_pos = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(
                         f"ms365 parse failed for {upn}:{m.get('subject', mid)!r}: {exc}"
                     )
                     continue
                 result.errors.extend(errs)
-                if events:
+                if events or cw_pos:
                     result.messages_parsed += 1
                     result.events.extend(events)
+                    result.cw_pos.extend(cw_pos)
                     if mark_read and not m.get("isRead"):
                         try:
                             self._graph_patch(
@@ -768,14 +880,15 @@ class EmailInboxClient:
                 raw = msg_data[0][1]
                 try:
                     msg = email.message_from_bytes(raw)
-                    events, errs = parse_message_with_errors(msg)
+                    events, errs, cw_pos = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
                     result.errors.append(f"parse failed for {msg_id!r}: {exc}")
                     continue
                 result.errors.extend(errs)
-                if events:
+                if events or cw_pos:
                     result.messages_parsed += 1
                     result.events.extend(events)
+                    result.cw_pos.extend(cw_pos)
                     if not mark_read:
                         imap.store(msg_id, "-FLAGS", "\\Seen")
 
@@ -786,14 +899,15 @@ class EmailInboxClient:
             try:
                 with open(path, "rb") as f:
                     msg = email.message_from_bytes(f.read())
-                events, errs = parse_message_with_errors(msg)
+                events, errs, cw_pos = parse_message_with_errors(msg)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"{path.name}: {exc}")
                 continue
             result.errors.extend(errs)
-            if events:
+            if events or cw_pos:
                 result.messages_parsed += 1
                 result.events.extend(events)
+                result.cw_pos.extend(cw_pos)
 
 
 __all__ = [
@@ -802,5 +916,8 @@ __all__ = [
     "ScanResult",
     "parse_message",
     "parse_message_with_errors",
+    "_chefs_warehouse_po_to_record",
+    "_usfoods_po_to_events",
+    "_cheney_po_to_events",
 ]
         
