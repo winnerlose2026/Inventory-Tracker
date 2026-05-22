@@ -82,6 +82,18 @@
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--surface2); }
 
+  /* Inventory tables: fixed layout so every warehouse sub-table on the
+     Inventory tab shares the same column widths. Without this, the
+     auto-table-layout algorithm sizes each table independently based on
+     its rows' content (long SKU names in one warehouse shove the Qty
+     column right; another warehouse with shorter names leaves Qty closer
+     to the left) — and the columns visibly drift down the page. The
+     <colgroup> on each rendered table provides the percentages. */
+  .inv-table { table-layout: fixed; }
+  .inv-table th, .inv-table td { overflow: hidden; text-overflow: ellipsis; }
+  .inv-table td:first-child { white-space: normal; }
+  .inv-table td.actions-col { white-space: nowrap; overflow: visible; }
+
   /* Stock bar */
   .bar-wrap { background: var(--border); border-radius: 4px; height: 6px; width: 100px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 4px; transition: width .4s; }
@@ -361,7 +373,193 @@
     .pager-row > div { width: 100%; justify-content: flex-start; }
   }
     @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
+  
+  /* =====================================================================
+     Responsive layout — three breakpoints:
+       1024px and below : narrow tablet / small laptop. Sidebar shrinks,
+                          tables get horizontal scroll, page header stacks.
+        768px and below : portrait tablet / large phone. Sidebar collapses
+                          to a fixed BOTTOM TAB BAR with icon-first nav and
+                          44px+ touch targets. Base font goes to 15px.
+        480px and below : phones. Tighter padding, 2-col stat grid, nav
+                          tab labels truncate to keep all 7 tabs in view.
+     ===================================================================== */
+
+  /* Tablet — keep the sidebar, but shrink everything */
+  @media (max-width: 1024px) {
+    .app { grid-template-columns: 200px 1fr; }
+    .main { padding: 24px 22px; }
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+    .report-grid { grid-template-columns: 1fr; }
+    /* Let wide tables scroll horizontally inside their containing card */
+    .card { overflow-x: auto; }
+    /* The page header (h1 + btn-group) stacks instead of side-by-side */
+    .page > div:first-child[style*="space-between"] {
+      flex-direction: column;
+      align-items: stretch !important;
+      gap: 14px;
+    }
+    .page > div:first-child[style*="space-between"] .btn-group {
+      flex-wrap: wrap;
+    }
+    .nav-icon { font-size: 18px; }
+    .nav-item { padding: 12px 18px; }
+  }
+
+  /* Phone & portrait tablet — bottom tab bar, big touch targets */
+  @media (max-width: 768px) {
+    body { font-size: 15px; }
+
+    /* Switch the app shell from sidebar+main to main+bottom-bar */
+    .app {
+      grid-template-columns: 1fr;
+      grid-template-rows: 1fr auto;
+    }
+    .sidebar {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      width: 100%;
+      flex-direction: row;
+      border-right: none;
+      border-top: 1px solid var(--border);
+      padding: 0;
+      z-index: 50;
+      box-shadow: 0 -4px 18px rgba(5,23,71,.08);
+      background: var(--surface);
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .sidebar-logo { display: none; }
+    .sidebar-footer {
+      /* Move the admin-token panel to a compact floating button on phones */
+      position: fixed;
+      top: 12px; right: 12px;
+      margin: 0; padding: 0;
+      border-top: none;
+      background: transparent;
+      z-index: 60;
+    }
+    .sidebar-footer .token-status { display: none; }
+    .sidebar-footer .token-actions { gap: 4px; }
+    .sidebar-footer .btn {
+      font-size: 11px; padding: 7px 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      box-shadow: 0 2px 8px rgba(5,23,71,.08);
+    }
+    .sidebar nav {
+      display: flex;
+      flex: 1;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .nav-item {
+      flex: 1 0 auto;
+      flex-direction: column;
+      gap: 3px;
+      padding: 8px 10px 7px;
+      min-height: 60px;
+      min-width: 70px;
+      border-left: none;
+      border-top: 3px solid transparent;
+      font-size: 11px;
+      font-weight: 600;
+      text-align: center;
+      justify-content: center;
+      line-height: 1.15;
+    }
+    .nav-item.active {
+      border-left-color: transparent;
+      border-top-color: var(--accent2);
+      background: var(--surface2);
+    }
+    .nav-icon { font-size: 22px; width: auto; }
+
+    /* Main content area: account for the 60px bottom tab bar */
+    .main { padding: 20px 16px 84px; }
+
+    /* Bigger, thumb-friendly page titles + button rows */
+    h1 { font-size: 24px; }
+    .subtitle { font-size: 13px; margin-bottom: 18px; }
+    .page > div:first-child[style*="space-between"] {
+      flex-direction: column;
+      align-items: stretch !important;
+      gap: 12px;
+    }
+    .btn-group { flex-wrap: wrap; gap: 8px; }
+    .btn {
+      padding: 11px 16px;
+      font-size: 13px;
+      min-height: 44px;   /* Apple HIG touch-target minimum */
+    }
+    .btn-sm { padding: 8px 12px; font-size: 12px; min-height: 36px; }
+
+    /* Stat cards: 2-up on phones, with smaller hero numbers */
+    .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px; }
+    .stat-card { padding: 14px 16px; }
+    .stat-value { font-size: 24px; }
+    .stat-label { font-size: 10px; }
+
+    /* Tables — overflow-x lets them scroll horizontally inside their card. */
+    .card { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .card > table, .card > div > table, .card > div > div > table {
+      min-width: 600px;   /* widest narrow-phone forces horizontal scroll vs squish */
+    }
+    th, td { padding: 10px 12px; font-size: 13px; }
+    th { font-size: 10px; }
+
+    /* The inventory page rolls warehouses into per-warehouse sub-tables
+       wrapped in flex layouts. Keep them scrollable too. */
+    .inv-table { min-width: 720px; }
+
+    /* Filter rows (Pending POs, Daily Production, etc.) stack vertically */
+    .filters { display: flex; flex-direction: column; gap: 10px !important; }
+    .filter-group { width: 100%; }
+    .filter-group select,
+    .filter-group input { width: 100% !important; min-width: 0 !important; }
+
+    /* Modals go almost-full-screen */
+    .modal {
+      width: calc(100% - 24px);
+      max-width: 480px;
+      padding: 22px 20px;
+      max-height: 88vh;
+    }
+    .form-grid { grid-template-columns: 1fr; gap: 12px; }
+
+    /* Toast doesn't crowd the bottom tab bar */
+    #toast { bottom: 76px; right: 12px; left: 12px; }
+    .toast-msg { max-width: 100%; }
+
+    /* Card headers wrap so the inline summary doesn't overflow */
+    .card-header { flex-wrap: wrap; gap: 8px; padding: 14px 16px; }
+
+    /* Ship-date input was 140px hardcoded — let it shrink */
+    .ship-date-input { width: 100%; max-width: 160px; }
+  }
+
+  /* Small phones (iPhone SE class, narrow Android) */
+  @media (max-width: 480px) {
+    .main { padding: 16px 12px 84px; }
+    h1 { font-size: 20px; }
+    .stat-grid { gap: 8px; }
+    .stat-card { padding: 12px 14px; }
+    .stat-value { font-size: 22px; }
+    .nav-item {
+      padding: 8px 4px 6px;
+      min-width: 56px;
+      font-size: 10px;
+    }
+    .nav-icon { font-size: 20px; }
+    /* Card header summaries (e.g. "12 SKU(s) · 4 warehouses ·...") wrap
+       into two lines instead of running off the screen */
+    .card-header span:last-child { font-size: 11px; line-height: 1.5; }
+    /* Tighter buttons on small phones */
+    .btn { padding: 10px 14px; font-size: 12px; }
+    .btn-group { gap: 6px; }
+  }
+</style>
 </head>
 <body>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1330,7 +1528,18 @@ async function loadInventory() {
                 ${w.low_stock_count > 0 ? ` &middot; <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
               </div>
             </div>
-            <table>
+            <table class="inv-table">
+              <colgroup>
+                <col style="width:24%">
+                <col style="width:7%">
+                <col style="width:12%">
+                <col style="width:6%">
+                <col style="width:8%">
+                <col style="width:11%">
+                <col style="width:11%">
+                <col style="width:8%">
+                <col style="width:13%">
+              </colgroup>
               <thead>
                 <tr>
                   <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
