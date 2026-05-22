@@ -74,11 +74,17 @@ services:
     # The cowork_graph_scan.py script talks to Microsoft Graph directly using
     # the same MS365_* client-credentials that the web service uses, fetches
     # PO PDFs from the JD@ and info@ mailboxes, parses them out-of-process,
-    # and POSTs the resulting events to /api/email/ingest-events on the web
-    # service. PO-revision idempotency in sync_inventory means re-scanning
-    # the same message (or a stale revision) cannot double-count the
-    # on_order column; the per-cron-container .cowork_seen_ids.txt is a
-    # nice-to-have message-level shortcut but is not required for safety.
+    # and POSTs the parsed records to the web service:
+    #   - US Foods + Cheney Brothers events -> /api/email/ingest-events
+    #     (apply through the inventory on_order pipeline)
+    #   - Chefs Warehouse records           -> /api/chefs-warehouse/ingest-pos
+    #     (apply to the parallel data/chefs_warehouse_pos.json store; CW
+    #     POs surface on the Pending POs tab but never touch the Inventory
+    #     tab by design).
+    # PO-revision idempotency in sync_inventory means re-scanning the same
+    # message (or a stale revision) cannot double-count the on_order column;
+    # the per-cron-container .cowork_seen_ids.txt is a nice-to-have
+    # message-level shortcut but is not required for safety.
     #
     # cowork_graph_scan.py imports integrations.email_scanner (which pulls
     # in pypdf for PDF parsing), so the cron service needs the full
