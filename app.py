@@ -144,15 +144,24 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        expected_user = os.environ.get("INVENTORY_USERNAME", "").strip()
+        # Allowed users come from INVENTORY_USERNAMES (comma-separated) with
+        # backward-compat fallback to the legacy single INVENTORY_USERNAME.
+        # All comparisons are case-insensitive so "jd" / "JD" / "Jd" all match.
+        users_raw = (os.environ.get("INVENTORY_USERNAMES")
+                     or os.environ.get("INVENTORY_USERNAME", ""))
+        allowed = {u.strip().lower()
+                   for u in users_raw.split(",") if u.strip()}
         expected_pass = os.environ.get("INVENTORY_PASSWORD", "")
 
-        # Both env vars must be set for login to be possible. If either is
-        # missing the operator hasn't finished configuration — fail closed.
-        if expected_user and expected_pass \
-                and username == expected_user \
+        # Both the user list and password must be set for login to be
+        # possible. If either is missing, the operator hasn't finished
+        # configuration — fail closed.
+        if allowed and expected_pass \
+                and username.lower() in allowed \
                 and secrets.compare_digest(password, expected_pass):
             session.permanent = True
+            # Preserve the casing the user typed so the header chip reads
+            # "Jay" / "JD" the way they signed in, not the env-var spelling.
             session["user"] = username
             return redirect(next_url)
         error = "Invalid username or password."
