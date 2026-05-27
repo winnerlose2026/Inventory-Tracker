@@ -451,7 +451,15 @@ def api_chefs_warehouse_pos():
         if r.get("canceled") or po_num in canceled:
             status = "canceled"
         else:
-            arrival_str = (r.get("arrival_date") or r.get("eta") or "").strip()
+            # Auto-ETA rule (2026-05-27): CW POs only auto-flip to
+            # "arrived" off an OPERATOR-set arrival_date. The parser-set
+            # eta (from the PDF's printed delivery date or a 30-day
+            # fallback) is ignored for status — the vendor's promise of
+            # when they'll deliver is not the same as confirmation that
+            # the truck showed up. Operator types ship_date -> the
+            # ship-date endpoint stores arrival_date = ship_date + 7d,
+            # and that's what flips us to "arrived" past its date.
+            arrival_str = (r.get("arrival_date") or "").strip()
             arrival_dt = None
             if arrival_str:
                 try:
@@ -2838,21 +2846,4 @@ def api_export_xlsx():
 
     wb = Workbook()
     _write_summary_sheet(wb.active, inv)
-    wb.active.title = "Summary"
-    _write_items_sheet(wb.create_sheet("Unified List"), items)
-    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
-    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return send_file(
-        buf,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name="bagel_inventory.xlsx",
-    )
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+  

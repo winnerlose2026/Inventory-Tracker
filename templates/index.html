@@ -706,7 +706,7 @@
       <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Pending POs</h1>
-          <p class="subtitle" style="margin-bottom:0">Open purchase orders not yet rolled into inventory. Set a Ship Date to lock in arrival = ship + 7 days; that supersedes the default 30-day eta.</p>
+          <p class="subtitle" style="margin-bottom:0">Purchase orders, filterable by status. Only US Foods and Cheney Brothers get an automatic 30-day ETA; every other distributor stays in <em>pending</em> until you type a Ship Date, which locks in arrival = ship + 7 days.</p>
         </div>
         <div class="btn-group">
           <button class="btn btn-ghost btn-sm" id="pending-filter-overdue" onclick="setPendingFilter('overdue')">Overdue</button>
@@ -717,6 +717,15 @@
       </div>
       <div class="card">
         <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group">
+            <label>Status</label>
+            <select id="pending-filter-status" onchange="onPendingStatusChange()" style="width:160px">
+              <option value="pending" selected>Pending</option>
+              <option value="arrived">Arrived</option>
+              <option value="canceled">Canceled</option>
+              <option value="all">All</option>
+            </select>
+          </div>
           <div class="filter-group">
             <label>Distributor</label>
             <select id="pending-filter-distributor" onchange="renderPendingPOs()" style="width:180px">
@@ -3072,6 +3081,18 @@ function onPendingSortClick(key) {
 // page render only, never the Inventory tab.
 let cwPendingGroups = [];
 
+// Status dropdown changed — reload so the CW endpoint gets the right
+// ?status= parameter. Inventory-side on_order entries are filtered
+// client-side inside renderPendingPOs().
+function onPendingStatusChange() {
+  loadPendingPOs();
+}
+
+function _currentPendingStatus() {
+  const el = document.getElementById('pending-filter-status');
+  return (el && el.value) || 'pending';
+}
+
 async function loadPendingPOs() {
   await ensureWarehouses();
   // Populate warehouse filter dropdown
@@ -3092,8 +3113,10 @@ async function loadPendingPOs() {
   // distinct from the inventory-backed pairs because CW POs never
   // appear in /api/inventory. A network failure here must not break
   // the rest of the page — just log it and render without CW rows.
+  // The status dropdown selects which slice of CW POs to fetch.
+  const status = _currentPendingStatus();
   try {
-    const cwResp = await api('/api/chefs-warehouse/pos?status=pending');
+    const cwResp = await api('/api/chefs-warehouse/pos?status=' + encodeURIComponent(status));
     cwPendingGroups = (cwResp && cwResp.pos) ? cwResp.pos : [];
   } catch (e) {
     console.warn('Failed to load Chefs Warehouse POs:', e);
@@ -3162,8 +3185,36 @@ function renderPendingPOs() {
   // warehouse filters work, even if a hypothetical multi-DC PO existed.
   const distF = document.getElementById('pending-filter-distributor').value;
   const whF   = document.getElementById('pending-filter-warehouse').value;
+  const statusF = _currentPendingStatus();
   if (distF) pairs = pairs.filter(p => (p.item.distributor || '') === distF);
   if (whF)   pairs = pairs.filter(p => (p.item.warehouse  || '') === whF);
+
+  // Apply the status filter to inventory-side on_order entries
+  // (USF/Cheney/etc.). "arrived" = arrival_date in the past, or eta in
+  // the past when no arrival_date set; "pending" = neither. There is no
+  // "canceled" branch here because the on_order list drops entries on
+  // cancel; canceled-only views show CW POs only.
+  if (statusF !== 'all') {
+    const now = new Date();
+    pairs = pairs.filter(p => {
+      const entry = p.entry || {};
+      const arr = (entry.arrival_date || '').trim();
+      const eta = (entry.eta || '').trim();
+      let arrivedAt = null;
+      if (arr) {
+        const d = new Date(arr);
+        if (!isNaN(d.getTime())) arrivedAt = d;
+      } else if (eta) {
+        const d = new Date(eta);
+        if (!isNaN(d.getTime())) arrivedAt = d;
+      }
+      const isArrived = !!(arrivedAt && arrivedAt <= now);
+      if (statusF === 'arrived')  return isArrived;
+      if (statusF === 'pending')  return !isArrived;
+      if (statusF === 'canceled') return false;  // on_order has no canceled state
+      return true;
+    });
+  }
 
   // Build groups from the (already-filtered) flat list
   let groups = _buildPoGroups(pairs);
@@ -4158,18 +4209,4 @@ async function loadToastSales() {
         </tr></thead>
         <tbody>${itemsHtml}</tbody>
       </table>`
-      : `<div class="empty" style="padding:12px;color:var(--muted);font-size:12px">${emptyHelp}</div>`;
-    return `<div style="border-top:1px solid var(--border);padding:10px 0">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-        <div style="font-weight:600">${escHtml(headerLabel)}</div>
-        <div style="color:var(--muted);font-size:12px">$${(b.total_gross || 0).toFixed(2)} gross &middot; ${b.item_count} items</div>
-      </div>
-      ${body}
-    </div>`;
-  }).join('');
-}
-
-</script>
-</body>
-</html>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
+      : `<div class="empty" style="padding:12px;color:var(--muted);font-size:12px">${emptyHelp}</div>`
