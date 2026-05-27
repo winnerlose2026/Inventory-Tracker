@@ -3,15 +3,35 @@
 
 import io
 import os
-from flask import Flask, jsonify, request, render_template, send_file, make_response
+import secrets
+from datetime import datetime, timedelta
+from flask import (
+    Flask, jsonify, request, render_template, send_file, make_response,
+    session, redirect, url_for,
+)
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     add_item, update_item, record_usage, restock, remove_item,
     reverse_usage,
 )
-from datetime import datetime
 
 app = Flask(__name__)
+
+# Session config — 30-day signed cookies. SECRET_KEY should come from Render's
+# environment (otherwise sessions reset on every redeploy when the random
+# fallback regenerates).
+app.config["SECRET_KEY"] = (
+    os.environ.get("FLASK_SECRET_KEY")
+    or os.environ.get("SECRET_KEY")
+    or secrets.token_hex(32)
+)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# HTTPS-only cookie in production; on localhost dev we'd lock ourselves out.
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("FLASK_ENV", "").lower() != "development"
+)
+app.permanent_session_lifetime = timedelta(days=30)
 
 
 # ---------------------------------------------------------------------------
