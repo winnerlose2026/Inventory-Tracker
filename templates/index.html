@@ -223,12 +223,30 @@
     gap: 10px;
     flex-shrink: 0;
   }
-  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; font-weight: 500; white-space: nowrap; }
-  .token-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-  .token-dot.ok { background: var(--green); }
-  .token-dot.missing { background: var(--red); }
-  .token-actions { display: flex; gap: 6px; }
-  .token-actions .btn { padding: 6px 12px; font-size: 11px; }
+  /* User chip — "Signed in as jd" indicator in the header */
+  .user-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 9999px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: .02em;
+    text-transform: lowercase;
+    white-space: nowrap;
+  }
+  .user-chip::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+  #logout-btn { padding: 6px 12px; font-size: 11px; }
 
   .pager-row {
     padding: 10px 20px;
@@ -597,14 +615,10 @@
       </div>
     </nav>
     <div class="sidebar-footer">
-      <div class="token-status" id="token-status">
-        <span class="token-dot" id="token-dot"></span>
-        <span id="token-status-label">Checking…</span>
-      </div>
-      <div class="token-actions">
-        <button class="btn btn-ghost" onclick="promptAdminToken()" id="token-set-btn">Set admin key</button>
-        <button class="btn btn-ghost" onclick="clearAdminToken()" id="token-clear-btn" style="display:none">Clear</button>
-      </div>
+      <span class="user-chip" title="Signed in">{{ current_user or 'guest' }}</span>
+      <form action="{{ url_for('logout') }}" method="POST" style="margin:0">
+        <button type="submit" class="btn btn-ghost" id="logout-btn">Sign out</button>
+      </form>
     </div>
   </aside>
 
@@ -1170,10 +1184,6 @@
 <!-- Toast container -->
 <div id="toast"></div>
 
-<!-- Tiny build stamp so we can verify the mobile-layout fix has actually
-     reached the browser. If you don't see this, the deploy is stale. -->
-<div id="build-stamp" style="position:fixed;bottom:4px;right:6px;font-size:9px;color:var(--muted);opacity:.55;pointer-events:none;font-family:ui-monospace,monospace;z-index:5">v2026-05-27-mobile</div>
-
 <script>
 // -------------------------------------------------------------------------
 // State
@@ -1272,91 +1282,31 @@ function toast(msg, type = 'success') {
 }
 
 // -------------------------------------------------------------------------
-// Admin token (X-Inventory-Token on write requests)
+// API helpers — auth is handled by the Flask session cookie (set when the
+// user signs in at /login). Browsers attach it automatically, so there's no
+// X-Inventory-Token header to manage from the page anymore.
 // -------------------------------------------------------------------------
-const ADMIN_TOKEN_KEY = 'bagelInvToken';
-let tokenRequired = false;
-
-function getAdminToken() {
-  try { return localStorage.getItem(ADMIN_TOKEN_KEY) || ''; } catch (e) { return ''; }
-}
-function setAdminToken(v) {
-  try {
-    if (v) localStorage.setItem(ADMIN_TOKEN_KEY, v);
-    else localStorage.removeItem(ADMIN_TOKEN_KEY);
-  } catch (e) {}
-}
 function authHeaders() {
-  const h = { 'Content-Type': 'application/json' };
-  const t = getAdminToken();
-  if (t) h['X-Inventory-Token'] = t;
-  return h;
-}
-function promptAdminToken() {
-  const v = window.prompt('Paste the INVENTORY_API_TOKEN value from Render:', getAdminToken());
-  if (v === null) return;
-  setAdminToken(v.trim());
-  refreshAuthStatus().then(() => {
-    if (getAdminToken()) toast('Admin key saved.');
-    refresh(currentPage);
-  });
-}
-function clearAdminToken() {
-  setAdminToken('');
-  refreshAuthStatus();
-  toast('Admin key cleared.');
+  return { 'Content-Type': 'application/json' };
 }
 
-// Server-injected admin token. When INVENTORY_AUTO_AUTH is set on Render, the
-// Flask handler renders the real INVENTORY_API_TOKEN value here. If it's
-// non-empty, save it to localStorage before the auth check runs so the user
-// isn't prompted on every fresh browser. Empty string means "auto-auth off,"
-// in which case behaviour is unchanged from before.
-const __AUTO_ADMIN_TOKEN__ = {{ auto_admin_token|tojson }};
-if (__AUTO_ADMIN_TOKEN__ && getAdminToken() !== __AUTO_ADMIN_TOKEN__) {
-  setAdminToken(__AUTO_ADMIN_TOKEN__);
-}
-async function refreshAuthStatus() {
-  const dot = document.getElementById('token-dot');
-  const label = document.getElementById('token-status-label');
-  const clearBtn = document.getElementById('token-clear-btn');
-  const setBtn = document.getElementById('token-set-btn');
-  try {
-    const r = await fetch('/api/auth/check', { headers: authHeaders() });
-    const j = await r.json();
-    tokenRequired = !!j.required;
-    if (!j.required) {
-      dot.className = 'token-dot ok';
-      label.textContent = 'Open backend';
-      clearBtn.style.display = 'none';
-      setBtn.textContent = 'Set admin key';
-    } else if (j.authorized) {
-      dot.className = 'token-dot ok';
-      label.textContent = 'Admin key OK';
-      clearBtn.style.display = '';
-      setBtn.textContent = 'Change';
-    } else {
-      dot.className = 'token-dot missing';
-      label.textContent = getAdminToken() ? 'Key rejected' : 'Admin key required';
-      clearBtn.style.display = getAdminToken() ? '' : 'none';
-      setBtn.textContent = 'Set admin key';
-    }
-  } catch (e) {
-    dot.className = 'token-dot';
-    label.textContent = 'Auth check failed';
-  }
-}
-
-// -------------------------------------------------------------------------
-// API helpers
-// -------------------------------------------------------------------------
 async function api(url, method = 'GET', body = null) {
-  const opts = { method, headers: authHeaders() };
+  const opts = {
+    method,
+    headers: authHeaders(),
+    credentials: 'same-origin', // ensure session cookie is sent
+  };
   if (body) opts.body = JSON.stringify(body);
   let r = await fetch(url, opts);
-  if (r.status === 401 && (method === 'POST' || method === 'PUT' || method === 'DELETE')) {
-    toast('Write blocked: admin key required.', 'error');
-    refreshAuthStatus();
+  if (r.status === 401) {
+    // Session expired or never existed — bounce to the login page,
+    // preserving the current page so we land back here after signing in.
+    toast('Session expired. Redirecting to sign-in…', 'error');
+    setTimeout(() => {
+      const next = encodeURIComponent(location.pathname + location.search);
+      location.href = '/login?next=' + next;
+    }, 800);
+    return {};
   }
   return r.json();
 }
@@ -3843,13 +3793,9 @@ function escAttr(s) {
 }
 
 // -------------------------------------------------------------------------
-// Boot
+// Boot — session cookie handles auth, so just load the dashboard. If the
+// session has expired, api() bounces the user to /login.
 // -------------------------------------------------------------------------
-refreshAuthStatus().then(() => {
-  if (tokenRequired && !getAdminToken()) {
-    promptAdminToken();
-  }
-});
 loadDashboard();
 // -------------------------------------------------------------------------
 // Traceability tab
@@ -4208,4 +4154,14 @@ async function loadToastSales() {
     return `<div style="border-top:1px solid var(--border);padding:10px 0">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
         <div style="font-weight:600">${escHtml(headerLabel)}</div>
-        <div s
+        <div style="color:var(--muted);font-size:12px">$${(b.total_gross || 0).toFixed(2)} gross &middot; ${b.item_count} items</div>
+      </div>
+      ${body}
+    </div>`;
+  }).join('');
+}
+
+</script>
+</body>
+</html>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  

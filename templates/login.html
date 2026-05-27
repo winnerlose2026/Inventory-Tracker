@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in · Inventory Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Libre+Caslon+Text:ital,wght@0,400;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #FAF6F0;
+    --surface: #FFFFFF;
+    --surface2: #F0ECE6;
+    --border: #E6DFD2;
+    --text: #051747;
+    --muted: #6B6657;
+    --accent: #051747;
+    --accent2: #EC5039;
+    --red: #EC5039;
+    --radius: 8px;
+    --font-display: 'Libre Caslon Text', Georgia, 'Times New Roman', serif;
+    --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 16px;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 16px;
+  }
+  .login-card {
+    width: 100%;
+    max-width: 380px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 24px 24px;
+    box-shadow: 0 12px 32px rgba(5,23,71,.08);
+  }
+  .login-logo {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 24px;
+    text-align: center;
+  }
+  .login-logo svg { width: 72px; height: auto; display: block; }
+  .login-logo h1 {
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    line-height: 1.1;
+  }
+  .login-logo .subtitle {
+    font-size: 13px;
+    color: var(--muted);
+    font-style: italic;
+  }
+  form { display: flex; flex-direction: column; gap: 14px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  label {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+  input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    font-size: 16px; /* 16px stops iOS auto-zoom on focus */
+    width: 100%;
+    outline: none;
+    transition: border-color .15s;
+    font-family: var(--font-body);
+  }
+  input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(5,23,71,.08);
+  }
+  .btn-submit {
+    margin-top: 4px;
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid var(--accent);
+    border-radius: 9999px;
+    padding: 13px 18px;
+    font-family: var(--font-body);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background .15s;
+    min-height: 48px;
+  }
+  .btn-submit:hover { background: #0A2466; }
+  .error {
+    background: rgba(236,80,57,.08);
+    border-left: 3px solid var(--red);
+    color: var(--red);
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .footer-note {
+    margin-top: 18px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-logo">
+      <svg viewBox="0 0 476 323" fill="none" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="H&amp;H Bagels"><path d="M476 63.6C379.61 63.6 334.39 0 238 0C141.61 0 96.39 63.6 0 63.6V254.4C96.39 254.4 141.61 318 238 318C334.39 318 379.61 254.4 476 254.4V63.6Z" fill="#051747"></path><path d="M115.43 168.047H71.0908V216.598H49.7422V101.402H71.0908V147.973H115.43V101.402H136.779V216.598H115.43V168.047Z" fill="#FFFFFF"></path><path d="M404.823 168.047H360.483V216.598H339.135V101.402H360.483V147.973H404.823V101.402H426.171V216.598H404.823V168.047Z" fill="#FFFFFF"></path><path d="M171.186 194.87C171.186 170.551 184.053 149.722 204.839 139.379C193.843 130.515 188.885 118.018 188.885 105.926C188.885 80.1281 209.805 60.6426 237.826 60.6426C257 60.6426 272.55 69.642 280.729 83.7533L261.023 94.0962C256.326 86.8379 248.02 82.0043 237.556 82.0043C222.808 82.0043 211.146 91.274 211.146 106.323C211.146 118.145 218.651 128.361 232.463 130.913V151.201C211.281 152.68 193.986 169.073 193.986 193.924C193.986 218.776 212.225 235.304 237.564 235.304C262.903 235.304 279.531 220.66 279.531 199.561C279.531 186.125 272.423 177.261 261.427 177.261C251.106 177.261 244.133 185.052 244.133 198.893H223.887C226.029 148.236 281.007 164.764 283.284 124.457H304.069C304.069 141.518 295.62 154.151 281.142 162.888C293.882 169.741 301.792 183.176 301.792 200.507C301.792 232.887 274.041 257.342 237.437 257.342C200.832 257.342 171.201 231.814 171.201 194.862L171.186 194.87Z" fill="#FFFFFF"></path></svg>
+      <h1>Inventory Tracker</h1>
+      <span class="subtitle">Sign in to continue</span>
+    </div>
+
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('login') }}" autocomplete="on">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <div class="form-group">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required autofocus>
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn-submit">Sign in</button>
+    </form>
+
+    <div class="footer-note">
+      H&amp;H Bagels · Inventory Tracker
+    </div>
+  </div>
+</body>
+</html>

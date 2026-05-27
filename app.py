@@ -57,37 +57,93 @@ def _cors_preflight(_any):
 
 
 # ---------------------------------------------------------------------------
-# Write-endpoint auth. When INVENTORY_API_TOKEN is set, every write route
-# requires `X-Inventory-Token: <value>`. Unset (the default) = open, matches
-# the original local-only behaviour.
+# Auth — session-based login for the browser, INVENTORY_API_TOKEN header for
+# cron jobs and scripts. A write request is authorised if EITHER:
+#   1. The browser session has session["user"] set (humans), OR
+#   2. The request carries the right X-Inventory-Token header (cron/scripts).
+# Reads on /api/* stay open so embedded widgets (Shopify storefront, etc.)
+# can keep loading data without a session cookie.
 # ---------------------------------------------------------------------------
 
-def _require_write_token():
+def _user_logged_in() -> bool:
+    return bool(session.get("user"))
+
+
+def _has_valid_api_token() -> bool:
     expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
     if not expected:
-        return None
+        return False
     got = (request.headers.get("X-Inventory-Token") or "").strip()
-    if got != expected:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return None
+    return bool(got) and secrets.compare_digest(got, expected)
+
+
+def _is_authenticated() -> bool:
+    return _user_logged_in() or _has_valid_api_token()
 
 
 @app.before_request
 def _gate_writes():
+    # OPTIONS preflight, login flow, and static files are always open.
+    if request.method == "OPTIONS":
+        return
+    if request.endpoint in ("login", "logout", "static"):
+        return
+    # Writes to /api/* require either a session or the API token.
     if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
-        denial = _require_write_token()
-        if denial is not None:
-            return denial
+        if not _is_authenticated():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
 
 
 @app.route("/api/auth/check")
 def api_auth_check():
-    """Let the widget ask 'does this backend require a token, and is mine good?'"""
-    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
-    if not expected:
-        return jsonify({"required": False, "authorized": True})
-    got = (request.headers.get("X-Inventory-Token") or "").strip()
-    return jsonify({"required": True, "authorized": got == expected})
+    """Tell the page who's logged in (or whether the API token is valid)."""
+    if _user_logged_in():
+        return jsonify({
+            "required": True,
+            "authorized": True,
+            "user": session.get("user"),
+            "auth_type": "session",
+        })
+    if _has_valid_api_token():
+        return jsonify({
+            "required": True,
+            "authorized": True,
+            "user": None,
+            "auth_type": "token",
+        })
+    return jsonify({"required": True, "authorized": False})
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    next_url = request.args.get("next") or request.form.get("next") or "/"
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = "/"
+
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        expected_user = os.environ.get("INVENTORY_USERNAME", "").strip()
+        expected_pass = os.environ.get("INVENTORY_PASSWORD", "")
+
+        # Both env vars must be set for login to be possible. If either is
+        # missing the operator hasn't finished configuration — fail closed.
+        if expected_user and expected_pass \
+                and username == expected_user \
+                and secrets.compare_digest(password, expected_pass):
+            session.permanent = True
+            session["user"] = username
+            return redirect(next_url)
+        error = "Invalid username or password."
+
+    return render_template("login.html", error=error, next_url=next_url)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ---------------------------------------------------------------------------
@@ -104,17 +160,11 @@ def favicon_ico():
 
 @app.route("/")
 def index():
-    # When INVENTORY_AUTO_AUTH is on, hand the admin token to the page so the
-    # browser doesn't have to prompt on each fresh login / incognito window.
-    # Off by default — turning it on means "anyone who can load this page is
-    # treated as admin." Acceptable for a single-tenant deployment behind an
-    # obscure URL; not for a shared one. Accepted truthy values:
-    # 1, true, yes, on (case-insensitive).
-    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
-    auto_flag = os.environ.get("INVENTORY_AUTO_AUTH", "").strip().lower()
-    auto_on = auto_flag in ("1", "true", "yes", "on")
-    auto_token = expected if (expected and auto_on) else ""
-    return render_template("index.html", auto_admin_token=auto_token)
+    # Humans must be logged in to see the dashboard. The API token is for
+    # scripts hitting /api/*, not for serving the HTML page.
+    if not _user_logged_in():
+        return redirect(url_for("login", next=request.full_path or "/"))
+    return render_template("index.html", current_user=session.get("user", ""))
 
 
 # ---------------------------------------------------------------------------
