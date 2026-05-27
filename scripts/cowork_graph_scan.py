@@ -598,12 +598,28 @@ def run(argv: list[str] | None = None) -> int:
             _vlog(args.verbose, f"failed to update seen-state: {exc}")
 
     new_seen_size = len(_read_seen_state(state_path))
-    cw_summary = (
-        f"; CW: {cw_report.get('fetched', 0)} fetched / "
-        f"{cw_report.get('added', 0)} added / "
-        f"{cw_report.get('updated', 0)} updated"
-        if cw_pos_out else ""
-    )
+    # Show the full ingest breakdown so the summary is self-explanatory.
+    # The previous (fetched / added / updated) line was misleading: when
+    # every PO matched an existing record, the line read "8 fetched / 0
+    # added / 0 updated" and looked like the apply path was dropping
+    # everything on the floor — when it was actually counting them as
+    # "unchanged" (right behaviour, just invisible).
+    cw_summary = ""
+    if cw_pos_out:
+        unchanged = cw_report.get("unchanged", 0)
+        skipped_cancel = cw_report.get("skipped_canceled", 0)
+        skipped_inval = cw_report.get("skipped_invalid", 0)
+        parts = [
+            f"{cw_report.get('fetched', 0)} fetched",
+            f"{cw_report.get('added', 0)} added",
+            f"{cw_report.get('updated', 0)} updated",
+            f"{unchanged} unchanged",
+        ]
+        if skipped_cancel:
+            parts.append(f"{skipped_cancel} canceled-skipped")
+        if skipped_inval:
+            parts.append(f"{skipped_inval} invalid-skipped")
+        cw_summary = "; CW: " + " / ".join(parts)
     print(
         f"ingest-events {'DRY ' if args.dry_run else ''}OK: "
         f"{msgs_parsed} parsed, {len(events_out)} events, "
