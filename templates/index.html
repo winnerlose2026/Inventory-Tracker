@@ -386,9 +386,15 @@
       table-layout: auto !important;
       min-width: 0 !important;
       width: 100% !important;
+      max-width: 100% !important;
     }
-    table colgroup, .inv-table colgroup { display: none; }
-    th, td { word-break: break-word; white-space: normal; }
+    /* The Inventory tab's JS injects <colgroup><col style="width:24%">...</col>
+       inside every per-warehouse table. Those percentage widths combined
+       with table-layout:fixed used to make the row wider than the viewport.
+       Neutralize both the colgroup and its child <col> elements. */
+    table colgroup, .inv-table colgroup { display: none !important; }
+    table col, .inv-table col { width: auto !important; }
+    th, td { word-break: break-word; white-space: normal; max-width: 100%; }
     .actions-col, td.actions-col, .inv-table td.actions-col {
       white-space: normal;
     }
@@ -417,6 +423,44 @@
     /* Charts (Chart.js canvas) must size to container, not their intrinsic
        canvas width which can be larger than the viewport. */
     canvas { max-width: 100% !important; height: auto !important; }
+
+    /* ==================================================================
+       NUCLEAR INLINE-STYLE OVERRIDES
+       Many filter-groups, pager rows, and report cards carry inline
+       min-width / width / display:flex attributes that were sized for a
+       desktop layout. Inline styles beat class selectors without
+       !important, so on a narrow phone these elements refuse to shrink
+       and force the page wider than the viewport. Override every one of
+       them, in one place, so no future inline style can sneak past.
+       ================================================================== */
+
+    /* Kill every inline min-width — nothing on mobile needs a min-width. */
+    [style*="min-width"] { min-width: 0 !important; }
+
+    /* Form controls with inline pixel widths fill their parent instead. */
+    .filter-group select, .filter-group input,
+    .filters select, .filters input,
+    .card-header select, .card-header input,
+    select[style*="width"], input[style*="width"], textarea[style*="width"] {
+      width: 100% !important;
+      max-width: 100% !important;
+      box-sizing: border-box;
+    }
+    .filter-group { flex: 1 1 100% !important; min-width: 0 !important; }
+    .filters { flex-wrap: wrap !important; }
+
+    /* Any inline display:flex container must wrap rather than overflow.
+       Safe because wrapping never breaks layout — items just stack onto
+       the next row when there isn't room for them side-by-side. */
+    [style*="display:flex"], [style*="display: flex"] {
+      flex-wrap: wrap !important;
+      max-width: 100%;
+    }
+
+    /* Any inline display:grid container collapses to single column. */
+    [style*="display:grid"], [style*="display: grid"] {
+      grid-template-columns: 1fr !important;
+    }
   }
 
   @media (max-width: 640px) {
@@ -1125,6 +1169,10 @@
 
 <!-- Toast container -->
 <div id="toast"></div>
+
+<!-- Tiny build stamp so we can verify the mobile-layout fix has actually
+     reached the browser. If you don't see this, the deploy is stale. -->
+<div id="build-stamp" style="position:fixed;bottom:4px;right:6px;font-size:9px;color:var(--muted);opacity:.55;pointer-events:none;font-family:ui-monospace,monospace;z-index:5">v2026-05-27-mobile</div>
 
 <script>
 // -------------------------------------------------------------------------
@@ -4160,14 +4208,4 @@ async function loadToastSales() {
     return `<div style="border-top:1px solid var(--border);padding:10px 0">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
         <div style="font-weight:600">${escHtml(headerLabel)}</div>
-        <div style="color:var(--muted);font-size:12px">$${(b.total_gross || 0).toFixed(2)} gross &middot; ${b.item_count} items</div>
-      </div>
-      ${body}
-    </div>`;
-  }).join('');
-}
-
-</script>
-</body>
-</html>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+        <div s
