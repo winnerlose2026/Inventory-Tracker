@@ -176,16 +176,34 @@ def sync_all(clients: list[DistributorClient] | None = None,
 # Email scanning
 # ---------------------------------------------------------------------------
 
+# USF occasionally re-issues a PO with the literal revision token
+# "REPRINT" (an entire copy of the latest state, not a numbered rev).
+# In USF's workflow REPRINT is ALWAYS newer than any numbered revision
+# that preceded it -- so we sort it after every integer. Same treatment
+# for any other non-numeric token we might see in the future.
+_REPRINT_REV_SENTINEL = 10_000_000
+
+
 def _po_rev_int(s) -> int:
-    """Coerce a PO revision string (e.g. '0000002' or '2') to an int.
-    Returns 0 when the value is missing or non-numeric so older-than-any-
-    real-rev comparisons still work."""
+    """Coerce a PO revision string to an int suitable for ordering.
+
+    Integer strings ('0000002', '2', '17') round-trip to their int.
+    Non-numeric tokens (USF's 'REPRINT', any other free-form revision
+    label) sort AFTER any plausible numeric revision via a fixed
+    sentinel. Missing / empty strings are treated as rev 0 (older than
+    everything) so an unrevised PO doesn't accidentally outrank a real
+    revision.
+    """
     if not s:
         return 0
-    try:
-        return int(str(s).lstrip("0") or "0")
-    except (ValueError, TypeError):
+    raw = str(s).strip()
+    if not raw:
         return 0
+    try:
+        return int(raw.lstrip("0") or "0")
+    except (ValueError, TypeError):
+        # Non-numeric token (REPRINT etc.) — treat as latest.
+        return _REPRINT_REV_SENTINEL
 
 
 def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:
@@ -302,13 +320,26 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
     auto_eta = distributor in _AUTO_ETA_DISTRIBUTORS
 
     lead_days = _po_lead_days() if auto_eta else 0
-    try:
-        ordered_at_dt = datetime.fromisoformat(now)
-    except (TypeError, ValueError):
-        ordered_at_dt = datetime.now()
-    # ETA stays blank for the non-auto distributors; the Pending POs tab
-    # already renders "—" for empty eta and the rollover skips entries
-    # with no resolvable arrival date.
+    # Anchor ordered_at to the PO's actual order date (parsed from the
+    # PDF) rather than "now". When a backlogged PO is scanned weeks
+    # after it was placed, this lets the 30-day rollover into quantity
+    # track real lead time instead of restarting the clock at ingest.
+    # Falls back to `now` when the parser didn't surface a date.
+    po_date_iso = (getattr(evt, "po_order_date", "") or "").strip()
+    if po_date_iso:
+        try:
+            ordered_at_dt = datetime.fromisoformat(po_date_iso)
+        except ValueError:
+            ordered_at_dt = None
+    else:
+        ordered_at_dt = None
+    if ordered_at_dt is None:
+        try:
+            ordered_at_dt = datetime.fromisoformat(now)
+        except (TypeError, ValueError):
+            ordered_at_dt = datetime.now()
+    # ETA stays blank for non-auto-ETA distributors; the rollover skips
+    # entries with no resolvable arrival date.
     eta_iso = (ordered_at_dt + timedelta(days=lead_days)).isoformat() if auto_eta else ""
     pending = item.get("on_order") or []
     existing_qty = sum(float(p.get("qty") or 0) for p in pending)
@@ -539,8 +570,7 @@ def _apply_cw_pos(cw_pos: list,
 
         existing_rec = by_po.get(po_num)
         # Preserve operator-set fields on re-ingest: ship_date,
-        # arrival_date, and the ingested_at of the first booking. Drop
-        # everything else and replace from the freshly-parsed record.
+        # arrival_date, and the ingested_at of the first booking.
         ship_date    = ""
         arrival_date = ""
         first_ingest = now_iso
@@ -566,7 +596,6 @@ def _apply_cw_pos(cw_pos: list,
             report["added"] += 1
             change_kind = "added"
         else:
-            # Same po_number + same total_cs + same line count = unchanged.
             same = (
                 round(float(existing_rec.get("total_cs") or 0), 2)
                     == round(float(normalized.get("total_cs") or 0), 2)
@@ -594,8 +623,6 @@ def _apply_cw_pos(cw_pos: list,
         by_po[po_num] = normalized
 
     if not dry_run:
-        # Preserve any pre-existing CW POs that this batch didn't touch.
-        # `by_po` already contains both refreshed and untouched entries.
         try:
             save_chefs_warehouse_pos(list(by_po.values()))
         except Exception as exc:  # noqa: BLE001
@@ -662,6 +689,32 @@ def _apply_events(events: list,
     report["po_revisions_superseded"] = []
 
     for po_num, grp in po_groups.items():
+        # Collapse duplicate lines that arrived in the same scan. The
+        # scanner pulls from multiple mailboxes (JD@ and info@), and the
+        # same PO email is often delivered to both, so each line item
+        # appears twice. Dedupe by (variety, warehouse, distributor, qty)
+        # within the group — same item + same qty in the same PO means
+        # the scanner double-parsed it.
+        seen_lines: set[tuple] = set()
+        deduped_grp = []
+        for _evt in grp:
+            line_key = (
+                (_evt.item.variety or "").strip().lower(),
+                (_evt.item.warehouse or "").strip().lower(),
+                (_evt.item.distributor or "").strip().lower(),
+                round(float(_evt.item.quantity or 0), 4),
+            )
+            if line_key in seen_lines:
+                continue
+            seen_lines.add(line_key)
+            deduped_grp.append(_evt)
+        if len(deduped_grp) < len(grp):
+            report.setdefault("dedup_dropped", []).append(
+                f"PO {po_num}: collapsed {len(grp) - len(deduped_grp)} "
+                f"duplicate line(s) within the scan batch."
+            )
+        grp = deduped_grp
+
         # All events in a group share the same revision; take it from the
         # first one. Fall back to "" if the parser didn't set it.
         new_rev = getattr(grp[0], "po_revision", "") or ""
@@ -777,4 +830,33 @@ def _print_report(reports: list[dict], dry_run: bool):
             print(f"      - {u}")
         for c in r["changes"][:20]:
             sign = "+" if c["delta"] >= 0 else ""
-   
+            print(f"      {c['name']:<48} {c['old_quantity']:>7.1f} -> "
+                  f"{c['new_quantity']:>7.1f}  ({sign}{c['delta']})")
+        if len(r["changes"]) > 20:
+            print(f"      ... and {len(r['changes']) - 20} more")
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    only_cheney = "--cheney" in args
+    only_usfoods = "--usfoods" in args
+    only_email = "--email" in args
+
+    reports: list[dict] = []
+
+    if only_email:
+        reports.append(scan_email(dry_run=dry_run))
+    else:
+        clients: list[DistributorClient] = []
+        if only_cheney or not only_usfoods:
+            clients.append(CheneyBrothersClient())
+        if only_usfoods or not only_cheney:
+            clients.append(USFoodsClient())
+        seen = set()
+        clients = [c for c in clients if not (c.name in seen or seen.add(c.name))]
+        reports.extend(sync_all(clients, dry_run=dry_run))
+        # Always offer email as an optional pass; it's silent when unconfigured.
+        if "--with-email" in args:
+            report

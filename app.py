@@ -2846,4 +2846,21 @@ def api_export_xlsx():
 
     wb = Workbook()
     _write_summary_sheet(wb.active, inv)
-  
+    wb.active.title = "Summary"
+    _write_items_sheet(wb.create_sheet("Unified List"), items)
+    _write_items_sheet(wb.create_sheet("Cheney Brothers"), cheney)
+    _write_items_sheet(wb.create_sheet("US Foods"), usfoods)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="bagel_inventory.xlsx",
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
