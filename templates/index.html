@@ -37,9 +37,12 @@
     --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
   html, body { max-width: 100%; overflow-x: hidden; }
-  body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 15px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
-  /* Nothing inside the app should push the document wider than the viewport. */
-  img, svg, table { max-width: 100%; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 16px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  /* Images and SVGs cap at viewport width so they can't push the document
+     sideways. Tables intentionally aren't constrained here — they sit inside
+     a card that swipe-scrolls horizontally, which keeps long rows readable
+     instead of crushing them into unreadable wrapped text. */
+  img, svg { max-width: 100%; }
 
   /* Layout — single column, sticky top header + content scrolls below */
   .app { display: flex; flex-direction: column; min-height: 100vh; }
@@ -378,9 +381,13 @@
     .card-header { flex-wrap: wrap; gap: 10px; }
     .btn-group   { flex-wrap: wrap; }
 
-    /* Smaller display type on tablets */
-    h1 { font-size: 26px; }
-    .stat-value { font-size: 26px; }
+    /* Display type sized for legibility on mobile. Headers stay on one
+       line — every page title in this app is a single word or short
+       phrase ("Dashboard", "Inventory", "Daily Production"...) that
+       comfortably fits a 412px viewport at 28px. */
+    h1 { font-size: 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stat-value { font-size: 30px; }
+    .stat-label { font-size: 12px; }
 
     /* Page header stacks: title on top, button row underneath but full-width. */
     .page-header { align-items: stretch; }
@@ -392,31 +399,37 @@
     .filter-group select,
     .filter-group input { width: 100% !important; }
 
-    /* No horizontal scroll, anywhere. Every card / table contains itself
-       inside the viewport and wraps cell content vertically instead of
-       pushing the page wider. The inv-table's table-layout: fixed and the
-       per-warehouse <colgroup> percentages get neutralized here so a long
-       SKU name wraps onto two lines instead of forcing a 720px row. */
+    /* The PAGE never scrolls horizontally — but individual cards CAN
+       swipe-scroll their wide tables. This trades ugly word-break-mid-word
+       wrapping for the familiar "drag the table left/right inside its
+       card" pattern. Headers, SKU names, lot codes etc. all stay on one
+       line and at a legible font.
+
+       (Removed: word-break:break-word, white-space:normal, width:100% on
+       tables, and the colgroup/col display:none — those forced tables to
+       compress and produced unreadable column layouts.) */
     .main { padding-left: 14px; padding-right: 14px; overflow-x: hidden; }
-    .card { overflow-x: hidden; max-width: 100%; }
-    .card > *, .card > div > * { max-width: 100%; }
+    .card { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
     table, .inv-table {
+      /* Let the table size to its natural content. table-layout: auto
+         widens cells to fit, which combined with white-space:nowrap on
+         cells means every column is exactly as wide as its longest value. */
       table-layout: auto !important;
-      min-width: 0 !important;
-      width: 100% !important;
-      max-width: 100% !important;
+      width: auto;
+      min-width: 100%;
+      max-width: none;
     }
-    /* The Inventory tab's JS injects <colgroup><col style="width:24%">...</col>
-       inside every per-warehouse table. Those percentage widths combined
-       with table-layout:fixed used to make the row wider than the viewport.
-       Neutralize both the colgroup and its child <col> elements. */
-    table colgroup, .inv-table colgroup { display: none !important; }
-    table col, .inv-table col { width: auto !important; }
-    th, td { word-break: break-word; white-space: normal; max-width: 100%; }
+    th, td {
+      white-space: nowrap;
+      word-break: normal;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    th { font-size: 12px; }
+    /* Action cells already shipped white-space:nowrap; keep that. */
     .actions-col, td.actions-col, .inv-table td.actions-col {
-      white-space: normal;
+      white-space: nowrap;
     }
-    .actions-col .btn-group { flex-wrap: wrap; }
 
     /* Defeat inline width="…px" on selects/inputs that were sized for
        desktop filter rows. Important so this beats the inline style attr. */
@@ -482,51 +495,40 @@
   }
 
   @media (max-width: 640px) {
-    body { font-size: 15px; }
-    .main { padding: 14px 10px; }
+    body { font-size: 16px; }
+    .main { padding: 14px 12px; }
 
-    /* Headings */
-    h1 { font-size: 22px; line-height: 1.15; }
-    .subtitle { margin-bottom: 16px; font-size: 14px; }
+    /* Headings — h1 stays on a single line (all our page titles are short) */
+    h1 { font-size: 26px; line-height: 1.15; }
+    .subtitle { margin-bottom: 16px; font-size: 14px; line-height: 1.45; }
 
     /* Stat tiles: 2-up by default on phones for compact overview */
     .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
     .stat-card { padding: 14px 16px; }
-    .stat-value { font-size: 22px; }
-    .stat-label { font-size: 11px; }
+    .stat-value { font-size: 26px; }
+    .stat-label { font-size: 12px; }
 
-    /* Card chrome */
-    .card { border-radius: 10px; margin-bottom: 16px; overflow-x: hidden; }
+    /* Card chrome — cards swipe-scroll horizontally if their table is wider
+       than the viewport (set up at the 1023px breakpoint). */
+    .card { border-radius: 10px; margin-bottom: 16px; }
     .card-header { padding: 12px 14px; }
-    .card-title { font-size: 15px; }
+    .card-title { font-size: 16px; }
 
-    /* Tables wrap content into the available width instead of scrolling right */
-    .card > table,
-    .card > div > table,
-    .card > div > div > table {
-      display: table;
-      width: 100%;
-      min-width: 0;
-      table-layout: auto;
-      white-space: normal;
-    }
-    table { word-break: break-word; }
-    th, td { padding: 8px 8px; font-size: 13px; }
-    th { font-size: 11px; }
-    .sku { font-size: 12px; }
-    /* Inventory sub-tables shouldn't force horizontal scroll either */
-    .inv-table { table-layout: auto; min-width: 0; }
-    .inv-table th, .inv-table td { white-space: normal; }
+    /* Table cells stay on a single line at a legible size; column widths
+       come from the natural width of the content. */
+    th, td { padding: 9px 12px; font-size: 14px; white-space: nowrap; }
+    th { font-size: 12px; }
+    .sku { font-size: 13px; }
 
-    /* Buttons sized for fingers */
-    .btn       { padding: 10px 14px; font-size: 13px; min-height: 40px; }
-    .btn-sm    { padding: 6px 10px;  font-size: 12px; min-height: 32px; }
+    /* Buttons sized for fingers, at a legible size */
+    .btn       { padding: 11px 16px; font-size: 14px; min-height: 44px; }
+    .btn-sm    { padding: 7px 12px;  font-size: 13px; min-height: 34px; }
     .btn-group { gap: 6px; }
 
     /* Forms / modal */
     .modal { width: 100%; max-width: calc(100vw - 24px); padding: 18px; border-radius: 12px; }
     .form-grid { gap: 10px; }
-    input, select, textarea { font-size: 14px; padding: 10px 12px; } /* 14px stops iOS zoom on focus */
+    input, select, textarea { font-size: 16px; padding: 11px 13px; } /* 16px stops iOS zoom on focus */
 
     /* PLH nav row: wrap so the window label drops below the buttons */
     .plh-nav-row { flex-wrap: wrap; }
@@ -561,22 +563,28 @@
 
   /* Narrow phones — tighten padding, keep tabs finger-friendly */
   @media (max-width: 480px) {
-    body { font-size: 15px; }
+    body { font-size: 16px; }
     .main { padding: 14px 10px; }
-    h1 { font-size: 20px; }
+    h1 { font-size: 24px; }
+    .subtitle { font-size: 14px; }
     .stat-grid { gap: 8px; }
     .stat-card { padding: 12px 14px; }
-    .stat-value { font-size: 20px; }
+    .stat-value { font-size: 24px; }
+    .stat-label { font-size: 11px; }
     .nav-item {
       padding: 12px 14px;
       font-size: 14px;
       min-height: 48px;
     }
     .nav-icon { font-size: 18px; }
-    th, td { padding: 8px 6px; font-size: 13px; }
-    /* Card header summaries wrap onto a second line instead of overflowing */
-    .card-header span:last-child { font-size: 12px; line-height: 1.5; }
-    .btn { padding: 10px 14px; font-size: 13px; }
+    /* Cells stay on a single line — the card swipe-scrolls horizontally
+       if the table is wider than the viewport. */
+    th, td { padding: 9px 10px; font-size: 14px; white-space: nowrap; }
+    th { font-size: 12px; }
+    /* Card header summaries (the inline status text on the right) wrap to
+       a second line rather than getting cut off. */
+    .card-header span:last-child { font-size: 13px; line-height: 1.5; }
+    .btn { padding: 10px 14px; font-size: 14px; min-height: 42px; }
     .btn-group { gap: 6px; }
   }
 </style>
@@ -4164,4 +4172,4 @@ async function loadToastSales() {
 </script>
 </body>
 </html>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
