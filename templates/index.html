@@ -36,14 +36,35 @@
     --font-display: 'Libre Caslon Text', Georgia, 'Times New Roman', serif;
     --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
-  body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 14px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font-body); font-size: 15px; min-height: 100vh; -webkit-font-smoothing: antialiased; }
 
-  /* Layout */
-  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
-  .sidebar { background: var(--surface); border-right: 1px solid var(--border); padding: 28px 0 24px; display: flex; flex-direction: column; }
-  .sidebar-logo { padding: 4px 22px 22px; border-bottom: 1px solid var(--border); margin-bottom: 12px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; }
-  .sidebar-logo svg { width: 96px; height: auto; display: block; }
-  .sidebar-logo .wordmark { font-family: var(--font-display); font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; line-height: 1; }
+  /* Layout — single column, sticky top header + content scrolls below */
+  .app { display: flex; flex-direction: column; min-height: 100vh; }
+  .sidebar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    box-shadow: 0 2px 8px rgba(5,23,71,.05);
+  }
+  .sidebar-logo {
+    padding: 10px 18px;
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+    margin: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .sidebar-logo svg { width: 48px; height: auto; display: block; }
+  .sidebar-logo .wordmark { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--accent); letter-spacing: .12em; text-transform: uppercase; line-height: 1; }
     th.sortable { cursor: pointer; user-select: none; position: relative; }
   th.sortable:hover { color: var(--accent); }
   th.sortable .sort-ind { display: inline-block; width: 10px; text-align: center; color: var(--muted); font-size: 11px; }
@@ -51,11 +72,33 @@
   th.sortable.sort-desc .sort-ind::after { content: '\25BC'; color: var(--accent); }
   .ship-date-input { width: 140px; padding: 4px 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 12px; }
   .btn-sm.active { background: var(--accent); color: white; }
-  .nav-item { display: flex; align-items: center; gap: 10px; padding: 11px 22px; cursor: pointer; color: var(--muted); transition: all .15s; border-left: 3px solid transparent; font-weight: 500; }
+  .sidebar nav {
+    display: flex;
+    flex-direction: row;
+    flex: 1;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px 18px;
+    cursor: pointer;
+    color: var(--muted);
+    transition: all .15s;
+    border-left: none;
+    border-bottom: 3px solid transparent;
+    font-weight: 500;
+    font-size: 14px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
   .nav-item:hover { color: var(--text); background: var(--surface2); }
-  .nav-item.active { color: var(--accent); background: var(--surface2); border-left-color: var(--accent2); font-weight: 600; }
-  .nav-icon { font-size: 16px; width: 20px; text-align: center; }
-  .main { padding: 32px 36px; overflow-y: auto; }
+  .nav-item.active { color: var(--accent); background: var(--surface2); border-bottom-color: var(--accent2); font-weight: 600; }
+  .nav-icon { font-size: 18px; width: 20px; text-align: center; }
+  .main { padding: 28px 32px; overflow-y: auto; overflow-x: hidden; }
   .page { display: none; }
   .page.active { display: block; }
   h1 { font-family: var(--font-display); font-size: 32px; font-weight: 700; letter-spacing: -.005em; line-height: 1.1; margin-bottom: 6px; color: var(--accent); }
@@ -165,14 +208,24 @@
 
   .actions-col { white-space: nowrap; }
 
-  /* Admin token panel (sidebar footer) */
-  .sidebar-footer { margin-top: auto; padding: 16px 22px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
-  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; font-weight: 500; }
+  /* Admin token panel — inline on the right side of the top header */
+  .sidebar-footer {
+    margin: 0;
+    padding: 0 16px;
+    border-top: none;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .token-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; font-weight: 500; white-space: nowrap; }
   .token-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
   .token-dot.ok { background: var(--green); }
   .token-dot.missing { background: var(--red); }
   .token-actions { display: flex; gap: 6px; }
-  .token-actions .btn { flex: 1; padding: 5px 10px; font-size: 10px; }
+  .token-actions .btn { padding: 6px 12px; font-size: 11px; }
 
   .pager-row {
     padding: 10px 20px;
@@ -238,28 +291,29 @@
   .card > div:has(> table) { overflow-x: auto; }
 
   @media (max-width: 1023px) {
-    /* Sidebar becomes a top strip; main fills the rest. */
-    .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    /* Header stacks vertically: logo row on top, scrollable tab row below. */
     .sidebar {
       flex-direction: column;
       border-right: none;
       border-bottom: 1px solid var(--border);
-      padding: 14px 0 4px;
+      padding: 0;
     }
     .sidebar-logo {
-      padding: 0 16px 12px;
+      padding: 10px 14px;
       flex-direction: row;
       gap: 12px;
-      justify-content: flex-start;
+      justify-content: space-between;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
     }
-    .sidebar-logo svg { width: 44px; height: auto; }
+    .sidebar-logo svg { width: 40px; height: auto; }
     .sidebar-logo .wordmark { font-size: 13px; }
     .sidebar nav {
       display: flex;
       flex-direction: row;
       overflow-x: auto;
-      gap: 4px;
-      padding: 0 12px 8px;
+      gap: 0;
+      padding: 0;
       scrollbar-width: thin;
     }
     .sidebar nav::-webkit-scrollbar { height: 6px; }
@@ -268,7 +322,10 @@
       border-left: none;
       border-bottom: 3px solid transparent;
       white-space: nowrap;
-      padding: 8px 14px;
+      padding: 14px 16px;
+      font-size: 15px;
+      font-weight: 600;
+      min-height: 52px;
       flex-shrink: 0;
     }
     .nav-item.active {
@@ -278,10 +335,11 @@
     .sidebar-footer {
       flex-direction: row;
       align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 8px 16px 12px;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 6px 14px;
       border-top: 1px solid var(--border);
+      border-left: none;
     }
     .main { padding: 20px 16px; }
 
@@ -310,32 +368,45 @@
   }
 
   @media (max-width: 640px) {
-    body { font-size: 13px; }
+    body { font-size: 15px; }
     .main { padding: 14px 10px; }
 
     /* Headings */
     h1 { font-size: 22px; line-height: 1.15; }
-    .subtitle { margin-bottom: 16px; font-size: 12px; }
+    .subtitle { margin-bottom: 16px; font-size: 14px; }
 
-    /* Stat tiles: full-width, less padding */
-    .stat-grid { grid-template-columns: 1fr; gap: 10px; margin-bottom: 16px; }
+    /* Stat tiles: 2-up by default on phones for compact overview */
+    .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
     .stat-card { padding: 14px 16px; }
     .stat-value { font-size: 22px; }
-    .stat-label { font-size: 10px; }
+    .stat-label { font-size: 11px; }
 
     /* Card chrome */
-    .card { border-radius: 10px; margin-bottom: 16px; }
+    .card { border-radius: 10px; margin-bottom: 16px; overflow-x: hidden; }
     .card-header { padding: 12px 14px; }
-    .card-title { font-size: 14px; }
+    .card-title { font-size: 15px; }
 
-    /* Tables -- scroll horizontally when too wide instead of overflowing. */
+    /* Tables wrap content into the available width instead of scrolling right */
     .card > table,
-    .card > div > table { display: block; overflow-x: auto; white-space: nowrap; }
-    th, td { padding: 8px 10px; font-size: 12px; }
+    .card > div > table,
+    .card > div > div > table {
+      display: table;
+      width: 100%;
+      min-width: 0;
+      table-layout: auto;
+      white-space: normal;
+    }
+    table { word-break: break-word; }
+    th, td { padding: 8px 8px; font-size: 13px; }
+    th { font-size: 11px; }
+    .sku { font-size: 12px; }
+    /* Inventory sub-tables shouldn't force horizontal scroll either */
+    .inv-table { table-layout: auto; min-width: 0; }
+    .inv-table th, .inv-table td { white-space: normal; }
 
-    /* Buttons shrink slightly */
-    .btn       { padding: 8px 14px; font-size: 12px; }
-    .btn-sm    { padding: 4px 9px;  font-size: 10px; }
+    /* Buttons sized for fingers */
+    .btn       { padding: 10px 14px; font-size: 13px; min-height: 40px; }
+    .btn-sm    { padding: 6px 10px;  font-size: 12px; min-height: 32px; }
     .btn-group { gap: 6px; }
 
     /* Forms / modal */
@@ -373,190 +444,25 @@
     .pager-row > div { width: 100%; justify-content: flex-start; }
   }
     @keyframes spin { to { transform: rotate(360deg); } }
-  
-  /* =====================================================================
-     Responsive layout — three breakpoints:
-       1024px and below : narrow tablet / small laptop. Sidebar shrinks,
-                          tables get horizontal scroll, page header stacks.
-        768px and below : portrait tablet / large phone. Sidebar collapses
-                          to a fixed BOTTOM TAB BAR with icon-first nav and
-                          44px+ touch targets. Base font goes to 15px.
-        480px and below : phones. Tighter padding, 2-col stat grid, nav
-                          tab labels truncate to keep all 7 tabs in view.
-     ===================================================================== */
 
-  /* Tablet — keep the sidebar, but shrink everything */
-  @media (max-width: 1024px) {
-    .app { grid-template-columns: 200px 1fr; }
-    .main { padding: 24px 22px; }
-    .stat-grid { grid-template-columns: repeat(2, 1fr); }
-    .report-grid { grid-template-columns: 1fr; }
-    /* Let wide tables scroll horizontally inside their containing card */
-    .card { overflow-x: auto; }
-    /* The page header (h1 + btn-group) stacks instead of side-by-side */
-    .page > div:first-child[style*="space-between"] {
-      flex-direction: column;
-      align-items: stretch !important;
-      gap: 14px;
-    }
-    .page > div:first-child[style*="space-between"] .btn-group {
-      flex-wrap: wrap;
-    }
-    .nav-icon { font-size: 18px; }
-    .nav-item { padding: 12px 18px; }
-  }
-
-  /* Phone & portrait tablet — bottom tab bar, big touch targets */
-  @media (max-width: 768px) {
-    body { font-size: 15px; }
-
-    /* Switch the app shell from sidebar+main to main+bottom-bar */
-    .app {
-      grid-template-columns: 1fr;
-      grid-template-rows: 1fr auto;
-    }
-    .sidebar {
-      position: fixed;
-      bottom: 0; left: 0; right: 0;
-      width: 100%;
-      flex-direction: row;
-      border-right: none;
-      border-top: 1px solid var(--border);
-      padding: 0;
-      z-index: 50;
-      box-shadow: 0 -4px 18px rgba(5,23,71,.08);
-      background: var(--surface);
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-    .sidebar-logo { display: none; }
-    .sidebar-footer {
-      /* Move the admin-token panel to a compact floating button on phones */
-      position: fixed;
-      top: 12px; right: 12px;
-      margin: 0; padding: 0;
-      border-top: none;
-      background: transparent;
-      z-index: 60;
-    }
-    .sidebar-footer .token-status { display: none; }
-    .sidebar-footer .token-actions { gap: 4px; }
-    .sidebar-footer .btn {
-      font-size: 11px; padding: 7px 10px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      box-shadow: 0 2px 8px rgba(5,23,71,.08);
-    }
-    .sidebar nav {
-      display: flex;
-      flex: 1;
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-    .nav-item {
-      flex: 1 0 auto;
-      flex-direction: column;
-      gap: 3px;
-      padding: 8px 10px 7px;
-      min-height: 60px;
-      min-width: 70px;
-      border-left: none;
-      border-top: 3px solid transparent;
-      font-size: 11px;
-      font-weight: 600;
-      text-align: center;
-      justify-content: center;
-      line-height: 1.15;
-    }
-    .nav-item.active {
-      border-left-color: transparent;
-      border-top-color: var(--accent2);
-      background: var(--surface2);
-    }
-    .nav-icon { font-size: 22px; width: auto; }
-
-    /* Main content area: account for the 60px bottom tab bar */
-    .main { padding: 20px 16px 84px; }
-
-    /* Bigger, thumb-friendly page titles + button rows */
-    h1 { font-size: 24px; }
-    .subtitle { font-size: 13px; margin-bottom: 18px; }
-    .page > div:first-child[style*="space-between"] {
-      flex-direction: column;
-      align-items: stretch !important;
-      gap: 12px;
-    }
-    .btn-group { flex-wrap: wrap; gap: 8px; }
-    .btn {
-      padding: 11px 16px;
-      font-size: 13px;
-      min-height: 44px;   /* Apple HIG touch-target minimum */
-    }
-    .btn-sm { padding: 8px 12px; font-size: 12px; min-height: 36px; }
-
-    /* Stat cards: 2-up on phones, with smaller hero numbers */
-    .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px; }
-    .stat-card { padding: 14px 16px; }
-    .stat-value { font-size: 24px; }
-    .stat-label { font-size: 10px; }
-
-    /* Tables — overflow-x lets them scroll horizontally inside their card. */
-    .card { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    .card > table, .card > div > table, .card > div > div > table {
-      min-width: 600px;   /* widest narrow-phone forces horizontal scroll vs squish */
-    }
-    th, td { padding: 10px 12px; font-size: 13px; }
-    th { font-size: 10px; }
-
-    /* The inventory page rolls warehouses into per-warehouse sub-tables
-       wrapped in flex layouts. Keep them scrollable too. */
-    .inv-table { min-width: 720px; }
-
-    /* Filter rows (Pending POs, Daily Production, etc.) stack vertically */
-    .filters { display: flex; flex-direction: column; gap: 10px !important; }
-    .filter-group { width: 100%; }
-    .filter-group select,
-    .filter-group input { width: 100% !important; min-width: 0 !important; }
-
-    /* Modals go almost-full-screen */
-    .modal {
-      width: calc(100% - 24px);
-      max-width: 480px;
-      padding: 22px 20px;
-      max-height: 88vh;
-    }
-    .form-grid { grid-template-columns: 1fr; gap: 12px; }
-
-    /* Toast doesn't crowd the bottom tab bar */
-    #toast { bottom: 76px; right: 12px; left: 12px; }
-    .toast-msg { max-width: 100%; }
-
-    /* Card headers wrap so the inline summary doesn't overflow */
-    .card-header { flex-wrap: wrap; gap: 8px; padding: 14px 16px; }
-
-    /* Ship-date input was 140px hardcoded — let it shrink */
-    .ship-date-input { width: 100%; max-width: 160px; }
-  }
-
-  /* Small phones (iPhone SE class, narrow Android) */
+  /* Narrow phones — tighten padding, keep tabs finger-friendly */
   @media (max-width: 480px) {
-    .main { padding: 16px 12px 84px; }
+    body { font-size: 15px; }
+    .main { padding: 14px 10px; }
     h1 { font-size: 20px; }
     .stat-grid { gap: 8px; }
     .stat-card { padding: 12px 14px; }
-    .stat-value { font-size: 22px; }
+    .stat-value { font-size: 20px; }
     .nav-item {
-      padding: 8px 4px 6px;
-      min-width: 56px;
-      font-size: 10px;
+      padding: 12px 14px;
+      font-size: 14px;
+      min-height: 48px;
     }
-    .nav-icon { font-size: 20px; }
-    /* Card header summaries (e.g. "12 SKU(s) · 4 warehouses ·...") wrap
-       into two lines instead of running off the screen */
-    .card-header span:last-child { font-size: 11px; line-height: 1.5; }
-    /* Tighter buttons on small phones */
-    .btn { padding: 10px 14px; font-size: 12px; }
+    .nav-icon { font-size: 18px; }
+    th, td { padding: 8px 6px; font-size: 13px; }
+    /* Card header summaries wrap onto a second line instead of overflowing */
+    .card-header span:last-child { font-size: 12px; line-height: 1.5; }
+    .btn { padding: 10px 14px; font-size: 13px; }
     .btn-group { gap: 6px; }
   }
 </style>
@@ -4212,3 +4118,4 @@ async function loadToastSales() {
 </script>
 </body>
 </html>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
