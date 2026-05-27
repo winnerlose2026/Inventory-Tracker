@@ -664,7 +664,9 @@ def restock(name: str, amount: float, note: str = ""):
     inv[key]["updated"] = datetime.now().isoformat()
     save_inventory(inv)
     _record_usage(key, inv[key]["name"], -amount, inv[key]["unit"],
-                  note or f"Restocked +{amount}")
+                  note or f"Restocked +{amount}",
+                  warehouse=inv[key].get("warehouse", ""),
+                  variety=_variety_from_name(inv[key].get("name", "")))
     print(f"  Restocked '{name}' by {amount} {inv[key]['unit']}. "
           f"New total: {inv[key]['quantity']}")
 
@@ -683,7 +685,9 @@ def record_usage(name: str, amount: float, note: str = ""):
     item["quantity"] -= amount
     item["updated"] = datetime.now().isoformat()
     save_inventory(inv)
-    _record_usage(key, item["name"], amount, item["unit"], note)
+    _record_usage(key, item["name"], amount, item["unit"], note,
+                  warehouse=item.get("warehouse", ""),
+                  variety=_variety_from_name(item.get("name", "")))
     print(f"  Used {amount} {item['unit']} of '{name}'. "
           f"Remaining: {item['quantity']}")
     if item["quantity"] <= item["low_stock_threshold"]:
@@ -691,17 +695,43 @@ def record_usage(name: str, amount: float, note: str = ""):
               f"({item['low_stock_threshold']} {item['unit']}) ***")
 
 
+def _variety_from_name(name: str) -> str:
+    """Pull the variety prefix out of a SKU name.
+
+    SKU names look like ``"Plain Bagel 4oz [CB - Ocala]"`` — the variety is
+    the chunk before the literal ``" Bagel"``. Mirrors the front-end split
+    in ``templates/index.html`` so the lot-map pair keys line up.
+    """
+    if not name:
+        return ""
+    return name.split(" Bagel")[0].strip()
+
+
 def _record_usage(key: str, display_name: str, amount: float,
-                  unit: str, note: str):
+                  unit: str, note: str,
+                  warehouse: str = "", variety: str = ""):
+    """Append one entry to the usage ledger.
+
+    ``warehouse`` and ``variety`` are stamped onto each new entry (when the
+    caller supplies them) so that FIFO lot accounting can attribute the
+    consumption to a (warehouse, variety) pair without parsing the display
+    name. Older entries that pre-date this stamping fall back to a lookup
+    on the inventory item; see :func:`compute_lot_fifo_state`.
+    """
     usage = load_usage()
-    usage.append({
+    entry = {
         "item_key": key,
         "item_name": display_name,
         "amount": amount,      # positive = consumed, negative = restocked
         "unit": unit,
         "note": note,
         "timestamp": datetime.now().isoformat(),
-    })
+    }
+    if warehouse:
+        entry["warehouse"] = warehouse
+    if variety:
+        entry["variety"] = variety
+    usage.append(entry)
     save_usage(usage)
 
 
@@ -779,6 +809,113 @@ def reverse_usage(timestamp: str) -> dict:
         "new_quantity": item["quantity"],
         "reversed_amount": amount,
     }
+
+
+def compute_lot_fifo_state(warehouse: str, variety: str,
+                           production_records: Optional[list] = None,
+                           usage_records: Optional[list] = None,
+                           inventory_snapshot: Optional[dict] = None) -> list:
+    """Compute FIFO lot state for a single ``(warehouse, variety)`` pair.
+
+    Rule (system-wide): **consume oldest first**. Cumulative consumption for
+    the pair is drawn down against the lots ordered by ``production_date``
+    ascending, ties broken by ``received_at`` then ``lot``. The oldest lot
+    is exhausted before any newer lot contributes anything.
+
+    Returns a list of dicts ordered oldest-first::
+
+        [{
+          "lot":              "...",
+          "po_number":        "...",
+          "production_date":  "YYYY-MM-DD",
+          "received_at":      "YYYY-MM-DDTHH:MM:SS",
+          "cs_produced":      56,
+          "cs_consumed":      56,
+          "cs_remaining":     0,
+          "is_active":        False,   # True when cs_remaining > 0
+          "is_next_out":      False,   # True only on the oldest active lot
+        }, ...]
+
+    Restock entries (``amount < 0``) and reversal entries are skipped —
+    restocks come in as fresh production lots, not as add-backs to existing
+    lots. Older usage entries that don't carry ``warehouse``/``variety``
+    fall back to a lookup on the inventory item via ``item_key``.
+    """
+    if production_records is None:
+        production_records = load_production()
+    if usage_records is None:
+        usage_records = load_usage()
+
+    # 1. Collect every lot for this (warehouse, variety) pair.
+    lots: list = []
+    for r in production_records:
+        if (r.get("warehouse") or "") != warehouse:
+            continue
+        for L in r.get("lines", []):
+            if (L.get("variety") or "") != variety:
+                continue
+            lot = (L.get("lot_number") or "").strip()
+            if not lot:
+                continue
+            lots.append({
+                "lot":             lot,
+                "cs_produced":     int(L.get("cs_count") or 0),
+                "production_date": r.get("production_date") or "",
+                "received_at":     r.get("received_at") or "",
+                "po_number":       r.get("po_number") or "",
+            })
+
+    # 2. Oldest-first sort. Empty production_date sinks to the top (treated
+    #    as "unknown/early") so we don't accidentally hold those lots back.
+    lots.sort(key=lambda L: (L["production_date"] or "0000-00-00",
+                             L["received_at"] or "",
+                             L["lot"]))
+
+    # 3. Sum positive consumption for this pair from the usage ledger.
+    inv_for_lookup = None
+    total_consumed = 0.0
+    for e in usage_records:
+        if e.get("reversed"):
+            continue
+        if e.get("source") == "reversal":
+            continue
+        amt = float(e.get("amount") or 0)
+        if amt <= 0:
+            continue  # restocks come in as their own lots, not draw-downs.
+        e_wh = e.get("warehouse") or ""
+        e_var = e.get("variety") or ""
+        if not e_wh or not e_var:
+            # Legacy entry without stamped pair: derive from inventory.
+            if inv_for_lookup is None:
+                inv_for_lookup = (inventory_snapshot
+                                  if inventory_snapshot is not None
+                                  else load_inventory())
+            it = inv_for_lookup.get(e.get("item_key") or "") or {}
+            e_wh = e_wh or it.get("warehouse", "")
+            e_var = e_var or _variety_from_name(
+                it.get("name") or e.get("item_name") or "")
+        if e_wh != warehouse or e_var != variety:
+            continue
+        total_consumed += amt
+
+    # 4. Walk oldest-first, drain FIFO.
+    remaining = total_consumed
+    next_out_marked = False
+    for L in lots:
+        if remaining <= 0:
+            L["cs_consumed"] = 0
+        elif remaining >= L["cs_produced"]:
+            L["cs_consumed"] = L["cs_produced"]
+            remaining -= L["cs_produced"]
+        else:
+            L["cs_consumed"] = remaining
+            remaining = 0
+        L["cs_remaining"] = L["cs_produced"] - L["cs_consumed"]
+        L["is_active"] = L["cs_remaining"] > 0
+        L["is_next_out"] = bool(L["is_active"] and not next_out_marked)
+        if L["is_next_out"]:
+            next_out_marked = True
+    return lots
 
 
 def remove_item(name: str):

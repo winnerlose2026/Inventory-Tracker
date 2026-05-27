@@ -559,23 +559,34 @@ def api_production_list():
 
 @app.route("/api/production/lots-by-pair")
 def api_production_lots_by_pair():
-    """Lot-level breakdown grouped by (warehouse, variety).
+    """Lot-level breakdown grouped by (warehouse, variety) with FIFO state.
 
     Returns a dict keyed by ``"<warehouse>|<variety>"`` whose values are
-    lists of ``{lot, cs, production_date, po_number, received_at}``
-    sorted newest first. The Distributors tab uses this to render an
-    expand-on-click lot breakdown beneath each SKU row.
+    **oldest-first** lists of:
+
+        {lot, cs, cs_produced, cs_consumed, cs_remaining,
+         is_active, is_next_out,
+         production_date, po_number, received_at}
+
+    The FIFO rule (consume earliest lot first) is computed centrally in
+    ``compute_lot_fifo_state``; this endpoint just enumerates the pairs and
+    delegates so the front-end and any future server-side consumers see the
+    same numbers. ``cs`` is preserved as an alias for ``cs_produced`` for
+    backward compatibility with older JS revisions.
     """
-    from inventory_tracker import load_production
+    from inventory_tracker import (
+        load_production, load_usage, load_inventory, compute_lot_fifo_state,
+    )
     records = load_production()
-    out: dict = {}
+    usage = load_usage()
+    inv_snapshot = load_inventory()
+
+    # Discover all distinct (warehouse, variety) pairs we have lots for.
+    pairs: set = set()
     for r in records:
         wh = r.get("warehouse") or ""
         if not wh:
             continue
-        pd = r.get("production_date") or ""
-        po = r.get("po_number") or ""
-        recv = r.get("received_at") or ""
         for L in r.get("lines", []):
             lot = (L.get("lot_number") or "").strip()
             if not lot:
@@ -583,19 +594,21 @@ def api_production_lots_by_pair():
             variety = L.get("variety") or ""
             if not variety:
                 continue
-            key = f"{wh}|{variety}"
-            out.setdefault(key, []).append({
-                "lot":             lot,
-                "cs":              L.get("cs_count") or 0,
-                "production_date": pd,
-                "po_number":       po,
-                "received_at":     recv,
-            })
-    # Sort each pair newest-first by production_date, then received_at.
-    for k in out:
-        out[k].sort(key=lambda e: (e.get("production_date") or "",
-                                    e.get("received_at") or ""),
-                    reverse=True)
+            pairs.add((wh, variety))
+
+    out: dict = {}
+    for (wh, variety) in pairs:
+        lots = compute_lot_fifo_state(
+            wh, variety,
+            production_records=records,
+            usage_records=usage,
+            inventory_snapshot=inv_snapshot,
+        )
+        # Surface cs as an alias for cs_produced so any older client that
+        # still reads L.cs keeps working until it is redeployed.
+        for L in lots:
+            L["cs"] = L["cs_produced"]
+        out[f"{wh}|{variety}"] = lots
     return jsonify(out)
 
 

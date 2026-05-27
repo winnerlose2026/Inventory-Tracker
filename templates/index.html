@@ -660,7 +660,7 @@
       <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Inventory</h1>
-          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU.</p>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first.</p>
         </div>
         <div class="btn-group">
           <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
@@ -1559,7 +1559,12 @@ async function loadInventory() {
                   const variety = (i.name || '').split(' Bagel')[0];
                   const pairKey = `${w.warehouse}|${variety}`;
                   const lots = (window._lotMapByPair && window._lotMapByPair[pairKey]) || [];
-                  const lotCs = lots.reduce((s, L) => s + (L.cs || 0), 0);
+                  // Lots come back from the API oldest-first with cs_produced
+                  // / cs_remaining already FIFO-applied. Fall back to L.cs if
+                  // we're talking to an older server that hasn't redeployed.
+                  const lotCs = lots.reduce((s, L) => s + (L.cs_produced ?? L.cs ?? 0), 0);
+                  const lotRemainingCs = lots.reduce((s, L) => s + (L.cs_remaining ?? L.cs ?? 0), 0);
+                  const activeLotCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
                   const hasLots = lots.length > 0;
                   const rowId = 'lots-' + Math.random().toString(36).slice(2, 10);
                   const chevron = hasLots
@@ -1575,7 +1580,7 @@ async function loadInventory() {
                     .replace(/\s{2,}/g, ' ')
                     .trim();
                   return `<tr>
-                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + lotRemainingCs + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + lotCs + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${renderOnOrder(i)}</td>
                     <td>${escHtml(i.unit)}</td>
@@ -1589,27 +1594,68 @@ async function loadInventory() {
                       <button class="btn btn-danger btn-sm" onclick="openUseModal('${escAttr(i.name)}')">Use</button>
                     </td>
                   </tr>
-                  ${hasLots ? `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
+                  ${hasLots ? (() => {
+                    // FIFO rule: each (warehouse, variety) lot list comes
+                    // back from /api/production/lots-by-pair sorted
+                    // oldest-first, with cs_remaining and is_next_out
+                    // pre-computed on the server. The "Next out" lot is the
+                    // oldest one with cs_remaining > 0 — that's the lot the
+                    // next usage event will draw down.
+                    const lotRemaining = lots.reduce((s, L) => s + (L.cs_remaining ?? L.cs ?? 0), 0);
+                    const activeCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
+                    const depletedCount = lots.length - activeCount;
+                    return `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
                     <td colspan="9" style="padding:8px 16px 12px 30px">
-                      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">Lot history (${lots.length} lot${lots.length === 1 ? '' : 's'}, ${lotCs} cs total across all production):</div>
+                      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
+                        <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
+                        ${lots.length} lot${lots.length === 1 ? '' : 's'} &middot;
+                        ${lotCs} cs produced &middot;
+                        <span style="color:var(--green)">${lotRemaining} cs remaining</span> &middot;
+                        ${activeCount} active${depletedCount ? ` &middot; ${depletedCount} depleted` : ''}
+                      </div>
                       <table style="margin:0;font-size:12px;width:auto;min-width:60%">
                         <thead><tr>
                           <th style="text-align:left">Lot #</th>
-                          <th style="text-align:right">cs</th>
+                          <th style="text-align:right">cs remaining</th>
+                          <th style="text-align:right">cs produced</th>
                           <th>Production date</th>
                           <th>PO #</th>
+                          <th>Status</th>
                         </tr></thead>
                         <tbody>
-                          ${lots.map(L => `<tr>
-                            <td style="font-family:monospace">${escHtml(L.lot)}</td>
-                            <td style="text-align:right;font-weight:600">${L.cs}</td>
-                            <td>${fmtProdDate(L.production_date)}</td>
-                            <td>${escHtml(L.po_number || '')}</td>
-                          </tr>`).join('')}
+                          ${lots.map(L => {
+                            const produced = L.cs_produced ?? L.cs ?? 0;
+                            const remaining = L.cs_remaining ?? produced;
+                            const consumed = L.cs_consumed ?? (produced - remaining);
+                            const nextOut = !!L.is_next_out;
+                            const depleted = remaining <= 0 && produced > 0;
+                            const rowBg = nextOut ? 'background:rgba(240,179,35,.18)' : '';
+                            const statusHtml = nextOut
+                              ? '<span class="badge badge-yellow" title="FIFO: next usage draws from this lot first">Next out</span>'
+                              : depleted
+                                ? '<span class="badge badge-red" title="Lot fully consumed under FIFO">Depleted</span>'
+                                : (remaining < produced && remaining > 0)
+                                  ? '<span class="badge badge-blue" title="Partially consumed under FIFO">Partial</span>'
+                                  : '<span class="badge badge-green">Active</span>';
+                            const remainingStyle = depleted
+                              ? 'color:var(--muted);text-decoration:line-through'
+                              : nextOut
+                                ? 'color:var(--accent);font-weight:700'
+                                : 'font-weight:600';
+                            return `<tr style="${rowBg}">
+                              <td style="font-family:monospace">${escHtml(L.lot)}</td>
+                              <td style="text-align:right;${remainingStyle}">${remaining}${consumed > 0 && consumed < produced ? ` <span style="color:var(--muted);font-weight:400">(−${consumed})</span>` : ''}</td>
+                              <td style="text-align:right;color:var(--muted)">${produced}</td>
+                              <td>${fmtProdDate(L.production_date)}</td>
+                              <td>${escHtml(L.po_number || '')}</td>
+                              <td>${statusHtml}</td>
+                            </tr>`;
+                          }).join('')}
                         </tbody>
                       </table>
                     </td>
-                  </tr>` : ''}`;
+                  </tr>`;
+                  })() : ''}`;
                 }).join('')}
               </tbody>
             </table>
