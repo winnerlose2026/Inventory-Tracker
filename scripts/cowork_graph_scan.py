@@ -416,14 +416,32 @@ def run(argv: list[str] | None = None) -> int:
 
     # ---- discover qualifying messages
     qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
+    mailbox_diag: list[str] = []  # one line per mailbox, always logged
     for mb in mailboxes:
         try:
             msgs = _list_recent_messages(token, mb, since, verbose=args.verbose)
         except Exception as exc:
             msg = _redact(str(exc), secrets_to_redact)
-            _vlog(args.verbose, f"  list_recent_messages({mb}) failed: {msg}")
+            # ALWAYS surface mailbox-list failures (not just under --verbose).
+            # Silent failures here are why a misconfigured mailbox can sit
+            # broken for weeks without anyone noticing.
+            err_line = f"list_recent_messages({mb}) failed: {msg}"
+            print(f"ERROR: {err_line}", file=sys.stderr)
+            mailbox_diag.append(f"{mb}: ERROR ({msg[:120]})")
             continue
-        _vlog(args.verbose, f"  {mb}: {len(msgs)} recent messages with attachments")
+        # Count senders we recognise so we can tell "scanner found CW emails
+        # but skipped them" from "scanner saw no relevant senders at all".
+        by_dist: dict[str, int] = {}
+        for m in msgs:
+            sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""
+            dist = _classify(sender, m.get("subject") or "")
+            if dist:
+                by_dist[dist] = by_dist.get(dist, 0) + 1
+        diag = (f"{mb}: {len(msgs)} msgs with attachments"
+                + (f"; matched: " + ", ".join(f"{d}={n}" for d, n in by_dist.items())
+                   if by_dist else "; matched: 0 (no tracked senders)"))
+        print(diag, file=sys.stderr)
+        mailbox_diag.append(diag)
         for m in msgs:
             mid = m.get("id") or ""
             if mid in seen_ids:
