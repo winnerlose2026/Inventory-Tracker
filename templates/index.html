@@ -1519,8 +1519,8 @@ async function loadInventory() {
           const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
           return `
           <div style="padding:14px 16px 4px">
-            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-              <div style="font-weight:600">${escHtml(w.warehouse)}</div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+              <div style="font-family:var(--font-display);font-weight:700;font-size:20px;color:var(--accent);letter-spacing:-.005em">${escHtml(w.warehouse)}</div>
               <div style="color:var(--muted);font-size:12px">
                 ${w.item_count} SKU(s) &middot; ${w.total_quantity.toFixed(0)} units &middot; $${w.total_value.toFixed(2)}
                 &middot; ${whWeekly.toFixed(0)}/wk
@@ -1565,8 +1565,17 @@ async function loadInventory() {
                   const chevron = hasLots
                     ? `<span style="cursor:pointer;display:inline-block;width:14px;color:var(--muted);user-select:none" onclick="toggleLotRow('${rowId}', this)">&#9656;</span>`
                     : '<span style="display:inline-block;width:14px"></span>';
+                  // Display name strips the "4oz" size and the trailing
+                  // "[CB - Ocala]" / "[USF - Alcoa]" distributor+DC tag —
+                  // both are already conveyed by the surrounding distributor
+                  // card and warehouse header, so they're noise in the row.
+                  const displayName = (i.name || '')
+                    .replace(/\s*\[[^\]]*\]\s*$/, '')
+                    .replace(/\s+\d+\s*oz\b/i, '')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim();
                   return `<tr>
-                    <td style="font-weight:600">${chevron} ${escHtml(i.name)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + lots.length + ' lot(s), ' + lotCs + ' cs across all production history">' + lots.length + ' lot' + (lots.length === 1 ? '' : 's') + '</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${renderOnOrder(i)}</td>
                     <td>${escHtml(i.unit)}</td>
