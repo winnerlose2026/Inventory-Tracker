@@ -320,6 +320,10 @@ def run(argv: list[str] | None = None) -> int:
                    help="Run end-to-end but POST with dry_run=true.")
     p.add_argument("--lookback-hours", type=int, default=24,
                    help="How far back to look for new messages (default 24).")
+    # Env-var override path. When LOOKBACK_HOURS_OVERRIDE is set, it WINS
+    # over both the default and the --lookback-hours CLI flag. Useful for
+    # one-off backfills (e.g. 90-day catch-up after adding a new mailbox)
+    # without having to edit the cron's startCommand. Unset = use --flag.
     p.add_argument("--mailboxes", default=os.environ.get("MAILBOXES", DEFAULT_MAILBOXES),
                    help="Comma-separated list. Default: env MAILBOXES or "
                         "JD@ms.hhbagels.com,info@ms.hhbagels.com")
@@ -379,9 +383,26 @@ def run(argv: list[str] | None = None) -> int:
     mailboxes = [m.strip() for m in args.mailboxes.split(",") if m.strip()]
     state_path = Path(args.state).expanduser()
     seen_ids = _read_seen_state(state_path)
+
+    # Resolve effective lookback: LOOKBACK_HOURS_OVERRIDE env var beats the
+    # CLI flag (the cron's startCommand hardcodes --lookback-hours 24, which
+    # we want to be able to override at runtime for one-off backfills).
+    lookback_override_raw = os.environ.get("LOOKBACK_HOURS_OVERRIDE", "").strip()
+    lookback_hours = args.lookback_hours
+    if lookback_override_raw:
+        try:
+            lookback_hours = int(lookback_override_raw)
+            _vlog(args.verbose,
+                  f"LOOKBACK_HOURS_OVERRIDE={lookback_override_raw} overrides "
+                  f"--lookback-hours {args.lookback_hours}")
+        except ValueError:
+            _vlog(args.verbose,
+                  f"LOOKBACK_HOURS_OVERRIDE={lookback_override_raw!r} is not "
+                  f"an integer; keeping --lookback-hours {args.lookback_hours}")
+
     _vlog(args.verbose, f"seen-set size at start: {len(seen_ids)}")
     _vlog(args.verbose, f"mailboxes: {mailboxes}")
-    _vlog(args.verbose, f"lookback: {args.lookback_hours}h")
+    _vlog(args.verbose, f"lookback: {lookback_hours}h")
 
     # ---- Graph token
     try:
@@ -391,7 +412,7 @@ def run(argv: list[str] | None = None) -> int:
         print(f"ERROR: Graph token failed: {msg}", file=sys.stderr)
         return 1
 
-    since = datetime.now(timezone.utc) - timedelta(hours=args.lookback_hours)
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
     # ---- discover qualifying messages
     qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
