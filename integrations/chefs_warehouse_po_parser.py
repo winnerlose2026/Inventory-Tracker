@@ -147,6 +147,12 @@ CW_DESCRIPTION_TO_VARIETY: dict[str, str] = {
     "BAGELS HH BLUEBERRY":              "Blueberry",
     "BAGELS HH ASIAGO":                 "Asiago",
     "BAGELS HH JALAPENO CHEDDAR":       "Jalapeno Cheddar",
+    "BAGEL HH WHOLE WHEAT":             "Whole Wheat",
+    "BAGEL HH WHOLE WHEAT SLICED":      "Whole Wheat Sliced",
+    "BAGELS HH WHOLE WHEAT":            "Whole Wheat",
+    "BAGELS HH WHOLE WHEAT SLICED":     "Whole Wheat Sliced",
+    "BAGEL HH ASSORTED":                "Assorted",
+    "BAGELS HH ASSORTED":               "Assorted",
 }
 
 
@@ -303,10 +309,11 @@ def parse_po_text(text: str, dc_code: str = "") -> ChefsWarehousePO:
     i = 0
     while i < len(lines):
         head_m = _LINE_HEAD_RE.match(lines[i])
-        # A line-item head only counts when the cw_item starts with "1050"
-        # (CW H&H bagel SKU prefix) -- filters out anything else that
+        # A line-item head only counts when the cw_item starts with "105"
+        # (CW H&H bagel SKU prefix; observed: 1050xxxx whole catalog +
+        # 10531083 Whole Wheat) -- filters out anything else that
         # happens to match the LN/spaces pattern.
-        if head_m and head_m.group(2).startswith("1050"):
+        if head_m and head_m.group(2).startswith("105"):
             prefix  = head_m.group(1)
             cw_item = head_m.group(2)
             desc    = head_m.group(3).strip()
