@@ -854,7 +854,8 @@ def api_freight_scan():
             flt = ("hasAttachments eq true "
                    f"and receivedDateTime ge {since_iso}")
         LINEAGE_DOMAINS = ("tms.blujaysolutions.net", "blujaysolutions.net",
-                           "lineagelogistics.com")
+                           "tms.e2open.com", "e2open.com",
+                           "lineagelogistics.com", "onelineage.com")
 
         # Track sender domains we see vs match, for diagnostics
         domain_seen: dict = {}

@@ -81,7 +81,8 @@ CHEFS_DOMAINS   = {"chefswarehouse.com"}
 # Solutions noreply address. The subject always contains "Billable
 # Invoice(s) from LINEAGE FREIGHT MANAGEMENT LLC".
 LINEAGE_DOMAINS = {"tms.blujaysolutions.net", "blujaysolutions.net",
-                   "lineagelogistics.com"}
+                   "tms.e2open.com", "e2open.com",
+                   "lineagelogistics.com", "onelineage.com"}
 
 
 # ---------------------------------------------------------------------------
