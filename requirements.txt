@@ -1,4 +1,7 @@
 flask>=3.0
 openpyxl>=3.1
 gunicorn>=21.2
-pypdf>=4.0
+# pypdf 5.x/6.x regress on whitespace extraction (concatenate label
+# tokens), which breaks our Lineage freight + USF / Cheney PO parsers.
+# Pin to the 3.17 line which produces well-spaced output our regexes rely on.
+pypdf>=3.17,<4.0
