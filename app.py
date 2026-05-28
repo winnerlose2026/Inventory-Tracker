@@ -749,6 +749,12 @@ def api_freight_scan():
 
     body = request.json or {}
     dry_run = bool(body.get("dry_run", False))
+    # Optional explicit ISO date window (YYYY-MM-DD). When set, supersedes
+    # lookback_days. Lets the caller batch a multi-year backfill into
+    # bite-sized 6-month windows so each request fits within gunicorn's
+    # 180s timeout.
+    since_date = (body.get("since_date") or "").strip()
+    until_date = (body.get("until_date") or "").strip()
     try:
         lookback_days = int(body.get("lookback_days") or 730)
     except (TypeError, ValueError):
@@ -818,20 +824,35 @@ def api_freight_scan():
     diag_parse_none = 0
     try:
         token = _token()
-        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-        # Lineage filter: messages WITH attachments, since the lookback
-        # cutoff. Graph rejects `hasAttachments + $orderby` together as
-        # InefficientFilter, so we drop the orderby. We CANNOT filter on
-        # `from/emailAddress/address` server-side — Graph indexes that
-        # field for `endsWith` but not `eq`, and the combination with
-        # receivedDateTime + hasAttachments routinely times out at 504.
-        # Post-filter on sender + subject in code instead; the date +
-        # hasAttachments narrows the page set far enough that the
-        # client-side check is cheap.
-        flt = ("hasAttachments eq true "
-               f"and receivedDateTime ge {since_iso}")
+        # Two ways to specify the window:
+        #   - lookback_days (relative): now() - N days .. now()
+        #   - since_date / until_date (absolute): explicit YYYY-MM-DD pair,
+        #     useful for batching a multi-year backfill into 6-month chunks
+        if since_date or until_date:
+            try:
+                since = datetime.fromisoformat(since_date) if since_date else (
+                    datetime.now(timezone.utc) - timedelta(days=3650))
+                since = since.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return jsonify({"ok": False,
+                                "error": f"bad since_date {since_date!r}"}), 200
+            try:
+                until = (datetime.fromisoformat(until_date)
+                         if until_date else datetime.now(timezone.utc))
+                until = until.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return jsonify({"ok": False,
+                                "error": f"bad until_date {until_date!r}"}), 200
+            since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            until_iso = until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            flt = ("hasAttachments eq true "
+                   f"and receivedDateTime ge {since_iso} "
+                   f"and receivedDateTime lt {until_iso}")
+        else:
+            since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            flt = ("hasAttachments eq true "
+                   f"and receivedDateTime ge {since_iso}")
         LINEAGE_DOMAINS = ("tms.blujaysolutions.net", "blujaysolutions.net",
                            "lineagelogistics.com")
 
