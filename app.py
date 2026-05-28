@@ -2942,6 +2942,151 @@ def api_forecast_decrement_daily():
     })
 
 
+@app.route("/api/forecast/backfill-historical", methods=["POST"])
+def api_forecast_backfill_historical():
+    """One-shot opening reconciliation between lot production and on-hand.
+
+    Why this exists:
+        Production lots get recorded as they arrive (each PO bakes new
+        lots into data/production.json), but FIFO consumption only ever
+        knew about *future* burns through the usage ledger. There was no
+        equivalent for the "between PO arrival and the first vendor
+        snapshot" gap — so the lots-by-pair view sat at cs_consumed=0
+        forever, even on SKUs whose on-hand was clearly much smaller
+        than total cases received.
+
+    What this does:
+        For each (warehouse, variety) pair on an inventory item:
+
+            target_consumed = max(0, sum(lots_produced) - quantity)
+            existing_consumed = sum(positive non-reversed usage entries)
+            delta = target_consumed - existing_consumed
+
+        If delta > 0, append one positive usage event of `delta` tagged
+        `source = "historical-backfill"` so FIFO drains oldest-first
+        until the lot remaining sums match the on-hand quantity. The
+        endpoint does NOT touch item.quantity — quantity is already
+        ground truth from the vendor; this purely seeds the consumption
+        side of the ledger.
+
+    Body (all optional):
+        warehouse   str    limit to one warehouse (e.g. "Zebulon, NC").
+                           Default: every warehouse.
+        dry_run     bool   compute deltas without writing.
+
+    Returns {ok, applied: [...], no_op: [...], dry_run}.
+    """
+    from datetime import datetime, timezone
+    from inventory_tracker import (
+        load_inventory, load_production, load_usage, save_usage,
+        _variety_from_name,
+    )
+
+    body = request.json or {}
+    warehouse = (body.get("warehouse") or "").strip()
+    dry_run = bool(body.get("dry_run"))
+
+    inv = load_inventory()
+    prod = load_production()
+    usage = load_usage()
+
+    # Sum produced cases per (warehouse, variety).
+    produced_by_pair: dict[tuple[str, str], float] = {}
+    for r in prod:
+        wh = r.get("warehouse") or ""
+        for L in r.get("lines") or []:
+            v = (L.get("variety") or "").strip()
+            if not wh or not v:
+                continue
+            produced_by_pair[(wh, v)] = (
+                produced_by_pair.get((wh, v), 0.0)
+                + float(L.get("cs_count") or 0)
+            )
+
+    # Existing positive (non-reversed) consumption per (warehouse, variety).
+    inv_for_lookup = inv
+    consumed_by_pair: dict[tuple[str, str], float] = {}
+    for e in usage:
+        if e.get("reversed"):
+            continue
+        if e.get("source") == "reversal":
+            continue
+        amt = float(e.get("amount") or 0)
+        if amt <= 0:
+            continue
+        e_wh = e.get("warehouse") or ""
+        e_var = e.get("variety") or ""
+        if not e_wh or not e_var:
+            it = inv_for_lookup.get(e.get("item_key") or "") or {}
+            e_wh = e_wh or it.get("warehouse", "")
+            e_var = e_var or _variety_from_name(
+                it.get("name") or e.get("item_name") or "")
+        if not e_wh or not e_var:
+            continue
+        consumed_by_pair[(e_wh, e_var)] = (
+            consumed_by_pair.get((e_wh, e_var), 0.0) + amt
+        )
+
+    applied: list[dict] = []
+    no_op: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for key, item in inv.items():
+        wh = item.get("warehouse") or ""
+        if warehouse and wh != warehouse:
+            continue
+        name = item.get("name") or ""
+        v = _variety_from_name(name)
+        if not wh or not v:
+            continue
+        produced = produced_by_pair.get((wh, v), 0.0)
+        if produced <= 0:
+            continue
+        cur_qty = float(item.get("quantity") or 0)
+        target_consumed = max(0.0, produced - cur_qty)
+        existing = consumed_by_pair.get((wh, v), 0.0)
+        delta = round(target_consumed - existing, 4)
+        if delta <= 0.001:
+            no_op.append({
+                "name": name, "warehouse": wh,
+                "produced": produced, "quantity": cur_qty,
+                "target_consumed": target_consumed,
+                "existing_consumed": existing,
+            })
+            continue
+        applied.append({
+            "name": name, "warehouse": wh,
+            "produced": produced, "quantity": cur_qty,
+            "target_consumed": target_consumed,
+            "existing_consumed": existing,
+            "backfill_amount": delta,
+        })
+        if not dry_run:
+            usage.append({
+                "item_key": key,
+                "item_name": name,
+                "amount": delta,
+                "unit": item.get("unit") or "cs",
+                "note": (f"Opening reconciliation: align FIFO lots "
+                         f"with vendor on-hand ({cur_qty} cs)"),
+                "timestamp": now_iso,
+                "source": "historical-backfill",
+                "warehouse": wh,
+                "variety": v,
+            })
+
+    if not dry_run and applied:
+        save_usage(usage)
+
+    return jsonify({
+        "ok": True,
+        "warehouse": warehouse or "(all)",
+        "dry_run": dry_run,
+        "applied": applied,
+        "no_op": no_op,
+    })
+
+
 @app.route("/api/forecast/true-up", methods=["POST"])
 def api_forecast_true_up():
     """Reconcile against a vendor on-hand snapshot.
