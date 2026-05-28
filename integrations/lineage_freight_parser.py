@@ -102,6 +102,27 @@ _DC_PATTERNS: list[tuple[str, str, str]] = [
     ("CHEF WAREHOUSE",               "Hanover, MD",       "Chefs Warehouse"),
     ("CHEFS' WAREHOUSE",             "Hanover, MD",       "Chefs Warehouse"),
     ("CHEF'S WAREHOUSE",             "Hanover, MD",       "Chefs Warehouse"),
+
+    # Other distributors that ship through Lineage but aren't on our
+    # normal inventory-tracked DC list. They get a synthetic dest_dc
+    # named after the consignee so freight spend rolls up correctly
+    # on the Freight Costs tab.
+    ("GOURMET FOODS INT. CONCORD",   "GFI Concord, NC",        "Gourmet Foods Int'l"),
+    ("GOURMET FOOD INTERNATIONAL",   "GFI",                    "Gourmet Foods Int'l"),
+    ("GOURMET FOODS INTERNATIONAL",  "GFI",                    "Gourmet Foods Int'l"),
+    ("GOURMET FOODS WEST",           "GFI West",               "Gourmet Foods Int'l"),
+    ("GFI CALIFORNIA",               "GFI California",         "Gourmet Foods Int'l"),
+    ("GFI",                          "GFI",                    "Gourmet Foods Int'l"),
+    ("CARIBBEAN SHIPPING SERVICES",  "Caribbean Shipping",     "Caribbean Export"),
+    ("CARIBBEAN SHIPPING SERVICE",   "Caribbean Shipping",     "Caribbean Export"),
+    ("CARRIBEAN SHIPPING SERVICES",  "Caribbean Shipping",     "Caribbean Export"),
+    ("CARRIBEAN SHIPPING SERVICE",   "Caribbean Shipping",     "Caribbean Export"),
+    ("CARIBBEAN COLD STORAGE",       "Caribbean Cold Storage", "Caribbean Export"),
+    ("CARRIBEAN COLD STORAGE",       "Caribbean Cold Storage", "Caribbean Export"),
+    ("CARGO INTERNATIONAL",          "Cargo International",    "Caribbean Export"),
+    ("SYSCO",                        "Sysco",                  "Sysco"),
+    ("COLGATE UNIVERSITY",           "Colgate University",     "Other"),
+    ("H&H BAGELS",                   "H&H (Returns)",          "H&H Internal"),
 ]
 
 # When the consignee name is too generic (e.g. just "US FOODS") we
