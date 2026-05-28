@@ -819,6 +819,7 @@ def api_freight_scan():
     seen = 0
     parsed_invoices: list[dict] = []
     diag_atts_seen = 0
+    lineage_attachment_samples: list = []
     diag_zips = 0
     diag_pdfs_in_zip = 0
     diag_parse_none = 0
@@ -907,8 +908,15 @@ def api_freight_scan():
                         continue
                     for a in (atts_resp.get("value") or []):
                         diag_atts_seen += 1
-                        aname = (a.get("name") or "").lower()
+                        aname_raw = a.get("name") or ""
+                        aname = aname_raw.lower()
                         actype = (a.get("contentType") or "").lower()
+                        if len(lineage_attachment_samples) < 10:
+                            lineage_attachment_samples.append({
+                                "name": aname_raw,
+                                "ctype": actype,
+                                "size": a.get("size"),
+                            })
                         if not (aname.endswith(".zip") or aname.endswith(".pdf")
                                 or actype in ("application/zip",
                                               "application/x-zip-compressed",
@@ -1026,6 +1034,7 @@ def api_freight_scan():
             "error_count":      len(errors),
             "top_sender_domains": top_domains,
             "sample_lineage_matches": lineage_subjects,
+            "lineage_attachment_samples": lineage_attachment_samples,
             "diag": {
                 "pypdf_version":        (lambda:
                     __import__("pypdf").__version__ if hasattr(__import__("pypdf"), "__version__") else "?")(),
