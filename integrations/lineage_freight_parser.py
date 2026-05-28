@@ -356,21 +356,39 @@ def parse_freight_pdf(pdf_bytes: bytes,
         try: inv.distance_mi = float(m.group(1).replace(",", ""))
         except ValueError: pass
 
+    # Line items appear between the "Reference Numbers" block and the
+    # "Weight" footer. Each item has the layout
+    #   <DESCRIPTION> <BASIS-CODE> <QTY> <RATE> <TOTAL>
+    # but pypdf sometimes collapses the space between QTY and RATE,
+    # producing tokens like "1.006,200.0000" that the prior regex
+    # missed. The description can also contain parens, e.g.
+    # "DETENTION (UNLOADING)".
+    line_region_start = text.find("Reference Numbers")
+    if line_region_start < 0:
+        line_region_start = 0
+    line_region_end = text.find("Weight")
+    if line_region_end < 0:
+        line_region_end = len(text)
+    line_region = text[line_region_start:line_region_end]
     line_pat = re.compile(
-        r"^([A-Z][A-Z\s\-/]+?)\s+([A-Z]{2,4})\s+([\d.]+)\s+([\d,]+\.\d{2,4})\s+([\d,]+\.\d{2})\s*$",
+        r"^\s*(?P<desc>[A-Z][A-Z()\s\-/]+?)\s+"
+        r"(?P<basis>[A-Z]{2,4})\s+"
+        r"(?P<qty>\d+\.\d{1,3})\s*"          # qty may butt up against rate
+        r"(?P<rate>[\d,]+\.\d{2,4})\s+"
+        r"(?P<total>[\d,]+\.\d{2})\s*$",
         re.MULTILINE,
     )
-    for m in line_pat.finditer(text):
-        desc, basis, qty, rate, ltot = m.group(1).strip(), m.group(2), m.group(3), m.group(4), m.group(5)
-        if desc.upper() in ("TOTAL", "PAGE", "QUANTITY"):
+    for m in line_pat.finditer(line_region):
+        desc = m.group("desc").strip()
+        if desc.upper() in ("TOTAL", "PAGE", "QUANTITY", "DESCRIPTION"):
             continue
         try:
             inv.line_items.append({
                 "description": desc,
-                "basis": basis,
-                "qty": float(qty),
-                "rate": float(rate.replace(",", "")),
-                "total": float(ltot.replace(",", "")),
+                "basis": m.group("basis"),
+                "qty":   float(m.group("qty")),
+                "rate":  float(m.group("rate").replace(",", "")),
+                "total": float(m.group("total").replace(",", "")),
             })
         except ValueError:
             continue

@@ -337,6 +337,11 @@ def run(argv: list[str] | None = None) -> int:
                    help="Run end-to-end but POST with dry_run=true.")
     p.add_argument("--lookback-hours", type=int, default=24,
                    help="How far back to look for new messages (default 24).")
+    p.add_argument("--lineage-lookback-hours", type=int, default=0,
+                   help="Override --lookback-hours just for Lineage Freight "
+                        "messages (their invoices land weeks after ship date, "
+                        "and they are rarer than POs so we can afford a "
+                        "deeper sweep). 0 = use --lookback-hours.")
     # Env-var override path. When LOOKBACK_HOURS_OVERRIDE is set, it WINS
     # over both the default and the --lookback-hours CLI flag. Useful for
     # one-off backfills (e.g. 90-day catch-up after adding a new mailbox)

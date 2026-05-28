@@ -571,6 +571,33 @@ def api_freight_invoices():
     total_cost = sum(float(r.get("total_due") or 0) for r in out)
     total_pallets = sum(int(r.get("pallets") or 0) for r in out)
     total_cases = sum(int(r.get("cases") or 0) for r in out)
+    # Aggregate by line-item category (Basis Item / Fuel Surcharge /
+    # Lumper / Detention / ...). Each Lineage invoice breaks the total
+    # into one or more line items, and operators want to see the
+    # categories rolled up across the visible filter window.
+    by_category: dict = {}
+    by_dc: dict = {}
+    for r in out:
+        dc = r.get("dest_dc") or "Unknown"
+        bd = by_dc.setdefault(dc, {"count": 0, "cost": 0.0,
+                                   "pallets": 0, "cases": 0})
+        bd["count"]   += 1
+        bd["cost"]    += float(r.get("total_due") or 0)
+        bd["pallets"] += int(r.get("pallets") or 0)
+        bd["cases"]   += int(r.get("cases") or 0)
+        for li in (r.get("line_items") or []):
+            desc = (li.get("description") or "Other").strip()
+            bc = by_category.setdefault(desc, {"count": 0, "total": 0.0})
+            bc["count"] += 1
+            bc["total"] += float(li.get("total") or 0)
+    # Round for clean transit
+    for v in by_category.values():
+        v["total"] = round(v["total"], 2)
+    for v in by_dc.values():
+        v["cost"] = round(v["cost"], 2)
+        v["per_pallet"] = round(v["cost"] / v["pallets"], 2) if v["pallets"] else 0
+        v["per_case"]   = round(v["cost"] / v["cases"], 4)   if v["cases"]   else 0
+
     summary = {
         "count":          len(out),
         "total_cost":     round(total_cost, 2),
@@ -578,6 +605,8 @@ def api_freight_invoices():
         "total_cases":    total_cases,
         "avg_cost_per_pallet": round(total_cost / total_pallets, 2) if total_pallets else 0,
         "avg_cost_per_case":   round(total_cost / total_cases, 4) if total_cases else 0,
+        "by_category":    by_category,
+        "by_dc":          by_dc,
     }
     return jsonify({"invoices": out, "summary": summary})
 

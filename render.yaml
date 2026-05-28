@@ -91,7 +91,11 @@ services:
     # requirements.txt installed in its build.
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/cowork_graph_scan.py --lookback-hours 24
+    # USF/Cheney/CW POs: 24h is plenty since the inbox refresh is fast and
+    # the apply path is idempotent. Lineage Freight invoices are rarer
+    # and arrive weeks after ship date, so we sweep a 90-day window for
+    # those. The seen-state dedup keeps re-scans cheap.
+    startCommand: python scripts/cowork_graph_scan.py --lookback-hours 24 --lineage-lookback-hours 2160
     envVars:
       - key: APP_URL
         sync: false  # set to https://<your-service>.onrender.com

@@ -798,6 +798,10 @@
           <div><div class="subtitle" style="margin-bottom:2px">Avg $ / case</div>
                <div style="font-size:22px;font-weight:700" id="freight-kpi-pc">—</div></div>
         </div>
+        <div id="freight-kpi-categories"
+             style="display:grid;gap:14px;margin-top:14px;
+                    grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+                    padding-top:14px;border-top:1px solid var(--border)"></div>
       </div>
 
       <div class="card" style="padding:14px 20px">
@@ -811,6 +815,7 @@
             <button class="btn btn-ghost btn-sm"        id="freight-metric-pp"      onclick="setFreightMetric('per_pallet')">$ / pallet</button>
             <button class="btn btn-ghost btn-sm"        id="freight-metric-pc"      onclick="setFreightMetric('per_case')">$ / case</button>
             <button class="btn btn-ghost btn-sm"        id="freight-metric-pallets" onclick="setFreightMetric('pallets')">Pallets</button>
+            <button class="btn btn-ghost btn-sm"        id="freight-metric-cats"    onclick="setFreightMetric('categories')" title="Stacked bar by cost category">By category</button>
           </div>
         </div>
         <div style="position:relative;height:340px">
@@ -857,6 +862,7 @@
               <th class="sortable" data-sort="total_due" style="text-align:right">Total</th>
               <th class="sortable" data-sort="cost_per_pallet" style="text-align:right">$/Pal</th>
               <th class="sortable" data-sort="cost_per_case" style="text-align:right">$/Case</th>
+              <th>Breakdown</th>
             </tr>
           </thead>
           <tbody id="freight-tbody"></tbody>
@@ -3688,6 +3694,33 @@ function renderFreight() {
   $("freight-kpi-cases").textContent   = cases.toLocaleString();
   $("freight-kpi-pp").textContent      = pallets ? ("$" + (cost / pallets).toFixed(2)) : "—";
   $("freight-kpi-pc").textContent      = cases   ? ("$" + (cost / cases).toFixed(2))   : "—";
+  // Category tiles — sum line_items by description across visible rows.
+  const cats = {};
+  for (const r of _freightInvoices) {
+    for (const li of (r.line_items || [])) {
+      const d = (li.description || "Other").trim();
+      cats[d] = (cats[d] || 0) + (Number(li.total) || 0);
+    }
+  }
+  const catSorted = Object.entries(cats).sort((a, b) => b[1] - a[1]);
+  const catBox = $("freight-kpi-categories");
+  if (catBox) {
+    if (!catSorted.length) {
+      catBox.innerHTML = `<div class="subtitle">No line-item breakdown available for this filter.</div>`;
+    } else {
+      catBox.innerHTML = catSorted.map(([d, v]) => {
+        const pct = cost ? (v / cost * 100).toFixed(1) : "0.0";
+        const color = _freightCatColor(d);
+        return `<div>
+          <div class="subtitle" style="margin-bottom:2px">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${color};vertical-align:middle;margin-right:6px"></span>${escHtml(d)}
+          </div>
+          <div style="font-size:18px;font-weight:700">$${v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
+          <div class="subtitle" style="font-size:11px">${pct}% of spend</div>
+        </div>`;
+      }).join("");
+    }
+  }
   // Table
   renderFreightTable();
   drawFreightChart();
@@ -3708,7 +3741,7 @@ function renderFreightTable() {
     return (b.ship_date || "").localeCompare(a.ship_date || "");
   });
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--muted)">No freight invoices in this range.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:24px;color:var(--muted)">No freight invoices in this range.</td></tr>`;
   } else {
     tbody.innerHTML = rows.map(r => {
       const inv = escHtml(r.invoice_number || "");
@@ -3721,6 +3754,7 @@ function renderFreightTable() {
       const tot = "$" + (Number(r.total_due) || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
       const pp  = r.pallets ? ("$" + (Number(r.cost_per_pallet) || 0).toFixed(2)) : "—";
       const pc  = r.cases   ? ("$" + (Number(r.cost_per_case)   || 0).toFixed(2)) : "—";
+      const bd  = renderFreightBreakdown(r);
       return `<tr>
         <td>${sd}</td>
         <td><code>${inv}</code></td>
@@ -3732,6 +3766,7 @@ function renderFreightTable() {
         <td style="text-align:right">${tot}</td>
         <td style="text-align:right">${pp}</td>
         <td style="text-align:right">${pc}</td>
+        <td>${bd}</td>
       </tr>`;
     }).join("");
   }
@@ -3751,6 +3786,7 @@ function renderFreightTable() {
       <td style="text-align:right">$${cost.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
       <td style="text-align:right">${pallets ? ('$' + (cost / pallets).toFixed(2)) : '—'}</td>
       <td style="text-align:right">${cases ? ('$' + (cost / cases).toFixed(2)) : '—'}</td>
+      <td></td>
     </tr>` : "";
   }
 }
@@ -3765,6 +3801,54 @@ function _freightBucket(sd, grain) {
   const day = (d.getUTCDay() + 6) % 7;           // Mon=0..Sun=6
   d.setUTCDate(d.getUTCDate() - day);
   return d.toISOString().slice(0, 10);
+}
+
+// Color palette for cost categories — stable across reloads.
+const _FREIGHT_CAT_COLORS = {
+  "BASIS ITEM":            "#1F77B4",
+  "FUEL SURCHARGE":        "#FF7F0E",
+  "LUMPER":                "#2CA02C",
+  "DETENTION (UNLOADING)": "#D62728",
+  "DETENTION":             "#D62728",
+  "LAYOVER":               "#9467BD",
+  "TONU":                  "#8C564B",
+  "ACCESSORIAL":           "#E377C2",
+};
+function _freightCatColor(cat) {
+  const k = (cat || "").toUpperCase();
+  if (_FREIGHT_CAT_COLORS[k]) return _FREIGHT_CAT_COLORS[k];
+  // Hash-based fallback so unknown categories still get a stable color.
+  let h = 0; for (let i = 0; i < k.length; i++) h = ((h << 5) - h + k.charCodeAt(i)) | 0;
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue}, 65%, 48%)`;
+}
+
+function renderFreightBreakdown(r) {
+  // Compact inline breakdown for the table — e.g. "Basis $608.58 · Fuel $319.50".
+  const items = (r.line_items || []);
+  if (!items.length) return '<span style="color:var(--muted)">—</span>';
+  // Aggregate by description in case a single invoice has two BASIS ITEM lines.
+  const byDesc = new Map();
+  for (const li of items) {
+    const d = (li.description || "Other").trim();
+    byDesc.set(d, (byDesc.get(d) || 0) + (Number(li.total) || 0));
+  }
+  const SHORT = {
+    "BASIS ITEM": "Basis", "FUEL SURCHARGE": "Fuel", "LUMPER": "Lumper",
+    "DETENTION (UNLOADING)": "Detention", "DETENTION": "Detention",
+    "LAYOVER": "Layover", "TONU": "TONU",
+  };
+  const parts = Array.from(byDesc.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([d, v]) => {
+      const label = SHORT[d.toUpperCase()] || d.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+      const color = _freightCatColor(d);
+      return `<span style="display:inline-block;margin-right:8px;white-space:nowrap">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${color};vertical-align:middle;margin-right:4px"></span>
+        ${escHtml(label)} <strong>$${v.toFixed(2)}</strong>
+      </span>`;
+    });
+  return `<div style="font-size:12px;line-height:1.7">${parts.join("")}</div>`;
 }
 
 function drawFreightChart() {
@@ -3789,6 +3873,58 @@ function drawFreightChart() {
   }
   const buckets = Array.from(bucketSet).sort();
   const dcs = Array.from(dcMap.keys()).sort();
+
+  // "By category" mode — stacked bar chart of line-item totals per bucket.
+  if (metric === "categories") {
+    const catSeries = {};   // category -> [bucket totals]
+    const bucketIdx = Object.fromEntries(buckets.map((b, i) => [b, i]));
+    for (const r of _freightInvoices) {
+      const b = _freightBucket(r.ship_date, grain);
+      if (!b) continue;
+      for (const li of (r.line_items || [])) {
+        const d = (li.description || "Other").trim();
+        if (!catSeries[d]) catSeries[d] = new Array(buckets.length).fill(0);
+        catSeries[d][bucketIdx[b]] += Number(li.total) || 0;
+      }
+    }
+    const catList = Object.keys(catSeries).sort((a, b) =>
+      catSeries[b].reduce((s, x) => s + x, 0) - catSeries[a].reduce((s, x) => s + x, 0)
+    );
+    const datasets = catList.map(cat => ({
+      label: cat,
+      data: catSeries[cat].map(v => Number(v.toFixed(2))),
+      backgroundColor: _freightCatColor(cat),
+      borderColor: _freightCatColor(cat),
+      stack: "cost",
+    }));
+    const sub = document.getElementById("freight-chart-sub");
+    if (sub) sub.textContent = "Cost categories per " + grain;
+    if (_freightChart) _freightChart.destroy();
+    _freightChart = new Chart(canvas.getContext("2d"), {
+      type: "bar",
+      data: { labels: buckets, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { position: "bottom" },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.dataset.label + ": $" + Number(ctx.parsed.y).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+            }
+          }
+        },
+        scales: {
+          x: { stacked: true },
+          y: { stacked: true, beginAtZero: true,
+               ticks: { callback: v => "$" + Number(v).toLocaleString() } }
+        }
+      }
+    });
+    return;
+  }
+
   // Stable color per DC
   const palette = [
     "#1F77B4","#FF7F0E","#2CA02C","#D62728","#9467BD",
