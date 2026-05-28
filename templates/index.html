@@ -1661,7 +1661,7 @@ async function loadInventory() {
                     .replace(/\s{2,}/g, ' ')
                     .trim();
                   return `<tr>
-                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + lotRemainingCs + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + lotCs + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
                     <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td>${renderOnOrder(i)}</td>
                     <td>${escHtml(i.unit)}</td>
@@ -1690,8 +1690,8 @@ async function loadInventory() {
                       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
                         <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
                         ${lots.length} lot${lots.length === 1 ? '' : 's'} &middot;
-                        ${lotCs} cs produced &middot;
-                        <span style="color:var(--green)">${lotRemaining} cs remaining</span> &middot;
+                        ${fmtCs(lotCs)} cs produced &middot;
+                        <span style="color:var(--green)">${fmtCs(lotRemaining)} cs remaining</span> &middot;
                         ${activeCount} active${depletedCount ? ` &middot; ${depletedCount} depleted` : ''}
                       </div>
                       <table style="margin:0;font-size:12px;width:auto;min-width:60%">
@@ -1725,8 +1725,8 @@ async function loadInventory() {
                                 : 'font-weight:600';
                             return `<tr style="${rowBg}">
                               <td style="font-family:monospace">${escHtml(L.lot)}</td>
-                              <td style="text-align:right;${remainingStyle}">${remaining}${consumed > 0 && consumed < produced ? ` <span style="color:var(--muted);font-weight:400">(−${consumed})</span>` : ''}</td>
-                              <td style="text-align:right;color:var(--muted)">${produced}</td>
+                              <td style="text-align:right;${remainingStyle}">${fmtCs(remaining)}${consumed > 0 && consumed < produced ? ` <span style="color:var(--muted);font-weight:400">(−${fmtCs(consumed)})</span>` : ''}</td>
+                              <td style="text-align:right;color:var(--muted)">${fmtCs(produced)}</td>
                               <td>${fmtProdDate(L.production_date)}</td>
                               <td>${escHtml(L.po_number || '')}</td>
                               <td>${statusHtml}</td>
@@ -1922,6 +1922,16 @@ function toggleLotRow(rowId, chev) {
     row.style.display = 'none';
     chev.textContent = '▸';
   }
+}
+// fmtCs — display case counts: integers stay clean (no '.00'); fractional
+// values round to 2 decimals so the dashboard never shows long tails like
+// '4.8171'. Used everywhere cs_remaining / cs_consumed / cs_produced are
+// rendered in the lot detail table and FIFO summary line.
+function fmtCs(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return String(n);
+  if (Math.abs(v - Math.round(v)) < 0.005) return String(Math.round(v));
+  return v.toFixed(2);
 }
 function fmtProdDate(iso) {
   if (!iso) return '<span style="color:var(--muted)">—</span>';
