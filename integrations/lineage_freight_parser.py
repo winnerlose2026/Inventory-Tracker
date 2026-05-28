@@ -276,7 +276,18 @@ def parse_freight_pdf(pdf_bytes: bytes,
     """Parse a single Lineage freight invoice PDF. Returns None if the PDF
     doesn't look like a Lineage freight invoice."""
     text = _pdf_text(pdf_bytes)
-    if "Lineage" not in text and "Freight Invoice" not in text:
+    # Sanity gate widened: some pypdf builds extract whitespace differently
+    # and lose 'Lineage' / 'Freight Invoice' as recognizable tokens. The
+    # invoice number 70xxxxxxxx is a robust fallback signal that this is
+    # in fact a Lineage invoice.
+    looks_lineage = (
+        "Lineage" in text
+        or "Freight Invoice" in text
+        or "LineageLogistics" in text
+        or "blujaysolutions" in text.lower()
+        or re.search(r"\b70\d{8}\b", text) is not None
+    )
+    if not looks_lineage:
         return None
 
     inv = FreightInvoice(

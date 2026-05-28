@@ -927,7 +927,19 @@ def api_freight_scan():
                             if inv is None:
                                 diag_parse_none += 1
                                 if len(errors) < 10:
-                                    errors.append(f"{mid[:12]}.. parse[{fname}] returned None ({len(pb)}b)")
+                                    # Capture the first chars of extracted
+                                    # PDF text so we can see what pypdf is
+                                    # actually returning on the server.
+                                    try:
+                                        from pypdf import PdfReader as _PR
+                                        import io as _io2
+                                        _r = _PR(_io2.BytesIO(pb))
+                                        _t = (_r.pages[0].extract_text() or "")[:160]
+                                    except Exception as _e:
+                                        _t = f"<text extract failed: {_e}>"
+                                    errors.append(
+                                        f"{mid[:12]}.. parse[{fname}] None "
+                                        f"({len(pb)}b) txt={_t!r}")
                                 continue
                             parsed_invoices.append(asdict(inv))
                 # Next page
@@ -993,6 +1005,8 @@ def api_freight_scan():
             "top_sender_domains": top_domains,
             "sample_lineage_matches": lineage_subjects,
             "diag": {
+                "pypdf_version":        (lambda:
+                    __import__("pypdf").__version__ if hasattr(__import__("pypdf"), "__version__") else "?")(),
                 "attachments_seen":     diag_atts_seen,
                 "zip_attachments":      diag_zips,
                 "pdfs_extracted_from_zip": diag_pdfs_in_zip,
