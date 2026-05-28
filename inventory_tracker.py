@@ -151,6 +151,50 @@ def save_chefs_warehouse_pos(records: list) -> None:
     with open(CHEFS_WAREHOUSE_POS_FILE, "w") as f:
         json.dump(records, f, indent=2)
 
+
+# Lineage freight invoices — one record per outbound shipment from H&H
+# to a distributor DC. Sourced from "Billable Invoice(s) from LINEAGE
+# FREIGHT MANAGEMENT LLC" emails (sender:
+# noreply@tms.blujaysolutions.net), whose .zip attachments unpack to
+# one or more PDF invoices. Each PDF is one shipment.
+#
+# These records DO NOT touch inventory.json or the on_order pipeline.
+# The Freight Costs tab reads them directly and groups by destination
+# DC and ship date.
+#
+# Dedup key: invoice_number (unique within Lineage's TMS). Re-ingesting
+# the same PDF replaces the existing record in place.
+FREIGHT_INVOICES_FILE = DATA_DIR / "freight_invoices.json"
+
+
+def load_freight_invoices() -> list:
+    """Return the list of Lineage freight invoices (empty list if none).
+
+    Schema (one dict per invoice — mirrors FreightInvoice dataclass):
+        invoice_number, invoice_date, ship_date, shipment_id, carrier,
+        origin_name/city/state/zip,
+        consignee_name/city/state/zip,
+        dest_dc ("<City>, <ST>"), distributor,
+        po_number, shipper_ref, order_number,
+        total_due, currency, weight_lb, pallets, cases, distance_mi,
+        line_items: [{description, basis, qty, rate, total}],
+        cost_per_pallet, cost_per_case,
+        source, source_message_id, source_subject, pdf_filename, ingested_at
+    """
+    if FREIGHT_INVOICES_FILE.exists():
+        with open(FREIGHT_INVOICES_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
+
+
+def save_freight_invoices(records: list) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(FREIGHT_INVOICES_FILE, "w") as f:
+        json.dump(records, f, indent=2)
+
 # Toast POS sales — per-location, per-day, per-item product mix.
 # One entry per (restaurant_guid, business_date, item_guid).
 # Used by the Report page Top Consumed section.

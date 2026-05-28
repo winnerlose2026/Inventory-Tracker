@@ -521,6 +521,167 @@ def api_chefs_warehouse_ingest_pos():
     return jsonify({"ok": True, "dry_run": dry_run, "report": report})
 
 
+# ---------------------------------------------------------------------------
+# API – Freight (Lineage outbound shipping invoices)
+# ---------------------------------------------------------------------------
+# Lineage Freight Management LLC invoices arrive in the same mailbox as
+# distributor POs (sender: noreply@tms.blujaysolutions.net, subject:
+# "Billable Invoice(s) from LINEAGE FREIGHT MANAGEMENT LLC"). The
+# attachment is a .zip containing one or more PDF invoices, one per
+# shipment H&H sent to a DC. We parse the PDFs in the cron-side scan
+# script (scripts/cowork_graph_scan.py) and POST the dict-form records
+# here, so the web service doesn't need outbound network access.
+#
+# Records live in data/freight_invoices.json and never touch inventory
+# state. The Freight Costs tab reads /api/freight/invoices for display.
+
+
+@app.route("/api/freight/invoices")
+def api_freight_invoices():
+    """Return all Lineage freight invoices, sorted by ship_date desc.
+
+    Query params:
+        ``dc``        filter to a single destination DC, e.g. "Manassas, VA"
+        ``distributor`` filter to "US Foods" | "Cheney Brothers" | "Chefs Warehouse"
+        ``since``     ISO date (YYYY-MM-DD); only invoices on or after
+        ``until``     ISO date; only invoices on or before
+    """
+    from inventory_tracker import load_freight_invoices
+    records = load_freight_invoices()
+    dc = (request.args.get("dc") or "").strip()
+    dist = (request.args.get("distributor") or "").strip()
+    since = (request.args.get("since") or "").strip()
+    until = (request.args.get("until") or "").strip()
+    out = []
+    for r in records:
+        if dc and r.get("dest_dc") != dc:
+            continue
+        if dist and r.get("distributor") != dist:
+            continue
+        sd = r.get("ship_date") or ""
+        if since and sd and sd < since:
+            continue
+        if until and sd and sd > until:
+            continue
+        out.append(r)
+    out.sort(key=lambda x: (x.get("ship_date") or "", x.get("invoice_number") or ""),
+             reverse=True)
+    # Also derive a few summary stats so the dashboard doesn't have to
+    # recompute them client-side.
+    total_cost = sum(float(r.get("total_due") or 0) for r in out)
+    total_pallets = sum(int(r.get("pallets") or 0) for r in out)
+    total_cases = sum(int(r.get("cases") or 0) for r in out)
+    summary = {
+        "count":          len(out),
+        "total_cost":     round(total_cost, 2),
+        "total_pallets":  total_pallets,
+        "total_cases":    total_cases,
+        "avg_cost_per_pallet": round(total_cost / total_pallets, 2) if total_pallets else 0,
+        "avg_cost_per_case":   round(total_cost / total_cases, 4) if total_cases else 0,
+    }
+    return jsonify({"invoices": out, "summary": summary})
+
+
+@app.route("/api/freight/ingest", methods=["POST"])
+def api_freight_ingest():
+    """Accept externally-parsed Lineage freight invoice records.
+
+    Called by the 6h cron mailbox scan after it has fetched
+    Lineage emails, unzipped the attachment, and parsed each PDF.
+
+    Request body:
+        {
+          "dry_run": false,
+          "source":  "cowork-routine/lineage",
+          "invoices": [ <FreightInvoice as dict>, ... ]
+        }
+
+    Dedup is by invoice_number — re-ingesting the same invoice replaces
+    the prior record. Records without invoice_number are rejected.
+    """
+    import traceback as _tb
+    from datetime import datetime
+    try:
+        from inventory_tracker import (
+            load_freight_invoices, save_freight_invoices,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False,
+                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run", False))
+    source = str(body.get("source") or "external").strip() or "external"
+    raw = body.get("invoices") or []
+    if not isinstance(raw, list):
+        return jsonify({"ok": False, "error": "invoices must be a list"}), 400
+
+    existing = load_freight_invoices()
+    by_inv = {str(r.get("invoice_number") or ""): r for r in existing if r.get("invoice_number")}
+
+    added = 0
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for idx, rec in enumerate(raw):
+        if not isinstance(rec, dict):
+            errors.append(f"invoices[{idx}]: not an object")
+            skipped += 1
+            continue
+        inv_no = str(rec.get("invoice_number") or "").strip()
+        if not inv_no:
+            errors.append(f"invoices[{idx}]: missing invoice_number")
+            skipped += 1
+            continue
+        # Re-derive cost_per_pallet / cost_per_case server-side so we
+        # never trust client math. Clients may omit them entirely.
+        try:
+            total = float(rec.get("total_due") or 0)
+            pallets = int(rec.get("pallets") or 0)
+            cases = int(rec.get("cases") or 0)
+        except (TypeError, ValueError):
+            total = pallets = cases = 0
+        rec["cost_per_pallet"] = round(total / pallets, 2) if pallets else 0
+        rec["cost_per_case"]   = round(total / cases, 4) if cases else 0
+        # Stamp ingest source + time
+        rec.setdefault("source", source)
+        rec["ingested_at"] = rec.get("ingested_at") or now
+
+        if inv_no in by_inv:
+            by_inv[inv_no] = rec
+            updated += 1
+        else:
+            by_inv[inv_no] = rec
+            added += 1
+
+    if not dry_run:
+        merged = sorted(by_inv.values(),
+                        key=lambda x: (x.get("ship_date") or "",
+                                       x.get("invoice_number") or ""))
+        try:
+            save_freight_invoices(merged)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({
+                "ok": False,
+                "error": f"save failed: {type(exc).__name__}: {exc}",
+                "traceback": _tb.format_exc()[-2000:],
+            }), 500
+
+    return jsonify({
+        "ok": True,
+        "dry_run": dry_run,
+        "report": {
+            "source": source,
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "total_after": len(by_inv),
+            "errors": errors,
+        },
+    })
+
+
 @app.route("/api/chefs-warehouse/ship-date", methods=["POST"])
 def api_chefs_warehouse_ship_date():
     """Set / clear ship_date (and the derived arrival_date) on a CW PO.

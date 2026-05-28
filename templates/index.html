@@ -609,6 +609,9 @@
       <div class="nav-item" onclick="showPage('pending-pos')">
         <span class="nav-icon">🚛</span> Pending POs
       </div>
+      <div class="nav-item" onclick="showPage('freight')">
+        <span class="nav-icon">💰</span> Freight Costs
+      </div>
       <div class="nav-item" onclick="showPage('production')">
         <span class="nav-icon">🥯</span> Daily Production
       </div>
@@ -760,6 +763,104 @@
             </tr>
           </thead>
           <tbody id="pending-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Freight Costs (Lineage outbound shipping) -->
+    <div class="page" id="page-freight">
+      <div class="page-header">
+        <div>
+          <h1 style="margin-bottom:6px">Freight Costs</h1>
+          <p class="subtitle" style="margin-bottom:0">Outbound shipping invoices from Lineage Freight Management LLC, pulled from the 6h mailbox scan. Ship dates are matched against pending POs so you can see what each delivery actually cost per pallet and per case.</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost btn-sm active" id="freight-range-90" onclick="setFreightRange(90)">90d</button>
+          <button class="btn btn-ghost btn-sm" id="freight-range-180" onclick="setFreightRange(180)">180d</button>
+          <button class="btn btn-ghost btn-sm" id="freight-range-365" onclick="setFreightRange(365)">12 mo</button>
+          <button class="btn btn-ghost btn-sm" id="freight-range-all" onclick="setFreightRange(0)">All</button>
+        </div>
+      </div>
+
+      <div class="card" style="padding:14px 20px">
+        <div id="freight-kpis"
+             style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
+          <div><div class="subtitle" style="margin-bottom:2px">Shipments</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-count">—</div></div>
+          <div><div class="subtitle" style="margin-bottom:2px">Total spend</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-cost">—</div></div>
+          <div><div class="subtitle" style="margin-bottom:2px">Pallets shipped</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-pallets">—</div></div>
+          <div><div class="subtitle" style="margin-bottom:2px">Cases shipped</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-cases">—</div></div>
+          <div><div class="subtitle" style="margin-bottom:2px">Avg $ / pallet</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-pp">—</div></div>
+          <div><div class="subtitle" style="margin-bottom:2px">Avg $ / case</div>
+               <div style="font-size:22px;font-weight:700" id="freight-kpi-pc">—</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="padding:14px 20px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div>
+            <strong>Cost over time by destination</strong>
+            <span class="subtitle" id="freight-chart-sub" style="margin-left:8px"></span>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-ghost btn-sm active" id="freight-metric-cost"    onclick="setFreightMetric('total')">Total $</button>
+            <button class="btn btn-ghost btn-sm"        id="freight-metric-pp"      onclick="setFreightMetric('per_pallet')">$ / pallet</button>
+            <button class="btn btn-ghost btn-sm"        id="freight-metric-pc"      onclick="setFreightMetric('per_case')">$ / case</button>
+            <button class="btn btn-ghost btn-sm"        id="freight-metric-pallets" onclick="setFreightMetric('pallets')">Pallets</button>
+          </div>
+        </div>
+        <div style="position:relative;height:340px">
+          <canvas id="freight-chart"></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group">
+            <label>Destination</label>
+            <select id="freight-filter-dc" onchange="renderFreight()" style="width:200px">
+              <option value="">All</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Distributor</label>
+            <select id="freight-filter-dist" onchange="renderFreight()" style="width:180px">
+              <option value="">All</option>
+              <option>US Foods</option>
+              <option>Cheney Brothers</option>
+              <option>Chefs Warehouse</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label>Group by</label>
+            <select id="freight-group-by" onchange="renderFreight()" style="width:140px">
+              <option value="week" selected>Week</option>
+              <option value="month">Month</option>
+              <option value="day">Day</option>
+            </select>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th class="sortable" data-sort="ship_date">Ship Date</th>
+              <th class="sortable" data-sort="invoice_number">Invoice #</th>
+              <th class="sortable" data-sort="dest_dc">Destination</th>
+              <th class="sortable" data-sort="distributor">Distributor</th>
+              <th class="sortable" data-sort="po_number">PO Match</th>
+              <th class="sortable" data-sort="pallets" style="text-align:right">Pallets</th>
+              <th class="sortable" data-sort="cases" style="text-align:right">Cases</th>
+              <th class="sortable" data-sort="total_due" style="text-align:right">Total</th>
+              <th class="sortable" data-sort="cost_per_pallet" style="text-align:right">$/Pal</th>
+              <th class="sortable" data-sort="cost_per_case" style="text-align:right">$/Case</th>
+            </tr>
+          </thead>
+          <tbody id="freight-tbody"></tbody>
+          <tfoot id="freight-tfoot"></tfoot>
         </table>
       </div>
     </div>
@@ -1274,6 +1375,7 @@ function refresh(page) {
   else if (page === 'distributors') showPage('inventory');
   else if (page === 'report') loadReport();
   else if (page === 'pending-pos') loadPendingPOs();
+  else if (page === 'freight') loadFreight();
   else if (page === 'production') loadProduction();
   else if (page === 'traceability') initTraceability();
 }
@@ -3494,6 +3596,273 @@ function _updateProdPager(first, last, total) {
 }
 
 let prodPoLookup = {};  // po_number -> aggregated on_order info
+
+// -------------------------------------------------------------------------
+// Freight Costs (Lineage outbound shipping)
+// -------------------------------------------------------------------------
+// Pulls Lineage Freight Management LLC invoices ingested via the 6h
+// mailbox scan. The same scan that picks up distributor POs (US Foods,
+// Cheney, Chefs Warehouse) also picks up the "Billable Invoice(s)
+// from LINEAGE FREIGHT MANAGEMENT LLC" emails sent by their TMS
+// (noreply@tms.blujaysolutions.net); the .zip attachment is unpacked
+// to PDFs server-side and each PDF turns into one freight_invoices.json
+// row.
+//
+// Ship dates from those invoices are matched against pending POs by
+// (distributor, dest_dc, po_number/shipper_ref) so the table shows
+// which inventory line a shipment actually backed.
+
+let _freightInvoices = [];
+let _freightAllInvoices = [];          // unfiltered server payload
+let _freightSummary    = {};
+let _freightRangeDays  = 90;           // 90 / 180 / 365 / 0 (all)
+let _freightMetric     = "total";      // total | per_pallet | per_case | pallets
+let _freightChart      = null;
+
+function setFreightRange(days) {
+  _freightRangeDays = days;
+  document.querySelectorAll('[id^="freight-range-"]').forEach(b => b.classList.remove('active'));
+  const id = "freight-range-" + (days === 0 ? "all" : String(days));
+  const btn = document.getElementById(id);
+  if (btn) btn.classList.add('active');
+  loadFreight();
+}
+
+function setFreightMetric(m) {
+  _freightMetric = m;
+  document.querySelectorAll('[id^="freight-metric-"]').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById(
+    "freight-metric-" + ({total: "cost", per_pallet: "pp", per_case: "pc", pallets: "pallets"})[m]
+  );
+  if (btn) btn.classList.add('active');
+  drawFreightChart();
+}
+
+async function loadFreight() {
+  const params = new URLSearchParams();
+  if (_freightRangeDays > 0) {
+    const since = new Date();
+    since.setDate(since.getDate() - _freightRangeDays);
+    params.set("since", since.toISOString().slice(0, 10));
+  }
+  let payload;
+  try {
+    payload = await api("/api/freight/invoices?" + params.toString());
+  } catch (err) {
+    toast("Failed to load freight: " + err.message, 'error');
+    return;
+  }
+  _freightAllInvoices = payload.invoices || [];
+  _freightSummary     = payload.summary || {};
+  // Populate the DC filter dropdown from the unfiltered set so users
+  // see every DC even when filtering returns no rows for one of them.
+  const dcs = Array.from(new Set(_freightAllInvoices.map(r => r.dest_dc).filter(Boolean))).sort();
+  const sel = document.getElementById("freight-filter-dc");
+  if (sel) {
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All</option>' +
+      dcs.map(d => `<option value="${escHtml(d)}">${escHtml(d)}</option>`).join("");
+    sel.value = cur;
+  }
+  renderFreight();
+}
+
+function renderFreight() {
+  const dc   = (document.getElementById("freight-filter-dc")   || {}).value || "";
+  const dist = (document.getElementById("freight-filter-dist") || {}).value || "";
+  _freightInvoices = _freightAllInvoices.filter(r =>
+    (!dc   || r.dest_dc     === dc) &&
+    (!dist || r.distributor === dist)
+  );
+  // KPI tiles
+  let cost = 0, pallets = 0, cases = 0;
+  for (const r of _freightInvoices) {
+    cost    += Number(r.total_due) || 0;
+    pallets += Number(r.pallets)   || 0;
+    cases   += Number(r.cases)     || 0;
+  }
+  const $ = id => document.getElementById(id);
+  $("freight-kpi-count").textContent   = _freightInvoices.length.toLocaleString();
+  $("freight-kpi-cost").textContent    = "$" + cost.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  $("freight-kpi-pallets").textContent = pallets.toLocaleString();
+  $("freight-kpi-cases").textContent   = cases.toLocaleString();
+  $("freight-kpi-pp").textContent      = pallets ? ("$" + (cost / pallets).toFixed(2)) : "—";
+  $("freight-kpi-pc").textContent      = cases   ? ("$" + (cost / cases).toFixed(2))   : "—";
+  // Table
+  renderFreightTable();
+  drawFreightChart();
+}
+
+function freightPoMatch(r) {
+  // Lineage PDFs put the distributor PO in the "PO:" reference. Strip
+  // an "HHB-" prefix if present (Lineage's correction invoices reuse
+  // the shipper ref as the PO).
+  const raw = (r.po_number || "").toString();
+  return raw.replace(/^HHB-/i, "");
+}
+
+function renderFreightTable() {
+  const tbody = document.getElementById("freight-tbody");
+  if (!tbody) return;
+  const rows = _freightInvoices.slice().sort((a, b) => {
+    return (b.ship_date || "").localeCompare(a.ship_date || "");
+  });
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--muted)">No freight invoices in this range.</td></tr>`;
+  } else {
+    tbody.innerHTML = rows.map(r => {
+      const inv = escHtml(r.invoice_number || "");
+      const sd  = escHtml(r.ship_date      || "");
+      const dest= escHtml(r.dest_dc || r.consignee_name || "");
+      const dist= distributorBadge(r.distributor);
+      const po  = escHtml(freightPoMatch(r));
+      const pal = (r.pallets || 0).toLocaleString();
+      const cs  = (r.cases   || 0).toLocaleString();
+      const tot = "$" + (Number(r.total_due) || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      const pp  = r.pallets ? ("$" + (Number(r.cost_per_pallet) || 0).toFixed(2)) : "—";
+      const pc  = r.cases   ? ("$" + (Number(r.cost_per_case)   || 0).toFixed(2)) : "—";
+      return `<tr>
+        <td>${sd}</td>
+        <td><code>${inv}</code></td>
+        <td>${dest}</td>
+        <td>${dist}</td>
+        <td>${po ? '<code>' + po + '</code>' : '<span style="color:var(--muted)">—</span>'}</td>
+        <td style="text-align:right">${pal}</td>
+        <td style="text-align:right">${cs}</td>
+        <td style="text-align:right">${tot}</td>
+        <td style="text-align:right">${pp}</td>
+        <td style="text-align:right">${pc}</td>
+      </tr>`;
+    }).join("");
+  }
+  // Footer totals
+  let cost = 0, pallets = 0, cases = 0;
+  for (const r of rows) {
+    cost    += Number(r.total_due) || 0;
+    pallets += Number(r.pallets)   || 0;
+    cases   += Number(r.cases)     || 0;
+  }
+  const tfoot = document.getElementById("freight-tfoot");
+  if (tfoot) {
+    tfoot.innerHTML = rows.length ? `<tr style="font-weight:600;background:var(--surface2)">
+      <td colspan="5">Total (${rows.length} shipments)</td>
+      <td style="text-align:right">${pallets.toLocaleString()}</td>
+      <td style="text-align:right">${cases.toLocaleString()}</td>
+      <td style="text-align:right">$${cost.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+      <td style="text-align:right">${pallets ? ('$' + (cost / pallets).toFixed(2)) : '—'}</td>
+      <td style="text-align:right">${cases ? ('$' + (cost / cases).toFixed(2)) : '—'}</td>
+    </tr>` : "";
+  }
+}
+
+function _freightBucket(sd, grain) {
+  if (!sd) return "";
+  if (grain === "day")   return sd;
+  if (grain === "month") return sd.slice(0, 7);  // YYYY-MM
+  // week: ISO week start (Monday)
+  const d = new Date(sd + "T00:00:00Z");
+  if (isNaN(d.getTime())) return sd;
+  const day = (d.getUTCDay() + 6) % 7;           // Mon=0..Sun=6
+  d.setUTCDate(d.getUTCDate() - day);
+  return d.toISOString().slice(0, 10);
+}
+
+function drawFreightChart() {
+  const canvas = document.getElementById("freight-chart");
+  if (!canvas || typeof Chart === "undefined") return;
+  const grain = (document.getElementById("freight-group-by") || {}).value || "week";
+  const metric = _freightMetric;
+  // Group: bucket -> dest_dc -> running sums
+  const bucketSet = new Set();
+  const dcMap = new Map();   // dc -> {bucket: {cost, pallets, cases}}
+  for (const r of _freightInvoices) {
+    const b = _freightBucket(r.ship_date, grain);
+    if (!b) continue;
+    bucketSet.add(b);
+    const dc = r.dest_dc || r.consignee_name || "Unknown";
+    if (!dcMap.has(dc)) dcMap.set(dc, {});
+    const tmap = dcMap.get(dc);
+    if (!tmap[b]) tmap[b] = {cost: 0, pallets: 0, cases: 0};
+    tmap[b].cost    += Number(r.total_due) || 0;
+    tmap[b].pallets += Number(r.pallets)   || 0;
+    tmap[b].cases   += Number(r.cases)     || 0;
+  }
+  const buckets = Array.from(bucketSet).sort();
+  const dcs = Array.from(dcMap.keys()).sort();
+  // Stable color per DC
+  const palette = [
+    "#1F77B4","#FF7F0E","#2CA02C","#D62728","#9467BD",
+    "#8C564B","#E377C2","#7F7F7F","#BCBD22","#17BECF",
+    "#3B82F6","#F59E0B","#10B981","#EF4444","#8B5CF6",
+  ];
+  const datasets = dcs.map((dc, i) => {
+    const buckets_for_dc = dcMap.get(dc) || {};
+    return {
+      label: dc,
+      data: buckets.map(b => {
+        const v = buckets_for_dc[b];
+        if (!v) return null;
+        if (metric === "total")      return Number(v.cost.toFixed(2));
+        if (metric === "per_pallet") return v.pallets ? Number((v.cost / v.pallets).toFixed(2)) : null;
+        if (metric === "per_case")   return v.cases   ? Number((v.cost / v.cases).toFixed(4))   : null;
+        if (metric === "pallets")    return v.pallets;
+        return null;
+      }),
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length] + "33",
+      tension: 0.25,
+      spanGaps: true,
+      pointRadius: 3,
+    };
+  });
+  // Subtitle
+  const labels = {
+    total: "Total $ per " + grain,
+    per_pallet: "$ per pallet per " + grain,
+    per_case: "$ per case per " + grain,
+    pallets: "Pallets shipped per " + grain,
+  };
+  const sub = document.getElementById("freight-chart-sub");
+  if (sub) sub.textContent = labels[metric] || "";
+  // Chart
+  if (_freightChart) _freightChart.destroy();
+  const ctx = canvas.getContext("2d");
+  _freightChart = new Chart(ctx, {
+    type: "line",
+    data: { labels: buckets, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom" },
+        tooltip: {
+          callbacks: {
+            label: function(ctx) {
+              const v = ctx.parsed.y;
+              if (v == null) return ctx.dataset.label + ": —";
+              const fmt = (metric === "pallets")
+                ? v.toLocaleString()
+                : "$" + Number(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+              return ctx.dataset.label + ": " + fmt;
+            }
+          }
+        }
+      },
+      scales: {
+        y: {
+          beginAtZero: true,
+          ticks: {
+            callback: v => (metric === "pallets")
+                ? v
+                : "$" + Number(v).toLocaleString()
+          }
+        }
+      }
+    }
+  });
+}
+
 
 async function loadProduction() {
   await ensureWarehouses();

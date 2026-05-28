@@ -61,6 +61,9 @@ from integrations.email_scanner import (  # noqa: E402
     _cheney_po_to_events,
     _chefs_warehouse_po_to_record,
 )
+from integrations.lineage_freight_parser import (  # noqa: E402
+    parse_freight_pdf,
+)
 
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -71,9 +74,14 @@ DEFAULT_MAILBOXES = "JD@ms.hhbagels.com,info@ms.hhbagels.com"
 
 # Keys we treat as PO-bearing senders. Other senders are ignored even if
 # the subject contains "Purchase Order".
-USF_DOMAINS    = {"usfoods.com", "usfood.com"}
-CHENEY_DOMAINS = {"cheneybrothers.com", "cheney.com"}
-CHEFS_DOMAINS  = {"chefswarehouse.com"}
+USF_DOMAINS     = {"usfoods.com", "usfood.com"}
+CHENEY_DOMAINS  = {"cheneybrothers.com", "cheney.com"}
+CHEFS_DOMAINS   = {"chefswarehouse.com"}
+# Lineage Freight TMS sends invoice notification emails from a BluJay
+# Solutions noreply address. The subject always contains "Billable
+# Invoice(s) from LINEAGE FREIGHT MANAGEMENT LLC".
+LINEAGE_DOMAINS = {"tms.blujaysolutions.net", "blujaysolutions.net",
+                   "lineagelogistics.com"}
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +118,15 @@ def _classify(sender: str, subject: str) -> str | None:
     for d in CHEFS_DOMAINS:
         if dom == d or dom.endswith("." + d):
             return "Chefs Warehouse"
+    # Lineage Freight TMS — sender domain check first (the noreply
+    # address from BluJay Solutions), then fall back to a subject
+    # match in case Lineage migrates to a different relay later.
+    for d in LINEAGE_DOMAINS:
+        if dom == d or dom.endswith("." + d):
+            return "Lineage Freight"
+    subj_u = (subject or "").upper()
+    if "LINEAGE FREIGHT" in subj_u and "BILLABLE INVOICE" in subj_u:
+        return "Lineage Freight"
     # Some PO confirmations get forwarded by internal staff. We do NOT
     # accept those automatically — the original PDF is the source of truth
     # and will arrive in the original distributor message too.
@@ -466,6 +483,7 @@ def run(argv: list[str] | None = None) -> int:
     # ---- fetch attachments + parse
     events_out: list[dict] = []     # USF + Cheney -> /api/email/ingest-events
     cw_pos_out: list[dict] = []     # Chefs Warehouse -> /api/chefs-warehouse/ingest-pos
+    freight_out: list[dict] = []    # Lineage Freight  -> /api/freight/ingest
     error_strs: list[str] = []
     msgs_parsed = 0
 
@@ -478,11 +496,18 @@ def run(argv: list[str] | None = None) -> int:
             error_strs.append(f"{mid[:12]}.. [list-att]: {msg}")
             continue
 
+        # Lineage Freight attachments are .zip files containing one or
+        # more PDFs. Everything else (USF/Cheney/CW) is a direct PDF.
+        wanted_zip = (dist == "Lineage Freight")
         any_pdf = False
         for a in atts:
             name = (a.get("name") or "").lower()
             ctype = (a.get("contentType") or "").lower()
-            if not (name.endswith(".pdf") or ctype == "application/pdf"):
+            is_pdf = name.endswith(".pdf") or ctype == "application/pdf"
+            is_zip = (wanted_zip and
+                      (name.endswith(".zip") or ctype in ("application/zip",
+                                                          "application/x-zip-compressed")))
+            if not (is_pdf or is_zip):
                 continue
             any_pdf = True
             try:
@@ -515,6 +540,40 @@ def run(argv: list[str] | None = None) -> int:
                         cw_pos_out.append(record)
                     for er in errors:
                         error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                elif dist == "Lineage Freight":
+                    # Unzip and parse each PDF inside.
+                    import io as _io
+                    import zipfile as _zipfile
+                    from dataclasses import asdict as _asdict
+                    pdfs: list[tuple[str, bytes]] = []
+                    if is_zip:
+                        try:
+                            zf = _zipfile.ZipFile(_io.BytesIO(pdf_bytes))
+                            for info in zf.infolist():
+                                if info.filename.lower().endswith(".pdf"):
+                                    pdfs.append((info.filename, zf.read(info.filename)))
+                        except _zipfile.BadZipFile as exc:
+                            error_strs.append(
+                                f"{mid[:12]}.. [Lineage]: bad zip: {exc}")
+                            pdfs = []
+                    else:
+                        # Some Lineage messages arrive with a single PDF
+                        # directly attached. Accept that too.
+                        pdfs = [(a.get("name") or "invoice.pdf", pdf_bytes)]
+                    for fname, pb in pdfs:
+                        try:
+                            inv = parse_freight_pdf(
+                                pb, pdf_filename=fname,
+                                source_message_id=mid, source_subject=subject)
+                        except Exception as exc:
+                            error_strs.append(
+                                f"{mid[:12]}.. [Lineage/{fname}]: parse failed: {exc}")
+                            continue
+                        if inv is None:
+                            error_strs.append(
+                                f"{mid[:12]}.. [Lineage/{fname}]: not a freight invoice")
+                            continue
+                        freight_out.append(_asdict(inv))
                 else:
                     error_strs.append(
                         f"{mid[:12]}.. [{dist}]: no parser for distributor")
@@ -590,6 +649,33 @@ def run(argv: list[str] | None = None) -> int:
             return 1
         cw_report = (cw_body or {}).get("report") or {}
 
+    # ---- POST freight invoices (Lineage) to /api/freight/ingest
+    freight_report: dict = {}
+    if freight_out:
+        fr_payload = {
+            "dry_run": bool(args.dry_run),
+            "source": "cowork-routine/graph-direct",
+            "invoices": freight_out,
+        }
+        try:
+            fr_status, fr_body = _post_ingest(
+                args.app_url, args.api_token, fr_payload,
+                path="/api/freight/ingest",
+                verbose=args.verbose,
+            )
+        except Exception as exc:
+            msg = _redact(str(exc), secrets_to_redact)
+            print(f"ERROR: Freight POST failed: {msg}", file=sys.stderr)
+            return 1
+        if fr_status != 200 or not isinstance(fr_body, dict):
+            body_text = (fr_body if isinstance(fr_body, str)
+                         else json.dumps(fr_body)[:400])
+            body_text = _redact(body_text, secrets_to_redact)
+            print(f"ERROR: freight/ingest HTTP {fr_status}: {body_text}",
+                  file=sys.stderr)
+            return 1
+        freight_report = (fr_body or {}).get("report") or {}
+
     # ---- update seen-IDs only on real success (skip on dry-run)
     if not args.dry_run and rep_status in ("ok", "not_configured"):
         try:
@@ -620,12 +706,21 @@ def run(argv: list[str] | None = None) -> int:
         if skipped_inval:
             parts.append(f"{skipped_inval} invalid-skipped")
         cw_summary = "; CW: " + " / ".join(parts)
+    freight_summary = ""
+    if freight_out:
+        fparts = [
+            f"{freight_report.get('added', 0)} added",
+            f"{freight_report.get('updated', 0)} updated",
+            f"{freight_report.get('skipped', 0)} skipped",
+            f"total now {freight_report.get('total_after', 0)}",
+        ]
+        freight_summary = "; FREIGHT: " + " / ".join(fparts)
     print(
         f"ingest-events {'DRY ' if args.dry_run else ''}OK: "
         f"{msgs_parsed} parsed, {len(events_out)} events, "
-        f"{len(cw_pos_out)} cw_pos, "
+        f"{len(cw_pos_out)} cw_pos, {len(freight_out)} freight, "
         f"{rep_errors} errors; status={rep_status}; updated={rep_updated}; "
-        f"seen-set now {new_seen_size}{cw_summary}"
+        f"seen-set now {new_seen_size}{cw_summary}{freight_summary}"
     )
     if args.verbose:
         _vlog(True, "report (full):")
