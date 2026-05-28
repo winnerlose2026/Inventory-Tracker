@@ -334,6 +334,74 @@ def api_on_order_ship_date():
     })
 
 
+@app.route("/api/admin/po-order-date", methods=["POST"])
+def api_admin_po_order_date():
+    """Set (or clear) ``ordered_at`` on every on_order entry matching a
+    PO number. Use when a PO was ingested before po_order_date was
+    plumbed through the scanner — the on_order entry inherited the
+    ingestion timestamp instead of the PDF's printed "ORDER DATE",
+    which threw off the Pending POs view and the 30-day rollover ETA.
+
+    Body:
+      po_number       required.
+      order_date      ISO date (YYYY-MM-DD) or empty/null to clear.
+      recompute_eta   bool; default true. If true and order_date is
+                      set, also reset eta = order_date + lead_days
+                      (entry-by-entry, using each entry's lead_days).
+
+    Returns {ok, po_number, order_date, entries_updated, items}.
+    """
+    from datetime import datetime, timedelta
+    from inventory_tracker import load_inventory, save_inventory
+
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    order_raw = body.get("order_date")
+    recompute_eta = bool(body.get("recompute_eta", True))
+
+    if order_raw is None or (isinstance(order_raw, str)
+                             and not order_raw.strip()):
+        order_iso = ""
+        order_dt = None
+    else:
+        try:
+            order_dt = datetime.fromisoformat(str(order_raw).strip())
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": "order_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
+            }), 400
+        order_iso = order_dt.isoformat()
+
+    inv = load_inventory()
+    updated = 0
+    touched_items: list[str] = []
+    for key, item in inv.items():
+        pending = item.get("on_order") or []
+        for entry in pending:
+            if (entry.get("po_number") or "") != po_number:
+                continue
+            entry["ordered_at"] = order_iso
+            if recompute_eta and order_dt is not None:
+                lead = int(entry.get("lead_days") or 0)
+                if lead > 0:
+                    entry["eta"] = (order_dt + timedelta(days=lead)).isoformat()
+            updated += 1
+            name = item.get("name") or key
+            if name not in touched_items:
+                touched_items.append(name)
+    save_inventory(inv)
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "order_date": order_iso,
+        "entries_updated": updated,
+        "items": touched_items,
+    })
+
+
 @app.route("/api/admin/remove-po", methods=["POST"])
 def api_admin_remove_po():
     """Drop all pending on_order entries matching a po_number.
@@ -3626,7 +3694,10 @@ def api_email_ingest_events():
               "source_message_id": "...",
               "source_subject": "...",
               "po_number": "2125123456",   # required for PO revision semantics
-              "po_revision": "1"           # numeric string; "" allowed
+              "po_revision": "1",          # numeric string; "" allowed
+              "po_order_date": "2026-05-13" # ISO YYYY-MM-DD from the PO PDF;
+                                            #   anchors ordered_at + ETA in
+                                            #   the on_order entry. Optional.
             }, ...
           ]
         }
@@ -3717,6 +3788,7 @@ def api_email_ingest_events():
                 source_subject=str(e.get("source_subject") or ""),
                 po_number=str(e.get("po_number") or ""),
                 po_revision=str(e.get("po_revision") or ""),
+                po_order_date=str(e.get("po_order_date") or ""),
             ))
         except (TypeError, ValueError, KeyError) as exc:
             build_errors.append(f"events[{idx}]: {exc}")
