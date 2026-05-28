@@ -812,6 +812,10 @@ def api_freight_scan():
     errors: list[str] = []
     seen = 0
     parsed_invoices: list[dict] = []
+    diag_atts_seen = 0
+    diag_zips = 0
+    diag_pdfs_in_zip = 0
+    diag_parse_none = 0
     try:
         token = _token()
         since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -880,12 +884,15 @@ def api_freight_scan():
                         errors.append(f"{mid[:12]}.. list-att: HTTP {exc.code}")
                         continue
                     for a in (atts_resp.get("value") or []):
+                        diag_atts_seen += 1
                         aname = (a.get("name") or "").lower()
                         actype = (a.get("contentType") or "").lower()
                         if not (aname.endswith(".zip") or aname.endswith(".pdf")
                                 or actype in ("application/zip",
                                               "application/x-zip-compressed",
                                               "application/pdf")):
+                            if len(errors) < 5:
+                                errors.append(f"skip att type={actype!r} name={aname!r}")
                             continue
                         try:
                             ab = _graph_get_bytes(token,
@@ -897,11 +904,13 @@ def api_freight_scan():
                         pdfs: list[tuple[str, bytes]] = []
                         if aname.endswith(".zip") or actype in ("application/zip",
                                                                 "application/x-zip-compressed"):
+                            diag_zips += 1
                             try:
                                 zf = zipfile.ZipFile(io.BytesIO(ab))
                                 for info in zf.infolist():
                                     if info.filename.lower().endswith(".pdf"):
                                         pdfs.append((info.filename, zf.read(info.filename)))
+                                        diag_pdfs_in_zip += 1
                             except zipfile.BadZipFile as exc:
                                 errors.append(f"{mid[:12]}.. bad-zip: {exc}")
                                 continue
@@ -916,6 +925,9 @@ def api_freight_scan():
                                 errors.append(f"{mid[:12]}.. parse[{fname}]: {exc}")
                                 continue
                             if inv is None:
+                                diag_parse_none += 1
+                                if len(errors) < 10:
+                                    errors.append(f"{mid[:12]}.. parse[{fname}] returned None ({len(pb)}b)")
                                 continue
                             parsed_invoices.append(asdict(inv))
                 # Next page
@@ -980,6 +992,12 @@ def api_freight_scan():
             "error_count":      len(errors),
             "top_sender_domains": top_domains,
             "sample_lineage_matches": lineage_subjects,
+            "diag": {
+                "attachments_seen":     diag_atts_seen,
+                "zip_attachments":      diag_zips,
+                "pdfs_extracted_from_zip": diag_pdfs_in_zip,
+                "parse_returned_none":  diag_parse_none,
+            },
         },
     })
 
