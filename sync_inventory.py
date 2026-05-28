@@ -338,11 +338,35 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
             ordered_at_dt = datetime.fromisoformat(now)
         except (TypeError, ValueError):
             ordered_at_dt = datetime.now()
+    pending = item.get("on_order") or []
+    existing_qty = sum(float(p.get("qty") or 0) for p in pending)
+
+    # Look for an existing pending entry at the SAME (po_number, po_revision).
+    # If one is there, this is a re-ingest of the same scan — preserve its
+    # ordered_at (and ship_date / arrival_date if the operator set them) so
+    # downstream views don't flip to "today" every time the cron re-fires.
+    new_rev_tag = getattr(evt, "po_revision", "") or ""
+    same_rev_existing = None
+    for p in pending:
+        if (p.get("po_number") == evt.po_number
+                and (p.get("po_revision") or "") == new_rev_tag):
+            same_rev_existing = p
+            break
+
+    if same_rev_existing is not None and not po_date_iso:
+        # Incoming event didn't carry the PDF's Order Date and we already
+        # have a date booked on this PO — keep the booked one instead of
+        # resetting to now.
+        prior = (same_rev_existing.get("ordered_at") or "").strip()
+        if prior:
+            try:
+                ordered_at_dt = datetime.fromisoformat(prior)
+            except ValueError:
+                pass  # malformed, fall back to whatever ordered_at_dt is
+
     # ETA stays blank for non-auto-ETA distributors; the rollover skips
     # entries with no resolvable arrival date.
     eta_iso = (ordered_at_dt + timedelta(days=lead_days)).isoformat() if auto_eta else ""
-    pending = item.get("on_order") or []
-    existing_qty = sum(float(p.get("qty") or 0) for p in pending)
 
     entry = {
         "qty": amount,
@@ -350,11 +374,21 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
         "eta": eta_iso,
         "ordered_at": ordered_at_dt.isoformat(),
         "po_number": evt.po_number,
-        "po_revision": getattr(evt, "po_revision", "") or "",
+        "po_revision": new_rev_tag,
         "source": "Email Inbox",
         "source_subject": (evt.source_subject or "")[:120],
         "lead_days": lead_days if auto_eta else 0,
     }
+    # Carry forward operator-set ship_date / arrival_date too, so a re-scan
+    # doesn't wipe them. _apply_po_on_order_ship_date is the only path
+    # that sets these; they should outlive any number of re-ingests.
+    if same_rev_existing is not None:
+        for k in ("ship_date", "arrival_date"):
+            if same_rev_existing.get(k):
+                entry[k] = same_rev_existing[k]
+        # Drop the old in-place so we don't end up with two rows for the
+        # same (po, rev). Order preserved below by re-appending.
+        pending = [p for p in pending if p is not same_rev_existing]
 
     report["changes"].append({
         "name": item["name"],
@@ -384,15 +418,29 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
 
 def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
                            now: str, report: dict, dry_run: bool) -> None:
-    """Drop pending on_order entries for a superseded PO."""
+    """Drop pending on_order entries for a SUPERSEDED PO revision.
+
+    Same-revision entries are intentionally kept so that
+    _apply_po_on_order can replace them in place, preserving
+    ordered_at across re-ingests of the same scan (which would
+    otherwise reset the date to "now"). Older revisions still get
+    nuked here; reversal audit lives in _reverse_po_entries."""
+    new_rev_int = _po_rev_int(new_rev)
     for key, item in inv.items():
         pending = item.get("on_order") or []
         if not pending:
             continue
-        removed = [p for p in pending if p.get("po_number") == po_number]
+        # Match same PO; partition by revision.
+        same_po = [p for p in pending if p.get("po_number") == po_number]
+        if not same_po:
+            continue
+        removed = [p for p in same_po
+                   if _po_rev_int(p.get("po_revision") or "") < new_rev_int]
         if not removed:
             continue
-        kept = [p for p in pending if p.get("po_number") != po_number]
+        kept = [p for p in pending
+                if p.get("po_number") != po_number
+                or _po_rev_int(p.get("po_revision") or "") >= new_rev_int]
         removed_qty = round(sum(float(p.get("qty") or 0) for p in removed), 2)
         report["changes"].append({
             "name": item["name"],
