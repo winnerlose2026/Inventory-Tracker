@@ -9,12 +9,22 @@ underlying ingest is idempotent against ``source="bakery-xlsx"`` --
 each run replaces the prior set of rows tagged that way -- so even if
 this runs twice for the same file state it stays safe.
 
-Mtime tracking
---------------
-The last successfully-ingested mtime is written to a sidecar file
-next to the workbook (default: ``<xlsx>.last-ingested-mtime``). On
-each run we compare ``os.path.getmtime(xlsx)`` against the stamp.
-Only when they differ do we shell out to ``ingest_bakery_xlsx.py``.
+Change tracking
+---------------
+We key off a SHA-256 of the workbook contents, not its mtime. Excel
+on Windows + Dropbox sometimes preserves the original mtime across a
+save (and the workspace mount can lag behind), so mtime-based gating
+silently skipped real edits. Content hashing is mtime-independent
+and catches any byte-level change.
+
+The stamp sidecar (default: ``<xlsx>.last-ingested-mtime`` -- name
+kept for back-compat) now stores two lines:
+
+    <sha256 hex>
+    <mtime as float>     # informational, for human debugging
+
+Legacy stamps that contain only an mtime are treated as unknown-hash
+and trigger one re-ingest to migrate forward.
 
 Mid-sync guard
 --------------
@@ -43,6 +53,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -64,17 +75,40 @@ SYNC_WAIT_TOTAL_SEC = 12
 SYNC_WAIT_INTERVAL_SEC = 3
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _read_stamp(stamp_path: Path):
+    """Return the previously-ingested SHA-256 hex, or None.
+
+    Handles three shapes:
+      * Missing / unreadable / empty file -> None
+      * Legacy single-line float (old mtime-only format) -> None
+        (forces one re-ingest, which then writes the new format)
+      * New format: first line is a 64-char sha256 hex -> return it
+    """
     if not stamp_path.exists():
         return None
     try:
-        return float(stamp_path.read_text().strip())
-    except (ValueError, OSError):
+        raw = stamp_path.read_text().strip()
+    except OSError:
         return None
+    if not raw:
+        return None
+    first = raw.splitlines()[0].strip()
+    # Legacy float-only stamp: not a hash, treat as unknown.
+    if len(first) != 64 or any(c not in "0123456789abcdef" for c in first.lower()):
+        return None
+    return first.lower()
 
 
-def _write_stamp(stamp_path: Path, mtime: float) -> None:
-    stamp_path.write_text(f"{mtime:.6f}\n")
+def _write_stamp(stamp_path: Path, sha: str, mtime: float) -> None:
+    stamp_path.write_text(f"{sha}\n{mtime:.6f}\n")
 
 
 def _workbook_is_complete(path: Path) -> bool:
@@ -142,11 +176,12 @@ def main() -> int:
         return 2
 
     current_mtime = os.path.getmtime(xlsx)
-    last_mtime    = _read_stamp(stamp)
+    current_sha   = _file_sha256(xlsx)
+    last_sha      = _read_stamp(stamp)
 
-    if not args.force and last_mtime is not None and abs(current_mtime - last_mtime) < 1e-3:
+    if not args.force and last_sha is not None and last_sha == current_sha:
         if not args.quiet:
-            print(f"no change since last ingest (mtime={current_mtime:.0f}) -- skipping")
+            print(f"no change since last ingest (sha256={current_sha[:12]}...) -- skipping")
         return 0
 
     # Locate the sibling ingest script.
@@ -167,7 +202,8 @@ def main() -> int:
         # Deliberately do NOT bump the stamp -- we want to retry next run.
         return 0
 
-    print(f"file changed (mtime: {last_mtime} -> {current_mtime:.0f}) -- running ingest")
+    old_tag = (last_sha[:12] + "...") if last_sha else "none"
+    print(f"file changed (sha256: {old_tag} -> {current_sha[:12]}...) -- running ingest")
     env = dict(os.environ)
     env["INVENTORY_API_TOKEN"] = args.token
     proc = subprocess.run(
@@ -179,7 +215,7 @@ def main() -> int:
         print(f"ingest exited {proc.returncode}", file=sys.stderr)
         return 3
 
-    _write_stamp(stamp, current_mtime)
+    _write_stamp(stamp, current_sha, current_mtime)
     return 0
 
 
