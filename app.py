@@ -450,6 +450,32 @@ def api_admin_remove_po():
     })
 
 
+@app.route("/api/admin/uncancel-po", methods=["POST"])
+def api_admin_uncancel_po():
+    """Remove a po_number from the canceled-POs ignore list.
+
+    Inverse of /api/admin/remove-po. Use when a PO was canceled in error
+    (or when an operator needs to allow a re-ingest of a PO whose stored
+    entries were wiped). Does NOT restore the previously-removed
+    on_order entries -- those have to come back via a fresh ingest from
+    the source email or a manual POST to /api/email/ingest-events.
+    """
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    from inventory_tracker import load_canceled_pos, save_canceled_pos
+    canceled = load_canceled_pos()
+    prior = canceled.pop(po_number, None)
+    save_canceled_pos(canceled)
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "was_canceled": prior is not None,
+        "prior_entry": prior,
+    })
+
+
 # ---------------------------------------------------------------------------
 # API – Chefs Warehouse POs
 # ---------------------------------------------------------------------------
