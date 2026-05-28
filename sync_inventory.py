@@ -691,27 +691,38 @@ def _apply_events(events: list,
     for po_num, grp in po_groups.items():
         # Collapse duplicate lines that arrived in the same scan. The
         # scanner pulls from multiple mailboxes (JD@ and info@), and the
-        # same PO email is often delivered to both, so each line item
-        # appears twice. Dedupe by (variety, warehouse, distributor, qty)
-        # within the group — same item + same qty in the same PO means
-        # the scanner double-parsed it.
-        seen_lines: set[tuple] = set()
-        deduped_grp = []
+        # same PO email is often delivered to both — and the same PO PDF
+        # often gets re-attached on a reply or forward (e.g., a "RE:
+        # Weekly Bagel Inventory & Usage Report" thread that quoted the
+        # original USF confirmation). When two messages parse to the same
+        # SKU with the SAME qty, dropping the dupe is obvious. When they
+        # parse to the same SKU with DIFFERENT qty (because one email
+        # carried a stale or earlier version of the PDF), the previous
+        # rule kept BOTH — and the SKU got double-counted (e.g., PO
+        # 6454635G shipped 16 cs of Onion but stored as 8 + 16 = 24,
+        # inflating the PO total from 448 to 456 cs). Fix: collapse to
+        # one event per (variety, warehouse, distributor) and keep the
+        # MAX qty across all messages. The max is the right pick because
+        # stale forwarded versions of a PO are typically partial (smaller
+        # qtys); the largest qty represents the canonical / latest order.
+        best: dict[tuple, "EmailEvent"] = {}
         for _evt in grp:
-            line_key = (
+            sku_key = (
                 (_evt.item.variety or "").strip().lower(),
                 (_evt.item.warehouse or "").strip().lower(),
                 (_evt.item.distributor or "").strip().lower(),
-                round(float(_evt.item.quantity or 0), 4),
             )
-            if line_key in seen_lines:
-                continue
-            seen_lines.add(line_key)
-            deduped_grp.append(_evt)
+            cur = best.get(sku_key)
+            if cur is None or float(_evt.item.quantity or 0) > float(
+                cur.item.quantity or 0
+            ):
+                best[sku_key] = _evt
+        deduped_grp = list(best.values())
         if len(deduped_grp) < len(grp):
             report.setdefault("dedup_dropped", []).append(
                 f"PO {po_num}: collapsed {len(grp) - len(deduped_grp)} "
-                f"duplicate line(s) within the scan batch."
+                f"duplicate line(s) within the scan batch "
+                f"(kept max qty per SKU)."
             )
         grp = deduped_grp
 
