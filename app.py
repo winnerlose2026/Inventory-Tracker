@@ -817,18 +817,25 @@ def api_freight_scan():
         since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-        # Lineage-specific filter: messages from the BluJay TMS relay,
-        # WITH attachments, since the lookback cutoff. This is enormously
-        # narrower than the generic PO scan so we can crank the message
-        # count without burning Graph quota.
-        flt = ("from/emailAddress/address eq 'noreply@tms.blujaysolutions.net' "
-               "and hasAttachments eq true "
+        # Lineage filter: messages WITH attachments, since the lookback
+        # cutoff. Graph rejects `hasAttachments + $orderby` together as
+        # InefficientFilter, so we drop the orderby. We CANNOT filter on
+        # `from/emailAddress/address` server-side — Graph indexes that
+        # field for `endsWith` but not `eq`, and the combination with
+        # receivedDateTime + hasAttachments routinely times out at 504.
+        # Post-filter on sender + subject in code instead; the date +
+        # hasAttachments narrows the page set far enough that the
+        # client-side check is cheap.
+        flt = ("hasAttachments eq true "
                f"and receivedDateTime ge {since_iso}")
+        LINEAGE_DOMAINS = ("tms.blujaysolutions.net", "blujaysolutions.net",
+                           "lineagelogistics.com")
 
         for mb in mailboxes:
             user = urllib.parse.quote(mb)
             list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/Inbox/messages"
-                        f"?$top=50&$filter={urllib.parse.quote(flt)}&$select=id,subject,from")
+                        f"?$top=100&$filter={urllib.parse.quote(flt)}"
+                        f"&$select=id,subject,from")
             fetched = 0
             while list_url and fetched < max_messages:
                 page = _graph_get(token, list_url)
@@ -839,6 +846,18 @@ def api_freight_scan():
                     seen += 1
                     if fetched >= max_messages:
                         break
+                    # Post-filter by sender domain or subject keyword
+                    sender = (((m.get("from") or {}).get("emailAddress") or {})
+                              .get("address") or "").lower()
+                    subj_check = (m.get("subject") or "").upper()
+                    dom = sender.split("@", 1)[-1] if "@" in sender else ""
+                    looks_lineage = (
+                        any(dom == d or dom.endswith("." + d) for d in LINEAGE_DOMAINS)
+                        or ("LINEAGE FREIGHT" in subj_check
+                            and "BILLABLE INVOICE" in subj_check)
+                    )
+                    if not looks_lineage:
+                        continue
                     fetched += 1
                     mid = m.get("id") or ""
                     subj = m.get("subject") or ""
