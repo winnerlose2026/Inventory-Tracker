@@ -831,9 +831,16 @@ def api_freight_scan():
         LINEAGE_DOMAINS = ("tms.blujaysolutions.net", "blujaysolutions.net",
                            "lineagelogistics.com")
 
+        # Track sender domains we see vs match, for diagnostics
+        domain_seen: dict = {}
+        lineage_subjects: list = []
         for mb in mailboxes:
             user = urllib.parse.quote(mb)
-            list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/Inbox/messages"
+            # ALL_MAIL search ALL folders (not just Inbox) because Lineage
+            # invoices may have been auto-filed via Outlook rules or
+            # manually moved. Use AllItems via the standard "messages"
+            # endpoint (no /mailFolders/Inbox prefix).
+            list_url = (f"{GRAPH_BASE}/users/{user}/messages"
                         f"?$top=100&$filter={urllib.parse.quote(flt)}"
                         f"&$select=id,subject,from")
             fetched = 0
@@ -851,6 +858,7 @@ def api_freight_scan():
                               .get("address") or "").lower()
                     subj_check = (m.get("subject") or "").upper()
                     dom = sender.split("@", 1)[-1] if "@" in sender else ""
+                    domain_seen[dom] = domain_seen.get(dom, 0) + 1
                     looks_lineage = (
                         any(dom == d or dom.endswith("." + d) for d in LINEAGE_DOMAINS)
                         or ("LINEAGE FREIGHT" in subj_check
@@ -859,6 +867,8 @@ def api_freight_scan():
                     if not looks_lineage:
                         continue
                     fetched += 1
+                    if len(lineage_subjects) < 5:
+                        lineage_subjects.append((sender, m.get("subject") or ""))
                     mid = m.get("id") or ""
                     subj = m.get("subject") or ""
                     # List + fetch zip attachments
@@ -953,6 +963,8 @@ def api_freight_scan():
                                        x.get("invoice_number") or ""))
         save_freight_invoices(merged)
 
+    # Trim domain_seen to top 25 for log readability
+    top_domains = dict(sorted(domain_seen.items(), key=lambda x: -x[1])[:25])
     return jsonify({
         "ok": True,
         "dry_run": dry_run,
@@ -966,6 +978,8 @@ def api_freight_scan():
             "total_after":      len(by_inv),
             "errors":           errors[:50],
             "error_count":      len(errors),
+            "top_sender_domains": top_domains,
+            "sample_lineage_matches": lineage_subjects,
         },
     })
 
