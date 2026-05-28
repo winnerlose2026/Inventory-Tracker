@@ -244,8 +244,14 @@ _RE_SHIP_DATE           = re.compile(r"Ship\s*Date:\s*([0-9/\-]+)")
 # Fallback patterns for pypdf's column-shifted layout. The 10-digit number
 # starting with 70 is the invoice number, immediately followed on the next
 # line by an MM/DD/YYYY-formatted invoice date.
+# pypdf 5.x emitted a line break after the "Freight Invoice" header
+# AND between the invoice number and the date; pypdf 6.x packs them
+# onto a single line ("Freight Invoice\n702065585405/22/2026"). Use
+# \s* (which already matches newlines OR nothing) and pin the invoice
+# number to exactly 10 digits so the regex doesn't greedily gobble
+# the date's leading digits.
 _RE_PYPDF_HEADER = re.compile(
-    r"Invoice\s*#:\s*Freight\s*Invoice\s*\n\s*(\d{6,12})\s*\n\s*(\d{1,2}/\d{1,2}/\d{2,4})"
+    r"Invoice\s*#:\s*Freight\s*Invoice\s*(\d{10})\s*(\d{1,2}/\d{1,2}/\d{2,4})"
 )
 _RE_SHIPMENT_ID  = re.compile(r"Shipment\s*ID:\s*(\S+)")
 _RE_TOTAL_DUE    = re.compile(r"TOTAL\s*D\s*U?\s*E?\s*([\d,]+\.\d{2})\s*(USD|US\$|\$)?",
