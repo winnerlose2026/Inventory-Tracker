@@ -711,6 +711,246 @@ def api_freight_ingest():
     })
 
 
+@app.route("/api/freight/scan", methods=["POST"])
+def api_freight_scan():
+    """Deep-sweep the configured MS365 mailboxes for Lineage Freight invoices.
+
+    Same Graph credentials the legacy /api/email/scan path uses (web
+    service has MS365_TENANT_ID / MS365_CLIENT_ID / MS365_CLIENT_SECRET
+    / MS365_USER) but with a Lineage-only sender filter so we can sweep
+    a very wide window without burning budget on every PO PDF in the
+    inbox.
+
+    Request body (all optional):
+        {
+          "dry_run":        false,
+          "lookback_days":  365,    # default 730 (~2 years)
+          "mailboxes":      "JD@ms.hhbagels.com,info@ms.hhbagels.com",
+                                    # default MS365_USER env var
+          "max_messages":   500     # default 500, hard cap 5000
+        }
+
+    Returns:
+        {"ok": true, "report": {"messages_seen": N, "invoices_added": A,
+         "invoices_updated": U, "errors": [...]}}
+    """
+    import io
+    import json as _json
+    import os as _os
+    import re as _re
+    import sys as _sys
+    import traceback as _tb
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import zipfile
+    from dataclasses import asdict
+    from datetime import datetime, timezone, timedelta
+
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run", False))
+    try:
+        lookback_days = int(body.get("lookback_days") or 730)
+    except (TypeError, ValueError):
+        lookback_days = 730
+    lookback_days = max(1, min(lookback_days, 3650))
+    try:
+        max_messages = int(body.get("max_messages") or 500)
+    except (TypeError, ValueError):
+        max_messages = 500
+    max_messages = max(1, min(max_messages, 5000))
+    mailboxes_raw = (body.get("mailboxes")
+                     or _os.environ.get("MS365_USER", "")).strip()
+    mailboxes = [m.strip() for m in mailboxes_raw.split(",") if m.strip()]
+
+    tenant = _os.environ.get("MS365_TENANT_ID")
+    client_id = _os.environ.get("MS365_CLIENT_ID")
+    client_secret = _os.environ.get("MS365_CLIENT_SECRET")
+    if not all([tenant, client_id, client_secret, mailboxes]):
+        return jsonify({
+            "ok": False,
+            "error": "MS365 credentials or mailboxes not configured",
+        }), 200
+
+    try:
+        from integrations.lineage_freight_parser import parse_freight_pdf
+        from inventory_tracker import (
+            load_freight_invoices, save_freight_invoices,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False,
+                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+    def _token():
+        url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+        data = urllib.parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+        return payload["access_token"]
+
+    def _graph_get(token, path):
+        url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+
+    def _graph_get_bytes(token, path):
+        url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read()
+
+    errors: list[str] = []
+    seen = 0
+    parsed_invoices: list[dict] = []
+    try:
+        token = _token()
+        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        # Lineage-specific filter: messages from the BluJay TMS relay,
+        # WITH attachments, since the lookback cutoff. This is enormously
+        # narrower than the generic PO scan so we can crank the message
+        # count without burning Graph quota.
+        flt = ("from/emailAddress/address eq 'noreply@tms.blujaysolutions.net' "
+               "and hasAttachments eq true "
+               f"and receivedDateTime ge {since_iso}")
+
+        for mb in mailboxes:
+            user = urllib.parse.quote(mb)
+            list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/Inbox/messages"
+                        f"?$top=50&$filter={urllib.parse.quote(flt)}&$select=id,subject,from")
+            fetched = 0
+            while list_url and fetched < max_messages:
+                page = _graph_get(token, list_url)
+                msgs = page.get("value", [])
+                if not msgs:
+                    break
+                for m in msgs:
+                    seen += 1
+                    if fetched >= max_messages:
+                        break
+                    fetched += 1
+                    mid = m.get("id") or ""
+                    subj = m.get("subject") or ""
+                    # List + fetch zip attachments
+                    try:
+                        atts_resp = _graph_get(token,
+                            f"/users/{user}/messages/{urllib.parse.quote(mid)}/attachments"
+                            "?$select=id,name,contentType,size")
+                    except urllib.error.HTTPError as exc:
+                        errors.append(f"{mid[:12]}.. list-att: HTTP {exc.code}")
+                        continue
+                    for a in (atts_resp.get("value") or []):
+                        aname = (a.get("name") or "").lower()
+                        actype = (a.get("contentType") or "").lower()
+                        if not (aname.endswith(".zip") or aname.endswith(".pdf")
+                                or actype in ("application/zip",
+                                              "application/x-zip-compressed",
+                                              "application/pdf")):
+                            continue
+                        try:
+                            ab = _graph_get_bytes(token,
+                                f"/users/{user}/messages/{urllib.parse.quote(mid)}"
+                                f"/attachments/{urllib.parse.quote(a.get('id') or '')}/$value")
+                        except urllib.error.HTTPError as exc:
+                            errors.append(f"{mid[:12]}.. fetch-att: HTTP {exc.code}")
+                            continue
+                        pdfs: list[tuple[str, bytes]] = []
+                        if aname.endswith(".zip") or actype in ("application/zip",
+                                                                "application/x-zip-compressed"):
+                            try:
+                                zf = zipfile.ZipFile(io.BytesIO(ab))
+                                for info in zf.infolist():
+                                    if info.filename.lower().endswith(".pdf"):
+                                        pdfs.append((info.filename, zf.read(info.filename)))
+                            except zipfile.BadZipFile as exc:
+                                errors.append(f"{mid[:12]}.. bad-zip: {exc}")
+                                continue
+                        else:
+                            pdfs = [(a.get("name") or "invoice.pdf", ab)]
+                        for fname, pb in pdfs:
+                            try:
+                                inv = parse_freight_pdf(
+                                    pb, pdf_filename=fname,
+                                    source_message_id=mid, source_subject=subj)
+                            except Exception as exc:  # noqa: BLE001
+                                errors.append(f"{mid[:12]}.. parse[{fname}]: {exc}")
+                                continue
+                            if inv is None:
+                                continue
+                            parsed_invoices.append(asdict(inv))
+                # Next page
+                list_url = page.get("@odata.nextLink")
+    except urllib.error.HTTPError as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"Graph HTTP {exc.code}: {exc.reason}",
+            "errors": errors,
+        }), 200
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": _tb.format_exc()[-1500:],
+            "errors": errors,
+        }), 200
+
+    # Merge into freight_invoices.json
+    existing = load_freight_invoices()
+    by_inv = {str(r.get("invoice_number") or ""): r
+              for r in existing if r.get("invoice_number")}
+    added = updated = 0
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    for rec in parsed_invoices:
+        ino = str(rec.get("invoice_number") or "").strip()
+        if not ino:
+            continue
+        try:
+            t = float(rec.get("total_due") or 0)
+            pl = int(rec.get("pallets") or 0)
+            cs = int(rec.get("cases") or 0)
+        except (TypeError, ValueError):
+            t = pl = cs = 0
+        rec["cost_per_pallet"] = round(t / pl, 2) if pl else 0
+        rec["cost_per_case"]   = round(t / cs, 4) if cs else 0
+        rec["ingested_at"]     = rec.get("ingested_at") or now
+        if ino in by_inv:
+            by_inv[ino] = rec; updated += 1
+        else:
+            by_inv[ino] = rec; added += 1
+    if not dry_run:
+        merged = sorted(by_inv.values(),
+                        key=lambda x: (x.get("ship_date") or "",
+                                       x.get("invoice_number") or ""))
+        save_freight_invoices(merged)
+
+    return jsonify({
+        "ok": True,
+        "dry_run": dry_run,
+        "report": {
+            "mailboxes":        mailboxes,
+            "lookback_days":    lookback_days,
+            "messages_seen":    seen,
+            "invoices_parsed":  len(parsed_invoices),
+            "invoices_added":   added,
+            "invoices_updated": updated,
+            "total_after":      len(by_inv),
+            "errors":           errors[:50],
+            "error_count":      len(errors),
+        },
+    })
+
+
 @app.route("/api/chefs-warehouse/ship-date", methods=["POST"])
 def api_chefs_warehouse_ship_date():
     """Set / clear ship_date (and the derived arrival_date) on a CW PO.
