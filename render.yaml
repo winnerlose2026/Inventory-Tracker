@@ -165,3 +165,24 @@ services:
         sync: false  # https://bagel-inventory.onrender.com
       - key: INVENTORY_API_TOKEN
         sync: false
+
+  - type: cron
+    name: bagel-inventory-forecast-daily
+    runtime: python
+    plan: starter
+    branch: main
+    # Bridge from weekly_usage (a forecast rate stamped on every SKU) into
+    # the usage ledger so FIFO lot consumption actually burns down. Each
+    # run posts weekly_usage/7 as a positive usage event per SKU with
+    # source="forecast-daily"; the endpoint is idempotent per (SKU, UTC
+    # date), so re-runs the same day are no-ops. Weekly true-ups against
+    # vendor on-hand snapshots reverse these entries when ground truth
+    # arrives — see /api/forecast/true-up.
+    schedule: "5 5 * * *"
+    buildCommand: "true"
+    startCommand: python scripts/forecast_decrement.py
+    envVars:
+      - key: APP_URL
+        sync: false  # https://bagel-inventory.onrender.com
+      - key: INVENTORY_API_TOKEN
+        sync: false

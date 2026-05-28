@@ -1896,6 +1896,36 @@ def api_production_ingest():
 
     sheet = parse_production_pdf(pdf_bytes, subject=subject)
 
+    # Content-signature dedup. Same email can land twice with two different
+    # IDs (RFC <...@outlook.com> Message-ID vs. Microsoft Graph
+    # internetMessageId) when more than one scanner path picks it up — see
+    # the 2026-05-19 incident where five Daily Production records got stored
+    # twice. The message_id check above only catches *exact* re-sends; this
+    # block catches the cross-ID dup by matching on (warehouse, po_number,
+    # production_date) + identical line signature. Legitimate amendments
+    # (different lines/cs counts) still pass through.
+    if (sheet.po_number and sheet.warehouse and sheet.production_date
+            and sheet.lines):
+        incoming_sig = tuple(sorted(
+            (L.variety or "", int(L.cs_count or 0), L.lot_number or "")
+            for L in sheet.lines))
+        for existing in records:
+            if (existing.get("warehouse") != sheet.warehouse
+                    or existing.get("po_number") != sheet.po_number
+                    or existing.get("production_date") != sheet.production_date):
+                continue
+            existing_sig = tuple(sorted(
+                (L.get("variety") or "", int(L.get("cs_count") or 0),
+                 L.get("lot_number") or "")
+                for L in (existing.get("lines") or [])))
+            if existing_sig == incoming_sig:
+                return jsonify({
+                    "ok": True,
+                    "status": "duplicate",
+                    "record": existing,
+                    "dedup_reason": "content_signature_match",
+                })
+
     if sheet.error and not sheet.lines:
         # Persist a stub for the dashboard so the operator can see the
         # email arrived but needs manual entry, then surface the error.
@@ -2764,6 +2794,335 @@ def datetime_now_iso() -> str:
     from datetime import datetime
     return datetime.now().isoformat()
 
+
+
+# ---------------------------------------------------------------------------
+# API – Forecast bridge (weekly_usage -> usage ledger, so lots burn down)
+# ---------------------------------------------------------------------------
+# Background: every SKU carries a `weekly_usage` rate (cs/wk) but nothing in
+# the system converted that rate into actual usage events, so production
+# lots never showed cs_consumed > 0 at the DCs. The user's request: bridge
+# the rate into the usage ledger so FIFO lot consumption works, with a
+# weekly true-up that reconciles forecasts against vendor on-hand snapshots.
+#
+# Design:
+#   - /api/forecast/decrement-daily   Idempotent per (sku, UTC date).
+#                                     Posts +weekly_usage/7 as a positive
+#                                     usage event tagged source="forecast-daily"
+#                                     and decrements item quantity by the
+#                                     same amount. Triggered by the daily
+#                                     Render cron (bagel-inventory-forecast-daily).
+#   - /api/forecast/true-up           Operator posts a vendor on-hand
+#                                     snapshot. We reverse every uncovered
+#                                     "forecast-daily" entry since the prior
+#                                     truth, post the actual usage as
+#                                     source="vendor-truth", and set
+#                                     quantity = reported_qty.
+#
+# Both write directly through load_usage/save_usage so they can tag entries
+# with a custom `source` (the existing record_usage helper hard-codes the
+# absence of one). The FIFO lot consumption logic in
+# inventory_tracker.compute_lot_fifo_state already honors `reversed: true`
+# and skips `source == "reversal"`, so the moving parts are minimal.
+
+@app.route("/api/forecast/decrement-daily", methods=["POST"])
+def api_forecast_decrement_daily():
+    """Apply one day's worth of forecast usage to every SKU.
+
+    Idempotent: for each SKU, if a non-reversed entry already exists today
+    with source == "forecast-daily", that SKU is skipped. Safe to re-run
+    or to call mid-day after the cron.
+
+    Body (all optional):
+      dry_run             bool   compute deltas without writing
+      date                str    YYYY-MM-DD override for testing (defaults
+                                 to today UTC). The idempotency check keys
+                                 off this value.
+      warehouse_prefix    str    restrict to SKUs whose `warehouse` field
+                                 starts with this string (e.g. "Zebulon").
+                                 Default: all SKUs with weekly_usage > 0.
+
+    Returns {ok, date, applied: [...], skipped_existing: [...], dry_run}.
+    """
+    from datetime import datetime, timezone
+    from inventory_tracker import (
+        load_inventory, save_inventory, load_usage, save_usage,
+        _variety_from_name,
+    )
+
+    body = request.json or {}
+    dry_run = bool(body.get("dry_run"))
+    date_iso = (body.get("date") or "").strip()
+    wh_prefix = (body.get("warehouse_prefix") or "").strip()
+    if not date_iso:
+        date_iso = datetime.now(timezone.utc).date().isoformat()
+
+    inv = load_inventory()
+    usage = load_usage()
+
+    # Index existing forecast-daily entries by (item_key, YYYY-MM-DD).
+    # Reversed entries don't count — the slot is "open" to re-fill.
+    have_today: set[tuple[str, str]] = set()
+    for e in usage:
+        if e.get("source") != "forecast-daily":
+            continue
+        if e.get("reversed"):
+            continue
+        ts = (e.get("timestamp") or "")[:10]
+        if not ts:
+            continue
+        have_today.add((e.get("item_key") or "", ts))
+
+    applied: list[dict] = []
+    skipped: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for key, item in inv.items():
+        wkly = float(item.get("weekly_usage") or 0)
+        if wkly <= 0:
+            continue
+        wh = item.get("warehouse") or ""
+        if wh_prefix and not wh.startswith(wh_prefix):
+            continue
+        if (key, date_iso) in have_today:
+            skipped.append(item.get("name") or key)
+            continue
+        daily_amount = round(wkly / 7.0, 4)
+        if daily_amount <= 0:
+            continue
+        cur_qty = float(item.get("quantity") or 0)
+        new_qty = round(cur_qty - daily_amount, 4)
+        # Floor at 0 — we don't model negative inventory; the operator
+        # will see the SKU pinned at 0 and reorder.
+        if new_qty < 0:
+            new_qty = 0.0
+            daily_amount = round(cur_qty, 4)
+            if daily_amount <= 0:
+                # Already at zero; nothing to decrement, but record
+                # nothing so the SKU stays eligible tomorrow.
+                continue
+        applied.append({
+            "name": item.get("name"),
+            "warehouse": wh,
+            "weekly_usage": wkly,
+            "daily_amount": daily_amount,
+            "old_quantity": cur_qty,
+            "new_quantity": new_qty,
+        })
+        if not dry_run:
+            entry = {
+                "item_key": key,
+                "item_name": item.get("name") or "",
+                "amount": daily_amount,
+                "unit": item.get("unit") or "",
+                "note": f"Forecast burn (weekly_usage/7) for {date_iso}",
+                "timestamp": now_iso,
+                "source": "forecast-daily",
+                "forecast_date": date_iso,
+            }
+            if wh:
+                entry["warehouse"] = wh
+            v = _variety_from_name(item.get("name") or "")
+            if v:
+                entry["variety"] = v
+            usage.append(entry)
+            item["quantity"] = new_qty
+            item["updated"] = now_iso
+
+    if not dry_run and applied:
+        save_usage(usage)
+        save_inventory(inv)
+
+    return jsonify({
+        "ok": True,
+        "date": date_iso,
+        "dry_run": dry_run,
+        "applied": applied,
+        "skipped_existing": skipped,
+    })
+
+
+@app.route("/api/forecast/true-up", methods=["POST"])
+def api_forecast_true_up():
+    """Reconcile against a vendor on-hand snapshot.
+
+    The vendor's number is ground truth. We reverse every uncovered
+    "forecast-daily" entry on each named SKU since the last vendor-truth
+    (or since the SKU was added if there has never been one), then post a
+    single "vendor-truth" usage entry equal to:
+
+        actual_used = prior_truth_qty + arrivals_since - reported_qty
+
+    where:
+        prior_truth_qty   = item.quantity (live) + forecast_burned - arrivals_since
+                            (i.e. what on-hand WAS at the last truth date)
+        arrivals_since    = sum of negative-amount entries since last truth
+        forecast_burned   = sum of positive forecast-daily entries since last
+                            truth that are NOT already reversed
+        reported_qty      = the new vendor snapshot
+
+    If actual_used <= 0 we skip the positive entry (vendor reports more
+    than expected — that's a count correction, not a consumption event).
+
+    Quantity is set to reported_qty in inventory.json so the dashboard
+    matches the vendor's number.
+
+    Body:
+      warehouse     str    label that matches inventory items' `warehouse`
+                           field (e.g. "Zebulon, NC"). Required.
+      reported_at   str    ISO date/datetime of the snapshot. Defaults to
+                           now (UTC).
+      items         list   [{name: str, reported_qty: float}, ...]
+
+    Returns {ok, reported_at, reconciled: [...], skipped: [...]}.
+    """
+    from datetime import datetime, timezone
+    from inventory_tracker import (
+        load_inventory, save_inventory, load_usage, save_usage,
+        _variety_from_name,
+    )
+
+    body = request.json or {}
+    warehouse = (body.get("warehouse") or "").strip()
+    if not warehouse:
+        return jsonify({"ok": False, "error": "warehouse required"}), 400
+    items_in = body.get("items") or []
+    if not isinstance(items_in, list) or not items_in:
+        return jsonify({"ok": False, "error": "items must be a non-empty list"}), 400
+    reported_at = (body.get("reported_at") or "").strip()
+    if not reported_at:
+        reported_at = datetime.now(timezone.utc).isoformat()
+    dry_run = bool(body.get("dry_run"))
+
+    inv = load_inventory()
+    usage = load_usage()
+
+    # Build a lookup of usage entries by item_key for fast filtering.
+    by_key: dict[str, list[dict]] = {}
+    for idx, e in enumerate(usage):
+        k = e.get("item_key") or ""
+        if k:
+            by_key.setdefault(k, []).append((idx, e))
+
+    reconciled: list[dict] = []
+    skipped: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for payload in items_in:
+        name = (payload.get("name") or "").strip()
+        if not name:
+            skipped.append({"name": "", "reason": "missing name"})
+            continue
+        try:
+            reported_qty = float(payload.get("reported_qty"))
+        except (TypeError, ValueError):
+            skipped.append({"name": name, "reason": "reported_qty not numeric"})
+            continue
+        key = name.lower()
+        item = inv.get(key)
+        if not item:
+            skipped.append({"name": name, "reason": "SKU not found"})
+            continue
+        if (item.get("warehouse") or "") != warehouse:
+            skipped.append({"name": name, "reason": f"warehouse mismatch ({item.get('warehouse')})"})
+            continue
+
+        # Find last vendor-truth timestamp for this SKU (exclusive lower
+        # bound for the reconciliation window). Empty string = no prior
+        # truth, so window is "all history".
+        prior_truth_ts = ""
+        for _idx, e in by_key.get(key, []):
+            if e.get("source") != "vendor-truth":
+                continue
+            if e.get("reversed"):
+                continue
+            ts = e.get("timestamp") or ""
+            if ts > prior_truth_ts:
+                prior_truth_ts = ts
+
+        arrivals_since = 0.0       # sum of negative amounts (restocks)
+        forecast_burned = 0.0      # positive forecast-daily not reversed
+        reverse_indices: list[int] = []
+        for idx, e in by_key.get(key, []):
+            if e.get("reversed"):
+                continue
+            ts = e.get("timestamp") or ""
+            if prior_truth_ts and ts <= prior_truth_ts:
+                continue
+            amt = float(e.get("amount") or 0)
+            if amt < 0:
+                arrivals_since += -amt
+            elif amt > 0 and e.get("source") == "forecast-daily":
+                forecast_burned += amt
+                reverse_indices.append(idx)
+            # Positive non-forecast entries (manual /api/use, prior
+            # vendor-truth) are left untouched — they represent real
+            # consumption the operator already booked.
+
+        cur_qty = float(item.get("quantity") or 0)
+        prior_truth_qty = cur_qty + forecast_burned - arrivals_since
+        actual_used = prior_truth_qty + arrivals_since - reported_qty
+        actual_used = round(actual_used, 4)
+
+        entry_record = {
+            "name": name,
+            "warehouse": warehouse,
+            "prior_truth_ts": prior_truth_ts or None,
+            "prior_truth_qty": round(prior_truth_qty, 4),
+            "arrivals_since": round(arrivals_since, 4),
+            "forecast_burned_reversed": round(forecast_burned, 4),
+            "reported_qty": reported_qty,
+            "actual_used": actual_used,
+            "old_quantity": cur_qty,
+            "new_quantity": reported_qty,
+        }
+        reconciled.append(entry_record)
+
+        if dry_run:
+            continue
+
+        # Reverse the forecast-daily entries that fell in this window.
+        for idx in reverse_indices:
+            usage[idx]["reversed"] = True
+            usage[idx]["reversed_at"] = now_iso
+            usage[idx]["reversed_by"] = "vendor-truth"
+
+        # Post the vendor-truth event. Skip when actual_used <= 0
+        # (vendor reported MORE than expected — a positive count
+        # correction we model as the quantity bump only, no consumption).
+        if actual_used > 0:
+            truth_entry = {
+                "item_key": key,
+                "item_name": item.get("name") or name,
+                "amount": actual_used,
+                "unit": item.get("unit") or "",
+                "note": f"Vendor on-hand true-up at {reported_at}",
+                "timestamp": now_iso,
+                "source": "vendor-truth",
+                "reported_at": reported_at,
+                "warehouse": warehouse,
+            }
+            v = _variety_from_name(item.get("name") or name)
+            if v:
+                truth_entry["variety"] = v
+            usage.append(truth_entry)
+
+        item["quantity"] = reported_qty
+        item["updated"] = now_iso
+        item["last_synced"] = now_iso
+        item["last_synced_from"] = "vendor-truth"
+
+    if not dry_run and reconciled:
+        save_usage(usage)
+        save_inventory(inv)
+
+    return jsonify({
+        "ok": True,
+        "warehouse": warehouse,
+        "reported_at": reported_at,
+        "dry_run": dry_run,
+        "reconciled": reconciled,
+        "skipped": skipped,
+    })
 
 
 # ---------------------------------------------------------------------------
