@@ -537,6 +537,7 @@ def api_chefs_warehouse_pos():
     canceled = load_canceled_pos()
 
     status_filter = (request.args.get("status") or "pending").lower()
+    freight_idx = _freight_ship_date_index()
 
     out = []
     now = datetime.now()
@@ -570,6 +571,14 @@ def api_chefs_warehouse_pos():
 
         item = _cw_po_summary(r)
         item["status"] = status
+        # Backfill a missing ship date on ARRIVED CW POs from the freight
+        # invoice index (links by PO #). Display-only; never persisted and
+        # never recomputes arrival, so the computed status is untouched.
+        if status == "arrived" and not (item.get("ship_date") or "").strip():
+            sd = freight_idx.get(_norm_po_key(po_num))
+            if sd:
+                item["ship_date"] = sd
+                item["ship_date_source"] = "freight"
         out.append(item)
 
     out.sort(key=lambda x: (x.get("ordered_at") or "", x.get("po_number") or ""))
@@ -1248,6 +1257,57 @@ def api_chefs_warehouse_cancel():
 # reconstructs arrived inventory POs by grouping those usage rows by
 # po_number so the frontend can merge them into the Arrived view.
 
+# ---------------------------------------------------------------------------
+# Freight -> PO ship-date linkage
+# ---------------------------------------------------------------------------
+# Lineage freight invoices carry the H&H PO number (plus order_number /
+# shipper_ref) and the real ship_date. Arrived POs frequently have no
+# ship_date — inventory POs lose it when they roll over, and some POs never
+# had one entered — so we link by PO number to backfill the ship date for
+# display in the Pending POs "Arrived" view.
+
+def _norm_po_key(s: str) -> str:
+    """Normalize a PO / reference token for cross-source matching.
+
+    Uppercases, trims, drops a leading ``HHB-`` / ``HHB `` shipper prefix,
+    and strips trailing punctuation. Leading zeros are preserved on
+    purpose — Cheney PO numbers like ``014511...`` vs ``054511...`` differ
+    only in those digits (the 2nd digit encodes the destination DC).
+    """
+    t = str(s or "").strip().upper()
+    if t.startswith("HHB-") or t.startswith("HHB "):
+        t = t[4:]
+    return t.strip().strip(".").strip()
+
+
+def _freight_ship_date_index() -> dict:
+    """Map normalized PO/order/shipper-ref key -> earliest freight ship_date.
+
+    Built from data/freight_invoices.json. When several invoices reference
+    the same PO (split shipments), the earliest non-empty ship_date wins —
+    that's when the order actually left the origin DC. Freight is auxiliary,
+    so any load failure yields an empty index rather than an error.
+    """
+    try:
+        from inventory_tracker import load_freight_invoices
+        invoices = load_freight_invoices()
+    except Exception:  # noqa: BLE001
+        return {}
+    idx: dict = {}
+    for inv in invoices or []:
+        sd = (inv.get("ship_date") or "").strip()
+        if not sd:
+            continue
+        for fld in ("po_number", "order_number", "shipper_ref"):
+            key = _norm_po_key(inv.get(fld) or "")
+            if not key:
+                continue
+            prev = idx.get(key)
+            if prev is None or sd < prev:
+                idx[key] = sd
+    return idx
+
+
 @app.route("/api/arrived-pos")
 def api_arrived_pos():
     """List arrived inventory-side POs reconstructed from the usage log.
@@ -1326,10 +1386,25 @@ def api_arrived_pos():
     out = list(groups.values())
     for g in out:
         g["total_cs"] = round(g["total_cs"], 2)
+
+    # Backfill missing ship dates from the Lineage freight invoices,
+    # linked by PO number. Display-only enrichment — nothing is persisted.
+    freight_idx = _freight_ship_date_index()
+    backfilled = 0
+    for g in out:
+        if (g.get("ship_date") or "").strip():
+            continue
+        sd = freight_idx.get(_norm_po_key(g.get("po_number") or ""))
+        if sd:
+            g["ship_date"] = sd
+            g["ship_date_source"] = "freight"
+            backfilled += 1
+
     # Newest arrivals first.
     out.sort(key=lambda x: (x.get("arrival_date") or "", x.get("po_number") or ""),
              reverse=True)
-    return jsonify({"ok": True, "count": len(out), "pos": out})
+    return jsonify({"ok": True, "count": len(out),
+                    "ship_date_backfilled": backfilled, "pos": out})
 
 
 # ---------------------------------------------------------------------------

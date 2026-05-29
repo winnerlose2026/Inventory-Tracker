@@ -3521,6 +3521,7 @@ function _assemblePendingGroups() {
     arrival_date: g.arrival_date || '',
     total_cs:     Number(g.total_cs) || 0,
     status:       g.status || '',
+    ship_date_source: g.ship_date_source || '',
     lines:        (g.lines || []).map(L => ({
       variety: L.variety || '', qty: Number(L.qty) || 0,
       unit: L.unit || 'cs', name: L.name || '',
@@ -3542,6 +3543,7 @@ function _assemblePendingGroups() {
       arrival_date: g.arrival_date || '',
       total_cs:     Number(g.total_cs) || 0,
       status:       'arrived',
+      ship_date_source: g.ship_date_source || '',
       lines:        (g.lines || []).map(L => ({
         variety: L.variety || '', qty: Number(L.qty) || 0,
         unit: L.unit || 'cs', name: L.name || '',
@@ -3596,7 +3598,11 @@ function _pendingRowHtml(g, now) {
   const source = g._source || 'inventory';
   const terminal = (state === 'arrived' || state === 'cancelled');
   const shipCell = terminal
-    ? (shipISO ? formatDate(shipISO) : '<span style="color:var(--muted)">—</span>')
+    ? (shipISO
+        ? (formatDate(shipISO) + (g.ship_date_source === 'freight'
+            ? ' <span title="Ship date inferred from a Lineage freight invoice" style="color:var(--muted);font-size:10px;cursor:help">ƒ</span>'
+            : ''))
+        : '<span style="color:var(--muted)">—</span>')
     : `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
   const actionsCell = terminal
     ? '<span style="color:var(--muted)">—</span>'
