@@ -158,6 +158,8 @@
      be distinguished at a glance from Cheney (.badge-blue, navy)
      and US Foods (.badge-yellow). */
   .badge-violet { background: rgba(124,58,237,.14); color: #6D28D9; }
+  /* Neutral grey bubble for terminal/dimmed states (e.g. Cancelled). */
+  .badge-gray { background: rgba(107,102,87,.12); color: var(--muted); }
 
   /* Buttons — pill primary, rounded for everything else */
   .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border-radius: var(--radius-pill); border: 1px solid transparent; cursor: pointer; font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: .02em; transition: all .15s; text-transform: uppercase; }
@@ -718,8 +720,41 @@
           <button class="btn btn-ghost btn-sm active" id="pending-filter-all" onclick="setPendingFilter('all')">All</button>
         </div>
       </div>
+      <!-- In Production: POs whose ship date lands within the next 7 days
+           (today → +7). Independent of the Status dropdown below — these
+           are imminent arrivals worth surfacing on their own. -->
+      <div class="card" id="pending-inprod-card" style="margin-bottom:20px;display:none">
+        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+          <span class="badge badge-violet" style="font-size:10px">In Production</span>
+          <strong>Shipping within 7 days</strong>
+          <span id="pending-inprod-count" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>PO #</th>
+              <th>Distributor</th>
+              <th>Warehouse</th>
+              <th>Items</th>
+              <th style="text-align:right">Total cs</th>
+              <th>Ship Date</th>
+              <th>Arrival</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="pending-inprod-tbody"></tbody>
+        </table>
+      </div>
+
       <div class="card">
         <div class="filters" style="padding:12px 20px;border-bottom:1px solid var(--border)">
+          <div class="filter-group" style="flex:1;min-width:200px">
+            <label>Search PO #</label>
+            <input id="pending-filter-search" type="search"
+                   placeholder="Full or partial PO # (e.g. 5334 or 533457)"
+                   oninput="onPendingSearchInput()"
+                   style="width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
           <div class="filter-group">
             <label>Status</label>
             <select id="pending-filter-status" onchange="onPendingStatusChange()" style="width:160px">
@@ -759,6 +794,7 @@
               <th>Ship Date</th>
               <th>Arrival</th>
               <th class="sortable" data-sort="eta">30-day ETA <span class="sort-ind"></span></th>
+              <th>Status</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -3173,8 +3209,15 @@ function onInvSortClick(key) {
 // -------------------------------------------------------------------------
 let pendingSortKey = 'ordered_at';
 let pendingSortDir = 1;        // earliest first by default
-let pendingFilterMode = 'all'; // 'all' | 'overdue' | 'noship'
+let pendingFilterMode = 'all'; // 'all' | 'overdue' | 'noship' | 'pallet'
 let pendingCache = [];          // flat list of {entry, item} pairs
+let pendingSearchQuery = '';    // PO# substring filter (full or partial)
+
+function onPendingSearchInput() {
+  const el = document.getElementById('pending-filter-search');
+  pendingSearchQuery = ((el && el.value) || '').trim().toLowerCase();
+  renderPendingPOs();
+}
 
 function setPendingFilter(mode) {
   pendingFilterMode = mode;
@@ -3196,14 +3239,20 @@ function onPendingSortClick(key) {
 // Stash of Chefs Warehouse PO groups, kept separate from `pendingCache`
 // (which is built from inventory `on_order` pairs). CW POs don't live
 // in inventory.json by design — they're merged into the Pending POs
-// page render only, never the Inventory tab.
+// page render only, never the Inventory tab. We fetch the FULL CW set
+// (status=all) once and filter client-side so the Status dropdown and
+// the In Production section can both work off one dataset.
 let cwPendingGroups = [];
+// Arrived inventory-side POs (USF/Cheney) reconstructed from the usage
+// log by /api/arrived-pos. These no longer live in `on_order` (they
+// rolled over into quantity), so without this the Arrived view could
+// only ever show Chefs Warehouse POs.
+let arrivedInvGroups = [];
 
-// Status dropdown changed — reload so the CW endpoint gets the right
-// ?status= parameter. Inventory-side on_order entries are filtered
-// client-side inside renderPendingPOs().
+// Status dropdown changed — re-render. All status slices are computed
+// client-side from the full dataset, so no reload is required.
 function onPendingStatusChange() {
-  loadPendingPOs();
+  renderPendingPOs();
 }
 
 function _currentPendingStatus() {
@@ -3227,18 +3276,27 @@ async function loadPendingPOs() {
   });
   pendingCache = pairs;
 
-  // Pull Chefs Warehouse POs from the parallel data store. They're
-  // distinct from the inventory-backed pairs because CW POs never
-  // appear in /api/inventory. A network failure here must not break
-  // the rest of the page — just log it and render without CW rows.
-  // The status dropdown selects which slice of CW POs to fetch.
-  const status = _currentPendingStatus();
+  // Pull the full Chefs Warehouse PO set (active + arrived + canceled)
+  // from the parallel data store. They never appear in /api/inventory.
+  // Each record carries a server-computed `status`. A network failure
+  // here must not break the rest of the page — log it and render
+  // without CW rows.
   try {
-    const cwResp = await api('/api/chefs-warehouse/pos?status=' + encodeURIComponent(status));
+    const cwResp = await api('/api/chefs-warehouse/pos?status=all');
     cwPendingGroups = (cwResp && cwResp.pos) ? cwResp.pos : [];
   } catch (e) {
     console.warn('Failed to load Chefs Warehouse POs:', e);
     cwPendingGroups = [];
+  }
+
+  // Pull arrived inventory-side POs (reconstructed from rollover usage
+  // rows). Non-fatal on failure.
+  try {
+    const arrResp = await api('/api/arrived-pos');
+    arrivedInvGroups = (arrResp && arrResp.pos) ? arrResp.pos : [];
+  } catch (e) {
+    console.warn('Failed to load arrived inventory POs:', e);
+    arrivedInvGroups = [];
   }
 
   renderPendingPOs();
@@ -3297,86 +3355,52 @@ function _pendingSortValue(group, key) {
 function renderPendingPOs() {
   const tbody = document.getElementById('pending-tbody');
   if (!tbody) return;
-  let pairs = pendingCache.slice();
 
-  // Filter the FLAT pair list first so partial-distributor / partial-
-  // warehouse filters work, even if a hypothetical multi-DC PO existed.
+  // Assemble the full PO set (inventory pending + Chefs Warehouse +
+  // reconstructed arrived inventory POs), each tagged with a computed
+  // _state, then slice it for the main table and the In Production
+  // section.
+  let groups = _assemblePendingGroups();
+
+  // Shared filters apply to BOTH the In Production section and the main
+  // table: distributor, warehouse, and the PO# search box.
   const distF = document.getElementById('pending-filter-distributor').value;
   const whF   = document.getElementById('pending-filter-warehouse').value;
-  const statusF = _currentPendingStatus();
-  if (distF) pairs = pairs.filter(p => (p.item.distributor || '') === distF);
-  if (whF)   pairs = pairs.filter(p => (p.item.warehouse  || '') === whF);
-
-  // Apply the status filter to inventory-side on_order entries
-  // (USF/Cheney/etc.). "arrived" = arrival_date in the past, or eta in
-  // the past when no arrival_date set; "pending" = neither. There is no
-  // "canceled" branch here because the on_order list drops entries on
-  // cancel; canceled-only views show CW POs only.
-  if (statusF !== 'all') {
-    const now = new Date();
-    pairs = pairs.filter(p => {
-      const entry = p.entry || {};
-      const arr = (entry.arrival_date || '').trim();
-      const eta = (entry.eta || '').trim();
-      let arrivedAt = null;
-      if (arr) {
-        const d = new Date(arr);
-        if (!isNaN(d.getTime())) arrivedAt = d;
-      } else if (eta) {
-        const d = new Date(eta);
-        if (!isNaN(d.getTime())) arrivedAt = d;
-      }
-      const isArrived = !!(arrivedAt && arrivedAt <= now);
-      if (statusF === 'arrived')  return isArrived;
-      if (statusF === 'pending')  return !isArrived;
-      if (statusF === 'canceled') return false;  // on_order has no canceled state
-      return true;
-    });
+  if (distF) groups = groups.filter(g => (g.distributor || '') === distF);
+  if (whF)   groups = groups.filter(g => (g.warehouse  || '') === whF);
+  if (pendingSearchQuery) {
+    groups = groups.filter(g =>
+      (g.po_number || '').toLowerCase().includes(pendingSearchQuery));
   }
 
-  // Build groups from the (already-filtered) flat list
-  let groups = _buildPoGroups(pairs);
+  // --- In Production section ------------------------------------------
+  // "Anything with a ship date within the next 7 days" — independent of
+  // the Status dropdown and quick-filter buttons. Excludes arrived /
+  // cancelled POs. A PO can carry an Overdue tag here (if it's also >30
+  // days old) and still belong in this section; that's intentional.
+  const now = new Date();
+  renderInProductionSection(groups.filter(g =>
+    g._state !== 'arrived' && g._state !== 'cancelled' &&
+    _shipInProductionWindow(g.ship_date, now)));
 
-  // Merge in Chefs Warehouse POs from the parallel data store. They
-  // arrive pre-grouped (one record per PO) and follow the same shape
-  // produced by _buildPoGroups, plus the distributor flag so the cancel
-  // / ship-date handlers can route to the CW API endpoints.
-  let cwGroups = cwPendingGroups.map(g => ({
-    po_number:    g.po_number || '',
-    po_revision:  g.po_revision || '',
-    distributor:  'Chefs Warehouse',
-    warehouse:    g.warehouse || '',
-    dc_code:      g.dc_code || '',
-    ordered_at:   g.ordered_at || '',
-    eta:          g.eta || '',
-    ship_date:    g.ship_date || '',
-    arrival_date: g.arrival_date || '',
-    total_cs:     Number(g.total_cs) || 0,
-    lines:        (g.lines || []).map(L => ({
-      variety: L.variety || '',
-      qty:     Number(L.qty) || 0,
-      unit:    L.unit || 'cs',
-      name:    L.name || '',
-    })),
-    _source: 'chefs_warehouse',   // routes cancel / ship-date below
-  }));
-  // Apply distributor / warehouse filters to CW too. The CW data has no
-  // pair structure, so we filter the groups directly.
-  if (distF) cwGroups = cwGroups.filter(g => (g.distributor || '') === distF);
-  if (whF)   cwGroups = cwGroups.filter(g => (g.warehouse  || '') === whF);
-  groups = groups.concat(cwGroups);
+  // --- Main table -----------------------------------------------------
+  // Status dropdown maps onto the computed tag state.
+  const statusF = _currentPendingStatus();
+  if (statusF === 'pending') {
+    groups = groups.filter(g => g._state !== 'arrived' && g._state !== 'cancelled');
+  } else if (statusF === 'arrived') {
+    groups = groups.filter(g => g._state === 'arrived');
+  } else if (statusF === 'canceled') {
+    groups = groups.filter(g => g._state === 'cancelled');
+  } // 'all' -> no status filter
 
-  // Mode filters operate on the group's effective trigger / ship state
+  // Quick-filter buttons.
   if (pendingFilterMode === 'overdue') {
-    const now = new Date();
-    groups = groups.filter(g => {
-      const trigger = g.arrival_date || g.eta;
-      return trigger && new Date(trigger) < now;
-    });
+    // Unified on the order-date + 30-day rule (same as the Overdue tag).
+    groups = groups.filter(g => g._state === 'overdue');
   } else if (pendingFilterMode === 'noship') {
     groups = groups.filter(g => !g.ship_date);
   } else if (pendingFilterMode === 'pallet') {
-    // POs whose total cs isn't a multiple of 56 (pallet unit).
     groups = groups.filter(g => (Number(g.total_cs) % 56) !== 0);
   }
 
@@ -3394,62 +3418,233 @@ function renderPendingPOs() {
   }
 
   if (groups.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="empty">No pending POs match this filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">No POs match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
     return;
   }
 
-  tbody.innerHTML = groups.map(g => {
-    const shipISO = (g.ship_date || '').slice(0, 10);
-    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
-    const eta = g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">—</span>';
-    const overdue = (g.arrival_date || g.eta) && new Date(g.arrival_date || g.eta) < new Date();
-    // Items column: variety · qty list. Up to 4 inline, then "+N more".
-    const sortedLines = g.lines.slice().sort((a, b) => a.variety.localeCompare(b.variety));
-    const head = sortedLines.slice(0, 4).map(L =>
-      `${escHtml(L.variety)}&nbsp;<span style="color:var(--muted)">${L.qty.toFixed(0)}</span>`
-    ).join(' · ');
-    const more = sortedLines.length > 4 ? ` · <span style="color:var(--muted)">+${sortedLines.length - 4} more</span>` : '';
-    const tipText = sortedLines.map(L => `${L.variety}: ${L.qty.toFixed(0)} ${L.unit}`).join('\n');
-    const palletMismatch = (Number(g.total_cs) % 56) !== 0;
-    const rowStyle = overdue
-      ? ' style="background:var(--surface2)"'
-      : palletMismatch
-        ? ' style="background:rgba(217, 119, 6, 0.08)"'
-        : '';
-    const palletBadge = palletMismatch
-      ? ` <span class="badge badge-yellow" title="Total cs (${g.total_cs}) is not a multiple of 56" style="margin-left:4px;font-size:10px">⚠ not ×56</span>`
+  tbody.innerHTML = groups.map(g => _pendingRowHtml(g, now)).join('');
+  updateSortIndicators('pending-tbody');
+}
+
+// ---------------------------------------------------------------------------
+// PO status tags
+// ---------------------------------------------------------------------------
+// Exactly one tag per PO, chosen by precedence:
+//   Cancelled > Arrived > Overdue > In Production > In Transit > Open
+//   - Cancelled / Arrived are terminal states.
+//   - Overdue = ordered_at + 30 days in the past (ops rule: ANY PO older
+//     than 30 days from its order date is overdue). Outranks the ship-
+//     date states so a stale PO keeps flagging even after a ship date is
+//     entered.
+//   - In Production = ship date set within the next 7 days (today -> +7);
+//     the order is being made and ships imminently.
+//   - In Transit = ship date set but outside that window (already shipped
+//     or scheduled further out), not yet arrived.
+//   - Open = pending, under 30 days old, no ship date yet.
+const PENDING_TAGS = {
+  arrived:       { label: 'Arrived',       cls: 'badge-green'  },
+  in_transit:    { label: 'In Transit',    cls: 'badge-blue'   },
+  in_production: { label: 'In Production', cls: 'badge-violet' },
+  overdue:       { label: 'Overdue',       cls: 'badge-red'    },
+  cancelled:     { label: 'Cancelled',     cls: 'badge-gray'   },
+  open:          { label: 'Open',          cls: 'badge-yellow' },
+};
+
+function _poTagHtml(state) {
+  const t = PENDING_TAGS[state] || PENDING_TAGS.open;
+  return `<span class="badge ${t.cls}" style="font-size:10px">${t.label}</span>`;
+}
+
+// Parse a stored date (ISO date or datetime) to a local midnight Date.
+function _poDate(s) {
+  const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+// True when a ship date is set AND lands in [today, today+7].
+function _shipInProductionWindow(shipDate, now) {
+  const ship = _poDate(shipDate);
+  if (!ship) return false;
+  now = now || new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const plus7 = new Date(today);
+  plus7.setDate(plus7.getDate() + 7);
+  return ship >= today && ship <= plus7;
+}
+
+// True when the PO's effective arrival trigger is in the past, or it has
+// been explicitly reconstructed / flagged as arrived.
+function _isPoArrived(g, now) {
+  if (g.status === 'arrived' || g._source === 'arrived') return true;
+  const trg = (g.arrival_date || g.eta || '').trim();
+  if (!trg) return false;
+  const d = new Date(trg);
+  return !isNaN(d.getTime()) && d <= (now || new Date());
+}
+
+function _poState(g, now) {
+  now = now || new Date();
+  if (g.status === 'canceled' || g.canceled) return 'cancelled';
+  if (_isPoArrived(g, now)) return 'arrived';
+  const ordered = _poDate(g.ordered_at);
+  if (ordered) {
+    const cutoff = new Date(ordered);
+    cutoff.setDate(cutoff.getDate() + 30);
+    if (cutoff < now) return 'overdue';
+  }
+  if (_shipInProductionWindow(g.ship_date, now)) return 'in_production';
+  if ((g.ship_date || '').trim()) return 'in_transit';
+  return 'open';
+}
+
+// Merge inventory on_order pairs, Chefs Warehouse POs, and reconstructed
+// arrived inventory POs into one normalized list, each carrying _source
+// and a computed _state. Dedupes arrived records against any PO already
+// represented by a live (inventory / CW) group.
+function _assemblePendingGroups() {
+  let groups = _buildPoGroups(pendingCache).map(g => {
+    g._source = 'inventory';
+    return g;
+  });
+
+  const cw = (cwPendingGroups || []).map(g => ({
+    po_number:    g.po_number || '',
+    po_revision:  g.po_revision || '',
+    distributor:  'Chefs Warehouse',
+    warehouse:    g.warehouse || '',
+    dc_code:      g.dc_code || '',
+    ordered_at:   g.ordered_at || '',
+    eta:          g.eta || '',
+    ship_date:    g.ship_date || '',
+    arrival_date: g.arrival_date || '',
+    total_cs:     Number(g.total_cs) || 0,
+    status:       g.status || '',
+    lines:        (g.lines || []).map(L => ({
+      variety: L.variety || '', qty: Number(L.qty) || 0,
+      unit: L.unit || 'cs', name: L.name || '',
+    })),
+    _source: 'chefs_warehouse',
+  }));
+
+  const seen = new Set(groups.concat(cw).map(g => g.po_number));
+  const arrived = (arrivedInvGroups || [])
+    .filter(g => !seen.has(g.po_number || ''))
+    .map(g => ({
+      po_number:    g.po_number || '',
+      po_revision:  g.po_revision || '',
+      distributor:  g.distributor || '',
+      warehouse:    g.warehouse || '',
+      ordered_at:   g.ordered_at || '',
+      eta:          g.eta || '',
+      ship_date:    g.ship_date || '',
+      arrival_date: g.arrival_date || '',
+      total_cs:     Number(g.total_cs) || 0,
+      status:       'arrived',
+      lines:        (g.lines || []).map(L => ({
+        variety: L.variety || '', qty: Number(L.qty) || 0,
+        unit: L.unit || 'cs', name: L.name || '',
+      })),
+      _source: 'arrived',
+    }));
+
+  groups = groups.concat(cw).concat(arrived);
+  const now = new Date();
+  groups.forEach(g => { g._state = _poState(g, now); });
+  return groups;
+}
+
+// Items column (shared by the main table and the In Production section).
+function _poItemsCellHtml(g) {
+  const sortedLines = (g.lines || []).slice()
+    .sort((a, b) => (a.variety || '').localeCompare(b.variety || ''));
+  const head = sortedLines.slice(0, 4).map(L =>
+    `${escHtml(L.variety)}&nbsp;<span style="color:var(--muted)">${(Number(L.qty) || 0).toFixed(0)}</span>`
+  ).join(' · ');
+  const more = sortedLines.length > 4
+    ? ` · <span style="color:var(--muted)">+${sortedLines.length - 4} more</span>` : '';
+  const tipText = sortedLines.map(L =>
+    `${L.variety}: ${(Number(L.qty) || 0).toFixed(0)} ${L.unit || 'cs'}`).join('\n');
+  return `<td title="${escAttr(tipText)}" style="font-size:12px">
+        <div>${head}${more}</div>
+        <div style="color:var(--muted);font-size:11px">${sortedLines.length} item${sortedLines.length === 1 ? '' : 's'}</div>
+      </td>`;
+}
+
+function _poWarehouseLabel(g) {
+  return (g._source === 'chefs_warehouse' && g.dc_code)
+    ? `${escHtml(g.warehouse || '')} <span style="color:var(--muted);font-size:11px">(${escHtml(g.dc_code)})</span>`
+    : escHtml(g.warehouse || '');
+}
+
+function _pendingRowHtml(g, now) {
+  now = now || new Date();
+  const state = g._state || _poState(g, now);
+  const shipISO = (g.ship_date || '').slice(0, 10);
+  const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
+  const eta = g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">—</span>';
+  const palletMismatch = (Number(g.total_cs) % 56) !== 0;
+  const rowStyle = (state === 'overdue')
+    ? ' style="background:var(--surface2)"'
+    : palletMismatch
+      ? ' style="background:rgba(217, 119, 6, 0.08)"'
       : '';
-    // CW POs route their actions to /api/chefs-warehouse/* instead of
-    // the inventory-on-order endpoints. The `_source` flag is set in
-    // renderPendingPOs() during the merge.
-    const source = g._source || 'inventory';
-    const warehouseLabel = (source === 'chefs_warehouse' && g.dc_code)
-      ? `${escHtml(g.warehouse || '')} <span style="color:var(--muted);font-size:11px">(${escHtml(g.dc_code)})</span>`
-      : escHtml(g.warehouse || '');
-    return `<tr${rowStyle}>
+  const palletBadge = palletMismatch
+    ? ` <span class="badge badge-yellow" title="Total cs (${g.total_cs}) is not a multiple of 56" style="margin-left:4px;font-size:10px">⚠ not ×56</span>`
+    : '';
+  const source = g._source || 'inventory';
+  const terminal = (state === 'arrived' || state === 'cancelled');
+  const shipCell = terminal
+    ? (shipISO ? formatDate(shipISO) : '<span style="color:var(--muted)">—</span>')
+    : `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
+  const actionsCell = terminal
+    ? '<span style="color:var(--muted)">—</span>'
+    : `<button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${(g.lines || []).length}, ${(Number(g.total_cs) || 0).toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>`;
+  return `<tr${rowStyle}>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
-      <td>${warehouseLabel}</td>
-      <td title="${escAttr(tipText)}" style="font-size:12px">
-        <div>${head}${more}</div>
-        <div style="color:var(--muted);font-size:11px">${g.lines.length} item${g.lines.length === 1 ? '' : 's'}</div>
-      </td>
-      <td style="text-align:right;font-weight:600">${g.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span>${palletBadge}</td>
+      <td>${_poWarehouseLabel(g)}</td>
+      ${_poItemsCellHtml(g)}
+      <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span>${palletBadge}</td>
       <td style="white-space:nowrap">${formatDate(g.ordered_at)}</td>
-      <td>
-        <input type="date" class="ship-date-input"
-               value="${escAttr(shipISO)}"
-               onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />
-      </td>
+      <td>${shipCell}</td>
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
-      <td class="actions-col" style="white-space:nowrap">
-        <button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${g.lines.length}, ${g.total_cs.toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>
-      </td>
+      <td>${_poTagHtml(state)}</td>
+      <td class="actions-col" style="white-space:nowrap">${actionsCell}</td>
+    </tr>`;
+}
+
+function renderInProductionSection(list) {
+  const card = document.getElementById('pending-inprod-card');
+  const tbody = document.getElementById('pending-inprod-tbody');
+  const countEl = document.getElementById('pending-inprod-count');
+  if (!card || !tbody) return;
+  list = (list || []).slice()
+    .sort((a, b) => (a.ship_date || '').localeCompare(b.ship_date || ''));
+  if (list.length === 0) {
+    card.style.display = 'none';
+    tbody.innerHTML = '';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  card.style.display = '';
+  if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
+  tbody.innerHTML = list.map(g => {
+    const ship = g.ship_date ? formatDate(g.ship_date) : '<span style="color:var(--muted)">—</span>';
+    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
+    return `<tr>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td>${distributorBadge(g.distributor)}</td>
+      <td>${_poWarehouseLabel(g)}</td>
+      ${_poItemsCellHtml(g)}
+      <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap;font-weight:600">${ship}</td>
+      <td style="white-space:nowrap">${arrival}</td>
+      <td>${_poTagHtml(g._state || 'in_production')}</td>
     </tr>`;
   }).join('');
-  updateSortIndicators('pending-tbody');
 }
 
 async function cancelPendingPO(poNumber, lineCount, totalCs, source) {

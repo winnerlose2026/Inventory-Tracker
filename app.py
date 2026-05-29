@@ -1235,6 +1235,104 @@ def api_chefs_warehouse_cancel():
 
 
 # ---------------------------------------------------------------------------
+# API – Arrived (rolled-over) inventory POs
+# ---------------------------------------------------------------------------
+# When a USF/Cheney on_order entry's trigger date passes,
+# inventory_tracker._rollover_on_order() drops it from item["on_order"]
+# and _append_rollover_usage() writes a usage row tagged
+# source="on_order_rollover". Those usage rows are the ONLY persistent
+# record that an inventory-side PO arrived (the on_order entry is gone),
+# so the Pending POs tab can't show arrived USF/Cheney POs from
+# /api/inventory alone — that's why "Arrived" historically showed only
+# Chefs Warehouse POs (which keep their own record). This endpoint
+# reconstructs arrived inventory POs by grouping those usage rows by
+# po_number so the frontend can merge them into the Arrived view.
+
+@app.route("/api/arrived-pos")
+def api_arrived_pos():
+    """List arrived inventory-side POs reconstructed from the usage log.
+
+    Groups usage rows with source=="on_order_rollover" by po_number and
+    enriches each group with the distributor / warehouse pulled from the
+    SKU's current inventory record. Chefs Warehouse POs are intentionally
+    excluded here — they're served (arrived + active) by
+    /api/chefs-warehouse/pos.
+
+    Each group matches the shape the Pending POs frontend expects:
+      po_number, po_revision, distributor, warehouse, ordered_at (best
+      effort), eta, ship_date, arrival_date, total_cs, lines[], status.
+    """
+    import re as _re
+    from inventory_tracker import load_inventory, load_usage
+
+    inv = load_inventory()
+    meta = {}
+    for key, item in inv.items():
+        meta[key] = {
+            "distributor": item.get("distributor") or "",
+            "warehouse":   item.get("warehouse") or "",
+            "name":        item.get("name") or key,
+        }
+
+    groups: dict = {}
+    for e in (load_usage() or []):
+        if (e.get("source") or "") != "on_order_rollover":
+            continue
+        po = (e.get("po_number") or "").strip()
+        if not po:
+            continue
+        m = meta.get(e.get("item_key") or "", {})
+        g = groups.get(po)
+        if g is None:
+            g = groups[po] = {
+                "po_number":    po,
+                "po_revision":  e.get("po_revision") or "",
+                "distributor":  m.get("distributor") or "",
+                "warehouse":    m.get("warehouse") or "",
+                "ordered_at":   "",
+                "eta":          "",
+                "ship_date":    "",
+                "arrival_date": e.get("timestamp") or "",
+                "total_cs":     0.0,
+                "lines":        [],
+                "status":       "arrived",
+            }
+        qty = abs(float(e.get("amount") or 0))
+        g["total_cs"] += qty
+        name = m.get("name") or e.get("item_name") or ""
+        variety = name.split(" Bagel")[0] if " Bagel" in name else name
+        g["lines"].append({
+            "variety": variety,
+            "name":    name,
+            "qty":     qty,
+            "unit":    e.get("unit") or "cs",
+        })
+        # arrival_date = the latest rollover timestamp across the PO's lines.
+        ts = e.get("timestamp") or ""
+        if ts > (g["arrival_date"] or ""):
+            g["arrival_date"] = ts
+        # First non-empty distributor / warehouse wins (lines may map to
+        # SKUs that lost their metadata; keep the first useful one).
+        if not g["distributor"] and m.get("distributor"):
+            g["distributor"] = m["distributor"]
+        if not g["warehouse"] and m.get("warehouse"):
+            g["warehouse"] = m["warehouse"]
+        # The rollover note carries "(ETA YYYY-MM-DD)" — surface it.
+        if not g["eta"]:
+            mm = _re.search(r"ETA (\d{4}-\d{2}-\d{2})", e.get("note") or "")
+            if mm:
+                g["eta"] = mm.group(1)
+
+    out = list(groups.values())
+    for g in out:
+        g["total_cs"] = round(g["total_cs"], 2)
+    # Newest arrivals first.
+    out.sort(key=lambda x: (x.get("arrival_date") or "", x.get("po_number") or ""),
+             reverse=True)
+    return jsonify({"ok": True, "count": len(out), "pos": out})
+
+
+# ---------------------------------------------------------------------------
 # API – Daily Production
 # ---------------------------------------------------------------------------
 # Production sheets are separate from inventory. Each record describes
