@@ -480,7 +480,16 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         return
 
     if evt.event_type == "on_hand":
-        if abs(amount - old_qty) < 1e-9:
+        # An inventory worksheet carries both the on-hand count and the rep's
+        # average weekly usage. Treat the event as a no-op only when NEITHER
+        # changed, so a weekly-usage refresh still lands even if cases on hand
+        # happen to match.
+        new_wu = evt.item.weekly_usage
+        old_wu = item.get("weekly_usage")
+        qty_changed = abs(amount - old_qty) >= 1e-9
+        wu_changed = (new_wu is not None
+                      and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
+        if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
         new_qty = amount
@@ -497,14 +506,20 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     else:
         return
 
-    report["changes"].append({
+    change = {
         "name": item["name"],
         "warehouse": item.get("warehouse", ""),
         "event_type": evt.event_type,
         "old_quantity": old_qty,
         "new_quantity": new_qty,
         "delta": round(new_qty - old_qty, 2),
-    })
+    }
+    # Surface a weekly-usage refresh (inventory worksheets carry it) so the
+    # report shows it even when cases-on-hand didn't move.
+    if evt.event_type == "on_hand" and evt.item.weekly_usage is not None:
+        change["old_weekly_usage"] = item.get("weekly_usage")
+        change["new_weekly_usage"] = round(float(evt.item.weekly_usage), 2)
+    report["changes"].append(change)
     report["updated"] += 1
 
     if dry_run:
@@ -514,6 +529,9 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     item["updated"] = now
     item["last_synced"] = now
     item["last_synced_from"] = "Email Inbox"
+    # On-hand worksheets also refresh the variety's average weekly usage.
+    if evt.event_type == "on_hand" and evt.item.weekly_usage is not None:
+        item["weekly_usage"] = round(float(evt.item.weekly_usage), 2)
     entry = {
         "item_key": key,
         "item_name": item["name"],

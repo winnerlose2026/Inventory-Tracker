@@ -60,6 +60,10 @@ from integrations.email_scanner import (  # noqa: E402
     _usfoods_po_to_events,
     _cheney_po_to_events,
     _chefs_warehouse_po_to_record,
+    _inventory_worksheet_to_events,
+)
+from integrations.bagel_inventory_worksheet import (  # noqa: E402
+    warehouse_for_sender as _worksheet_warehouse_for_sender,
 )
 from integrations.lineage_freight_parser import (  # noqa: E402
     parse_freight_pdf,
@@ -128,6 +132,12 @@ def _classify(sender: str, subject: str) -> str | None:
     subj_u = (subject or "").upper()
     if "LINEAGE FREIGHT" in subj_u and "BILLABLE INVOICE" in subj_u:
         return "Lineage Freight"
+    # Known inventory-worksheet reps may email from any address; honor the
+    # explicit rep map so their weekly worksheets qualify even if the domain
+    # isn't one of the distributor domains above.
+    rep_dist, _rep_wh = _worksheet_warehouse_for_sender(sender)
+    if rep_dist:
+        return rep_dist
     # Some PO confirmations get forwarded by internal staff. We do NOT
     # accept those automatically — the original PDF is the source of truth
     # and will arrive in the original distributor message too.
@@ -493,8 +503,12 @@ def run(argv: list[str] | None = None) -> int:
     error_strs: list[str] = []
     msgs_parsed = 0
 
+    XLSX_CTYPE = ("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet")
     for q in qualifying:
-        mb, mid, subject, dist = q["mailbox"], q["id"], q["subject"], q["distributor"]
+        mb, mid, subject, dist, sender = (
+            q["mailbox"], q["id"], q["subject"], q["distributor"], q["sender"],
+        )
         try:
             atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
         except Exception as exc:
@@ -513,7 +527,8 @@ def run(argv: list[str] | None = None) -> int:
             is_zip = (wanted_zip and
                       (name.endswith(".zip") or ctype in ("application/zip",
                                                           "application/x-zip-compressed")))
-            if not (is_pdf or is_zip):
+            is_xlsx = name.endswith(".xlsx") or ctype == XLSX_CTYPE
+            if not (is_pdf or is_zip or is_xlsx):
                 continue
             any_pdf = True
             try:
@@ -525,7 +540,16 @@ def run(argv: list[str] | None = None) -> int:
                 error_strs.append(f"{mid[:12]}.. [fetch-att]: {msg}")
                 continue
             try:
-                if dist == "US Foods":
+                if is_xlsx:
+                    # Weekly inventory worksheet (on-hand + avg weekly usage).
+                    # Warehouse is keyed off the sending rep, not the file.
+                    events, errors = _inventory_worksheet_to_events(
+                        pdf_bytes, sender, mid, subject)
+                    for e in events:
+                        events_out.append(asdict(e))
+                    for er in errors:
+                        error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                elif dist == "US Foods":
                     events, errors = _usfoods_po_to_events(
                         pdf_bytes, dist, mid, subject)
                     for e in events:
@@ -590,7 +614,8 @@ def run(argv: list[str] | None = None) -> int:
         if any_pdf:
             msgs_parsed += 1
         else:
-            error_strs.append(f"{mid[:12]}.. [{dist}]: no PDF attachment found")
+            error_strs.append(
+                f"{mid[:12]}.. [{dist}]: no PDF/xlsx/zip attachment found")
 
     # ---- POST events (USF + Cheney) to /api/email/ingest-events
     rep0: dict = {}

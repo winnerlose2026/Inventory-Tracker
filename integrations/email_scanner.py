@@ -99,6 +99,11 @@ from .chefs_warehouse_po_parser import (
     parse_po_pdf as _cw_parse_po_pdf,
     dc_code_from_subject as _cw_dc_code_from_subject,
 )
+from .bagel_inventory_worksheet import (
+    CASE_SIZE as _WORKSHEET_CASE_SIZE,
+    parse_worksheet_xlsx as _parse_inventory_worksheet,
+    warehouse_for_sender as _worksheet_warehouse_for_sender,
+)
 
 
 EventType = Literal["on_hand", "restock", "usage"]
@@ -509,6 +514,79 @@ def _chefs_warehouse_po_to_record(pdf_bytes, msg_id, subject):
     return record, errors
 
 
+def _looks_like_inventory_worksheet(subject: str) -> bool:
+    """Heuristic: does this subject look like a weekly inventory worksheet?
+
+    Used only to decide whether to surface an "unknown rep" error for an
+    .xlsx from a sender that isn't yet mapped -- so a new warehouse rep's
+    first worksheet doesn't get silently dropped, while unrelated
+    spreadsheets stay quiet.
+    """
+    s = (subject or "").lower()
+    return "inventory" in s and ("usage" in s or "weekly" in s)
+
+
+def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
+    """Parse a "Bagel Inventory and Weekly Usage" .xlsx into on_hand events.
+
+    A warehouse rep emails a per-variety worksheet of current cases on hand
+    (CS OH) and average weekly usage (WKLY USE). Each line becomes one
+    ``on_hand`` EmailEvent whose SyncItem also carries ``weekly_usage`` so the
+    apply path refreshes both the on-hand quantity and the usage reference.
+
+    The warehouse is resolved from the sending rep's email address (the file
+    never names it -- see bagel_inventory_worksheet.REP_EMAIL_TO_WAREHOUSE).
+
+    Returns (events, errors). Unknown reps and unmapped MFG codes are surfaced
+    as errors rather than silently dropped.
+    """
+    events = []
+    errors = []
+    distributor, warehouse = _worksheet_warehouse_for_sender(sender)
+    if not warehouse:
+        errors.append(
+            f"inventory worksheet ({subject!r}): unknown rep {sender!r} -- add "
+            "them to bagel_inventory_worksheet.REP_EMAIL_TO_WAREHOUSE"
+        )
+        return events, errors
+
+    try:
+        sheet = _parse_inventory_worksheet(
+            xlsx_bytes, distributor=distributor, warehouse=warehouse,
+        )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"inventory worksheet parse failed ({subject!r}): {exc}")
+        return events, errors
+
+    if sheet.unmapped_codes:
+        errors.append(
+            f"inventory worksheet ({warehouse}): unmapped MFG codes "
+            f"{sorted(set(sheet.unmapped_codes))} -- add them to "
+            "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
+        )
+
+    for line in sheet.lines:
+        if not line.variety:
+            continue
+        events.append(EmailEvent(
+            event_type="on_hand",
+            item=SyncItem(
+                quantity=line.cases_on_hand,
+                distributor=distributor,
+                variety=line.variety,
+                warehouse=warehouse,
+                unit="cs",
+                case_size=_WORKSHEET_CASE_SIZE,
+                weekly_usage=line.weekly_usage,
+                distributor_sku=line.usf_item_no or None,
+            ),
+            source_message_id=msg_id,
+            source_subject=subject,
+        ))
+
+    return events, errors
+
+
 def parse_message_with_errors(msg):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
@@ -565,6 +643,20 @@ def parse_message_with_errors(msg):
             errors.extend(d_errs)
         else:
             continue
+
+    # 1b) Inventory-worksheet .xlsx attachments (on-hand snapshot + weekly
+    #     usage from a warehouse rep). Warehouse is keyed off the sender.
+    for fname, payload in _attachments(msg):
+        if not fname.lower().endswith(".xlsx"):
+            continue
+        _dist, _wh = _worksheet_warehouse_for_sender(from_hdr)
+        if not (_wh or _looks_like_inventory_worksheet(subject)):
+            continue  # not a worksheet rep and subject doesn't look like one
+        w_events, w_errs = _inventory_worksheet_to_events(
+            payload, from_hdr, msg_id, subject,
+        )
+        events.extend(w_events)
+        errors.extend(w_errs)
 
     # 2) CSV attachments
     for fname, payload in _attachments(msg):
@@ -919,5 +1011,6 @@ __all__ = [
     "_chefs_warehouse_po_to_record",
     "_usfoods_po_to_events",
     "_cheney_po_to_events",
+    "_inventory_worksheet_to_events",
 ]
         
