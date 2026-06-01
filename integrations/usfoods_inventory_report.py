@@ -283,7 +283,15 @@ def _build_report_from_table(table: list[list[str]],
         if on_hand is None:
             continue
         on_order = _to_float(r[col_oo]) if (col_oo is not None and col_oo < len(r)) else None
-        weekly = _to_float(r[week_col]) if (week_col is not None and week_col < len(r)) else None
+        # weekly_usage = AVERAGE of all forecast-week columns -- a smoother
+        # rate than any single week (JD: weeks remaining = on hand / avg usage).
+        _wk_vals = []
+        for _c, _ in week_cols:
+            if _c < len(r):
+                _v = _to_float(r[_c])
+                if _v is not None:
+                    _wk_vals.append(_v)
+        weekly = round(sum(_wk_vals) / len(_wk_vals), 2) if _wk_vals else None
         desc = r[col_desc].strip() if (col_desc is not None and col_desc < len(r)) else ""
 
         # Variety via MFG code, falling back to USF item # -> MFG.
@@ -438,7 +446,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
 
     header = rows[header_idx]
     norms = [_norm(c) for c in header]
-    col_item = col_mfg = col_desc = col_oh = col_use = None
+    col_item = col_mfg = col_desc = col_oh = None
+    col_use_list = []
     week_label = ""
     for idx, (raw, n) in enumerate(zip(header, norms)):
         if n in _ITEM_HEADERS and col_item is None:
@@ -449,8 +458,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
             col_desc = idx
         elif _is_on_hand(n) and col_oh is None:
             col_oh = idx
-        elif _is_usage(n) and col_use is None:
-            col_use = idx
+        elif _is_usage(n):
+            col_use_list.append(idx)
         if raw and "time frame" in str(raw).lower() and not week_label:
             week_label = str(raw).strip()
 
@@ -466,7 +475,13 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
         if on_hand is None:
             continue
-        weekly = _to_float(r[col_use]) if (col_use is not None and col_use < len(r)) else None
+        _wk_vals = []
+        for _c in col_use_list:
+            if _c < len(r):
+                _v = _to_float(r[_c])
+                if _v is not None:
+                    _wk_vals.append(_v)
+        weekly = round(sum(_wk_vals) / len(_wk_vals), 2) if _wk_vals else None
         mfg = _clean_code(r[col_mfg]) if (col_mfg is not None and col_mfg < len(r)) else ""
         desc = (str(r[col_desc]).strip()
                 if (col_desc is not None and col_desc < len(r) and r[col_desc] is not None)

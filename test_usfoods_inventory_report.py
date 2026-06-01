@@ -86,8 +86,8 @@ def test_parse_html_nearest_week_and_varieties():
     assert len(rep.lines) == len(ROWS), len(rep.lines)
     by_variety = {L.variety: L for L in rep.lines}
     assert by_variety["Plain"].cases_on_hand == 81
-    assert by_variety["Plain"].weekly_usage == 22.28          # wk1, not wk2 (22.9)
-    assert by_variety["Egg"].weekly_usage == 5.39
+    assert by_variety["Plain"].weekly_usage == round((22.28 + 22.9) / 2, 2)  # avg of the forecast weeks
+    assert by_variety["Egg"].weekly_usage == round((5.39 + 5.54) / 2, 2)
     assert by_variety["Everything"].cases_on_hand == 101
     assert by_variety["Plain"].usf_item_no == "7095637"
     print("ok: HTML parse picks nearest week + resolves all varieties")
@@ -107,8 +107,8 @@ def test_text_fallback():
     assert len(rep.lines) == len(ROWS), len(rep.lines)
     by_variety = {L.variety: L for L in rep.lines}
     assert by_variety["Plain"].cases_on_hand == 81
-    assert by_variety["Plain"].weekly_usage == 22.28
-    print("ok: text fallback parses rows + nearest week")
+    assert by_variety["Plain"].weekly_usage == round((22.28 + 22.9) / 2, 2)
+    print("ok: text fallback parses rows + avg usage")
 
 
 def test_usf_item_fallback_without_vendor_column():
@@ -139,7 +139,7 @@ def test_scanner_integration_emits_on_hand_events():
         assert e.item.weekly_usage is not None
     plain = next(e for e in events if e.item.variety == "Plain")
     assert plain.item.quantity == 81
-    assert plain.item.weekly_usage == 22.28
+    assert plain.item.weekly_usage == round((22.28 + 22.9) / 2, 2)
     assert plain.item.distributor_sku == "7095637"
     print("ok: scanner emits on_hand events w/ weekly_usage for a known rep")
 

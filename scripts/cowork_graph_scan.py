@@ -61,6 +61,7 @@ from integrations.email_scanner import (  # noqa: E402
     _cheney_po_to_events,
     _chefs_warehouse_po_to_record,
     _inventory_worksheet_to_events,
+    _usfoods_inventory_report_to_events,
 )
 from integrations.bagel_inventory_worksheet import (  # noqa: E402
     warehouse_for_sender as _worksheet_warehouse_for_sender,
@@ -278,6 +279,29 @@ def _fetch_attachment_bytes(token: str, mailbox: str, message_id: str,
                 f"(odata.type={meta.get('@odata.type')!r})"
             ) from exc
         return b64decode(content_b64)
+
+
+def _fetch_message_body(token: str, mailbox: str, message_id: str,
+                        *, verbose: bool = False) -> tuple[str, str]:
+    """Return (html, text) for a message body via Graph.
+
+    Prefers ``uniqueBody`` (just the latest reply, no quoted thread) so a
+    US Foods rep's inline inventory table is parsed without the older quoted
+    reports beneath it; falls back to the full ``body``.
+    """
+    path = (f"/users/{urllib.parse.quote(mailbox)}"
+            f"/messages/{urllib.parse.quote(message_id)}"
+            f"?$select=body,uniqueBody")
+    meta = _graph_get(token, path, verbose=verbose)
+    for key in ("uniqueBody", "body"):
+        b = meta.get(key) or {}
+        content = b.get("content") or ""
+        if not content:
+            continue
+        if (b.get("contentType") or "").lower() == "html":
+            return content, ""
+        return "", content
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +533,7 @@ def run(argv: list[str] | None = None) -> int:
         mb, mid, subject, dist, sender = (
             q["mailbox"], q["id"], q["subject"], q["distributor"], q["sender"],
         )
+        events_before = len(events_out)
         try:
             atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
         except Exception as exc:
@@ -541,10 +566,15 @@ def run(argv: list[str] | None = None) -> int:
                 continue
             try:
                 if is_xlsx:
-                    # Weekly inventory worksheet (on-hand + avg weekly usage).
-                    # Warehouse is keyed off the sending rep, not the file.
-                    events, errors = _inventory_worksheet_to_events(
-                        pdf_bytes, sender, mid, subject)
+                    # US Foods inventory & usage report (.xlsx): Manassas
+                    # "Product Usage" / La Mirada "SM Inventory". Try the report
+                    # parser first; fall back to the older CS OH / WKLY USE
+                    # worksheet parser when this isn't a report layout.
+                    events, errors = _usfoods_inventory_report_to_events(
+                        "", "", sender, mid, subject, xlsx=pdf_bytes)
+                    if not events and not errors:
+                        events, errors = _inventory_worksheet_to_events(
+                            pdf_bytes, sender, mid, subject)
                     for e in events:
                         events_out.append(asdict(e))
                     for er in errors:
@@ -611,7 +641,28 @@ def run(argv: list[str] | None = None) -> int:
                 msg = _redact(str(exc), secrets_to_redact)
                 error_strs.append(f"{mid[:12]}.. [parse]: {msg}")
                 continue
-        if any_pdf:
+        # US Foods inventory & usage report pasted into the message body
+        # (Zebulon): no PDF/xlsx attachment carries it. When the attachments
+        # produced no events for a US Foods message, fetch the body and parse
+        # the inline table.
+        if dist == "US Foods" and len(events_out) == events_before:
+            try:
+                html_body, text_body = _fetch_message_body(
+                    token, mb, mid, verbose=args.verbose)
+            except Exception as exc:
+                html_body, text_body = "", ""
+                error_strs.append(
+                    f"{mid[:12]}.. [body-fetch]: "
+                    f"{_redact(str(exc), secrets_to_redact)}")
+            if html_body or text_body:
+                b_events, b_errs = _usfoods_inventory_report_to_events(
+                    html_body, text_body, sender, mid, subject)
+                for e in b_events:
+                    events_out.append(asdict(e))
+                for er in b_errs:
+                    error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+
+        if any_pdf or len(events_out) > events_before:
             msgs_parsed += 1
         else:
             error_strs.append(
