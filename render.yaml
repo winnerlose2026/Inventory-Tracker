@@ -1,12 +1,12 @@
-# Render Blueprint — source of truth for the bagel-inventory web service,
-# the 6-hourly mailbox scan cron, and the 15-minute SFTP pull cron.
+# Render Blueprint — source of truth for the bagel-inventory web service
+# and the 6-hourly mailbox scan cron.
 #
 # Adoption: open Render -> Blueprints -> New Blueprint Instance, point it
 # at this repo on branch `main`. For each service Render will detect the
 # matching existing service by name and offer to adopt it rather than
-# create a duplicate (web=bagel-inventory, crons=bagel-inventory-6h-scan
-# and bagel-inventory-sftp-pull). After adoption, any commit to main that
-# touches render.yaml auto-syncs to the dashboard.
+# create a duplicate (web=bagel-inventory, cron=bagel-inventory-6h-scan).
+# After adoption, any commit to main that touches render.yaml auto-syncs
+# to the dashboard.
 #
 # Why each piece exists:
 #   - Web service: serves the Flask app + dashboard, persists inventory.json
@@ -15,7 +15,6 @@
 #     directly, fetches PO PDFs from JD@/info@, parses out-of-process, and
 #     POSTs to /api/email/ingest-events. Out-of-process so the gunicorn
 #     worker isn't blocked on big attachment fetches.
-#   - sftp-pull cron: pulls distributor CSVs from sftp.hhbagels.com.
 #
 # Secrets (sync:false) are NOT carried in this file. Set them once on
 # each service in the dashboard; Render preserves them across blueprint
@@ -110,42 +109,6 @@ services:
       - key: MAILBOXES
         value: JD@ms.hhbagels.com,info@ms.hhbagels.com
 
-  - type: cron
-    name: bagel-inventory-sftp-pull
-    runtime: python
-    plan: starter
-    branch: main
-    region: virginia
-    # Pull distributor CSVs from the FTPS inbox (cPanel-hosted at
-    # sftp.hhbagels.com) every 15 minutes. Files we've already processed
-    # are tracked locally in data/sftp_cursor.json (cron-container-local,
-    # ephemeral) and ALSO moved into processed/ on the FTPS host so we
-    # see them server-side too. Re-ingestion safety is additionally
-    # guaranteed by the PO revision-replace logic on the receiving end.
-    schedule: "*/15 * * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/pull_sftp_inbox.py
-    envVars:
-      - key: APP_URL
-        sync: false  # https://bagel-inventory.onrender.com
-      - key: INVENTORY_API_TOKEN
-        sync: false
-      - key: SFTP_HOST
-        value: sftp.hhbagels.com
-      - key: SFTP_PORT
-        value: "21"
-      - key: SFTP_USERNAME_USFOODS
-        sync: false
-      - key: SFTP_PASSWORD_USFOODS
-        sync: false
-      - key: SFTP_USERNAME_CHENEY
-        sync: false
-      - key: SFTP_PASSWORD_CHENEY
-        sync: false
-      - key: SFTP_INCOMING_DIR
-        value: incoming
-      - key: SFTP_PROCESSED_DIR
-        value: processed
 
   - type: cron
     name: bagel-inventory-graph-sub-renew
