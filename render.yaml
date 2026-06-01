@@ -1,12 +1,27 @@
-# Render Blueprint — source of truth for the bagel-inventory web service
-# and the 6-hourly mailbox scan cron.
+# Render Blueprint — source of truth for the whole Inventory-Tracker
+# family: the bagel-inventory web service plus its three crons
+# (6h mailbox scan, daily Graph-subscription renew, daily forecast
+# decrement).
+#
+# Region: every service is pinned to `virginia` so the family is
+# co-located with the web service's persistent disk (which can't move
+# regions) and close to H&H's East-Coast ops + MS365 mailboxes. The
+# graph-sub-renew and forecast-daily crons previously omitted `region:`
+# and so defaulted to Oregon — pinning them here is what brings the
+# family back together. NOTE: Render regions are immutable, so the two
+# Oregon crons must be deleted and recreated by this blueprint to land
+# in Virginia; adoption alone can't relocate an existing service.
+#
+# Runtime: Python is pinned via the repo's .python-version (3.14.3, the
+# version these services already run) so builds are reproducible and
+# don't silently drift when Render bumps its native-runtime default.
 #
 # Adoption: open Render -> Blueprints -> New Blueprint Instance, point it
 # at this repo on branch `main`. For each service Render will detect the
 # matching existing service by name and offer to adopt it rather than
-# create a duplicate (web=bagel-inventory, cron=bagel-inventory-6h-scan).
-# After adoption, any commit to main that touches render.yaml auto-syncs
-# to the dashboard.
+# create a duplicate (web=bagel-inventory, cron=bagel-inventory-6h-scan,
+# both already in Virginia). After adoption, any commit to main that
+# touches render.yaml auto-syncs to the dashboard.
 #
 # Why each piece exists:
 #   - Web service: serves the Flask app + dashboard, persists inventory.json
@@ -115,6 +130,7 @@ services:
     runtime: python
     plan: starter
     branch: main
+    region: virginia
     # Mail change-notification subscriptions cap at ~71 hours. Renew daily
     # at 09:00 UTC (~04:00 ET) so we always have well over a day of
     # headroom even if a renewal fails. The renew endpoint also recreates
@@ -134,6 +150,7 @@ services:
     runtime: python
     plan: starter
     branch: main
+    region: virginia
     # Bridge from weekly_usage (a forecast rate stamped on every SKU) into
     # the usage ledger so FIFO lot consumption actually burns down. Each
     # run posts weekly_usage/7 as a positive usage event per SKU with
