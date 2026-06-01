@@ -757,25 +757,15 @@ def parse_message_with_errors(msg):
         else:
             continue
 
-    # 1b) Inventory-worksheet .xlsx attachments (on-hand snapshot + weekly
-    #     usage from a warehouse rep). Warehouse is keyed off the sender.
-    for fname, payload in _attachments(msg):
-        if not fname.lower().endswith(".xlsx"):
-            continue
-        _dist, _wh = _worksheet_warehouse_for_sender(from_hdr)
-        if not (_wh or _looks_like_inventory_worksheet(subject)):
-            continue  # not a worksheet rep and subject doesn't look like one
-        w_events, w_errs = _inventory_worksheet_to_events(
-            payload, from_hdr, msg_id, subject,
-        )
-        events.extend(w_events)
-        errors.extend(w_errs)
-
-    # 1b2) US Foods "Product Usage" .xlsx report attachments. A DC rep emails
-    #      an .xlsx of cases used (one week) + cases on hand -- a different
-    #      layout from the CS OH / WKLY USE worksheet above, self-detected by
-    #      its header. Only attempted for US Foods senders / known report reps
-    #      and only when nothing else produced events.
+    # 1b) US Foods inventory & usage report .xlsx attachments (Manassas
+    #     "Product Usage" / La Mirada "SM Inventory"). A DC rep attaches an
+    #     .xlsx of current on hand + weekly usage; each mapped row -> on_hand
+    #     event with weekly_usage. Self-detected by header, so it claims these
+    #     reports BEFORE the older CS OH / WKLY USE worksheet branch below --
+    #     whose subject heuristic would otherwise misfire on the shared
+    #     "Weekly … Inventory & Usage Report" subject. Only USF senders /
+    #     known report reps, only when nothing else produced events.
+    report_xlsx_handled = False
     if not events and not cw_pos:
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
@@ -788,7 +778,25 @@ def parse_message_with_errors(msg):
             if x_events or x_errs:
                 events.extend(x_events)
                 errors.extend(x_errs)
+                report_xlsx_handled = True
                 break  # one report per message
+
+    # 1b2) Inventory-worksheet .xlsx attachments (CS OH / WKLY USE layout from
+    #      a warehouse rep). Distinct from the report .xlsx above; handled only
+    #      if the report parser didn't claim the message. Warehouse keyed off
+    #      the sender.
+    if not events and not cw_pos and not report_xlsx_handled:
+        for fname, payload in _attachments(msg):
+            if not fname.lower().endswith(".xlsx"):
+                continue
+            _dist, _wh = _worksheet_warehouse_for_sender(from_hdr)
+            if not (_wh or _looks_like_inventory_worksheet(subject)):
+                continue  # not a worksheet rep and subject doesn't look like one
+            w_events, w_errs = _inventory_worksheet_to_events(
+                payload, from_hdr, msg_id, subject,
+            )
+            events.extend(w_events)
+            errors.extend(w_errs)
 
     # 1c) Inventory & usage report pasted into the message body (no
     #     attachment). A US Foods DC rep emails an HTML table of current cases

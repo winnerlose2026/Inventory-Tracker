@@ -35,11 +35,12 @@ Two delivery shapes are understood, both handled here:
   - **Body table** (e.g. Zebulon, NC) -- the rep pastes the report into the
     message as an HTML table (``parse_report_html``; text/plain fallback
     ``parse_report_text``). ``Forecast <week>`` columns give the usage.
-  - **.xlsx attachment** (e.g. Manassas, VA -- "Product Usage" report) -- the
-    rep attaches a spreadsheet with ``Product Number`` / ``Cases`` (cases used
-    in a one-week time frame) / ``Cases On Hand`` (``parse_report_xlsx``). This
-    is a different layout from the CS OH / WKLY USE worksheet handled by
-    ``bagel_inventory_worksheet`` and is self-detected by its header.
+  - **.xlsx attachment** -- the rep attaches a spreadsheet, read by
+    ``parse_report_xlsx``. Two layouts are seen, both self-detected by header:
+    Manassas "Product Usage" (``Product Number`` / ``Cases`` used in a one-week
+    frame / ``Cases On Hand``) and La Mirada "SM Inventory" (``SKU`` /
+    ``US Foods Number`` / ``CURR OH`` / ``Forecast``). Both differ from the
+    CS OH / WKLY USE worksheet handled by ``bagel_inventory_worksheet``.
 
 The report never names the warehouse; the *sending rep's email address*
 identifies it (``REPORT_SENDER_TO_WAREHOUSE``). Add each rep here as they come
@@ -73,6 +74,8 @@ REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
     # from the team alias rather than a named coordinator.
     "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
+    "sam.travlos@usfoods.com": ("US Foods", "La Mirada, CA"),
+    "ozzy.corut@usfoods.com": ("US Foods", "La Mirada, CA"),
 }
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
@@ -376,20 +379,28 @@ def parse_report_text(text: str, *, distributor: str = "",
 
 def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
                       warehouse: str = "") -> Optional[InventoryReport]:
-    """Parse a US Foods "Product Usage" .xlsx report into an InventoryReport.
+    """Parse a US Foods inventory & usage .xlsx report into an InventoryReport.
 
-    Sheet layout (one sheet, e.g. "Product Usage")::
+    Two layouts are recognized, both self-detected by their header row:
 
-        Time Frame May 24 - 31 | Customer Name | Customer Number | Product Number | Product Description | Cases |  | Cases On Hand
-        Total Time Frame       | HH BAGELS     | 91634139        | 1055064        | BAGEL, ASIGO ...    | 3     |  | 22
+      Manassas "Product Usage"::
 
-    ``Cases`` is the cases consumed during the (one-week) time frame, taken as
-    the ``weekly_usage`` reference. ``Cases On Hand`` is the current snapshot.
-    The ``Product Number`` is the USF catalog item # -- there is no Vendor#/MFG
-    column -- so variety resolves through the ``USF_ITEM_NO_TO_MFG`` fallback.
+        ... | Product Number | Product Description | Cases |  | Cases On Hand
+        ... | 1055064        | BAGEL, ASIGO ...    | 3     |  | 22
 
-    Returns None when the workbook isn't a recognizable Product Usage report,
-    so the caller can fall through to other parsers without raising.
+      La Mirada "SM Inventory"::
+
+        SKU   | US Foods Number | CURR OH | Forecast | Weeks on Hand | ...
+        Plain | 7095637         | 173     | 60       | 2.88          | ...
+
+    The on-hand column is "Cases On Hand" / "CURR OH"; the weekly usage column
+    is "Cases" (cases used, one week) or "Forecast" (predicted weekly cases).
+    The item column is the USF catalog item # ("Product Number" / "US Foods
+    Number") -- there is no Vendor#/MFG column -- so variety resolves through
+    the ``USF_ITEM_NO_TO_MFG`` fallback.
+
+    Returns None when the workbook isn't a recognizable report, so the caller
+    can fall through to other parsers without raising.
     """
     try:
         import openpyxl  # local import; openpyxl is already a project dep
@@ -402,12 +413,24 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
     if not rows:
         return None
 
-    _ITEM_HEADERS = ("productnumber", "productnum", "productno", "item")
+    # Item-number header across the USF report variants: Manassas "Product
+    # Number", La Mirada "US Foods Number".
+    _ITEM_HEADERS = ("productnumber", "productnum", "productno",
+                     "usfoodsnumber", "usfnumber", "usfoodsnum", "item")
+
+    def _is_on_hand(n):
+        # Explicit set only, so "Pot Forecast on Hand" / "Pot weeks OH" /
+        # "WOH plus next PO" on the La Mirada sheet aren't mistaken for it.
+        return n in ("currentonhand", "casesonhand", "curroh", "onhand")
+
+    def _is_usage(n):
+        # Manassas weekly "Cases"; La Mirada weekly "Forecast".
+        return n in ("cases", "forecast")
 
     header_idx = None
     for i, row in enumerate(rows):
         norms = [_norm(c) for c in row if c is not None]
-        if any(n in _ITEM_HEADERS for n in norms) and any("onhand" in n for n in norms):
+        if any(n in _ITEM_HEADERS for n in norms) and any(_is_on_hand(n) for n in norms):
             header_idx = i
             break
     if header_idx is None:
@@ -424,9 +447,9 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
             col_mfg = idx
         elif "description" in n and col_desc is None:
             col_desc = idx
-        elif "onhand" in n and col_oh is None:
+        elif _is_on_hand(n) and col_oh is None:
             col_oh = idx
-        elif n == "cases" and col_use is None:   # exact: not "casesonhand"
+        elif _is_usage(n) and col_use is None:
             col_use = idx
         if raw and "time frame" in str(raw).lower() and not week_label:
             week_label = str(raw).strip()

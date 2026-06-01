@@ -253,6 +253,65 @@ def test_scanner_xlsx_unknown_rep_surfaces_error():
     print("ok: unknown rep .xlsx report surfaces an error")
 
 
+def _sm_inventory_xlsx_bytes():
+    """Build an in-memory La Mirada "SM Inventory" .xlsx: SKU (variety name) /
+    US Foods Number / CURR OH / Forecast, plus the extra analysis columns and a
+    trailing total row that must be ignored."""
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["US FOODS - SM Inventory"])
+    ws.append(["SKU", "US Foods Number", None, "CURR OH", "Forecast", None,
+               "Weeks on Hand", "WOH plus next PO", "next PO", None,
+               "After next PO", "Pot Forecast on Hand", "Pot  weeks OH"])
+    rows = [
+        # SKU,        usf#,      curr_oh, forecast
+        ("Plain",                7095637, 173, 60),
+        ("Poppy",                1528283, 50,  20),   # canonical -> Poppy Seed
+        ("Whole Wheat Everything", 1137644, 133, 15),
+    ]
+    for sku, usf, oh, fc in rows:
+        ws.append([sku, usf, None, oh, fc, None, 2.8, 5.1, 100, None, 300,
+                   999, 9.9])   # Pot Forecast on Hand=999 must NOT be on_hand
+    ws.append([None, "total", None, 356, 95])   # total row -> skipped
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def test_xlsx_sm_inventory_parser():
+    rep = R.parse_report_xlsx(_sm_inventory_xlsx_bytes(),
+                              distributor="US Foods", warehouse="La Mirada, CA")
+    assert rep is not None
+    assert rep.unmapped_codes == [], rep.unmapped_codes
+    assert len(rep.lines) == 3, len(rep.lines)          # total row excluded
+    bv = {L.variety: L for L in rep.lines}
+    assert bv["Plain"].cases_on_hand == 173             # CURR OH, not Pot=999
+    assert bv["Plain"].weekly_usage == 60               # Forecast column
+    assert bv["Poppy Seed"].cases_on_hand == 50         # SKU "Poppy" -> canonical
+    assert bv["Whole Wheat Everything"].weekly_usage == 15
+    print("ok: xlsx SM Inventory parser (CURR OH / Forecast, total row skipped)")
+
+
+def test_scanner_sm_inventory_known_rep_no_worksheet_misfire():
+    # Subject matches the worksheet heuristic; the report parser must claim it
+    # first so the worksheet branch does NOT emit a spurious unknown-rep error.
+    msg = _mime_xlsx(_sm_inventory_xlsx_bytes(), sender="sam.travlos@usfoods.com",
+                     subject="RE: Weekly Bagel Inventory & Usage Report — H&H Bagels")
+    events, errors, cw = parse_message_with_errors(msg)
+    assert not cw
+    assert errors == [], errors
+    assert len(events) == 3, (len(events), errors)
+    for e in events:
+        assert e.event_type == "on_hand"
+        assert e.item.warehouse == "La Mirada, CA"
+        assert e.item.unit == "cs"
+    plain = next(e for e in events if e.item.variety == "Plain")
+    assert plain.item.quantity == 173 and plain.item.weekly_usage == 60
+    print("ok: scanner ingests La Mirada SM Inventory; no worksheet misfire")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -266,4 +325,6 @@ if __name__ == "__main__":
     test_xlsx_product_usage_parser()
     test_scanner_xlsx_attachment_known_rep()
     test_scanner_xlsx_unknown_rep_surfaces_error()
+    test_xlsx_sm_inventory_parser()
+    test_scanner_sm_inventory_known_rep_no_worksheet_misfire()
     print("\nAll usfoods_inventory_report tests passed.")
