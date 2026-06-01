@@ -39,6 +39,14 @@ Input formats understood (in priority order):
      followed by lines like `Plain @ Ocala, FL: 480 each` or
      `Plain Bagel 4oz [CB - Ocala]: 72`.
 
+  4. **Inventory & usage report in the message body** — a US Foods DC rep
+     pastes a "Weekly Bagel Inventory & Usage Report" table (ITEM / Vendor# /
+     Description / CURRENT ON HAND / Forecast <week>…) directly into the email
+     with no attachment. Each mapped row becomes an ``on_hand`` event carrying
+     ``weekly_usage`` (the nearest forecast week). The warehouse is resolved
+     from the sending rep — see
+     ``usfoods_inventory_report.REPORT_SENDER_TO_WAREHOUSE``.
+
 Distributor is inferred from the sender's domain (cheneybrothers.com ->
 "Cheney Brothers", usfoods.com -> "US Foods"). An explicit
 `# distributor: <name>` line in the body overrides the inference.
@@ -103,6 +111,12 @@ from .bagel_inventory_worksheet import (
     CASE_SIZE as _WORKSHEET_CASE_SIZE,
     parse_worksheet_xlsx as _parse_inventory_worksheet,
     warehouse_for_sender as _worksheet_warehouse_for_sender,
+)
+from .usfoods_inventory_report import (
+    CASE_SIZE as _REPORT_CASE_SIZE,
+    parse_report_html as _parse_report_html,
+    parse_report_text as _parse_report_text,
+    warehouse_for_sender as _report_warehouse_for_sender,
 )
 
 
@@ -254,6 +268,26 @@ def _text_body(msg: Message) -> str:
         return ""
     payload = msg.get_payload(decode=True) or b""
     return payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+
+
+def _html_body(msg: Message) -> str:
+    """Return the message's text/html part (the inline report table lives
+    here, not in text/plain). Empty string when there is no HTML part."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp:
+                continue
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+        return ""
+    if msg.get_content_type() == "text/html":
+        payload = msg.get_payload(decode=True) or b""
+        return payload.decode(msg.get_content_charset() or "utf-8",
+                              errors="replace")
+    return ""
 
 
 def _attachments(msg: Message):
@@ -587,6 +621,76 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
     return events, errors
 
 
+def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject):
+    """Parse a "Weekly Bagel Inventory & Usage Report" pasted into the email
+    body into on_hand events.
+
+    The report is an HTML table (text/plain fallback) of current cases on hand
+    plus a weekly usage forecast. Each mapped row becomes one ``on_hand``
+    EmailEvent whose SyncItem also carries ``weekly_usage`` (the nearest
+    forecast week), so the apply path refreshes both the on-hand quantity and
+    the usage reference -- identical semantics to the .xlsx worksheet path.
+
+    The ``ON ORDER`` column is intentionally NOT emitted as a restock: the open
+    PO is ingested separately from its own confirmation, and the report body
+    excludes it from CURRENT ON HAND, so applying it here would double count.
+
+    The warehouse is resolved from the sending rep. This function self-detects
+    a report (returns no events for unrelated mail) and only surfaces an
+    "unknown rep" error when a report table is actually present, so a new DC
+    rep's first report isn't silently dropped while ordinary mail stays quiet.
+
+    Returns (events, errors).
+    """
+    events = []
+    errors = []
+    distributor, warehouse = _report_warehouse_for_sender(sender)
+    report = _parse_report_html(
+        html or "", distributor=distributor or "", warehouse=warehouse or "",
+    )
+    if report is None:
+        report = _parse_report_text(
+            text or "", distributor=distributor or "", warehouse=warehouse or "",
+        )
+    if report is None:
+        return events, errors  # not an inventory & usage report
+
+    if not warehouse:
+        errors.append(
+            f"inventory & usage report ({subject!r}): unknown rep {sender!r} -- "
+            "add them to usfoods_inventory_report.REPORT_SENDER_TO_WAREHOUSE"
+        )
+        return events, errors
+
+    if report.unmapped_codes:
+        errors.append(
+            f"inventory & usage report ({warehouse}): unmapped MFG codes "
+            f"{sorted(set(report.unmapped_codes))} -- add them to "
+            "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
+        )
+
+    for line in report.lines:
+        if not line.variety:
+            continue
+        events.append(EmailEvent(
+            event_type="on_hand",
+            item=SyncItem(
+                quantity=line.cases_on_hand,
+                distributor=distributor,
+                variety=line.variety,
+                warehouse=warehouse,
+                unit="cs",
+                case_size=_REPORT_CASE_SIZE,
+                weekly_usage=line.weekly_usage,
+                distributor_sku=line.usf_item_no or None,
+            ),
+            source_message_id=msg_id,
+            source_subject=subject,
+        ))
+
+    return events, errors
+
+
 def parse_message_with_errors(msg):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
@@ -657,6 +761,19 @@ def parse_message_with_errors(msg):
         )
         events.extend(w_events)
         errors.extend(w_errs)
+
+    # 1c) Inventory & usage report pasted into the message body (no
+    #     attachment). A US Foods DC rep emails an HTML table of current cases
+    #     on hand plus a weekly usage forecast; each mapped row -> on_hand
+    #     event with weekly_usage. Warehouse is keyed off the sending rep.
+    #     Only runs when nothing else produced events, and self-detects a
+    #     report so unrelated mail stays quiet.
+    if not events and not cw_pos:
+        r_events, r_errs = _usfoods_inventory_report_to_events(
+            _html_body(msg), body, from_hdr, msg_id, subject,
+        )
+        events.extend(r_events)
+        errors.extend(r_errs)
 
     # 2) CSV attachments
     for fname, payload in _attachments(msg):
@@ -1012,5 +1129,6 @@ __all__ = [
     "_usfoods_po_to_events",
     "_cheney_po_to_events",
     "_inventory_worksheet_to_events",
+    "_usfoods_inventory_report_to_events",
 ]
         
