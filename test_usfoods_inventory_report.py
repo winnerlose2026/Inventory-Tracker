@@ -170,6 +170,89 @@ def test_scanner_ignores_unrelated_mail():
     print("ok: unrelated mail produces no events and no noise")
 
 
+def _manassas_xlsx_bytes():
+    """Build an in-memory "Product Usage" .xlsx mirroring the Manassas layout:
+    Product Number / Cases (one-week usage) / Cases On Hand, no Vendor# column.
+    """
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Product Usage"
+    ws.append(["Time Frame May 24 - 31", "Customer Name", "Customer Number",
+               "Product Number", "Product Description", "Cases", None,
+               "Cases On Hand"])
+    data = [
+        # product#,  description,                     cases used, on hand
+        ("7095637", "BAGEL, PLN 4.25 Z UNSL PARBK",   7, 32),
+        ("7928199", "BAGEL, ONION 4.25 Z UNSL PARBK", 0, 21),   # zero usage
+        ("1528283", "BAGEL, POPPY SEED 4.25 Z UNSL",  4, 7),
+    ]
+    for item, desc, used, oh in data:
+        ws.append(["Total Time Frame", "HH BAGELS", "91634139", item, desc,
+                   used, None, oh])
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _mime_xlsx(xlsx_bytes, sender="jasmin.gomez@usfoods.com",
+               subject="HH Bagels Report"):
+    msg = email.message.EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f'"Gomez, Jasmin" <{sender}>'
+    msg["To"] = "jd@hhbagels.com"
+    msg["Message-ID"] = "<test-xlsx@usfoods.com>"
+    msg.set_content("Please see attached.")
+    msg.add_attachment(
+        xlsx_bytes, maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="HH Bagels Report.xlsx",
+    )
+    return email.message_from_bytes(bytes(msg))
+
+
+def test_xlsx_product_usage_parser():
+    rep = R.parse_report_xlsx(_manassas_xlsx_bytes(),
+                              distributor="US Foods", warehouse="Manassas, VA")
+    assert rep is not None
+    assert rep.unmapped_codes == [], rep.unmapped_codes
+    assert len(rep.lines) == 3, len(rep.lines)
+    bv = {L.variety: L for L in rep.lines}
+    assert bv["Plain"].cases_on_hand == 32
+    assert bv["Plain"].weekly_usage == 7          # "Cases" = cases used = usage
+    assert bv["Onion"].weekly_usage == 0          # zero usage is valid
+    assert bv["Poppy Seed"].cases_on_hand == 7
+    assert bv["Plain"].mfg_code == "1150"         # resolved via USF item #
+    print("ok: xlsx Product Usage parser (Cases=usage, Cases On Hand=on hand)")
+
+
+def test_scanner_xlsx_attachment_known_rep():
+    msg = _mime_xlsx(_manassas_xlsx_bytes())
+    events, errors, cw = parse_message_with_errors(msg)
+    assert not cw
+    assert errors == [], errors
+    assert len(events) == 3, (len(events), errors)
+    for e in events:
+        assert e.event_type == "on_hand"
+        assert e.item.distributor == "US Foods"
+        assert e.item.warehouse == "Manassas, VA"
+        assert e.item.unit == "cs"
+        assert e.item.case_size == R.CASE_SIZE
+    plain = next(e for e in events if e.item.variety == "Plain")
+    assert plain.item.quantity == 32
+    assert plain.item.weekly_usage == 7
+    print("ok: scanner ingests Manassas .xlsx report for a known rep")
+
+
+def test_scanner_xlsx_unknown_rep_surfaces_error():
+    msg = _mime_xlsx(_manassas_xlsx_bytes(), sender="newcoord@usfoods.com")
+    events, errors, _ = parse_message_with_errors(msg)
+    assert events == [], events
+    assert any("unknown rep" in e for e in errors), errors
+    print("ok: unknown rep .xlsx report surfaces an error")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -180,4 +263,7 @@ if __name__ == "__main__":
     test_scanner_text_only_message()
     test_scanner_unknown_rep_surfaces_error()
     test_scanner_ignores_unrelated_mail()
+    test_xlsx_product_usage_parser()
+    test_scanner_xlsx_attachment_known_rep()
+    test_scanner_xlsx_unknown_rep_surfaces_error()
     print("\nAll usfoods_inventory_report tests passed.")

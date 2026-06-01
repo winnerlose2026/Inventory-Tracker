@@ -116,6 +116,7 @@ from .usfoods_inventory_report import (
     CASE_SIZE as _REPORT_CASE_SIZE,
     parse_report_html as _parse_report_html,
     parse_report_text as _parse_report_text,
+    parse_report_xlsx as _parse_report_xlsx,
     warehouse_for_sender as _report_warehouse_for_sender,
 )
 
@@ -621,12 +622,14 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
     return events, errors
 
 
-def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject):
+def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
+                                        xlsx=None):
     """Parse a "Weekly Bagel Inventory & Usage Report" pasted into the email
     body into on_hand events.
 
-    The report is an HTML table (text/plain fallback) of current cases on hand
-    plus a weekly usage forecast. Each mapped row becomes one ``on_hand``
+    The report is an HTML body table, a text/plain fallback, or a .xlsx
+    attachment of current cases on hand plus a weekly usage figure. Each
+    mapped row becomes one ``on_hand``
     EmailEvent whose SyncItem also carries ``weekly_usage`` (the nearest
     forecast week), so the apply path refreshes both the on-hand quantity and
     the usage reference -- identical semantics to the .xlsx worksheet path.
@@ -645,13 +648,19 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject):
     events = []
     errors = []
     distributor, warehouse = _report_warehouse_for_sender(sender)
-    report = _parse_report_html(
-        html or "", distributor=distributor or "", warehouse=warehouse or "",
-    )
-    if report is None:
-        report = _parse_report_text(
-            text or "", distributor=distributor or "", warehouse=warehouse or "",
+    report = None
+    if xlsx is not None:
+        report = _parse_report_xlsx(
+            xlsx, distributor=distributor or "", warehouse=warehouse or "",
         )
+    if report is None and (html or text):
+        report = _parse_report_html(
+            html or "", distributor=distributor or "", warehouse=warehouse or "",
+        )
+        if report is None:
+            report = _parse_report_text(
+                text or "", distributor=distributor or "", warehouse=warehouse or "",
+            )
     if report is None:
         return events, errors  # not an inventory & usage report
 
@@ -761,6 +770,25 @@ def parse_message_with_errors(msg):
         )
         events.extend(w_events)
         errors.extend(w_errs)
+
+    # 1b2) US Foods "Product Usage" .xlsx report attachments. A DC rep emails
+    #      an .xlsx of cases used (one week) + cases on hand -- a different
+    #      layout from the CS OH / WKLY USE worksheet above, self-detected by
+    #      its header. Only attempted for US Foods senders / known report reps
+    #      and only when nothing else produced events.
+    if not events and not cw_pos:
+        for fname, payload in _attachments(msg):
+            if not fname.lower().endswith(".xlsx"):
+                continue
+            if distributor != "US Foods" and not _report_warehouse_for_sender(from_hdr)[1]:
+                continue
+            x_events, x_errs = _usfoods_inventory_report_to_events(
+                "", "", from_hdr, msg_id, subject, xlsx=payload,
+            )
+            if x_events or x_errs:
+                events.extend(x_events)
+                errors.extend(x_errs)
+                break  # one report per message
 
     # 1c) Inventory & usage report pasted into the message body (no
     #     attachment). A US Foods DC rep emails an HTML table of current cases

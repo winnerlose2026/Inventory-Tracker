@@ -30,6 +30,17 @@ usage reference, so each mapped line becomes one ``on_hand`` event whose
 ``SyncItem`` also carries ``weekly_usage`` -- the apply path refreshes both the
 on-hand quantity and the usage rate (sync_inventory._apply_email_event).
 
+Two delivery shapes are understood, both handled here:
+
+  - **Body table** (e.g. Zebulon, NC) -- the rep pastes the report into the
+    message as an HTML table (``parse_report_html``; text/plain fallback
+    ``parse_report_text``). ``Forecast <week>`` columns give the usage.
+  - **.xlsx attachment** (e.g. Manassas, VA -- "Product Usage" report) -- the
+    rep attaches a spreadsheet with ``Product Number`` / ``Cases`` (cases used
+    in a one-week time frame) / ``Cases On Hand`` (``parse_report_xlsx``). This
+    is a different layout from the CS OH / WKLY USE worksheet handled by
+    ``bagel_inventory_worksheet`` and is self-detected by its header.
+
 The report never names the warehouse; the *sending rep's email address*
 identifies it (``REPORT_SENDER_TO_WAREHOUSE``). Add each rep here as they come
 online -- an unknown sender is surfaced as an error rather than guessed.
@@ -40,6 +51,7 @@ No third-party HTML library is used: the table is extracted with the stdlib
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -57,6 +69,10 @@ except ImportError:  # standalone / test use
 # each US Foods DC rep starts sending the weekly body report.
 REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     "maria.hernandez@usfoods.com": ("US Foods", "Zebulon, NC"),
+    "jasmin.gomez@usfoods.com": ("US Foods", "Manassas, VA"),
+    # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
+    # from the team alias rather than a named coordinator.
+    "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
 }
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
@@ -358,6 +374,97 @@ def parse_report_text(text: str, *, distributor: str = "",
     return _build_report_from_table(rows, distributor, warehouse)
 
 
+def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
+                      warehouse: str = "") -> Optional[InventoryReport]:
+    """Parse a US Foods "Product Usage" .xlsx report into an InventoryReport.
+
+    Sheet layout (one sheet, e.g. "Product Usage")::
+
+        Time Frame May 24 - 31 | Customer Name | Customer Number | Product Number | Product Description | Cases |  | Cases On Hand
+        Total Time Frame       | HH BAGELS     | 91634139        | 1055064        | BAGEL, ASIGO ...    | 3     |  | 22
+
+    ``Cases`` is the cases consumed during the (one-week) time frame, taken as
+    the ``weekly_usage`` reference. ``Cases On Hand`` is the current snapshot.
+    The ``Product Number`` is the USF catalog item # -- there is no Vendor#/MFG
+    column -- so variety resolves through the ``USF_ITEM_NO_TO_MFG`` fallback.
+
+    Returns None when the workbook isn't a recognizable Product Usage report,
+    so the caller can fall through to other parsers without raising.
+    """
+    try:
+        import openpyxl  # local import; openpyxl is already a project dep
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True,
+                                    read_only=True)
+    except Exception:  # noqa: BLE001 -- a non-xlsx / corrupt file isn't a report
+        return None
+
+    rows = [list(r) for r in wb.active.iter_rows(values_only=True)]
+    if not rows:
+        return None
+
+    _ITEM_HEADERS = ("productnumber", "productnum", "productno", "item")
+
+    header_idx = None
+    for i, row in enumerate(rows):
+        norms = [_norm(c) for c in row if c is not None]
+        if any(n in _ITEM_HEADERS for n in norms) and any("onhand" in n for n in norms):
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    header = rows[header_idx]
+    norms = [_norm(c) for c in header]
+    col_item = col_mfg = col_desc = col_oh = col_use = None
+    week_label = ""
+    for idx, (raw, n) in enumerate(zip(header, norms)):
+        if n in _ITEM_HEADERS and col_item is None:
+            col_item = idx
+        elif (n.startswith("vendor") or n.startswith("mfg")) and col_mfg is None:
+            col_mfg = idx
+        elif "description" in n and col_desc is None:
+            col_desc = idx
+        elif "onhand" in n and col_oh is None:
+            col_oh = idx
+        elif n == "cases" and col_use is None:   # exact: not "casesonhand"
+            col_use = idx
+        if raw and "time frame" in str(raw).lower() and not week_label:
+            week_label = str(raw).strip()
+
+    if col_oh is None or col_item is None:
+        return None
+
+    report = InventoryReport(distributor=distributor, warehouse=warehouse,
+                             week_label=week_label)
+    for r in rows[header_idx + 1:]:
+        usf_item = _clean_code(r[col_item]) if col_item < len(r) else ""
+        if not re.fullmatch(r"\d{3,}", usf_item):
+            continue
+        on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
+        if on_hand is None:
+            continue
+        weekly = _to_float(r[col_use]) if (col_use is not None and col_use < len(r)) else None
+        mfg = _clean_code(r[col_mfg]) if (col_mfg is not None and col_mfg < len(r)) else ""
+        desc = (str(r[col_desc]).strip()
+                if (col_desc is not None and col_desc < len(r) and r[col_desc] is not None)
+                else "")
+        code = mfg or USF_ITEM_NO_TO_MFG.get(usf_item, "")
+        variety = _HH_MFG_MAP.get(code)
+        if variety is None:
+            report.unmapped_codes.append(mfg or usf_item)
+        report.lines.append(ReportLine(
+            usf_item_no=usf_item,
+            mfg_code=code,
+            description=desc,
+            variety=variety,
+            cases_on_hand=on_hand,
+            on_order=None,
+            weekly_usage=weekly,
+        ))
+
+    return report if report.lines else None
+
+
 __all__ = [
     "REPORT_SENDER_TO_WAREHOUSE",
     "USF_ITEM_NO_TO_MFG",
@@ -368,4 +475,5 @@ __all__ = [
     "looks_like_report",
     "parse_report_html",
     "parse_report_text",
+    "parse_report_xlsx",
 ]
