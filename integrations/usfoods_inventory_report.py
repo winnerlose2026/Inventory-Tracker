@@ -36,11 +36,15 @@ Two delivery shapes are understood, both handled here:
     message as an HTML table (``parse_report_html``; text/plain fallback
     ``parse_report_text``). ``Forecast <week>`` columns give the usage.
   - **.xlsx attachment** -- the rep attaches a spreadsheet, read by
-    ``parse_report_xlsx``. Two layouts are seen, both self-detected by header:
+    ``parse_report_xlsx``. Three layouts are seen, all self-detected by header:
     Manassas "Product Usage" (``Product Number`` / ``Cases`` used in a one-week
-    frame / ``Cases On Hand``) and La Mirada "SM Inventory" (``SKU`` /
-    ``US Foods Number`` / ``CURR OH`` / ``Forecast``). Both differ from the
-    CS OH / WKLY USE worksheet handled by ``bagel_inventory_worksheet``.
+    frame / ``Cases On Hand``), La Mirada "SM Inventory" (``SKU`` /
+    ``US Foods Number`` / ``CURR OH`` / ``Forecast``), and the Alcoa/Knoxville
+    "Assortment Management Tool" export (``APN`` / ``Manufacturer Product
+    Number`` / ``On Hand Quantity`` / ``On Order Quantity`` / ``Weekly Average
+    Demand``), whose grid sits on a later sheet behind a stack of single-cell
+    summary sheets. All three differ from the CS OH / WKLY USE worksheet
+    handled by ``bagel_inventory_worksheet``.
 
 The report never names the warehouse; the *sending rep's email address*
 identifies it (``REPORT_SENDER_TO_WAREHOUSE``). Add each rep here as they come
@@ -76,6 +80,13 @@ REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
     "sam.travlos@usfoods.com": ("US Foods", "La Mirada, CA"),
     "ozzy.corut@usfoods.com": ("US Foods", "La Mirada, CA"),
+    # Knoxville market (DC 6H, 2270) -- delivered as the USF "Assortment
+    # Management Tool" .xlsx export. The DC is physically in Alcoa, TN, which is
+    # the seeded warehouse label (seed_bagels.py). Kimberly Cobb is the Alcoa
+    # territory manager who sends the weekly spreadsheet; Christy Dunn is the
+    # Volunteer State area buyer copied on the same standing thread.
+    "kimberly.cobb@usfoods.com": ("US Foods", "Alcoa, TN"),
+    "christy.dunn@usfoods.com": ("US Foods", "Alcoa, TN"),
 }
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
@@ -185,9 +196,14 @@ _DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def _norm(s: str) -> str:
-    """Collapse a header cell to lowercase alphanumerics for matching."""
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+def _norm(s) -> str:
+    """Collapse a header cell to lowercase alphanumerics for matching.
+
+    Coerces non-string cells (datetime, int) to str first -- the Assortment
+    Management Tool grid carries a datetime "Date Updated" column and integer
+    APNs, which are scanned while hunting for the header row.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(s if s is not None else "").lower())
 
 
 def _to_float(v) -> Optional[float]:
@@ -389,7 +405,7 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
                       warehouse: str = "") -> Optional[InventoryReport]:
     """Parse a US Foods inventory & usage .xlsx report into an InventoryReport.
 
-    Two layouts are recognized, both self-detected by their header row:
+    Three layouts are recognized, all self-detected by their header row:
 
       Manassas "Product Usage"::
 
@@ -401,11 +417,20 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         SKU   | US Foods Number | CURR OH | Forecast | Weeks on Hand | ...
         Plain | 7095637         | 173     | 60       | 2.88          | ...
 
-    The on-hand column is "Cases On Hand" / "CURR OH"; the weekly usage column
-    is "Cases" (cases used, one week) or "Forecast" (predicted weekly cases).
-    The item column is the USF catalog item # ("Product Number" / "US Foods
-    Number") -- there is no Vendor#/MFG column -- so variety resolves through
-    the ``USF_ITEM_NO_TO_MFG`` fallback.
+      Alcoa/Knoxville "Assortment Management Tool" (DC 6H, market 2270)::
+
+        ... | APN     | Description | Manufacturer Product Number | Sales Pack Size | On Hand Quantity | On Order Quantity | Weekly Average Demand (Last 4 Weeks)
+        ... | 7095637 | BAGEL, PLAIN| 1150                        | 10/6/4.25 OZ    | 2                | 56                | 5
+
+    The on-hand column is "Cases On Hand" / "CURR OH" / "On Hand Quantity"; the
+    weekly usage column is "Cases" (cases used, one week), "Forecast"
+    (predicted weekly cases), or "Weekly Average Demand". The item column is the
+    USF catalog item # ("Product Number" / "US Foods Number" / "APN"). The
+    Assortment Management Tool also carries the H&H mfg code in "Manufacturer
+    Product Number"; the other two have no Vendor#/MFG column, so variety
+    resolves through the ``USF_ITEM_NO_TO_MFG`` fallback. Every worksheet is
+    scanned because the Assortment Management Tool puts its grid on a later
+    sheet behind ~9 single-cell summary sheets (QOH, QOO, APN Count, ...).
 
     Returns None when the workbook isn't a recognizable report, so the caller
     can fall through to other parsers without raising.
@@ -417,47 +442,70 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
     except Exception:  # noqa: BLE001 -- a non-xlsx / corrupt file isn't a report
         return None
 
-    rows = [list(r) for r in wb.active.iter_rows(values_only=True)]
-    if not rows:
-        return None
-
     # Item-number header across the USF report variants: Manassas "Product
-    # Number", La Mirada "US Foods Number".
+    # Number", La Mirada "US Foods Number", Assortment Management Tool "APN".
+    # (The Assortment Management Tool's leading "Market|APN" column normalizes
+    # to "marketapn", so only the bare "APN" column is read as the item #.)
     _ITEM_HEADERS = ("productnumber", "productnum", "productno",
-                     "usfoodsnumber", "usfnumber", "usfoodsnum", "item")
+                     "usfoodsnumber", "usfnumber", "usfoodsnum", "item", "apn")
 
     def _is_on_hand(n):
         # Explicit set only, so "Pot Forecast on Hand" / "Pot weeks OH" /
         # "WOH plus next PO" on the La Mirada sheet aren't mistaken for it.
-        return n in ("currentonhand", "casesonhand", "curroh", "onhand")
+        # "onhandquantity" is the Assortment Management Tool on-hand column.
+        return n in ("currentonhand", "casesonhand", "curroh", "onhand",
+                     "onhandquantity")
 
     def _is_usage(n):
-        # Manassas weekly "Cases"; La Mirada weekly "Forecast".
-        return n in ("cases", "forecast")
+        # Manassas weekly "Cases"; La Mirada weekly "Forecast"; Assortment
+        # Management Tool "Weekly Average Demand (Last 4 Weeks)".
+        return n in ("cases", "forecast") or n.startswith("weeklyaveragedemand")
 
+    def _find_header(sheet_rows):
+        for i, row in enumerate(sheet_rows):
+            norms = [_norm(c) for c in row if c is not None]
+            if (any(n in _ITEM_HEADERS for n in norms)
+                    and any(_is_on_hand(n) for n in norms)):
+                return i
+        return None
+
+    # The report grid may not be on the active sheet. The Assortment Management
+    # Tool workbook leads with ~9 single-cell summary sheets (QOH, QOO, APN
+    # Count, OH $, ...) and puts the line items on a later sheet. Scan every
+    # worksheet and use the first one that carries a recognizable report header.
+    rows = []
     header_idx = None
-    for i, row in enumerate(rows):
-        norms = [_norm(c) for c in row if c is not None]
-        if any(n in _ITEM_HEADERS for n in norms) and any(_is_on_hand(n) for n in norms):
-            header_idx = i
+    for ws in wb.worksheets:
+        sheet_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        idx = _find_header(sheet_rows)
+        if idx is not None:
+            rows = sheet_rows
+            header_idx = idx
             break
     if header_idx is None:
         return None
 
     header = rows[header_idx]
     norms = [_norm(c) for c in header]
-    col_item = col_mfg = col_desc = col_oh = None
+    col_item = col_mfg = col_desc = col_oh = col_oo = None
     col_use_list = []
     week_label = ""
     for idx, (raw, n) in enumerate(zip(header, norms)):
         if n in _ITEM_HEADERS and col_item is None:
             col_item = idx
-        elif (n.startswith("vendor") or n.startswith("mfg")) and col_mfg is None:
+        elif (n.startswith("vendor") or n.startswith("mfg")
+              or n.startswith("manufacturer")) and col_mfg is None:
+            # Manassas/La Mirada have no MFG column; the Assortment Management
+            # Tool carries "Manufacturer Product Number" (the H&H mfg code).
             col_mfg = idx
         elif "description" in n and col_desc is None:
             col_desc = idx
         elif _is_on_hand(n) and col_oh is None:
             col_oh = idx
+        elif n.startswith("onorder") and col_oo is None:
+            # Informational only -- the open PO is ingested from its own
+            # confirmation, so it is never applied to on hand here.
+            col_oo = idx
         elif _is_usage(n):
             col_use_list.append(idx)
         if raw and "time frame" in str(raw).lower() and not week_label:
@@ -465,6 +513,10 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
 
     if col_oh is None or col_item is None:
         return None
+    # Fall back to the usage column's own header as the week label (the
+    # Assortment Management Tool has no "time frame" cell).
+    if not week_label and col_use_list:
+        week_label = str(header[col_use_list[0]]).strip()
 
     report = InventoryReport(distributor=distributor, warehouse=warehouse,
                              week_label=week_label)
@@ -475,6 +527,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
         if on_hand is None:
             continue
+        on_order = (_to_float(r[col_oo])
+                    if (col_oo is not None and col_oo < len(r)) else None)
         _wk_vals = []
         for _c in col_use_list:
             if _c < len(r):
@@ -496,7 +550,7 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
             description=desc,
             variety=variety,
             cases_on_hand=on_hand,
-            on_order=None,
+            on_order=on_order,
             weekly_usage=weekly,
         ))
 

@@ -312,6 +312,101 @@ def test_scanner_sm_inventory_known_rep_no_worksheet_misfire():
     print("ok: scanner ingests La Mirada SM Inventory; no worksheet misfire")
 
 
+def _assortment_tool_xlsx_bytes():
+    """Build an in-memory USF "Assortment Management Tool" .xlsx mirroring the
+    Alcoa/Knoxville export: a stack of single-cell summary sheets first, with
+    the line-item grid on a LATER sheet (so the parser must scan past the
+    active sheet). The grid carries a datetime "Date Updated" column, a
+    "Market|APN" column that must NOT be read as the item #, the bare "APN"
+    item #, "Manufacturer Product Number" (the H&H mfg code), "On Hand
+    Quantity", "On Order Quantity" and "Weekly Average Demand (Last 4 Weeks)".
+    """
+    import io
+    import datetime
+    import openpyxl
+    wb = openpyxl.Workbook()
+    # Repurpose the default (active) sheet as the first summary sheet, then add
+    # more summary sheets -- none of these is the data grid.
+    first = wb.active
+    first.title = "DATA LAST REFRESHED"
+    first.append(["Max of Date Updated"])
+    first.append([datetime.datetime(2026, 6, 1)])
+    for name, val in (("QOH", 164), ("QOO", 112), ("APN Count", 13)):
+        ws = wb.create_sheet(name)
+        ws.append([name])
+        ws.append([val])
+    # The data grid, created LAST so it is not the active sheet.
+    data = wb.create_sheet("ASSORTMENT MANAGEMENT TOOL D")
+    data.append(["Date Updated", "Region Name", "Area Name", "Market Name",
+                 "Market|APN", "PIM Superclass", "PIM Class", "APN",
+                 "Description", "Manufacturer Product Number", "Sales Pack Size",
+                 "On Hand Quantity", "On Order Quantity",
+                 "Weekly Average Demand (Last 4 Weeks)"])
+    rows = [
+        # apn,     mfg,    description,                       OH, OO, wkly
+        (7095637, "1150", "BAGEL, PLAIN 4.25 OZ UNSLICED",     2, 56, 5),
+        (7309056, "1158", "BAGEL, EVERYTHING 4 OZ UNSLICED",  31, 32, 5.5),
+        (1055074, "1189", "BAGEL, JALAPENO CHEDDAR WHEAT",    22,  8, 2.25),
+        (7928199, "1151", "BAGEL, ONION 4.25 OZ UNSLICED",     8,  0, 0.5),
+    ]
+    dt = datetime.datetime(2026, 6, 1)
+    for apn, mfg, desc, oh, oo, wkly in rows:
+        data.append([dt, "SOUTHEAST", "VOLUNTEER STATE", "KNOXVILLE (6H, 2270)",
+                     f"2270|{apn}", "GROCERY - REF & FROZEN", "GROCERY, REF & FZN",
+                     apn, desc, mfg, "10/6/4.25 OZ", oh, oo, wkly])
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def test_sender_resolves_to_alcoa():
+    for addr in ("kimberly.cobb@usfoods.com", "christy.dunn@usfoods.com"):
+        dist, wh = R.warehouse_for_sender(f"<{addr}>")
+        assert dist == "US Foods", (addr, dist)
+        assert wh == "Alcoa, TN", (addr, wh)
+    print("ok: Cobb + Dunn resolve to Alcoa, TN")
+
+
+def test_xlsx_assortment_management_tool_parser():
+    rep = R.parse_report_xlsx(_assortment_tool_xlsx_bytes(),
+                              distributor="US Foods", warehouse="Alcoa, TN")
+    assert rep is not None, "Assortment Management Tool grid (non-active sheet) not found"
+    assert rep.unmapped_codes == [], rep.unmapped_codes
+    assert len(rep.lines) == 4, len(rep.lines)
+    bv = {L.variety: L for L in rep.lines}
+    assert bv["Plain"].cases_on_hand == 2            # On Hand Quantity
+    assert bv["Plain"].weekly_usage == 5             # Weekly Average Demand
+    assert bv["Plain"].on_order == 56                # On Order Quantity (informational)
+    assert bv["Plain"].mfg_code == "1150"            # via Manufacturer Product Number
+    assert bv["Plain"].usf_item_no == "7095637"      # bare APN, not "2270|..."
+    assert bv["Everything"].weekly_usage == 5.5
+    assert bv["Jalapeno Cheddar"].cases_on_hand == 22
+    print("ok: xlsx Assortment Management Tool parser (non-active sheet, APN/MFG/Weekly Avg Demand)")
+
+
+def test_scanner_assortment_tool_cobb_known_rep():
+    # Subject matches the worksheet heuristic; the report parser must claim it
+    # first so the worksheet branch does NOT emit a spurious unknown-rep error.
+    msg = _mime_xlsx(_assortment_tool_xlsx_bytes(),
+                     sender="kimberly.cobb@usfoods.com",
+                     subject="Re: Weekly Bagel Inventory & Usage Report — H&H Bagels")
+    events, errors, cw = parse_message_with_errors(msg)
+    assert not cw
+    assert errors == [], errors
+    assert len(events) == 4, (len(events), errors)
+    for e in events:
+        assert e.event_type == "on_hand"
+        assert e.item.distributor == "US Foods"
+        assert e.item.warehouse == "Alcoa, TN"
+        assert e.item.unit == "cs"
+        assert e.item.case_size == R.CASE_SIZE
+    plain = next(e for e in events if e.item.variety == "Plain")
+    assert plain.item.quantity == 2
+    assert plain.item.weekly_usage == 5
+    assert plain.item.distributor_sku == "7095637"
+    print("ok: scanner ingests Cobb's Assortment Management Tool .xlsx -> Alcoa, TN")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -327,4 +422,7 @@ if __name__ == "__main__":
     test_scanner_xlsx_unknown_rep_surfaces_error()
     test_xlsx_sm_inventory_parser()
     test_scanner_sm_inventory_known_rep_no_worksheet_misfire()
+    test_sender_resolves_to_alcoa()
+    test_xlsx_assortment_management_tool_parser()
+    test_scanner_assortment_tool_cobb_known_rep()
     print("\nAll usfoods_inventory_report tests passed.")
