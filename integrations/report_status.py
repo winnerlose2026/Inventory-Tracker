@@ -137,36 +137,20 @@ def _graph_get(token: str, url: str) -> dict:
         return _json.loads(resp.read().decode("utf-8"))
 
 
-def _iter_candidates(token: str, mailbox: str, since_iso: str, rep_emails: set,
-                     max_pages: int = 12):
-    """Yield (id, sender, subject, receivedDateTime) for messages since
-    ``since_iso`` whose sender is one of ``rep_emails``."""
+def _rep_messages(token: str, mailbox: str, rep_email: str, since_iso: str,
+                  top: int = 10) -> list:
+    """All messages from ``rep_email`` in ``mailbox`` since ``since_iso``,
+    each with body + attachment metadata, in a single Graph call (no inbox
+    paging). Returns the raw message dicts."""
     q = {
-        "$select": "id,subject,from,receivedDateTime",
-        "$top": "100",
-        "$filter": f"receivedDateTime ge {since_iso}",
-        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,receivedDateTime,hasAttachments,body",
+        "$expand": "attachments($select=name,contentType,isInline,size)",
+        "$top": str(top),
+        "$filter": (f"from/emailAddress/address eq '{rep_email}' "
+                    f"and receivedDateTime ge {since_iso}"),
     }
     url = f"{GRAPH_BASE}/users/{_url.quote(mailbox)}/messages?{_url.urlencode(q)}"
-    pages = 0
-    while url and pages < max_pages:
-        data = _graph_get(token, url)
-        for msg in data.get("value", []):
-            addr = (((msg.get("from") or {}).get("emailAddress") or {})
-                    .get("address") or "").lower()
-            if addr in rep_emails:
-                yield msg.get("id"), addr, (msg.get("subject") or ""), \
-                    (msg.get("receivedDateTime") or "")
-        url = data.get("@odata.nextLink")
-        pages += 1
-
-
-def _fetch_full(token: str, mailbox: str, mid: str) -> dict:
-    q = {"$select": "id,subject,from,receivedDateTime,hasAttachments,body",
-         "$expand": "attachments($select=name,contentType,isInline,size)"}
-    url = (f"{GRAPH_BASE}/users/{_url.quote(mailbox)}/messages/{_url.quote(mid)}"
-           f"?{_url.urlencode(q)}")
-    return _graph_get(token, url)
+    return _graph_get(token, url).get("value", []) or []
 
 
 _TAG_RE = _re.compile(r"<[^>]+>")
@@ -236,39 +220,32 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
 
     rep_wh = _rep_to_warehouses()
     names = _email_to_name()
-    rep_emails = set(rep_wh)
     best: "dict[str, dict]" = {}
     scanned = 0
-    for mailbox in mailboxes:
-        try:
-            for mid, addr, subj, _rd in _iter_candidates(token, mailbox,
-                                                         since_iso, rep_emails):
+    for rep_email, whs in rep_wh.items():
+        found = None
+        for mailbox in mailboxes:
+            try:
+                msgs = _rep_messages(token, mailbox, rep_email, since_iso)
+            except Exception:  # noqa: BLE001
+                continue  # a rep we can't query just stays unconfirmed (missing)
+            for msg in msgs:
                 scanned += 1
-                try:
-                    full = _fetch_full(token, mailbox, mid)
-                except Exception:  # noqa: BLE001
-                    continue
-                is_rep, fmt = _classify(full)
+                is_rep, fmt = _classify(msg)
                 if not is_rep:
                     continue
-                rd = full.get("receivedDateTime") or _rd
-                for wh in rep_wh.get(addr, []):
-                    cur = best.get(wh)
-                    if cur is None or rd > cur["received_at"]:
-                        best[wh] = {
-                            "received_at": rd, "rep_name": names.get(addr, addr),
-                            "rep_email": addr, "mailbox": mailbox,
-                            "subject": full.get("subject") or "", "format": fmt,
-                        }
-        except _uerr.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8")[:300]
-            except Exception:  # noqa: BLE001
-                pass
-            result["error"] = f"Graph query failed for {mailbox}: HTTP {exc.code} {detail}"
-        except Exception as exc:  # noqa: BLE001
-            result["error"] = f"Graph query failed for {mailbox}: {type(exc).__name__}: {exc}"
+                rd = msg.get("receivedDateTime") or ""
+                if found is None or rd > found["received_at"]:
+                    found = {
+                        "received_at": rd, "rep_name": names.get(rep_email, rep_email),
+                        "rep_email": rep_email, "mailbox": mailbox,
+                        "subject": msg.get("subject") or "", "format": fmt,
+                    }
+        if found:
+            for wh in whs:
+                cur = best.get(wh)
+                if cur is None or found["received_at"] > cur["received_at"]:
+                    best[wh] = found
 
     result["scanned"] = scanned
     for wh, reps in WAREHOUSE_REPS.items():
