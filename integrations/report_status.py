@@ -6,14 +6,17 @@ inventory & usage report and which are still outstanding — without the Cowork
 desktop app running.
 
 Detection mirrors the chaser logic: the WAREHOUSE is the unit, not the person.
-A warehouse counts as reported if ANY of its covering reps sent a genuine
-inventory/usage report since the most recent Friday (the cadence is a Monday
-report; Friday is an early-bird cutoff). Cheney's three FL facilities all clear
-off Michael Ross's single combined report.
+A warehouse counts as reported if ANY of its covering reps sent a *genuine*
+inventory/usage report since the most recent Friday. "Genuine" means the email
+carries a real (non-inline) spreadsheet/CSV attachment OR its body is an actual
+multi-variety data table — NOT a signature-logo image or a prose email that
+merely mentions the words "inventory"/"bagels" (e.g. an "out of stock"
+escalation thread). Cheney's three FL facilities clear off Michael Ross's
+single combined report.
 
 Read-only: uses the same MS365 client-credentials (Mail.Read) the rest of the
-app already uses; it sends nothing. All times handled in UTC; the page renders
-an approximate US-Eastern (EDT) label for readability.
+app already uses; it sends nothing. All times are handled in UTC; the page
+renders an approximate US-Eastern (EDT) label for readability.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import html as _html
 import json as _json
 import os as _os
 import pathlib as _pathlib
+import re as _re
 import time as _time
 import urllib.error as _uerr
 import urllib.parse as _url
@@ -31,9 +35,9 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 # Warehouse -> covering reps. Warehouse labels match seed_bagels.py exactly.
-# Multiple reps can cover one warehouse; any one of them sending clears it.
-# Cheney: Michael Ross sends ONE report covering all three FL facilities, so
-# his address is listed against each — one report clears all three.
+# Multiple reps can cover one warehouse; any one of them sending a genuine
+# report clears it. Cheney: Michael Ross sends ONE report (per-facility sheets)
+# covering all three FL facilities, so his address is listed against each.
 WAREHOUSE_REPS: "dict[str, list[dict]]" = {
     "Manassas, VA": [
         {"name": "Thomas Paxson", "email": "thomas.paxson@usfoods.com"},
@@ -55,15 +59,9 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
         {"name": "Kimberly Cobb", "email": "kimberly.cobb@usfoods.com"},
         {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com"},
     ],
-    "Riviera Beach, FL": [
-        {"name": "Michael Ross", "email": "mross@cheneybrothers.com"},
-    ],
-    "Ocala, FL": [
-        {"name": "Michael Ross", "email": "mross@cheneybrothers.com"},
-    ],
-    "Punta Gorda, FL": [
-        {"name": "Michael Ross", "email": "mross@cheneybrothers.com"},
-    ],
+    "Riviera Beach, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
+    "Ocala, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
+    "Punta Gorda, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
 }
 
 DISTRIBUTOR_OF = {
@@ -73,9 +71,20 @@ DISTRIBUTOR_OF = {
     "Punta Gorda, FL": "Cheney Brothers",
 }
 
-_REPORT_KEYWORDS = ("inventory", "usage", "report", "on hand", "on-hand", "bagel")
+# A genuine body report lists many SKUs. Count distinct variety names; a real
+# report hits the whole order guide, while a prose "out of Everything & Plain"
+# escalation hits only one or two. Require at least 3 distinct varieties.
+_VARIETY_TOKENS = ("plain", "everything", "sesame", "poppy", "onion", "asiago",
+                   "cinnamon raisin", "jalapeno", "blueberry", "egg",
+                   "whole wheat", "pumpernickel", "salt", "garlic")
+_MIN_VARIETIES = 3
+
 _AUTO_REPLY_MARKERS = ("automatic reply", "out of office", "out-of-office",
                        "undeliverable", "delivery has failed", "delivery failure")
+# Subjects that are clearly not the weekly report; block body-only acceptance.
+_BLOCK_SUBJECT = ("out of bagel", "past due", "appointment", "forgery",
+                  "statement", "affidavit", "invoice")
+_DATA_EXT = (".xlsx", ".xls", ".csv")
 
 _CACHE = {"at": 0.0, "data": None}
 
@@ -88,11 +97,8 @@ def most_recent_friday(now: _dt.datetime) -> _dt.datetime:
 
 
 def _email_to_name() -> "dict[str, str]":
-    out = {}
-    for reps in WAREHOUSE_REPS.values():
-        for rep in reps:
-            out[rep["email"].lower()] = rep["name"]
-    return out
+    return {rep["email"].lower(): rep["name"]
+            for reps in WAREHOUSE_REPS.values() for rep in reps}
 
 
 def _rep_to_warehouses() -> "dict[str, list[str]]":
@@ -131,9 +137,12 @@ def _graph_get(token: str, url: str) -> dict:
         return _json.loads(resp.read().decode("utf-8"))
 
 
-def _iter_messages(token: str, mailbox: str, since_iso: str, max_pages: int = 12):
+def _iter_candidates(token: str, mailbox: str, since_iso: str, rep_emails: set,
+                     max_pages: int = 12):
+    """Yield (id, sender, subject, receivedDateTime) for messages since
+    ``since_iso`` whose sender is one of ``rep_emails``."""
     q = {
-        "$select": "id,subject,from,receivedDateTime,hasAttachments,bodyPreview",
+        "$select": "id,subject,from,receivedDateTime",
         "$top": "100",
         "$filter": f"receivedDateTime ge {since_iso}",
         "$orderby": "receivedDateTime desc",
@@ -143,23 +152,63 @@ def _iter_messages(token: str, mailbox: str, since_iso: str, max_pages: int = 12
     while url and pages < max_pages:
         data = _graph_get(token, url)
         for msg in data.get("value", []):
-            yield msg
+            addr = (((msg.get("from") or {}).get("emailAddress") or {})
+                    .get("address") or "").lower()
+            if addr in rep_emails:
+                yield msg.get("id"), addr, (msg.get("subject") or ""), \
+                    (msg.get("receivedDateTime") or "")
         url = data.get("@odata.nextLink")
         pages += 1
 
 
-def _is_report(msg: dict) -> bool:
+def _fetch_full(token: str, mailbox: str, mid: str) -> dict:
+    q = {"$select": "id,subject,from,receivedDateTime,hasAttachments,body",
+         "$expand": "attachments($select=name,contentType,isInline,size)"}
+    url = (f"{GRAPH_BASE}/users/{_url.quote(mailbox)}/messages/{_url.quote(mid)}"
+           f"?{_url.urlencode(q)}")
+    return _graph_get(token, url)
+
+
+_TAG_RE = _re.compile(r"<[^>]+>")
+_WS_RE = _re.compile(r"\s+")
+
+
+def _strip_html(body: dict) -> str:
+    content = (body or {}).get("content") or ""
+    if ((body or {}).get("contentType") or "").lower() == "html":
+        content = _re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", content)
+        content = _TAG_RE.sub(" ", content)
+        content = _html.unescape(content)
+    return _WS_RE.sub(" ", content).strip().lower()
+
+
+def _variety_count(text_lower: str) -> int:
+    return sum(1 for tok in _VARIETY_TOKENS if tok in text_lower)
+
+
+def _has_data_attachment(msg: dict) -> bool:
+    for att in msg.get("attachments", []) or []:
+        if att.get("isInline"):
+            continue
+        name = (att.get("name") or "").lower()
+        ctype = (att.get("contentType") or "").lower()
+        if name.endswith(_DATA_EXT) or "spreadsheet" in ctype or ctype == "text/csv":
+            return True
+    return False
+
+
+def _classify(msg: dict) -> "tuple[bool, str]":
+    """Return (is_report, format_label) for a fully-fetched message."""
     subj = (msg.get("subject") or "").lower()
     if any(mk in subj for mk in _AUTO_REPLY_MARKERS):
-        return False
-    if msg.get("hasAttachments"):
-        return True
-    body = (msg.get("bodyPreview") or "").lower()
-    return any(k in subj or k in body for k in _REPORT_KEYWORDS)
-
-
-def _sender(msg: dict) -> str:
-    return (((msg.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+        return False, ""
+    if _has_data_attachment(msg):
+        return True, "spreadsheet"
+    if any(b in subj for b in _BLOCK_SUBJECT):
+        return False, ""
+    if _variety_count(_strip_html(msg.get("body") or {})) >= _MIN_VARIETIES:
+        return True, "in email body"
+    return False, ""
 
 
 def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
@@ -172,18 +221,13 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
         "since_iso": since_iso,
         "mailboxes": mailboxes,
         "configured": bool(mailboxes and _os.environ.get("MS365_TENANT_ID")),
-        "warehouses": [],
-        "received": 0,
-        "missing": 0,
-        "scanned": 0,
-        "error": None,
+        "warehouses": [], "received": 0, "missing": 0, "scanned": 0, "error": None,
     }
     if not result["configured"]:
         result["error"] = ("MS365 not configured — set MS365_TENANT_ID/"
-                           "MS365_CLIENT_ID/MS365_CLIENT_SECRET and "
-                           "MAILBOXES (or MS365_USER).")
+                           "MS365_CLIENT_ID/MS365_CLIENT_SECRET and MAILBOXES "
+                           "(or MS365_USER).")
         return result
-
     try:
         token = _token()
     except Exception as exc:  # noqa: BLE001
@@ -192,27 +236,29 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
 
     rep_wh = _rep_to_warehouses()
     names = _email_to_name()
+    rep_emails = set(rep_wh)
     best: "dict[str, dict]" = {}
     scanned = 0
     for mailbox in mailboxes:
         try:
-            for msg in _iter_messages(token, mailbox, since_iso):
+            for mid, addr, subj, _rd in _iter_candidates(token, mailbox,
+                                                         since_iso, rep_emails):
                 scanned += 1
-                addr = _sender(msg)
-                whs = rep_wh.get(addr)
-                if not whs or not _is_report(msg):
+                try:
+                    full = _fetch_full(token, mailbox, mid)
+                except Exception:  # noqa: BLE001
                     continue
-                rd = msg.get("receivedDateTime") or ""
-                for wh in whs:
+                is_rep, fmt = _classify(full)
+                if not is_rep:
+                    continue
+                rd = full.get("receivedDateTime") or _rd
+                for wh in rep_wh.get(addr, []):
                     cur = best.get(wh)
                     if cur is None or rd > cur["received_at"]:
                         best[wh] = {
-                            "received_at": rd,
-                            "rep_name": names.get(addr, addr),
-                            "rep_email": addr,
-                            "mailbox": mailbox,
-                            "subject": msg.get("subject") or "",
-                            "has_attachment": bool(msg.get("hasAttachments")),
+                            "received_at": rd, "rep_name": names.get(addr, addr),
+                            "rep_email": addr, "mailbox": mailbox,
+                            "subject": full.get("subject") or "", "format": fmt,
                         }
         except _uerr.HTTPError as exc:
             detail = ""
@@ -220,26 +266,19 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
                 detail = exc.read().decode("utf-8")[:300]
             except Exception:  # noqa: BLE001
                 pass
-            result["error"] = (f"Graph query failed for {mailbox}: "
-                               f"HTTP {exc.code} {detail}")
+            result["error"] = f"Graph query failed for {mailbox}: HTTP {exc.code} {detail}"
         except Exception as exc:  # noqa: BLE001
-            result["error"] = (f"Graph query failed for {mailbox}: "
-                               f"{type(exc).__name__}: {exc}")
+            result["error"] = f"Graph query failed for {mailbox}: {type(exc).__name__}: {exc}"
 
     result["scanned"] = scanned
     for wh, reps in WAREHOUSE_REPS.items():
         detail = best.get(wh)
         result["warehouses"].append({
-            "warehouse": wh,
-            "distributor": DISTRIBUTOR_OF.get(wh, ""),
-            "reps": reps,
-            "status": "received" if detail else "missing",
+            "warehouse": wh, "distributor": DISTRIBUTOR_OF.get(wh, ""),
+            "reps": reps, "status": "received" if detail else "missing",
             "detail": detail,
         })
-        if detail:
-            result["received"] += 1
-        else:
-            result["missing"] += 1
+        result["received" if detail else "missing"] += 1
     return result
 
 
@@ -256,8 +295,7 @@ def _read_disk():
     try:
         path = _status_path()
         age = _time.time() - path.stat().st_mtime
-        data = _json.loads(path.read_text(encoding="utf-8"))
-        return data, age
+        return _json.loads(path.read_text(encoding="utf-8")), age
     except Exception:  # noqa: BLE001
         return None, None
 
@@ -272,27 +310,17 @@ def _write_disk(data: dict) -> None:
 
 
 def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
-    """Return the weekly report status, served from a fast cache when possible.
-
-    Layered cache so a phone load never blocks on Graph longer than it must:
-    in-process memory -> shared on-disk snapshot (data/report_status.json,
-    survives restarts and is shared across gunicorn workers) -> live recompute.
-    ``force=True`` (the ?refresh=1 button) always recomputes.
-    """
+    """Layered cache: in-process memory -> shared on-disk snapshot
+    (data/report_status.json) -> live recompute. ``force`` always recomputes."""
     now = _time.time()
     if not force:
         cached = _CACHE.get("data")
         if cached is not None and (now - _CACHE.get("at", 0.0)) < max_age_sec:
-            out = dict(cached)
-            out["cached"] = "memory"
-            return out
+            out = dict(cached); out["cached"] = "memory"; return out
         disk, age = _read_disk()
-        if (disk is not None and age is not None and age < max_age_sec
-                and not disk.get("error")):
+        if disk is not None and age is not None and age < max_age_sec and not disk.get("error"):
             _CACHE.update(at=now, data=disk)
-            out = dict(disk)
-            out["cached"] = "disk"
-            return out
+            out = dict(disk); out["cached"] = "disk"; return out
     try:
         data = compute_report_status()
     except Exception as exc:  # noqa: BLE001
@@ -302,9 +330,7 @@ def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
     if not data.get("error"):
         _CACHE.update(at=now, data=data)
         _write_disk(data)
-    out = dict(data)
-    out["cached"] = False
-    return out
+    out = dict(data); out["cached"] = False; return out
 
 
 def _fmt_et(iso_z: str) -> str:
@@ -339,22 +365,18 @@ def render_html(status: dict) -> str:
         if wh.get("status") == "received":
             d = wh.get("detail") or {}
             badge = '<span class="ok">✅ received</span>'
-            who = esc(d.get("rep_name") or "")
-            when = _fmt_et(d.get("received_at") or "")
-            fmt = "spreadsheet" if d.get("has_attachment") else "in email body"
-            note = f'from {who} · {esc(when)} · {fmt}'
+            note = (f'from {esc(d.get("rep_name") or "")} · '
+                    f'{esc(_fmt_et(d.get("received_at") or ""))} · '
+                    f'{esc(d.get("format") or "report")}')
         else:
             badge = '<span class="no">❌ missing</span>'
             chasing = ", ".join(esc(r["name"]) for r in wh.get("reps", [])
                                 if not r["name"].startswith("USF "))
             note = f'<span class="muted">chasing: {chasing}</span>'
-        rows.append(
-            f'<tr><td class="wh">{esc(wh.get("warehouse") or "")}</td>'
-            f'<td class="st">{badge}</td><td class="dt">{note}</td></tr>'
-        )
+        rows.append(f'<tr><td class="wh">{esc(wh.get("warehouse") or "")}</td>'
+                    f'<td class="st">{badge}</td><td class="dt">{note}</td></tr>')
     rows_html = "\n".join(rows)
 
-    banner = ""
     if err:
         banner = f'<div class="err">⚠️ {esc(err)}</div>'
     elif total:
@@ -362,6 +384,8 @@ def render_html(status: dict) -> str:
         msg = ("All warehouses have reported this week 🎉" if missing == 0
                else f"{missing} of {total} warehouses still missing this week's report")
         banner = f'<div class="summary {tone}">{esc(msg)}</div>'
+    else:
+        banner = ""
 
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -384,8 +408,8 @@ def render_html(status: dict) -> str:
   table {{ width: 100%; border-collapse: collapse; background: #fff;
           border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }}
   td {{ padding: 11px 12px; border-top: 1px solid #eef0f2; font-size: 14px; vertical-align: top; }}
-  tr.grp td {{ background: #f0f2f5; font-weight: 700; font-size: 12px;
-              text-transform: uppercase; letter-spacing: .04em; color: #4b5563; border-top: none; }}
+  tr.grp td {{ background: #f0f2f5; font-weight: 700; font-size: 12px; text-transform: uppercase;
+              letter-spacing: .04em; color: #4b5563; border-top: none; }}
   td.wh {{ font-weight: 600; white-space: nowrap; }}
   td.st {{ white-space: nowrap; }}
   td.dt {{ color: #374151; }}
@@ -405,10 +429,10 @@ def render_html(status: dict) -> str:
   </tbody></table>
   <a class="btn" href="/report-status?refresh=1">↻ Refresh now</a>
   <div class="foot">
-    A warehouse is marked received if any of its reps sent this week's bagel
-    inventory &amp; usage report. Cheney's three FL facilities clear off Michael
-    Ross's single report. Detected read-only from the JD@ / info@ mailboxes via
-    Microsoft Graph; times approximate US Eastern. Auto-refreshes every 15 min.
+    A warehouse shows received only when a rep sent a real spreadsheet/CSV or a
+    multi-variety data table this week — signature images and prose mentions do
+    not count. Cheney's three FL facilities clear off Michael Ross's single
+    report. Read-only via Microsoft Graph; times approximate US Eastern.
   </div>
 </div></body></html>"""
 
