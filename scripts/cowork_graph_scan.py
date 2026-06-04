@@ -365,6 +365,17 @@ def _post_ingest(app_url: str, token: str, payload: dict,
         return exc.code, body_txt
 
 
+def _cheney_inventory_report_to_events(xlsx_bytes, filename, mid, subject):
+    """Parse a Cheney per-facility inventory .xlsx into on_hand event dicts
+    (warehouse keyed off the filename). Returns (events, errors)."""
+    from integrations.cheney_inventory_report import parse_report_xlsx
+    events, errors = parse_report_xlsx(xlsx_bytes, filename)
+    for e in events:
+        e["source_message_id"] = mid
+        e["source_subject"] = (subject or "")[:120]
+    return events, errors
+
+
 def run(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -566,19 +577,28 @@ def run(argv: list[str] | None = None) -> int:
                 continue
             try:
                 if is_xlsx:
-                    # US Foods inventory & usage report (.xlsx): Manassas
-                    # "Product Usage" / La Mirada "SM Inventory". Try the report
-                    # parser first; fall back to the older CS OH / WKLY USE
-                    # worksheet parser when this isn't a report layout.
-                    events, errors = _usfoods_inventory_report_to_events(
-                        "", "", sender, mid, subject, xlsx=pdf_bytes)
-                    if not events and not errors:
-                        events, errors = _inventory_worksheet_to_events(
-                            pdf_bytes, sender, mid, subject)
-                    for e in events:
-                        events_out.append(asdict(e))
-                    for er in errors:
-                        error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                    if dist == "Cheney Brothers":
+                        # Cheney per-facility inventory & usage .xlsx — warehouse
+                        # comes from the filename (RVB/Ocala/PuntaGorda). Emits
+                        # on_hand event dicts directly (not dataclasses).
+                        c_events, c_errors = _cheney_inventory_report_to_events(
+                            pdf_bytes, a.get("name") or "", mid, subject)
+                        for e in c_events:
+                            events_out.append(e)
+                        for er in c_errors:
+                            error_strs.append(f"{mid[:12]}.. [Cheney inv]: {er}")
+                    else:
+                        # US Foods inventory & usage report (.xlsx). Try the report
+                        # parser first; fall back to the older worksheet parser.
+                        events, errors = _usfoods_inventory_report_to_events(
+                            "", "", sender, mid, subject, xlsx=pdf_bytes)
+                        if not events and not errors:
+                            events, errors = _inventory_worksheet_to_events(
+                                pdf_bytes, sender, mid, subject)
+                        for e in events:
+                            events_out.append(asdict(e))
+                        for er in errors:
+                            error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
                 elif dist == "US Foods":
                     events, errors = _usfoods_po_to_events(
                         pdf_bytes, dist, mid, subject)
