@@ -757,6 +757,24 @@ def parse_message_with_errors(msg):
         else:
             continue
 
+    # 1a) Cheney per-facility inventory & usage .xlsx (warehouse from the
+    #     filename: H&HRVB../H&HOcala../H&HPuntaGorda..). Ross sends one sheet
+    #     per FL facility; each mapped row -> on_hand event with weekly_usage.
+    if not events and not cw_pos and distributor == "Cheney Brothers":
+        from .cheney_inventory_report import parse_report_xlsx as _cheney_report_xlsx
+        for fname, payload in _attachments(msg):
+            if not fname.lower().endswith(".xlsx"):
+                continue
+            c_events, c_errs = _cheney_report_xlsx(payload, fname)
+            for d in c_events:
+                events.append(EmailEvent(
+                    event_type=d["event_type"],
+                    item=SyncItem(**d["item"]),
+                    source_message_id=msg_id,
+                    source_subject=subject,
+                ))
+            errors.extend(c_errs)
+
     # 1b) US Foods inventory & usage report .xlsx attachments (Manassas
     #     "Product Usage" / La Mirada "SM Inventory"). A DC rep attaches an
     #     .xlsx of current on hand + weekly usage; each mapped row -> on_hand
