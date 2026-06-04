@@ -3670,6 +3670,24 @@ WAREHOUSES = {
 }
 
 
+@app.route("/api/report-status")
+def api_report_status():
+    """JSON: which distributor warehouses have sent this week\'s inventory & usage report."""
+    from integrations import report_status as _rs
+    force = request.args.get("refresh") in ("1", "true", "yes", "on")
+    return jsonify(_rs.get_status(force=force))
+
+
+@app.route("/report-status")
+def report_status_page():
+    """Mobile-friendly weekly-report status page (read-only, no login)."""
+    from flask import Response
+    from integrations import report_status as _rs
+    force = request.args.get("refresh") in ("1", "true", "yes", "on")
+    html = _rs.render_html(_rs.get_status(force=force))
+    return Response(html, mimetype="text/html")
+
+
 @app.route("/api/warehouses")
 def api_warehouses():
     return jsonify(WAREHOUSES)
