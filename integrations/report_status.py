@@ -21,6 +21,7 @@ import datetime as _dt
 import html as _html
 import json as _json
 import os as _os
+import pathlib as _pathlib
 import time as _time
 import urllib.error as _uerr
 import urllib.parse as _url
@@ -242,14 +243,56 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
     return result
 
 
+def _status_path() -> "_pathlib.Path":
+    try:
+        from inventory_tracker import DATA_DIR  # type: ignore
+        base = DATA_DIR
+    except Exception:  # noqa: BLE001
+        base = _pathlib.Path("data")
+    return _pathlib.Path(base) / "report_status.json"
+
+
+def _read_disk():
+    try:
+        path = _status_path()
+        age = _time.time() - path.stat().st_mtime
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        return data, age
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _write_disk(data: dict) -> None:
+    try:
+        path = _status_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
+    """Return the weekly report status, served from a fast cache when possible.
+
+    Layered cache so a phone load never blocks on Graph longer than it must:
+    in-process memory -> shared on-disk snapshot (data/report_status.json,
+    survives restarts and is shared across gunicorn workers) -> live recompute.
+    ``force=True`` (the ?refresh=1 button) always recomputes.
+    """
     now = _time.time()
-    cached = _CACHE.get("data")
-    if (not force and cached is not None
-            and (now - _CACHE.get("at", 0.0)) < max_age_sec):
-        out = dict(cached)
-        out["cached"] = True
-        return out
+    if not force:
+        cached = _CACHE.get("data")
+        if cached is not None and (now - _CACHE.get("at", 0.0)) < max_age_sec:
+            out = dict(cached)
+            out["cached"] = "memory"
+            return out
+        disk, age = _read_disk()
+        if (disk is not None and age is not None and age < max_age_sec
+                and not disk.get("error")):
+            _CACHE.update(at=now, data=disk)
+            out = dict(disk)
+            out["cached"] = "disk"
+            return out
     try:
         data = compute_report_status()
     except Exception as exc:  # noqa: BLE001
@@ -258,9 +301,10 @@ def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
                 "error": f"{type(exc).__name__}: {exc}"}
     if not data.get("error"):
         _CACHE.update(at=now, data=data)
-    data = dict(data)
-    data["cached"] = False
-    return data
+        _write_disk(data)
+    out = dict(data)
+    out["cached"] = False
+    return out
 
 
 def _fmt_et(iso_z: str) -> str:
