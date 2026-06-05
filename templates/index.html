@@ -593,6 +593,39 @@
     .btn { padding: 10px 14px; font-size: 14px; min-height: 42px; }
     .btn-group { gap: 6px; }
   }
+  /* ---- Mobile: stack the inventory table into per-SKU cards. There is room
+     to do this now that per-row actions are gone. Scoped to .inv-table so the
+     other tables keep their swipe-scroll behavior. ---- */
+  @media (max-width: 640px) {
+    .inv-table > colgroup,
+    .inv-table > thead { display: none; }
+    .inv-table, .inv-table > tbody { display: block; width: 100%; }
+    .inv-table > tbody > tr.sku-row {
+      display: block; border: 1px solid var(--border); border-radius: 10px;
+      background: var(--surface); padding: 10px 12px; margin: 0 0 10px;
+    }
+    .inv-table > tbody > tr.sku-row > td {
+      display: flex; justify-content: space-between; align-items: baseline;
+      gap: 12px; padding: 5px 0; border: 0; white-space: normal;
+      text-align: right; font-size: 14px;
+    }
+    .inv-table > tbody > tr.sku-row > td::before {
+      content: attr(data-label); font-weight: 600; color: var(--muted);
+      text-align: left; white-space: nowrap;
+    }
+    /* Variety is the card title: full width, no label */
+    .inv-table > tbody > tr.sku-row > td[data-label="Variety"] {
+      display: block; text-align: left; font-size: 15px; font-weight: 700;
+      padding: 2px 0 8px; margin-bottom: 6px; border-bottom: 1px solid var(--border);
+    }
+    .inv-table > tbody > tr.sku-row > td[data-label="Variety"]::before { display: none; }
+    /* Expanded lot detail: let the nested table scroll rather than stack */
+    .inv-table > tbody > tr.lot-detail-row > td { display: block; overflow-x: auto; }
+    /* Bottom action bar stacks full-width */
+    #inv-actions { flex-direction: column; align-items: stretch; }
+    #inv-actions > .btn, #inv-actions > select, #inv-actions > a { width: 100%; }
+    #inv-actions > span { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -666,7 +699,7 @@
       <!-- Bottom action bar. Per-row Edit/Restock/Use were removed to slim the
            table; pick a SKU here to edit it. Usage + restocks come from ingested
            data now, so manual Use/Restock are gone. -->
-      <div class="btn-group" style="margin-top:24px;flex-wrap:wrap;align-items:center;gap:10px">
+      <div class="btn-group" id="inv-actions" style="margin-top:24px;flex-wrap:wrap;align-items:center;gap:10px">
         <label for="sku-edit-select" style="font-size:13px;color:var(--muted)">Modify a SKU:</label>
         <select id="sku-edit-select" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;min-width:280px">
           <option value="">Select a SKU…</option>
@@ -1714,15 +1747,15 @@ async function loadInventory() {
                     .replace(/\s+\d+\s*oz\b/i, '')
                     .replace(/\s{2,}/g, ' ')
                     .trim();
-                  return `<tr>
-                    <td style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
-                    <td style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
-                    <td>${renderOnOrder(i)}</td>
-                    <td>${escHtml(i.unit)}</td>
-                    <td>${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-                    <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-                    <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-                    <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
+                  return `<tr class="sku-row">
+                    <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td data-label="Qty" style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td data-label="On Order">${renderOnOrder(i)}</td>
+                    <td data-label="Unit">${escHtml(i.unit)}</td>
+                    <td data-label="Price">${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td data-label="Weekly Usage">${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td data-label="Weeks Remaining" style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+                    <td data-label="Status">${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
                   </tr>
                   ${hasLots ? (() => {
                     // FIFO rule: each (warehouse, variety) lot list comes
@@ -1734,7 +1767,7 @@ async function loadInventory() {
                     const lotRemaining = lots.reduce((s, L) => s + (L.cs_remaining ?? L.cs ?? 0), 0);
                     const activeCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
                     const depletedCount = lots.length - activeCount;
-                    return `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
+                    return `<tr id="${rowId}" class="lot-detail-row" style="display:none;background:var(--surface-alt,#f7f7f9)">
                     <td colspan="8" style="padding:8px 16px 12px 30px">
                       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
                         <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
