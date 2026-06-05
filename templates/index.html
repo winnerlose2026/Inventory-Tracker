@@ -594,17 +594,14 @@
     .btn { padding: 10px 14px; font-size: 14px; min-height: 42px; }
     .btn-group { gap: 6px; }
   }
-  /* ---- Mobile: slim the inventory table to its key columns (Variety, Qty,
-     Weeks Remaining, Status) so it fits a phone with no sideways scroll. The
-     secondary columns (On Order, Unit, Price, Weekly Usage) are hidden; full
-     detail stays on desktop and in the expandable lot rows. Scoped to
-     .inv-table so the other tables keep their swipe-scroll behavior. ---- */
-  @media (max-width: 640px) {
-    .inv-table { table-layout: fixed !important; width: 100% !important; min-width: 0 !important; }
-    .inv-table > colgroup > col:nth-child(3),
-    .inv-table > colgroup > col:nth-child(4),
-    .inv-table > colgroup > col:nth-child(5),
-    .inv-table > colgroup > col:nth-child(6),
+  /* ---- Mobile/tablet: slim the inventory table to its key columns (Variety,
+     Qty, Weeks, Status) so it fits a narrow screen with no sideways scroll.
+     Uses the app's standard <=1023px breakpoint so it ALSO applies when a
+     phone requests the "desktop" site (~980px). Secondary columns are hidden;
+     full detail stays on wide screens and in the expandable lot rows. ---- */
+  @media (max-width: 1023px) {
+    .inv-table { width: 100% !important; }
+    .inv-table > colgroup { display: none; }
     .inv-table > thead th:nth-child(3),
     .inv-table > thead th:nth-child(4),
     .inv-table > thead th:nth-child(5),
@@ -613,24 +610,21 @@
     .inv-table > tbody > tr.sku-row > td:nth-child(4),
     .inv-table > tbody > tr.sku-row > td:nth-child(5),
     .inv-table > tbody > tr.sku-row > td:nth-child(6) { display: none; }
-    .inv-table > colgroup > col:nth-child(1) { width: 44%; }
-    .inv-table > colgroup > col:nth-child(2) { width: 15%; }
-    .inv-table > colgroup > col:nth-child(7) { width: 19%; }
-    .inv-table > colgroup > col:nth-child(8) { width: 22%; }
     .inv-table > thead th,
-    .inv-table > tbody > tr.sku-row > td { padding: 9px 8px; font-size: 13px; white-space: normal; word-break: normal; }
+    .inv-table > tbody > tr.sku-row > td { white-space: normal; word-break: normal; padding: 9px 8px; font-size: 13px; }
     .inv-table > tbody > tr.sku-row > td:first-child { font-size: 14px; }
     .inv-table > tbody > tr.lot-detail-row > td { overflow-x: auto; }
     #inv-actions { flex-direction: column; align-items: stretch; }
     #inv-actions > .btn, #inv-actions > select, #inv-actions > a { width: 100%; }
     #inv-actions > span { display: none; }
   }
-  /* Mobile: abbreviate the long "Weeks Remaining" header and slim the Low
-     Stock Alerts table to Name / Qty / Threshold / Restock. */
-  @media (max-width: 640px) {
+  /* Mobile/tablet: abbreviate "Weeks Remaining" -> "Wks" and slim the Low
+     Stock Alerts table to Name / Qty / Threshold / Restock. <=1023px to match
+     the inventory table (and catch desktop-site phone widths). */
+  @media (max-width: 1023px) {
     .inv-table .wks-full { display: none; }
     .inv-table .wks-abbr { display: inline; }
-    #low-stock-card table { table-layout: fixed !important; width: 100% !important; min-width: 0 !important; }
+    #low-stock-card table { width: 100% !important; }
     #low-stock-card thead th:nth-child(1),
     #low-stock-card thead th:nth-child(3),
     #low-stock-card thead th:nth-child(6),
@@ -638,10 +632,6 @@
     #low-stock-card tbody td:nth-child(3),
     #low-stock-card tbody td:nth-child(6) { display: none; }
     #low-stock-card th, #low-stock-card td { padding: 9px 8px; font-size: 13px; white-space: normal; word-break: normal; }
-    #low-stock-card th:nth-child(2), #low-stock-card td:nth-child(2) { width: 42%; }
-    #low-stock-card th:nth-child(4), #low-stock-card td:nth-child(4) { width: 16%; }
-    #low-stock-card th:nth-child(5), #low-stock-card td:nth-child(5) { width: 20%; }
-    #low-stock-card th:nth-child(7), #low-stock-card td:nth-child(7) { width: 22%; }
   }
 </style>
 </head>
