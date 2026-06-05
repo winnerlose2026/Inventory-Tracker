@@ -3532,6 +3532,7 @@ def api_forecast_true_up():
         item["updated"] = now_iso
         item["last_synced"] = now_iso
         item["last_synced_from"] = "vendor-truth"
+        item["last_count_at"] = now_iso
 
     if not dry_run and reconciled:
         save_usage(usage)
@@ -3697,6 +3698,24 @@ def api_warehouses():
 # API – Distributors (unified view across Cheney Brothers and US Foods)
 # ---------------------------------------------------------------------------
 
+def _warehouse_last_count(wh_items):
+    """Most recent 'count received' timestamp for a warehouse.
+
+    A count is a rep inventory worksheet (stamps item['last_count_at']) or a
+    vendor-truth on-hand true-up. Falls back to a vendor-truth last_synced so
+    vendor-fed warehouses still show a date before their next worksheet lands.
+    Returns an ISO string or None. ISO strings sort chronologically.
+    """
+    best = None
+    for x in wh_items:
+        ts = x.get("last_count_at")
+        if not ts and x.get("last_synced_from") == "vendor-truth":
+            ts = x.get("last_synced")
+        if ts and (best is None or ts > best):
+            best = ts
+    return best
+
+
 @app.route("/api/distributors")
 def api_distributors():
     inv = load_inventory()
@@ -3721,6 +3740,7 @@ def api_distributors():
         for wh_name, wh_items in sorted(wh_groups.items()):
             warehouses.append({
                 "warehouse": wh_name,
+                "last_count_at": _warehouse_last_count(wh_items),
                 "item_count": len(wh_items),
                 "total_quantity": round(sum(x["quantity"] for x in wh_items), 2),
                 "total_value": round(sum(x["quantity"] * x["price"] for x in wh_items), 2),

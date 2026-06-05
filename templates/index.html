@@ -104,6 +104,10 @@
   .nav-item:hover { color: var(--text); background: var(--surface2); }
   .nav-item.active { color: var(--accent); background: var(--surface2); border-bottom-color: var(--accent2); font-weight: 600; }
   .nav-icon { font-size: 16px; width: 18px; text-align: center; }
+  /* Per-warehouse count-freshness chip (Inventory page) */
+  .wh-fresh { display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:600; padding:2px 9px; border-radius:9999px; white-space:nowrap; line-height:1.7; }
+  .wh-fresh-green { background:rgba(43,125,94,.12); color:var(--green); }
+  .wh-fresh-red { background:rgba(236,80,57,.12); color:var(--red); }
   .main { padding: 28px 32px; overflow-y: auto; overflow-x: hidden; }
   .page { display: none; }
   .page.active { display: block; }
@@ -1546,6 +1550,23 @@ async function reverseActivity(timestamp) {
 // -------------------------------------------------------------------------
 // Inventory
 // -------------------------------------------------------------------------
+// Per-warehouse count-freshness chip. A "count" is a rep inventory
+// worksheet (or vendor on-hand true-up). Worksheets land weekly, so a count
+// within 8 days is current (green); older or never is stale (red).
+function renderWarehouseFreshness(iso) {
+  if (!iso) {
+    return '<span class="wh-fresh wh-fresh-red" title="No inventory count received yet">\u2717 No count</span>';
+  }
+  const then = new Date(iso);
+  const days = Math.floor((Date.now() - then.getTime()) / 86400000);
+  const ok = days <= 8;
+  const dateStr = then.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const ageStr = days <= 0 ? 'today' : (days === 1 ? '1 day ago' : days + ' days ago');
+  const mark = ok ? '\u2713' : '\u2717';
+  const cls = ok ? 'wh-fresh-green' : 'wh-fresh-red';
+  return `<span class="wh-fresh ${cls}" title="Latest count received ${dateStr} (${ageStr})">${mark} Counted ${dateStr}</span>`;
+}
+
 async function loadInventory() {
   // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
   // that used to live on the Distributors tab. It also pulls the lot map
@@ -1600,10 +1621,14 @@ async function loadInventory() {
         ${g.warehouses.map(w => {
           const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
           const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
+          const whFresh = renderWarehouseFreshness(w.last_count_at);
           return `
           <div style="padding:14px 16px 4px">
-            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
-              <div style="font-family:var(--font-display);font-weight:700;font-size:20px;color:var(--accent);letter-spacing:-.005em">${escHtml(w.warehouse)}</div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;gap:12px;flex-wrap:wrap">
+              <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+                <div style="font-family:var(--font-display);font-weight:700;font-size:20px;color:var(--accent);letter-spacing:-.005em">${escHtml(w.warehouse)}</div>
+                ${whFresh}
+              </div>
               <div style="color:var(--muted);font-size:12px">
                 ${w.item_count} SKU(s) &middot; ${w.total_quantity.toFixed(0)} units &middot; $${w.total_value.toFixed(2)}
                 &middot; ${whWeekly.toFixed(0)}/wk

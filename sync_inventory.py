@@ -489,6 +489,11 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         qty_changed = abs(amount - old_qty) >= 1e-9
         wu_changed = (new_wu is not None
                       and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
+        # Record that a fresh count was received for this warehouse today,
+        # even when the numbers match last week's. Drives the per-warehouse
+        # freshness indicator on the Inventory page.
+        if not dry_run:
+            item["last_count_at"] = now
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
