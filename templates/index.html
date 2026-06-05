@@ -663,9 +663,16 @@
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
       <div id="inventory-container"></div>
 
-      <!-- Add Item / Export moved to the bottom of the page: both are
-           rarely used, so they no longer occupy the prime top-right slot. -->
-      <div class="btn-group" style="margin-top:24px">
+      <!-- Bottom action bar. Per-row Edit/Restock/Use were removed to slim the
+           table; pick a SKU here to edit it. Usage + restocks come from ingested
+           data now, so manual Use/Restock are gone. -->
+      <div class="btn-group" style="margin-top:24px;flex-wrap:wrap;align-items:center;gap:10px">
+        <label for="sku-edit-select" style="font-size:13px;color:var(--muted)">Modify a SKU:</label>
+        <select id="sku-edit-select" style="padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;min-width:280px">
+          <option value="">Select a SKU…</option>
+        </select>
+        <button class="btn btn-ghost" onclick="editSelectedSku()">Edit</button>
+        <span style="flex:1 1 24px"></span>
         <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
         <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
       </div>
@@ -1567,6 +1574,26 @@ function renderWarehouseFreshness(iso) {
   return `<span class="wh-fresh ${cls}" title="Latest count received ${dateStr} (${ageStr})">${mark} Counted ${dateStr}</span>`;
 }
 
+// Bottom-of-page SKU editor. Per-row actions were removed to slim the table;
+// pick a SKU here and edit it. Options are rebuilt from inventoryCache on
+// every inventory load.
+function populateSkuEditSelect() {
+  const sel = document.getElementById('sku-edit-select');
+  if (!sel) return;
+  const prev = sel.value;
+  const items = inventoryCache.slice().sort((a, b) => (a.name < b.name ? -1 : 1));
+  sel.innerHTML = '<option value="">Select a SKU\u2026</option>' +
+    items.map(i => `<option value="${escAttr(i.name)}">${escHtml(i.name)}</option>`).join('');
+  if (prev) sel.value = prev;
+}
+
+function editSelectedSku() {
+  const sel = document.getElementById('sku-edit-select');
+  const name = sel && sel.value;
+  if (!name) { toast('Pick a SKU to edit first.', 'error'); return; }
+  openEditModal(name);
+}
+
 async function loadInventory() {
   // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
   // that used to live on the Distributors tab. It also pulls the lot map
@@ -1583,6 +1610,7 @@ async function loadInventory() {
   // Cache flat items for Edit/Use/Restock modal lookups.
   inventoryCache = [];
   groups.forEach(g => g.warehouses.forEach(w => w.items.forEach(it => inventoryCache.push(it))));
+  populateSkuEditSelect();
 
   const container = document.getElementById('inventory-container');
   if (!container) return;
@@ -1638,20 +1666,19 @@ async function loadInventory() {
             </div>
             <table class="inv-table">
               <colgroup>
-                <col style="width:24%">
-                <col style="width:7%">
-                <col style="width:12%">
-                <col style="width:6%">
-                <col style="width:8%">
-                <col style="width:11%">
-                <col style="width:11%">
+                <col style="width:28%">
                 <col style="width:8%">
                 <col style="width:13%">
+                <col style="width:7%">
+                <col style="width:9%">
+                <col style="width:13%">
+                <col style="width:13%">
+                <col style="width:9%">
               </colgroup>
               <thead>
                 <tr>
                   <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
-                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th><th>Actions</th>
+                  <th>Weekly Usage</th><th>Weeks Remaining</th><th>Status</th>
                 </tr>
               </thead>
               <tbody>
@@ -1696,11 +1723,6 @@ async function loadInventory() {
                     <td>${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
                     <td style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
                     <td>${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
-                    <td class="actions-col" style="white-space:nowrap">
-                      <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escAttr(i.name)}')">Edit</button>
-                      <button class="btn btn-success btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button>
-                      <button class="btn btn-danger btn-sm" onclick="openUseModal('${escAttr(i.name)}')">Use</button>
-                    </td>
                   </tr>
                   ${hasLots ? (() => {
                     // FIFO rule: each (warehouse, variety) lot list comes
@@ -1713,7 +1735,7 @@ async function loadInventory() {
                     const activeCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
                     const depletedCount = lots.length - activeCount;
                     return `<tr id="${rowId}" style="display:none;background:var(--surface-alt,#f7f7f9)">
-                    <td colspan="9" style="padding:8px 16px 12px 30px">
+                    <td colspan="8" style="padding:8px 16px 12px 30px">
                       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
                         <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
                         ${lots.length} lot${lots.length === 1 ? '' : 's'} &middot;
