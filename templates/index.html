@@ -642,12 +642,6 @@
           <h1 style="margin-bottom:6px">Inventory</h1>
           <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first.</p>
         </div>
-        <div class="btn-group">
-          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
-          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
-          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
-          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
-        </div>
       </div>
       <!-- Low Stock Alerts: moved here from the old Dashboard now that
            Inventory is the landing page. Hidden until /api/report flags
@@ -664,6 +658,13 @@
 
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
       <div id="inventory-container"></div>
+
+      <!-- Add Item / Export moved to the bottom of the page: both are
+           rarely used, so they no longer occupy the prime top-right slot. -->
+      <div class="btn-group" style="margin-top:24px">
+        <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+        <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
+      </div>
     </div>
 
     <!-- Distributors (merged into Inventory) -->
