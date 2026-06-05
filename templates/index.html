@@ -59,7 +59,7 @@
     box-shadow: 0 2px 8px rgba(5,23,71,.05);
   }
   .sidebar-logo {
-    padding: 10px 18px;
+    padding: 10px 14px;
     border-right: 1px solid var(--border);
     border-bottom: none;
     margin: 0;
@@ -89,8 +89,8 @@
   .nav-item {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 16px 18px;
+    gap: 6px;
+    padding: 16px 13px;
     cursor: pointer;
     color: var(--muted);
     transition: all .15s;
@@ -103,7 +103,7 @@
   }
   .nav-item:hover { color: var(--text); background: var(--surface2); }
   .nav-item.active { color: var(--accent); background: var(--surface2); border-bottom-color: var(--accent2); font-weight: 600; }
-  .nav-icon { font-size: 18px; width: 20px; text-align: center; }
+  .nav-icon { font-size: 16px; width: 18px; text-align: center; }
   .main { padding: 28px 32px; overflow-y: auto; overflow-x: hidden; }
   .page { display: none; }
   .page.active { display: block; }
@@ -602,29 +602,26 @@
       <div class="wordmark">Inventory Tracker</div>
     </div>
     <nav>
-      <div class="nav-item active" onclick="showPage('dashboard')">
-        <span class="nav-icon">📊</span> Dashboard
-      </div>
-      <div class="nav-item" onclick="showPage('inventory')">
+      <div class="nav-item active" onclick="showPage('inventory')">
         <span class="nav-icon">🗂️</span> Inventory
+      </div>
+      <div class="nav-item" onclick="showPage('report')">
+        <span class="nav-icon">📈</span> Report
       </div>
       <div class="nav-item" onclick="showPage('pending-pos')">
         <span class="nav-icon">🚛</span> Pending POs
       </div>
-      <div class="nav-item" onclick="showPage('freight')">
-        <span class="nav-icon">💰</span> Freight Costs
-      </div>
       <div class="nav-item" onclick="showPage('production')">
         <span class="nav-icon">🥯</span> Daily Production
+      </div>
+      <div class="nav-item" onclick="showPage('freight')">
+        <span class="nav-icon">💰</span> Freight Costs
       </div>
       <div class="nav-item" onclick="showPage('traceability')">
         <span class="nav-icon">🔎</span> Traceability
       </div>
       <div class="nav-item" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
-      </div>
-      <div class="nav-item" onclick="showPage('report')">
-        <span class="nav-icon">📈</span> Report
       </div>
     </nav>
     <div class="sidebar-footer">
@@ -638,31 +635,24 @@
   <!-- Main -->
   <main class="main">
 
-    <!-- Dashboard -->
-    <div class="page active" id="page-dashboard">
-      <h1>Dashboard</h1>
-      <p class="subtitle">Overview of your 12 SKUs</p>
-      <div class="stat-grid">
-        <div class="stat-card">
-          <div class="stat-label">Total SKUs</div>
-          <div class="stat-value blue" id="stat-skus">—</div>
+    <!-- Inventory -->
+    <div class="page active" id="page-inventory">
+      <div class="page-header">
+        <div>
+          <h1 style="margin-bottom:6px">Inventory</h1>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first.</p>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">Inventory Value</div>
-          <div class="stat-value green" id="stat-value">—</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Low Stock</div>
-          <div class="stat-value yellow" id="stat-low">—</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Usage Events</div>
-          <div class="stat-value blue" id="stat-events">—</div>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
+          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
+          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
+          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
         </div>
       </div>
-
-      <!-- Low stock warnings -->
-      <div class="card" id="low-stock-card" style="display:none">
+      <!-- Low Stock Alerts: moved here from the old Dashboard now that
+           Inventory is the landing page. Hidden until /api/report flags
+           at least one SKU below threshold (see refreshLowStock). -->
+      <div class="card" id="low-stock-card" style="display:none;margin-bottom:20px">
         <div class="card-header">
           <span class="card-title">⚠️ Low Stock Alerts</span>
         </div>
@@ -672,35 +662,6 @@
         </table>
       </div>
 
-      <!-- Recent activity -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">Recent Activity</span>
-        </div>
-        <table>
-          <thead><tr><th>Time</th><th>Item</th><th>Type</th><th>Amount</th><th>Note</th><th>Actions</th></tr></thead>
-          <tbody id="recent-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Inventory -->
-    <div class="page" id="page-inventory">
-      <div class="page-header">
-        <div>
-          <h1 style="margin-bottom:6px">Inventory</h1>
-          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first.</p>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-primary" onclick="openAddModal()">+ Add Item</button>
-          <button class="btn btn-ghost" onclick="runSeed()">Seed Bagels</button>
-          <button class="btn btn-ghost" onclick="runSync(true)">Preview Sync</button>
-          <button class="btn btn-success" onclick="runSync(false)">Sync Now</button>
-          <button class="btn btn-ghost" onclick="runEmailScan(true)">Preview Email</button>
-          <button class="btn btn-success" onclick="runEmailScan(false)">Scan Email</button>
-          <a class="btn btn-primary" href="/api/export.xlsx" download>Export to Excel</a>
-        </div>
-      </div>
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
       <div id="inventory-container"></div>
     </div>
@@ -1033,8 +994,16 @@
 
     <!-- Usage Log -->
     <div class="page" id="page-usage">
-      <h1>Usage Log</h1>
-      <p class="subtitle">All inventory movements, grouped by PO. Each PO header shows the total cs that moved; expand to see per-variety detail with lot codes.</p>
+      <div class="page-header">
+        <div>
+          <h1 style="margin-bottom:6px">Usage Log</h1>
+          <p class="subtitle" id="usage-subtitle" style="margin-bottom:0">Every inventory movement, newest first &mdash; restocks (PO arrivals), uses, and reversals. Filter by item or type, or switch to <strong>By PO</strong> to roll movements up by purchase order with per-variety lot detail.</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost btn-sm active" id="usage-view-chrono" onclick="setUsageView('chrono')">Chronological</button>
+          <button class="btn btn-ghost btn-sm" id="usage-view-grouped" onclick="setUsageView('grouped')">By PO</button>
+        </div>
+      </div>
       <div class="card" style="margin-bottom:14px">
         <div class="filters" style="padding:12px 20px">
           <div class="filter-group">
@@ -1074,7 +1043,7 @@
               <option value="50">50</option>
               <option value="100">100</option>
             </select>
-            <span>POs / page</span>
+            <span id="usage-pagesize-label">rows / page</span>
             <button class="btn btn-ghost btn-sm" id="usage-page-prev" onclick="onUsagePageNav(-1)">&laquo; Prev</button>
             <span id="usage-page-indicator" style="min-width:80px;text-align:center"></span>
             <button class="btn btn-ghost btn-sm" id="usage-page-next" onclick="onUsagePageNav(1)">Next &raquo;</button>
@@ -1348,7 +1317,7 @@
 // -------------------------------------------------------------------------
 // State
 // -------------------------------------------------------------------------
-let currentPage = 'dashboard';
+let currentPage = 'inventory';
 let editingName = null;   // null = add mode, string = edit mode
 let txnType = 'use';      // 'use' | 'restock'
 let txnItemName = '';
@@ -1411,8 +1380,7 @@ function showPage(page) {
 }
 
 function refresh(page) {
-  if (page === 'dashboard') loadDashboard();
-  else if (page === 'inventory') loadInventory();
+  if (page === 'inventory') loadInventory();
   else if (page === 'usage') loadUsage();
   else if (page === 'distributors') showPage('inventory');
   else if (page === 'report') loadReport();
@@ -1475,22 +1443,17 @@ async function api(url, method = 'GET', body = null) {
 // -------------------------------------------------------------------------
 // Dashboard
 // -------------------------------------------------------------------------
-async function loadDashboard() {
-  const [inv, report, usage] = await Promise.all([
-    api('/api/inventory'),
-    api('/api/report'),
-    api('/api/usage?limit=10'),
-  ]);
-
-  document.getElementById('stat-skus').textContent = report.total_items;
-  document.getElementById('stat-value').textContent = '$' + report.total_value.toFixed(2);
-  document.getElementById('stat-low').textContent = report.low_stock_count;
-  document.getElementById('stat-events').textContent = report.total_usage_events;
-
-  // Low stock
+async function refreshLowStock() {
   const lowCard = document.getElementById('low-stock-card');
   const lowTbody = document.getElementById('low-stock-tbody');
-  if (report.low_stock.length > 0) {
+  if (!lowCard || !lowTbody) return;
+  let report;
+  try {
+    report = await api('/api/report');
+  } catch (e) {
+    return;
+  }
+  if (report && Array.isArray(report.low_stock) && report.low_stock.length > 0) {
     lowCard.style.display = '';
     lowTbody.innerHTML = report.low_stock.map(i => `
       <tr>
@@ -1505,14 +1468,13 @@ async function loadDashboard() {
   } else {
     lowCard.style.display = 'none';
   }
+}
 
-  // Recent activity
-  const tbody = document.getElementById('recent-tbody');
-  if (usage.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No activity yet.</td></tr>';
-  } else {
-    tbody.innerHTML = usage.map(e => renderActivityRow(e, 6)).join('');
-  }
+// Back-compat: sync, reversal, and PO-cancel flows call loadDashboard() to
+// refresh at-a-glance state. The Dashboard tab is gone, so this now just
+// refreshes the Low Stock Alerts card on the Inventory page.
+async function loadDashboard() {
+  return refreshLowStock();
 }
 
 // Renders a usage/restock row with a Reverse button. Also handles reversal
@@ -1587,6 +1549,9 @@ async function loadInventory() {
   // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
   // that used to live on the Distributors tab. It also pulls the lot map
   // so each row can expand a lot-history sub-table.
+  // Inventory is the landing page now; keep the Low Stock Alerts card at the
+  // top of this page in sync on every load (fire-and-forget).
+  refreshLowStock();
   const [groups, lotMap] = await Promise.all([
     api('/api/distributors'),
     api('/api/production/lots-by-pair').catch(() => ({})),
@@ -1988,8 +1953,42 @@ async function loadDistributors() { return loadInventory(); }
 // Usage Log — PO-grouped view with cs / lot # detail and pagination.
 let usagePageSize = 10;
 let usagePage = 0;
+let usageView = 'chrono';      // 'chrono' (flat, newest-first) | 'grouped' (by PO)
 let _usageCache = [];          // last fetched flat list
 let _usageLotMap = {};         // {po_number: {variety: lot_number}}
+
+// Toggle between the flat chronological feed (default) and the PO-grouped
+// roll-up. Resets to page 1 and re-labels the pager so it reads correctly.
+function setUsageView(view) {
+  usageView = (view === 'grouped') ? 'grouped' : 'chrono';
+  usagePage = 0;
+  const cb = document.getElementById('usage-view-chrono');
+  const gb = document.getElementById('usage-view-grouped');
+  if (cb) cb.classList.toggle('active', usageView === 'chrono');
+  if (gb) gb.classList.toggle('active', usageView === 'grouped');
+  const psLabel = document.getElementById('usage-pagesize-label');
+  if (psLabel) psLabel.textContent = usageView === 'grouped' ? 'POs / page' : 'rows / page';
+  renderUsage();
+}
+
+// Dispatch to whichever view is active.
+function renderUsage() {
+  if (usageView === 'grouped') renderUsageGroups();
+  else renderUsageChrono();
+}
+
+// Shared type filter for both views. Mirrors the Type dropdown:
+//   restock  -> PO-arrival rollovers (amount < 0, source on_order_rollover)
+//   use      -> consumption (amount > 0, non-reversal)
+//   reversal -> reversal records
+function _applyUsageTypeFilter(rows) {
+  const typeF = document.getElementById('filter-usage-type')?.value || '';
+  if (typeF === 'restock') return rows.filter(e => e.source !== 'reversal' && e.amount < 0 && e.source === 'on_order_rollover');
+  if (typeF === 'use')      return rows.filter(e => e.source !== 'reversal' && e.amount > 0);
+  if (typeF === 'reversal') return rows.filter(e => e.source === 'reversal');
+  return rows;
+}
+
 function onUsageFilterChange() {
   usagePage = 0;
   loadUsage();
@@ -1998,12 +1997,13 @@ function onUsagePageSizeChange() {
   const v = parseInt(document.getElementById('usage-page-size').value, 10);
   usagePageSize = (v > 0 ? v : 10);
   usagePage = 0;
-  renderUsageGroups();
+  renderUsage();
 }
 function onUsagePageNav(delta) {
   usagePage = Math.max(0, usagePage + delta);
-  renderUsageGroups();
+  renderUsage();
 }
+
 function _updateUsagePager(first, last, total) {
   const info = document.getElementById('usage-pager-info');
   const ind  = document.getElementById('usage-page-indicator');
@@ -2017,7 +2017,8 @@ function _updateUsagePager(first, last, total) {
     next.disabled = true;
     return;
   }
-  info.textContent = `Showing PO groups ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`;
+  const noun = usageView === 'grouped' ? 'PO groups' : 'entries';
+  info.textContent = `Showing ${noun} ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()}`;
   const totalPages = Math.max(1, Math.ceil(total / usagePageSize));
   ind.textContent = `Page ${usagePage + 1} of ${totalPages}`;
   prev.disabled = usagePage <= 0;
@@ -2066,21 +2067,17 @@ async function loadUsage() {
   });
   _usageLotMap = m;
 
-  renderUsageGroups();
+  renderUsage();
 }
 
 function renderUsageGroups() {
   const container = document.getElementById('usage-container');
   if (!container) return;
 
-  // Apply type filter
-  const typeF = document.getElementById('filter-usage-type')?.value || '';
-  let rows = _usageCache.slice();
-  if (typeF === 'restock') rows = rows.filter(e => e.source !== 'reversal' && e.amount < 0 && e.source === 'on_order_rollover');
-  // (Wait: on_order_rollover entries deduct off "on order" while ADDING to qty,
-  // so 'amount < 0' represents +qty in usage feed. We expose them as Restocks.)
-  else if (typeF === 'use') rows = rows.filter(e => e.source !== 'reversal' && e.amount > 0);
-  else if (typeF === 'reversal') rows = rows.filter(e => e.source === 'reversal');
+  // Apply type filter (shared with the chronological view). NB: on_order_rollover
+  // entries deduct off "on order" while ADDING to qty, so amount < 0 reads as a
+  // restock in the usage feed -- _applyUsageTypeFilter handles that mapping.
+  let rows = _applyUsageTypeFilter(_usageCache.slice());
 
   // Group by po_number (fallback: 'Manual' for entries without a PO).
   const groups = {};
@@ -2212,6 +2209,43 @@ function renderUsageGroups() {
       </div>
     </div>`;
   }).join('');
+}
+
+
+// Flat, newest-first activity feed -- the old Dashboard "Recent Activity"
+// view, merged in as the default Usage Log view. Reuses renderActivityRow so
+// the row markup + Reverse button match, and paginates by entry (vs. the
+// grouped view, which paginates by PO).
+function renderUsageChrono() {
+  const container = document.getElementById('usage-container');
+  if (!container) return;
+
+  let rows = _applyUsageTypeFilter(_usageCache.slice());
+  rows.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+
+  const total = rows.length;
+  if (total === 0) {
+    container.innerHTML = '<div class="empty" style="padding:24px">No movements match this filter.</div>';
+    _updateUsagePager(0, 0, 0);
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / usagePageSize));
+  if (usagePage >= totalPages) usagePage = totalPages - 1;
+  if (usagePage < 0) usagePage = 0;
+  const start = usagePage * usagePageSize;
+  const end = Math.min(start + usagePageSize, total);
+  const paged = rows.slice(start, end);
+  _updateUsagePager(start + 1, end, total);
+
+  container.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Item</th><th>Type</th>
+        <th>Amount</th><th>Note</th><th>Actions</th>
+      </tr></thead>
+      <tbody>${paged.map(e => renderActivityRow(e, 6)).join('')}</tbody>
+    </table>`;
 }
 
 
@@ -4571,7 +4605,7 @@ function escAttr(s) {
 // Boot — session cookie handles auth, so just load the dashboard. If the
 // session has expired, api() bounces the user to /login.
 // -------------------------------------------------------------------------
-loadDashboard();
+loadInventory();
 // -------------------------------------------------------------------------
 // Traceability tab
 // -------------------------------------------------------------------------
