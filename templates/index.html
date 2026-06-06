@@ -233,6 +233,11 @@
     gap: 10px;
     flex-shrink: 0;
   }
+  .app-footer {
+    display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+    margin-top: 28px; padding: 14px 4px 4px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+  }
   /* User chip — "Signed in as jd" indicator in the header */
   .user-chip {
     display: inline-flex;
@@ -633,6 +638,60 @@
     #low-stock-card tbody td:nth-child(6) { display: none; }
     #low-stock-card th, #low-stock-card td { padding: 9px 8px; font-size: 13px; white-space: normal; word-break: normal; }
   }
+  /* ---- Mobile/tablet (<=1023px): carry the slim-table treatment to the
+     other data tabs so they fit a phone with no horizontal slider. Each table
+     keeps only its most useful columns; full detail stays on desktop. Also
+     hides the Usage tab on mobile and enlarges the logo/title. ---- */
+  @media (max-width: 1023px) {
+    .nav-item.nav-usage { display: none; }
+    .sidebar-logo svg { width: 60px; }
+    .sidebar-logo .wordmark { font-size: 16px; }
+    /* Pending POs - In Production card: keep PO#, Warehouse, Total cs, Arrival */
+    #pending-inprod-thead th:nth-child(2), #pending-inprod-tbody td:nth-child(2),
+    #pending-inprod-thead th:nth-child(4), #pending-inprod-tbody td:nth-child(4),
+    #pending-inprod-thead th:nth-child(6), #pending-inprod-tbody td:nth-child(6),
+    #pending-inprod-thead th:nth-child(8), #pending-inprod-tbody td:nth-child(8) { display: none; }
+    /* Pending POs - main table: keep PO#, Warehouse, Total cs, Arrival */
+    #pending-thead-row th:nth-child(2), #pending-tbody td:nth-child(2),
+    #pending-thead-row th:nth-child(4), #pending-tbody td:nth-child(4),
+    #pending-thead-row th:nth-child(6), #pending-tbody td:nth-child(6),
+    #pending-thead-row th:nth-child(7), #pending-tbody td:nth-child(7),
+    #pending-thead-row th:nth-child(9), #pending-tbody td:nth-child(9),
+    #pending-thead-row th:nth-child(10), #pending-tbody td:nth-child(10),
+    #pending-thead-row th:nth-child(11), #pending-tbody td:nth-child(11) { display: none; }
+    /* Daily Production - period summary: keep Period, Range, Total cs */
+    #prod-summary-thead th:nth-child(4), #prod-summary-tbody td:nth-child(4),
+    #prod-summary-thead th:nth-child(5), #prod-summary-tbody td:nth-child(5),
+    #prod-summary-thead th:nth-child(6), #prod-summary-tbody td:nth-child(6),
+    #prod-summary-thead th:nth-child(7), #prod-summary-tbody td:nth-child(7) { display: none; }
+    /* Daily Production - detail: keep Production Date, Warehouse, Total cs, Status */
+    #prod-thead-row th:nth-child(3), #prod-tbody td:nth-child(3),
+    #prod-thead-row th:nth-child(4), #prod-tbody td:nth-child(4),
+    #prod-thead-row th:nth-child(5), #prod-tbody td:nth-child(5),
+    #prod-thead-row th:nth-child(7), #prod-tbody td:nth-child(7),
+    #prod-thead-row th:nth-child(8), #prod-tbody td:nth-child(8),
+    #prod-thead-row th:nth-child(10), #prod-tbody td:nth-child(10) { display: none; }
+    /* Freight: keep Ship Date, Destination, Total, $/Case; drop totals row */
+    #freight-thead th:nth-child(2), #freight-tbody td:nth-child(2),
+    #freight-thead th:nth-child(4), #freight-tbody td:nth-child(4),
+    #freight-thead th:nth-child(5), #freight-tbody td:nth-child(5),
+    #freight-thead th:nth-child(6), #freight-tbody td:nth-child(6),
+    #freight-thead th:nth-child(7), #freight-tbody td:nth-child(7),
+    #freight-thead th:nth-child(9), #freight-tbody td:nth-child(9),
+    #freight-thead th:nth-child(11), #freight-tbody td:nth-child(11) { display: none; }
+    #freight-tfoot { display: none; }
+    /* Report - Top Consumed (Toast) table: keep Item, Gross $, Mix % */
+    #toast-sales-container th:nth-child(1), #toast-sales-container td:nth-child(1),
+    #toast-sales-container th:nth-child(4), #toast-sales-container td:nth-child(4) { display: none; }
+    #page-pending-pos table, #page-production table, #page-freight table,
+    #toast-sales-container table { width: 100% !important; min-width: 0 !important; }
+    #page-pending-pos th, #page-pending-pos td,
+    #page-production th, #page-production td,
+    #page-freight th, #page-freight td,
+    #toast-sales-container th, #toast-sales-container td {
+      white-space: normal; word-break: normal; padding: 9px 8px; font-size: 13px;
+    }
+  }
 </style>
 </head>
 <body>
@@ -664,16 +723,10 @@
       <div class="nav-item" onclick="showPage('traceability')">
         <span class="nav-icon">🔎</span> Traceability
       </div>
-      <div class="nav-item" onclick="showPage('usage')">
+      <div class="nav-item nav-usage" onclick="showPage('usage')">
         <span class="nav-icon">📋</span> Usage Log
       </div>
     </nav>
-    <div class="sidebar-footer">
-      <span class="user-chip" title="Signed in">{{ current_user or 'guest' }}</span>
-      <form action="{{ url_for('logout') }}" method="POST" style="margin:0">
-        <button type="submit" class="btn btn-ghost" id="logout-btn">Sign out</button>
-      </form>
-    </div>
   </aside>
 
   <!-- Main -->
@@ -744,7 +797,7 @@
         </div>
         <table>
           <thead>
-            <tr>
+            <tr id="pending-inprod-thead">
               <th>PO #</th>
               <th>Distributor</th>
               <th>Warehouse</th>
@@ -900,7 +953,7 @@
         </div>
         <table>
           <thead>
-            <tr>
+            <tr id="freight-thead">
               <th class="sortable" data-sort="ship_date">Ship Date</th>
               <th class="sortable" data-sort="invoice_number">Invoice #</th>
               <th class="sortable" data-sort="dest_dc">Destination</th>
@@ -991,7 +1044,7 @@
         </div>
         <table>
           <thead>
-            <tr>
+            <tr id="prod-summary-thead">
               <th>Period</th>
               <th>Range</th>
               <th style="text-align:right">Total cs</th>
@@ -1270,6 +1323,13 @@
       </div>
 
     </div>
+
+    <footer class="app-footer">
+      <span class="user-chip" title="Signed in">{{ current_user or 'guest' }}</span>
+      <form action="{{ url_for('logout') }}" method="POST" style="margin:0">
+        <button type="submit" class="btn btn-ghost btn-sm" id="logout-btn">Sign out</button>
+      </form>
+    </footer>
 
   </main>
 </div>

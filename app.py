@@ -3716,10 +3716,36 @@ def _warehouse_last_count(wh_items):
     return best
 
 
+def _last_count_by_warehouse(inv):
+    """Latest 'inventory received' timestamp per warehouse, derived from the
+    usage history. A receipt is a rep/vendor on-hand report (usage note starts
+    with 'Email on-hand sync') or a vendor-truth true-up. Deriving from history
+    catches reports ingested before last_count_at stamping existed, so a
+    warehouse that sent its weekly count shows green with the received date.
+    Returns {warehouse: iso_timestamp}.
+    """
+    key_to_wh = {k: (v.get("warehouse") or "") for k, v in inv.items()}
+    out: dict[str, str] = {}
+    try:
+        usage = load_usage()
+    except Exception:  # noqa: BLE001
+        return out
+    for e in usage:
+        note = str(e.get("note") or "")
+        if e.get("source") != "vendor-truth" and not note.startswith("Email on-hand sync"):
+            continue
+        wh = e.get("warehouse") or key_to_wh.get(e.get("item_key") or "", "")
+        ts = e.get("timestamp") or e.get("reported_at") or ""
+        if wh and ts and out.get(wh, "") < ts:
+            out[wh] = ts
+    return out
+
+
 @app.route("/api/distributors")
 def api_distributors():
     inv = load_inventory()
     items_enriched = [_enrich_on_order(dict(v)) for v in inv.values()]
+    derived_counts = _last_count_by_warehouse(inv)
     groups: dict[str, list] = {}
     for item in items_enriched:
         dist = item.get("distributor") or "Unassigned"
@@ -3738,9 +3764,13 @@ def api_distributors():
             wh_groups.setdefault(i.get("warehouse") or "Unassigned", []).append(i)
         warehouses = []
         for wh_name, wh_items in sorted(wh_groups.items()):
+            _lc = _warehouse_last_count(wh_items)
+            _dc = derived_counts.get(wh_name)
+            if _dc and (not _lc or _dc > _lc):
+                _lc = _dc
             warehouses.append({
                 "warehouse": wh_name,
-                "last_count_at": _warehouse_last_count(wh_items),
+                "last_count_at": _lc,
                 "item_count": len(wh_items),
                 "total_quantity": round(sum(x["quantity"] for x in wh_items), 2),
                 "total_value": round(sum(x["quantity"] * x["price"] for x in wh_items), 2),
