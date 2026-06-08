@@ -3927,6 +3927,137 @@ def api_email_scan():
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
+@app.route("/api/email/send", methods=["POST"])
+def api_email_send():
+    """Send an email from the configured M365 mailbox via Microsoft Graph.
+
+    Uses the same app-only client-credentials token the mailbox scan uses
+    (EmailInboxClient._ms365_token), so the app registration must have the
+    **Mail.Send** application permission with admin consent. Protected by the
+    global _gate_writes() before_request hook: any POST to /api/* requires a
+    browser session or the X-Inventory-Token header.
+
+    Body:
+        {
+          "to": "a@x.com" | ["a@x.com", ...],     # required
+          "cc": "b@x.com" | [...],                # optional
+          "subject": "...",                        # subject for new mail
+          "body": "plain text",                    # default Text content
+          "html": "<p>..</p>",                     # optional; overrides body
+          "from": "jd@hhbagels.com",               # optional sender UPN
+          "reply_to_message_id": "<graph id>",     # optional; reply in-thread
+          "save_to_sent_items": true,              # optional, default true
+          "dry_run": false                         # optional; build, don't send
+        }
+
+    Always returns a structured 200 (never a bare 500):
+      {"ok": true, "sent": true, ...} or {"ok": false, "error": "..."}.
+    """
+    import json as _json
+    import traceback as _tb
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    try:
+        from integrations.email_scanner import EmailInboxClient, GRAPH_BASE
+
+        body = request.get_json(silent=True) or {}
+
+        def _as_list(v):
+            if not v:
+                return []
+            if isinstance(v, str):
+                return [v.strip()] if v.strip() else []
+            return [str(x).strip() for x in v if str(x).strip()]
+
+        to = _as_list(body.get("to"))
+        cc = _as_list(body.get("cc"))
+        if not to:
+            return jsonify({"ok": False, "error": "missing required field 'to'"}), 200
+
+        subject = (body.get("subject") or "").strip()
+        html = body.get("html")
+        if html:
+            content_type, content = "HTML", html
+        else:
+            content_type, content = "Text", (body.get("body") or "")
+
+        dry_run = bool(body.get("dry_run", False))
+        save_to_sent = bool(body.get("save_to_sent_items", True))
+        reply_to = (body.get("reply_to_message_id") or "").strip()
+
+        # Sender: explicit 'from' wins, else MS365_SEND_AS, else first MS365_USER.
+        sender = (body.get("from") or os.environ.get("MS365_SEND_AS") or "").strip()
+        if not sender:
+            users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
+            sender = users[0] if users else ""
+        if not sender:
+            return jsonify({"ok": False, "error": "no sender configured (set MS365_SEND_AS or MS365_USER, or pass 'from')"}), 200
+
+        if dry_run:
+            return jsonify({"ok": True, "sent": False, "dry_run": True,
+                            "from": sender, "to": to, "cc": cc,
+                            "subject": subject, "threaded": bool(reply_to)})
+
+        client = EmailInboxClient()
+        token = client._ms365_token()
+        uq = urllib.parse.quote
+
+        def _recips(addrs):
+            return [{"emailAddress": {"address": a}} for a in addrs]
+
+        def _graph(method, url, data=None):
+            payload = None if data is None else _json.dumps(data).encode("utf-8")
+            headers = {"Authorization": f"Bearer {token}"}
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                return resp.status, (raw.decode("utf-8", "replace") if raw else "")
+
+        try:
+            if reply_to:
+                # Reply in-thread: createReply -> patch body/recipients -> send.
+                base = f"{GRAPH_BASE}/users/{uq(sender)}/messages/{uq(reply_to)}"
+                _, draft_raw = _graph("POST", base + "/createReply")
+                draft = _json.loads(draft_raw or "{}")
+                draft_id = draft.get("id")
+                if not draft_id:
+                    return jsonify({"ok": False, "error": f"createReply returned no draft id: {draft_raw[:300]}"}), 200
+                patch = {"body": {"contentType": content_type, "content": content},
+                         "toRecipients": _recips(to)}
+                if cc:
+                    patch["ccRecipients"] = _recips(cc)
+                if subject:
+                    patch["subject"] = subject
+                _graph("PATCH", f"{GRAPH_BASE}/users/{uq(sender)}/messages/{uq(draft_id)}", patch)
+                _graph("POST", f"{GRAPH_BASE}/users/{uq(sender)}/messages/{uq(draft_id)}/send")
+            else:
+                message = {"subject": subject,
+                           "body": {"contentType": content_type, "content": content},
+                           "toRecipients": _recips(to)}
+                if cc:
+                    message["ccRecipients"] = _recips(cc)
+                _graph("POST", f"{GRAPH_BASE}/users/{uq(sender)}/sendMail",
+                       {"message": message, "saveToSentItems": save_to_sent})
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:500]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return jsonify({"ok": False,
+                            "error": f"Graph send failed: HTTP {exc.code} {exc.reason}",
+                            "detail": detail}), 200
+
+        return jsonify({"ok": True, "sent": True, "dry_run": False,
+                        "from": sender, "to": to, "cc": cc,
+                        "subject": subject, "threaded": bool(reply_to)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": _tb.format_exc()[-1500:]}), 200
+
+
 @app.route("/api/email/ingest-events", methods=["POST"])
 def api_email_ingest_events():
     """Accept externally-parsed EmailEvents and apply them through the same
