@@ -39,4 +39,24 @@ HH_MFG_CODE_TO_VARIETY: dict[str, str] = {
     "1189": "Jalapeno Cheddar",
 }
 
-__all__ = ["HH_MFG_CODE_TO_VARIETY"]
+# Cheney Brothers catalog item # -> H&H mfg code. Cheney's on-hand stock
+# export ("Item # / Description / ... / Stock") has no H&H mfg column, so this
+# crosswalk resolves variety from Cheney's own catalog number. Derived from
+# Cheney's case-movement export, which lists Dist Item # and Mfq.Product Code
+# side by side. Extend as new items appear.
+CHENEY_ITEM_NO_TO_MFG: dict[str, str] = {
+    "10153018": "1150",  # Plain
+    "10153034": "1151",  # Onion
+    "10153019": "1152",  # Poppy Seed
+    "10153041": "1153",  # Sesame
+    "10153046": "1155",  # Cinnamon Raisin
+    "10153042": "1156",  # Whole Wheat
+    "10153049": "1157",  # Whole Wheat Everything
+    "10153048": "1158",  # Everything
+    "10153043": "1159",  # Asiago
+    "10153044": "1171",  # Blueberry
+    "10153047": "1184",  # Egg
+    "10153045": "1189",  # Jalapeno Cheddar
+}
+
+__all__ = ["HH_MFG_CODE_TO_VARIETY", "CHENEY_ITEM_NO_TO_MFG"]

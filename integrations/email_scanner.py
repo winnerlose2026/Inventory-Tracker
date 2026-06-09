@@ -121,7 +121,7 @@ from .usfoods_inventory_report import (
 )
 
 
-EventType = Literal["on_hand", "restock", "usage"]
+EventType = Literal["on_hand", "restock", "usage", "usage_rate"]
 
 # Sender-domain -> our canonical distributor name.
 DOMAIN_TO_DISTRIBUTOR = {

@@ -479,6 +479,40 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         _apply_po_on_order(evt, item, key, now, report, dry_run)
         return
 
+    if evt.event_type == "usage_rate":
+        # A reported average weekly-usage refresh -- e.g. Cheney's case-
+        # movement export converted to cases/week. Updates the variety's
+        # weekly_usage reference ONLY: it does not touch cases on hand and
+        # writes no movement entry to the usage ledger (usage here is
+        # reported, not inferred from a count delta).
+        new_wu = evt.item.weekly_usage
+        old_wu = item.get("weekly_usage")
+        wu_changed = (new_wu is not None
+                      and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
+        if not dry_run:
+            item["last_usage_report_at"] = now
+        if not wu_changed:
+            report["unchanged"] += 1
+            return
+        report["changes"].append({
+            "name": item["name"],
+            "warehouse": item.get("warehouse", ""),
+            "event_type": "usage_rate",
+            "old_quantity": old_qty,
+            "new_quantity": old_qty,
+            "delta": 0,
+            "old_weekly_usage": old_wu,
+            "new_weekly_usage": round(float(new_wu), 2),
+        })
+        report["updated"] += 1
+        if dry_run:
+            return
+        item["weekly_usage"] = round(float(new_wu), 2)
+        item["updated"] = now
+        item["last_synced"] = now
+        item["last_synced_from"] = "Email Inbox"
+        return
+
     if evt.event_type == "on_hand":
         # An inventory worksheet carries both the on-hand count and the rep's
         # average weekly usage. Treat the event as a no-op only when NEITHER

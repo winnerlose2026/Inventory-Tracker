@@ -4158,7 +4158,7 @@ def api_email_ingest_events():
             continue
         try:
             etype = e.get("event_type")
-            if etype not in ("on_hand", "restock", "usage"):
+            if etype not in ("on_hand", "restock", "usage", "usage_rate"):
                 build_errors.append(f"events[{idx}]: bad event_type {etype!r}")
                 continue
             raw_item = e.get("item") or {}

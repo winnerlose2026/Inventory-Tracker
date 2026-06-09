@@ -19,15 +19,17 @@ headers it saw) rather than silently ingesting nothing.
 from __future__ import annotations
 
 import io
+import re
+from datetime import date
 from typing import Optional
 
 try:  # package import
-    from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY
+    from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY, CHENEY_ITEM_NO_TO_MFG
     from .parsers._common import (canonical_variety, normalize_to_cases,
                                   opt_float, opt_int)
     from .parsers.inventory_csv import _build_name
 except ImportError:  # pragma: no cover - standalone/test
-    from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY  # type: ignore
+    from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY, CHENEY_ITEM_NO_TO_MFG  # type: ignore
     from parsers._common import (canonical_variety, normalize_to_cases,  # type: ignore
                                  opt_float, opt_int)
     from parsers.inventory_csv import _build_name  # type: ignore
@@ -99,8 +101,13 @@ def _desc_keyword(desc: str) -> str:
     return ""
 
 
-def _variety(mfg: str, desc: str) -> str:
+def _variety(mfg: str, desc: str, sku: str = "") -> str:
+    # Cheney's on-hand stock export has no Mfg# column; fall back to the
+    # Cheney catalog # -> H&H mfg crosswalk before description heuristics.
+    via_sku = HH_MFG_CODE_TO_VARIETY.get(
+        CHENEY_ITEM_NO_TO_MFG.get(_clean_code(sku), ""))
     return (HH_MFG_CODE_TO_VARIETY.get(_clean_code(mfg))
+            or via_sku
             or canonical_variety(desc) or _desc_keyword(desc))
 
 
@@ -110,6 +117,7 @@ def _is_qty(h: str) -> bool:
         return False
     return ("on hand" in h or "on-hand" in h or "qoh" in h or "cs oh" in h
             or "cases on hand" in h or "cs_qty" in h or "cs qty" in h
+            or h == "stock"
             or h in ("quantity", "qty", "cases", "case qty", "on hand quantity",
                      "qty on hand", "oh", "current on hand"))
 
@@ -169,6 +177,103 @@ def _find_header(rows: list) -> Optional[tuple]:
     return None
 
 
+_DATE_RE = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})")
+
+
+def _span_days(rows: list) -> tuple:
+    """Find the 'Date Range >= lo AND <= hi' line; return
+    (span_days, lo, hi, note). span_days counts both endpoints; defaults to 30
+    when no usable range is present."""
+    for r in rows:
+        for c in r:
+            if c and "date range" in c.lower():
+                found = _DATE_RE.findall(c)
+                if len(found) >= 2:
+                    try:
+                        mo, dy, yr = (int(x) for x in found[0].split("/"))
+                        lo = date(yr, mo, dy)
+                        mo, dy, yr = (int(x) for x in found[1].split("/"))
+                        hi = date(yr, mo, dy)
+                        span = (hi - lo).days + 1
+                        if span > 0:
+                            return span, found[0], found[1], ""
+                    except ValueError:
+                        pass
+    return 30, "", "", "no usable date range found; defaulted span to 30 days"
+
+
+def _find_cm_header(rows: list):
+    """Locate a case-movement header: a 'Full Cases' column plus a
+    'Dist Item #' or 'Mfq.Product Code' column. Returns
+    (header_idx, col_cases, col_mfg, col_item) or None."""
+    for i, row in enumerate(rows[:40]):
+        h = [(_cell_str(c) or "").lower() for c in row]
+        col_cases = next((k for k, x in enumerate(h) if "full cases" in x), None)
+        if col_cases is None:
+            continue
+        col_mfg = next((k for k, x in enumerate(h)
+                        if x.startswith("mfq") or x.startswith("mfg")), None)
+        col_item = next((k for k, x in enumerate(h)
+                         if "dist item" in x or x in ("item #", "item number")), None)
+        if col_mfg is not None or col_item is not None:
+            return i, col_cases, col_mfg, col_item
+    return None
+
+
+def _parse_case_movement(rows: list, warehouse: str, filename: str,
+                         distributor: str) -> "tuple[list[dict], list[str]]":
+    """Parse a Cheney case-movement (usage) sheet into usage_rate events.
+
+    'Full Cases' totals the report's date range (currently a month); it is
+    converted to a weekly average (total * 7 / span_days). These events carry
+    weekly_usage ONLY -- the apply path refreshes the usage reference without
+    touching cases on hand or writing a movement ledger entry. Returns
+    ([], []) when the sheet isn't a case-movement export, so the caller falls
+    through to the on-hand grid parser."""
+    hdr = _find_cm_header(rows)
+    if not hdr:
+        return [], []
+    hi, col_cases, col_mfg, col_item = hdr
+    span, _lo, _hi, note = _span_days(rows)
+    events: list[dict] = []
+    errors: list[str] = []
+    if note:
+        errors.append(f"{warehouse}: {note}")
+    for r in rows[hi + 1:]:
+        mfg = _clean_code(r[col_mfg]) if (col_mfg is not None and col_mfg < len(r)) else ""
+        sku = _clean_code(r[col_item]) if (col_item is not None and col_item < len(r)) else ""
+        cases = opt_float(r[col_cases]) if col_cases < len(r) else None
+        if cases is None:
+            continue
+        variety = (HH_MFG_CODE_TO_VARIETY.get(mfg)
+                   or HH_MFG_CODE_TO_VARIETY.get(CHENEY_ITEM_NO_TO_MFG.get(sku, "")))
+        if not variety:
+            # Total rows (e.g. "Sum of All Products Activity") carry no code --
+            # skip silently; surface only rows that DO carry an unmapped code.
+            if mfg or sku:
+                errors.append(f"{warehouse}: unmapped case-movement row "
+                              f"(mfg={mfg!r}, item={sku!r})")
+            continue
+        weekly = round(cases * 7.0 / span, 2)
+        events.append({
+            "event_type": "usage_rate",
+            "item": {
+                "quantity": 0.0,
+                "distributor": distributor,
+                "name": _build_name(distributor, variety, warehouse),
+                "variety": variety,
+                "warehouse": warehouse,
+                "unit": "cs",
+                "weekly_usage": weekly,
+            },
+            "source_message_id": f"cheney-xlsx:{filename}",
+            "source_subject": f"Cheney case movement: {filename}",
+            "po_number": "",
+            "po_revision": "",
+        })
+    return events, errors
+
+
 def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
                       distributor: str = DISTRIBUTOR) -> "tuple[list[dict], list[str]]":
     events: list[dict] = []
@@ -183,77 +288,89 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
     except Exception as exc:  # noqa: BLE001
         errors.append(f"{filename}: cannot open xlsx: {type(exc).__name__}: {exc}")
         return events, errors
-
-    headers_seen: list[str] = []
-    idx = 0
     try:
-        for ws in wb.worksheets:
-            rows = [[_cell_str(c) for c in row] for row in ws.iter_rows(values_only=True)]
-            hdr = _find_header(rows)
-            if not hdr:
-                for r in rows[:6]:
-                    if any(r):
-                        headers_seen.append(" | ".join(x for x in r if x)[:120])
-                        break
-                continue
-            hi, roles = hdr
-            qhdr = roles.get("_qtyhdr", "")
-            unit_raw = "each" if any(t in qhdr for t in ("each", "eaches", " ea", "unit")) else "cs"
-
-            def cell(role: str) -> str:
-                j = roles.get(role)
-                return r[j] if (j is not None and j < len(r)) else ""
-
-            blanks = 0
-            for r in rows[hi + 1:]:
-                if not any(r):
-                    blanks += 1
-                    if blanks >= 5:
-                        break
-                    continue
-                blanks = 0
-                mfg = cell("mfg")
-                desc = cell("variety")
-                variety = _variety(mfg, desc)
-                qty = opt_float(cell("quantity"))
-                if not variety:
-                    if qty is not None or desc or _clean_code(mfg):
-                        errors.append(f"{warehouse}: unmapped row "
-                                      f"(mfg={_clean_code(mfg)!r}, desc={desc!r})")
-                    continue
-                if qty is None:
-                    continue
-                cs = opt_int(cell("case_size")) or DEFAULT_CASE_SIZE
-                qty_norm, unit_norm = normalize_to_cases(qty, unit_raw, cs)
-                idx += 1
-                item: dict = {
-                    "quantity": qty_norm,
-                    "distributor": distributor,
-                    "name": _build_name(distributor, variety, warehouse),
-                    "variety": variety,
-                    "warehouse": warehouse,
-                    "unit": unit_norm,
-                    "case_size": cs,
-                }
-                wu = opt_float(cell("weekly_usage"))
-                if wu is not None:
-                    item["weekly_usage"] = wu
-                sku = cell("distributor_sku")
-                if sku:
-                    item["distributor_sku"] = sku
-                events.append({
-                    "event_type": "on_hand",
-                    "item": item,
-                    "source_message_id": f"cheney-xlsx:{filename}#{idx}",
-                    "source_subject": f"Cheney inventory & usage: {filename}",
-                    "po_number": "",
-                    "po_revision": "",
-                })
+        rows_by_sheet = [
+            [[_cell_str(c) for c in row] for row in ws.iter_rows(values_only=True)]
+            for ws in wb.worksheets
+        ]
     finally:
         try:
             wb.close()
         except Exception:  # noqa: BLE001
             pass
+
+    # Case-movement (usage) export -> usage_rate events. Ross sends this
+    # SEPARATELY from the on-hand stock sheet; it has a "Full Cases" total over
+    # a date range and NO cases-on-hand, so it must not be read as on_hand.
+    for rows in rows_by_sheet:
+        cm_events, cm_errors = _parse_case_movement(rows, warehouse, filename, distributor)
+        if cm_events or cm_errors:
+            return cm_events, cm_errors
+
+    # On-hand stock grid.
+    headers_seen: list[str] = []
+    idx = 0
+    for rows in rows_by_sheet:
+        hdr = _find_header(rows)
+        if not hdr:
+            for r in rows[:6]:
+                if any(r):
+                    headers_seen.append(" | ".join(x for x in r if x)[:120])
+                    break
+            continue
+        hi, roles = hdr
+        qhdr = roles.get("_qtyhdr", "")
+        unit_raw = "each" if any(t in qhdr for t in ("each", "eaches", " ea", "unit")) else "cs"
+
+        def cell(role: str) -> str:
+            j = roles.get(role)
+            return r[j] if (j is not None and j < len(r)) else ""
+
+        blanks = 0
+        for r in rows[hi + 1:]:
+            if not any(r):
+                blanks += 1
+                if blanks >= 5:
+                    break
+                continue
+            blanks = 0
+            mfg = cell("mfg")
+            desc = cell("variety")
+            variety = _variety(mfg, desc, cell("distributor_sku"))
+            qty = opt_float(cell("quantity"))
+            if not variety:
+                if qty is not None or desc or _clean_code(mfg):
+                    errors.append(f"{warehouse}: unmapped row "
+                                  f"(mfg={_clean_code(mfg)!r}, desc={desc!r})")
+                continue
+            if qty is None:
+                continue
+            cs = opt_int(cell("case_size")) or DEFAULT_CASE_SIZE
+            qty_norm, unit_norm = normalize_to_cases(qty, unit_raw, cs)
+            idx += 1
+            item: dict = {
+                "quantity": qty_norm,
+                "distributor": distributor,
+                "name": _build_name(distributor, variety, warehouse),
+                "variety": variety,
+                "warehouse": warehouse,
+                "unit": unit_norm,
+                "case_size": cs,
+            }
+            wu = opt_float(cell("weekly_usage"))
+            if wu is not None:
+                item["weekly_usage"] = wu
+            sku = cell("distributor_sku")
+            if sku:
+                item["distributor_sku"] = sku
+            events.append({
+                "event_type": "on_hand",
+                "item": item,
+                "source_message_id": f"cheney-xlsx:{filename}#{idx}",
+                "source_subject": f"Cheney inventory & usage: {filename}",
+                "po_number": "",
+                "po_revision": "",
+            })
 
     if not events and not errors:
         seen = ("; ".join(headers_seen)) or "no non-empty rows"
