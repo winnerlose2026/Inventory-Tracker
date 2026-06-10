@@ -154,10 +154,14 @@
 
   /* Badges */
   .badge { display: inline-block; padding: 3px 10px; border-radius: var(--radius-pill); font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+  /* Enlarged distributor pills in the inventory card headers (~warehouse-name size). */
+  .dist-badge-lg .badge { font-size: 18px; padding: 4px 13px; }
   .badge-green { background: rgba(43,125,94,.12); color: var(--green); }
   .badge-yellow { background: rgba(240,179,35,.16); color: #B07F0E; }
   .badge-red { background: rgba(236,80,57,.12); color: var(--red); }
   .badge-blue { background: rgba(5,23,71,.10); color: var(--accent); }
+  /* Cheney Brothers — a high-visibility blue (the old faint navy washed out). */
+  .badge-cheney { background: rgba(21,101,192,.15); color: #1565C0; }
   .badge-purple { background: rgba(5,23,71,.06); color: var(--accent); }
   /* Dedicated bubble for Chefs Warehouse — a true violet so it can
      be distinguished at a glance from Cheney (.badge-blue, navy)
@@ -748,6 +752,7 @@
       </div>
 
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
+      <div class="card-title" style="font-size:22px;margin:28px 0 14px">Warehouse Inventory</div>
       <div id="inventory-container"></div>
 
       <!-- Bottom action bar. Per-row Edit/Restock/Use were removed to slim the
@@ -1498,7 +1503,7 @@ function refresh(page) {
 
 function distributorBadge(name) {
   if (!name) return '<span style="color:var(--muted)">—</span>';
-  const cls = name === 'Cheney Brothers' ? 'badge-blue'
+  const cls = name === 'Cheney Brothers' ? 'badge-cheney'
             : name === 'US Foods' ? 'badge-yellow'
             : name === 'Chefs Warehouse' ? 'badge-violet'
             : 'badge-purple';
@@ -1839,7 +1844,7 @@ async function loadInventory() {
     return `
     <div class="card">
       <div class="card-header">
-        <span class="card-title">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)} ${g.distributor}</span>
+        <span class="card-title"><span class="dist-badge-lg">${distributorBadge(g.distributor === 'Unassigned' ? '' : g.distributor)}</span>${g.distributor === 'Unassigned' ? ' Unassigned' : ''}</span>
         <span style="color:var(--muted);font-size:12px">
           ${g.warehouses.length} warehouse(s) &middot; ${g.item_count} SKU(s) &middot; ${g.total_quantity.toFixed(0)} units &middot; $${g.total_value.toFixed(2)}
           ${caseCost !== null ? ` &middot; case $${caseCost.toFixed(2)}${caseSize ? '/' + caseSize : ''}` : ''}
