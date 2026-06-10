@@ -101,6 +101,17 @@ def _is_authenticated() -> bool:
     return _user_logged_in() or _has_valid_api_token()
 
 
+def _safe_err(exc, ctx=""):
+    """Log the full exception to the server log (Render) and return a generic,
+    non-sensitive message for the HTTP response. Prevents leaking stack traces
+    or internal details to clients (CodeQL py/stack-trace-exposure)."""
+    import sys as _sys
+    import traceback as _tb2
+    label = "[error " + ctx + "]" if ctx else "[error]"
+    print(f"{label} {type(exc).__name__}: {exc}\n{_tb2.format_exc()}", file=_sys.stderr)
+    return "internal error" + (f" ({ctx})" if ctx else "")
+
+
 @app.before_request
 def _gate_writes():
     # OPTIONS preflight, login flow, and static files are always open.
@@ -138,7 +149,13 @@ def api_auth_check():
 def login():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or "/"
-    if not next_url.startswith("/") or next_url.startswith("//"):
+    # Same-site paths only: must start with a single "/", and reject
+    # protocol-relative ("//"), backslash ("/\\" or any "\\"), and CR/LF
+    # tricks that browsers can normalise into an off-site redirect.
+    if (not next_url.startswith("/")
+            or next_url.startswith("//")
+            or "\\" in next_url
+            or "\n" in next_url or "\r" in next_url):
         next_url = "/"
 
     if request.method == "POST":
@@ -780,7 +797,7 @@ def api_chefs_warehouse_ingest_pos():
         from sync_inventory import _apply_cw_pos
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False,
-                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+                        "error": _safe_err(exc, "import")}), 500
     body = request.json or {}
     dry_run = bool(body.get("dry_run", False))
     source = str(body.get("source") or "external").strip() or "external"
@@ -792,8 +809,8 @@ def api_chefs_warehouse_ingest_pos():
     except Exception as exc:  # noqa: BLE001
         return jsonify({
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": _tb.format_exc()[-2000:],
+            "error": _safe_err(exc),
+            "traceback": "",
         }), 500
     return jsonify({"ok": True, "dry_run": dry_run, "report": report})
 
@@ -913,7 +930,7 @@ def api_freight_ingest():
         )
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False,
-                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+                        "error": _safe_err(exc, "import")}), 500
     body = request.json or {}
     dry_run = bool(body.get("dry_run", False))
     source = str(body.get("source") or "external").strip() or "external"
@@ -970,8 +987,8 @@ def api_freight_ingest():
         except Exception as exc:  # noqa: BLE001
             return jsonify({
                 "ok": False,
-                "error": f"save failed: {type(exc).__name__}: {exc}",
-                "traceback": _tb.format_exc()[-2000:],
+                "error": _safe_err(exc, "save"),
+                "traceback": "",
             }), 500
 
     return jsonify({
@@ -1062,7 +1079,7 @@ def api_freight_scan():
         )
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False,
-                        "error": f"import failed: {type(exc).__name__}: {exc}"}), 500
+                        "error": _safe_err(exc, "import")}), 500
 
     GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -1219,7 +1236,7 @@ def api_freight_scan():
                                         pdfs.append((info.filename, zf.read(info.filename)))
                                         diag_pdfs_in_zip += 1
                             except zipfile.BadZipFile as exc:
-                                errors.append(f"{mid[:12]}.. bad-zip: {exc}")
+                                errors.append(f"{mid[:12]}.. bad-zip")
                                 continue
                         else:
                             pdfs = [(a.get("name") or "invoice.pdf", ab)]
@@ -1229,7 +1246,7 @@ def api_freight_scan():
                                     pb, pdf_filename=fname,
                                     source_message_id=mid, source_subject=subj)
                             except Exception as exc:  # noqa: BLE001
-                                errors.append(f"{mid[:12]}.. parse[{fname}]: {exc}")
+                                errors.append(f"{mid[:12]}.. parse[{fname}]")
                                 continue
                             if inv is None:
                                 diag_parse_none += 1
@@ -1260,8 +1277,8 @@ def api_freight_scan():
     except Exception as exc:  # noqa: BLE001
         return jsonify({
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": _tb.format_exc()[-1500:],
+            "error": _safe_err(exc),
+            "traceback": "",
             "errors": errors,
         }), 200
 
@@ -2466,7 +2483,7 @@ def api_production_ingest():
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"bad pdf_b64: {exc}"}), 400
+        return jsonify({"ok": False, "error": _safe_err(exc, "pdf_b64")}), 400
 
     sheet = parse_production_pdf(pdf_bytes, subject=subject)
 
@@ -2580,8 +2597,8 @@ def api_production_scan():
         from integrations.production_pdf_parser import parse_production_pdf
         from inventory_tracker import load_production, save_production
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"import failed: {exc}",
-                        "traceback": _tb.format_exc()[-1500:]}), 500
+        return jsonify({"ok": False, "error": _safe_err(exc, "import"),
+                        "traceback": ""}), 500
 
     body = request.json or {}
     try:
@@ -2611,7 +2628,7 @@ def api_production_scan():
     try:
         token = client._ms365_token()
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"ms365 token failed: {exc}"}), 500
+        return jsonify({"ok": False, "error": _safe_err(exc, "ms365 token")}), 500
 
     import os, json as _json, urllib.parse, urllib.request, urllib.error
     users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
@@ -2651,7 +2668,7 @@ def api_production_scan():
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     page = _json.loads(resp.read().decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
-                parse_errors.append(f"{upn} page {pages}: {exc}")
+                parse_errors.append(f"{upn} page {pages}: parse error")
                 break
             for m in page.get("value", []):
                 scanned += 1
@@ -2677,7 +2694,7 @@ def api_production_scan():
                     araw, _ = client._graph_get(att_url, token)
                     apage = _json.loads(araw.decode("utf-8"))
                 except Exception as exc:  # noqa: BLE001
-                    parse_errors.append(f"{subject[:60]!r}: list-att failed: {exc}")
+                    parse_errors.append(f"{subject[:60]!r}: list-att failed")
                     continue
                 pdf_atts = [a for a in apage.get("value", [])
                             if (a.get("name") or "").lower().endswith(".pdf")
@@ -2693,7 +2710,7 @@ def api_production_scan():
                     apayload = _json.loads(fraw.decode("utf-8"))
                     pdf_bytes = base64.b64decode(apayload.get("contentBytes") or "")
                 except Exception as exc:  # noqa: BLE001
-                    parse_errors.append(f"{subject[:60]!r}: fetch-att failed: {exc}")
+                    parse_errors.append(f"{subject[:60]!r}: fetch-att failed")
                     continue
                 sheet = parse_production_pdf(pdf_bytes, subject=subject)
                 if sheet.error and not sheet.lines:
@@ -4109,7 +4126,7 @@ def api_seed():
     try:
         summary = seed(reset=reset)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": str(exc)}), 200
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 200
     return jsonify({"ok": True, **summary})
 
 
@@ -4121,7 +4138,7 @@ def api_migrate_units():
     try:
         summary = migrate_units_to_case(inv)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": str(exc)}), 200
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 200
     save_inventory(inv)
     return jsonify({"ok": True, **summary})
 
@@ -4191,8 +4208,8 @@ def api_email_scan():
                            else "error"),
                 "fetched": 0, "updated": 0, "unchanged": 0,
                 "unmatched": [], "changes": [],
-                "error": f"{type(exc).__name__}: {exc}",
-                "traceback": _tb.format_exc()[-2000:],
+                "error": _safe_err(exc),
+                "traceback": "",
                 "messages_seen": 0, "messages_parsed": 0,
                 "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
             }
@@ -4216,8 +4233,8 @@ def api_email_scan():
             "unchanged": 0,
             "unmatched": [],
             "changes": [],
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": _tb.format_exc()[-2000:],
+            "error": _safe_err(exc),
+            "traceback": "",
             "messages_seen": 0,
             "messages_parsed": 0,
         }
@@ -4351,8 +4368,8 @@ def api_email_send():
                         "from": sender, "to": to, "cc": cc,
                         "subject": subject, "threaded": bool(reply_to)})
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                        "traceback": _tb.format_exc()[-1500:]}), 200
+        return jsonify({"ok": False, "error": _safe_err(exc),
+                        "traceback": ""}), 200
 
 
 @app.route("/api/email/ingest-events", methods=["POST"])
@@ -4413,8 +4430,8 @@ def api_email_ingest_events():
                 "unchanged": 0,
                 "unmatched": [],
                 "changes": [],
-                "error": f"import failed: {type(exc).__name__}: {exc}",
-                "traceback": _tb.format_exc()[-2000:],
+                "error": _safe_err(exc, "import"),
+                "traceback": "",
                 "messages_seen": 0,
                 "messages_parsed": 0,
             }],
@@ -4486,7 +4503,7 @@ def api_email_ingest_events():
                 po_order_date=str(e.get("po_order_date") or ""),
             ))
         except (TypeError, ValueError, KeyError) as exc:
-            build_errors.append(f"events[{idx}]: {exc}")
+            build_errors.append(f"events[{idx}]: error")
 
     try:
         all_errors = errors + build_errors
@@ -4510,7 +4527,7 @@ def api_email_ingest_events():
                 "fetched": len(built),
                 "updated": 0, "unchanged": 0,
                 "unmatched": [], "changes": [],
-                "error": str(exc),
+                "error": _safe_err(exc),
                 "messages_seen": messages_seen,
                 "messages_parsed": messages_parsed,
             }],
@@ -4554,6 +4571,12 @@ def graph_webhook_notifications():
     #    is created. The body is empty; the token comes via query string.
     validation_token = request.args.get("validationToken")
     if validation_token:
+        # Echo the token back verbatim for the Graph handshake, but only if it
+        # matches the safe opaque-token shape Graph sends (no HTML metachars),
+        # so arbitrary request input can never be reflected (CodeQL reflective-xss).
+        import re as _re_vt
+        if not _re_vt.fullmatch(r"[A-Za-z0-9_\-.~+/= ]{1,4096}", validation_token):
+            return make_response("invalid validation token", 400)
         resp = make_response(validation_token, 200)
         resp.headers["Content-Type"] = "text/plain"
         return resp
@@ -4573,8 +4596,8 @@ def graph_webhook_notifications():
         import traceback as _tb
         return jsonify({
             "ok": False,
-            "error": f"webhook handler crashed: {exc}",
-            "traceback": _tb.format_exc()[-1500:],
+            "error": _safe_err(exc, "webhook"),
+            "traceback": "",
         }), 202
 
     return jsonify(result), 202
@@ -4594,7 +4617,7 @@ def api_graph_subscriptions():
             create_subscriptions, list_subscriptions,
         )
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+        return jsonify({"ok": False, "error": _safe_err(exc, "import")}), 500
 
     if request.method == "GET":
         return jsonify({"ok": True, "subscriptions": list_subscriptions()})
@@ -4603,8 +4626,8 @@ def api_graph_subscriptions():
         result = create_subscriptions()
     except Exception as exc:  # noqa: BLE001
         return jsonify({
-            "ok": False, "error": str(exc),
-            "traceback": _tb.format_exc()[-1500:],
+            "ok": False, "error": _safe_err(exc),
+            "traceback": "",
         }), 500
     return jsonify(result)
 
@@ -4620,13 +4643,13 @@ def api_graph_subscriptions_renew():
     try:
         from integrations.graph_subscriptions import renew_subscriptions
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"import failed: {exc}"}), 500
+        return jsonify({"ok": False, "error": _safe_err(exc, "import")}), 500
     try:
         result = renew_subscriptions()
     except Exception as exc:  # noqa: BLE001
         return jsonify({
-            "ok": False, "error": str(exc),
-            "traceback": _tb.format_exc()[-1500:],
+            "ok": False, "error": _safe_err(exc),
+            "traceback": "",
         }), 500
     return jsonify(result)
 
@@ -4660,4 +4683,4 @@ def api_export_xlsx():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)

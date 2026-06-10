@@ -173,7 +173,7 @@ def _graph_token(tenant: str, client_id: str, client_secret: str,
         raise RuntimeError(f"Graph token failed: {exc.code} {exc.reason}: {body_txt[:300]}") from exc
     tok = payload.get("access_token")
     if not tok:
-        raise RuntimeError(f"Graph token response missing access_token: {payload}")
+        raise RuntimeError(f"Graph token response missing access_token (keys={sorted(payload.keys())})")
     return tok
 
 

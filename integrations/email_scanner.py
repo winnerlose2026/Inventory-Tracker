@@ -205,9 +205,9 @@ class ScanResult:
 
 _BODY_ITEM_RE = re.compile(
     r"""^\s*
-        (?:(?P<variety>[A-Za-z][A-Za-z \-]+?)\s+Bagel\s+4oz\s*
+        (?:(?P<variety>[A-Za-z][A-Za-z \-]{1,40}?)\s+Bagel\s+4oz\s*
               (?:\[[^\]]+\])?                               # optional [CB - Ocala]
-           |(?P<variety2>[A-Za-z][A-Za-z \-]+?)\s*@\s*(?P<warehouse>[^:]+?))
+           |(?P<variety2>[A-Za-z][A-Za-z \-]{1,40}?)\s*@\s*(?P<warehouse>[^:]+?))
         \s*:\s*(?P<qty>\d+(?:\.\d+)?)
         (?:\s*(?P<unit>[A-Za-z]+))?
         \s*$""",

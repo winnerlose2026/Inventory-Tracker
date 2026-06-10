@@ -30,6 +30,7 @@ import time as _time
 import urllib.error as _uerr
 import urllib.parse as _url
 import urllib.request as _ureq
+from html.parser import HTMLParser as _HTMLParser
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
@@ -153,15 +154,46 @@ def _rep_messages(token: str, mailbox: str, rep_email: str, since_iso: str,
     return _graph_get(token, url).get("value", []) or []
 
 
-_TAG_RE = _re.compile(r"<[^>]+>")
 _WS_RE = _re.compile(r"\s+")
+
+
+class _HTMLTextExtractor(_HTMLParser):
+    """Pull visible text out of an HTML email body, dropping <script>/<style>
+    content. Uses a real HTML parser rather than a tag-stripping regex, so
+    malformed or obfuscated markup can't slip through (CodeQL py/bad-tag-filter).
+    The output is only used for keyword counting, never rendered."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts: list = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip > 0:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if self._skip == 0:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts)
 
 
 def _strip_html(body: dict) -> str:
     content = (body or {}).get("content") or ""
     if ((body or {}).get("contentType") or "").lower() == "html":
-        content = _re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", content)
-        content = _TAG_RE.sub(" ", content)
+        parser = _HTMLTextExtractor()
+        try:
+            parser.feed(content)
+            parser.close()
+            content = parser.get_text()
+        except Exception:
+            content = ""
         content = _html.unescape(content)
     return _WS_RE.sub(" ", content).strip().lower()
 
