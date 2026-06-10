@@ -604,6 +604,52 @@ def api_pending_reopen():
     })
 
 
+_ALLOWED_PO_STATUSES = {
+    "open", "overdue", "in_transit", "in_production", "arrived", "cancelled",
+}
+
+
+@app.route("/api/pending/status-overrides")
+def api_pending_status_overrides():
+    """Return the manual Pending-PO status overrides {normPOkey: status}."""
+    from inventory_tracker import load_status_overrides
+    return jsonify({"ok": True, "overrides": load_status_overrides()})
+
+
+@app.route("/api/pending/set-status", methods=["POST"])
+def api_pending_set_status():
+    """Set or clear a manual status override for a PO.
+
+    Body: { po_number (required), status }
+      status in {open, overdue, in_transit, in_production, arrived,
+      cancelled}; empty / "auto" clears the override (back to computed).
+
+    Display-only: the override forces the tag shown on the Pending POs tab
+    (winning over the 30-day ETA / freight rules). It does NOT move
+    inventory on-hand.
+    """
+    from inventory_tracker import load_status_overrides, save_status_overrides
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    status = (body.get("status") or "").strip().lower()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    if status in ("", "auto"):
+        status = ""
+    elif status not in _ALLOWED_PO_STATUSES:
+        return jsonify({"ok": False,
+                        "error": f"status must be one of {sorted(_ALLOWED_PO_STATUSES)} or empty"}), 400
+    key = _norm_po_key(po_number)
+    overrides = load_status_overrides()
+    if status:
+        overrides[key] = status
+    else:
+        overrides.pop(key, None)
+    save_status_overrides(overrides)
+    return jsonify({"ok": True, "po_number": po_number, "key": key,
+                    "status": status or None})
+
+
 # ---------------------------------------------------------------------------
 # API – Chefs Warehouse POs
 # ---------------------------------------------------------------------------

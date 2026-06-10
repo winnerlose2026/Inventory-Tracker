@@ -314,6 +314,31 @@ def is_po_canceled(po_number: str) -> bool:
     return po_number.strip() in load_canceled_pos()
 
 
+STATUS_OVERRIDES_FILE = DATA_DIR / "po_status_overrides.json"
+
+
+def load_status_overrides() -> dict:
+    """Return {normalized_po_key: status} manual Pending-PO status overrides.
+
+    Display-only: forces the tag shown on the Pending POs tab, winning over
+    the date-computed status and any freight inference. Does not touch
+    inventory quantity.
+    """
+    if STATUS_OVERRIDES_FILE.exists():
+        with open(STATUS_OVERRIDES_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
+    return {}
+
+
+def save_status_overrides(data: dict):
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(STATUS_OVERRIDES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 
 # ---------------------------------------------------------------------------
 # On-order rollover

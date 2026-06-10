@@ -780,6 +780,7 @@
           <p class="subtitle" style="margin-bottom:0">Purchase orders, filterable by status. Only US Foods and Cheney Brothers get an automatic 30-day ETA; every other distributor stays in <em>pending</em> until you type a Ship Date, which locks in arrival = ship + 7 days.</p>
         </div>
         <div class="btn-group">
+          <button class="btn btn-primary btn-sm" onclick="openModifyModal()" title="Change a PO's status or ship date, or cancel it">&#9998; Modify PO</button>
           <button class="btn btn-ghost btn-sm" id="pending-filter-overdue" onclick="setPendingFilter('overdue')">Overdue</button>
           <button class="btn btn-ghost btn-sm" id="pending-filter-noship" onclick="setPendingFilter('noship')">No ship date</button>
           <button class="btn btn-ghost btn-sm" id="pending-filter-pallet" onclick="setPendingFilter('pallet')" title="Total cs not a multiple of 56">Pallet mismatch</button>
@@ -886,7 +887,6 @@
               <th>Arrival</th>
               <th class="sortable" data-sort="eta">30-day ETA <span class="sort-ind"></span></th>
               <th>Status</th>
-              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="pending-tbody"></tbody>
@@ -1454,6 +1454,42 @@
     <div class="form-actions">
       <button class="btn btn-ghost" onclick="closeModal('txn-modal')">Cancel</button>
       <button class="btn btn-primary" id="txn-submit" onclick="submitTxn()">Submit</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modify-po-modal">
+  <div class="modal">
+    <h2>Modify PO</h2>
+    <div class="form-grid">
+      <div class="form-group full">
+        <label>Purchase Order</label>
+        <select id="modify-po-select" onchange="onModifyPoSelect()"></select>
+      </div>
+      <div class="form-group full">
+        <label>Status</label>
+        <select id="modify-po-status">
+          <option value="">Auto (computed from dates)</option>
+          <option value="open">Open</option>
+          <option value="overdue">Overdue</option>
+          <option value="in_transit">In Transit</option>
+          <option value="in_production">In Production</option>
+          <option value="arrived">Arrived</option>
+        </select>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">A manual status wins over the auto 30-day ETA / freight rules. Label only &mdash; it does not move inventory.</div>
+      </div>
+      <div class="form-group full">
+        <label>Ship Date</label>
+        <input id="modify-po-ship" type="date">
+        <div id="modify-po-ship-note" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+      </div>
+    </div>
+    <div class="form-actions" style="justify-content:space-between">
+      <button class="btn btn-danger" onclick="cancelModifyPO()">Cancel PO</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost" onclick="closeModal('modify-po-modal')">Close</button>
+        <button class="btn btn-primary" onclick="saveModifyPO()">Save</button>
+      </div>
     </div>
   </div>
 </div>
@@ -3586,6 +3622,8 @@ let cwPendingGroups = [];
 // only ever show Chefs Warehouse POs.
 let arrivedInvGroups = [];
 let freightShipIndex = {};      // normalized PO key -> verified ship date (Lineage freight)
+let statusOverrides = {};       // normalized PO key -> manual status override
+let modifyPoMap = {};           // po_number -> modify-modal info
 
 // Status dropdown changed — re-render. All status slices are computed
 // client-side from the full dataset, so no reload is required.
@@ -3645,6 +3683,14 @@ async function loadPendingPOs() {
   } catch (e) {
     console.warn('Failed to load freight ship-date index:', e);
     freightShipIndex = {};
+  }
+
+  try {
+    const so = await api('/api/pending/status-overrides');
+    statusOverrides = (so && so.overrides) || {};
+  } catch (e) {
+    console.warn('Failed to load status overrides:', e);
+    statusOverrides = {};
   }
 
   renderPendingPOs();
@@ -3784,7 +3830,7 @@ function renderPendingPOs() {
   }
 
   if (groups.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty">No POs match this filter.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">No POs match this filter.</td></tr>';
     updateSortIndicators('pending-tbody');
     return;
   }
@@ -3964,7 +4010,11 @@ function _assemblePendingGroups() {
   });
 
   const now = new Date();
-  groups.forEach(g => { g._state = _poState(g, now); });
+  groups.forEach(g => {
+    const ov = statusOverrides[_normPoKey(g.po_number || '')];
+    g._stateOverride = ov || '';
+    g._state = ov || _poState(g, now);
+  });
   return groups;
 }
 
@@ -4023,13 +4073,6 @@ function _pendingRowHtml(g, now) {
     : shipISO
       ? (formatDate(shipISO) + (shipVerified ? _shipVerifiedMark() : ''))
       : '<span style="color:var(--muted)">&mdash;</span>';
-  const actionsCell = isCancelled
-    ? '<span style="color:var(--muted)">&mdash;</span>'
-    : (isArrived && !shipVerified)
-      ? `<button class="btn btn-ghost btn-sm" onclick="reopenPendingPO('${escAttr(g.po_number || '')}', '${escAttr(source)}', ${(Number(g.total_cs) || 0).toFixed(0)})" title="Return this PO to the active pipeline (use when it hasn't actually arrived)">Reopen</button>`
-      : terminal
-        ? '<span style="color:var(--muted)">&mdash;</span>'
-        : `<button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${(g.lines || []).length}, ${(Number(g.total_cs) || 0).toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>`
   return `<tr${rowStyle}>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
@@ -4041,7 +4084,6 @@ function _pendingRowHtml(g, now) {
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
       <td>${_poTagHtml(state)}</td>
-      <td class="actions-col" style="white-space:nowrap">${actionsCell}</td>
     </tr>`;
 }
 
@@ -4168,6 +4210,85 @@ function renderOnOrderBreakdown(groups) {
         </table>
       </div>
     </div>`;
+}
+
+function openModifyModal(presetPo) {
+  const sel = document.getElementById('modify-po-select');
+  if (!sel) return;
+  const groups = _assemblePendingGroups()
+    .filter(g => (g.po_number || '').trim())
+    .sort((a, b) => (a.po_number || '').localeCompare(b.po_number || ''));
+  modifyPoMap = {};
+  sel.innerHTML = groups.map(g => {
+    modifyPoMap[g.po_number] = {
+      source: g._source || 'inventory',
+      total_cs: Number(g.total_cs) || 0,
+      lines: (g.lines || []).length,
+      ship_date: (g.ship_date || '').slice(0, 10),
+      ship_date_source: g.ship_date_source || '',
+      override: g._stateOverride || '',
+    };
+    const tag = (PENDING_TAGS[g._state] || PENDING_TAGS.open).label;
+    return `<option value="${escAttr(g.po_number)}">${escHtml(g.po_number)} - ${escHtml(g.distributor || '')} - ${escHtml(g.warehouse || '')} [${tag}]</option>`;
+  }).join('');
+  if (!groups.length) {
+    sel.innerHTML = '<option value="">No POs</option>';
+  }
+  if (presetPo && modifyPoMap[presetPo]) sel.value = presetPo;
+  onModifyPoSelect();
+  document.getElementById('modify-po-modal').classList.add('open');
+}
+
+function onModifyPoSelect() {
+  const po = document.getElementById('modify-po-select').value;
+  const info = modifyPoMap[po] || {};
+  const statusSel = document.getElementById('modify-po-status');
+  const shipInput = document.getElementById('modify-po-ship');
+  const note = document.getElementById('modify-po-ship-note');
+  if (statusSel) statusSel.value = info.override || '';
+  const verified = info.ship_date_source === 'freight';
+  if (shipInput) {
+    shipInput.value = info.ship_date || '';
+    shipInput.disabled = !!verified;
+  }
+  if (note) note.textContent = verified
+    ? 'Ship date is verified by a freight invoice and is locked.'
+    : 'Arrival auto-sets to ship + 7 days. Leave blank to use the 30-day ETA.';
+}
+
+async function saveModifyPO() {
+  const po = document.getElementById('modify-po-select').value;
+  if (!po) { closeModal('modify-po-modal'); return; }
+  const info = modifyPoMap[po] || {};
+  const newStatus = document.getElementById('modify-po-status').value;
+  const shipInput = document.getElementById('modify-po-ship');
+  const newShip = shipInput ? shipInput.value : '';
+  try {
+    if ((newStatus || '') !== (info.override || '')) {
+      await api('/api/pending/set-status', 'POST', { po_number: po, status: newStatus });
+    }
+    if (info.ship_date_source !== 'freight' && (newShip || '') !== (info.ship_date || '')) {
+      const isCW = info.source === 'chefs_warehouse';
+      await api(isCW ? '/api/chefs-warehouse/ship-date' : '/api/on-order/ship-date', 'POST',
+                isCW ? { po_number: po, ship_date: newShip || '' }
+                     : { po_number: po, ship_date: newShip || null });
+    }
+  } catch (e) {
+    toast('Save failed: ' + String(e), 'error');
+    return;
+  }
+  toast(`Updated PO ${po}`);
+  closeModal('modify-po-modal');
+  await loadPendingPOs();
+  loadDashboard();
+}
+
+async function cancelModifyPO() {
+  const po = document.getElementById('modify-po-select').value;
+  if (!po) return;
+  const info = modifyPoMap[po] || {};
+  closeModal('modify-po-modal');
+  await cancelPendingPO(po, info.lines || 0, (info.total_cs || 0).toFixed(0), info.source || 'inventory');
 }
 
 async function reopenPendingPO(poNumber, source, totalCs) {
