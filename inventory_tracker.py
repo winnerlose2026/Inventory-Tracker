@@ -998,17 +998,40 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
     #     the FIFO drain to on-hand -- consume (produced - on_hand) from the
     #     OLDEST lots so the NEWEST cases are what remain. Fall back to the
     #     usage-ledger sum only when the SKU can't be matched.
-    total_produced = sum(L["cs_produced"] for L in lots)
+    # 3c. In-transit lots: a PO still sitting in on_order has NOT arrived, so
+    #     its produced lots are en route (baked at origin, tagged to the
+    #     destination warehouse) and must NOT count toward on-hand -- else a
+    #     not-yet-arrived lot displaces a real one in the FIFO remaining.
+    snap = inventory_snapshot if inventory_snapshot is not None else load_inventory()
+    pending_pos = set()
+    for _it in (snap or {}).values():
+        for _e in (_it.get("on_order") or []):
+            _po = (_e.get("po_number") or "").strip()
+            if _po:
+                pending_pos.add(_po)
+    for L in lots:
+        L["is_in_transit"] = bool((L.get("po_number") or "").strip() in pending_pos)
+
+    # Reconcile on-hand against the ARRIVED lots only.
+    total_produced = sum(L["cs_produced"] for L in lots if not L["is_in_transit"])
     on_hand = _pair_on_hand_cs(warehouse, variety, inventory_snapshot)
     if on_hand is None:
         total_consumed = usage_consumed
     else:
         total_consumed = max(0.0, total_produced - on_hand)
 
-    # 4. Walk oldest-first, drain FIFO.
+    # 4. Walk oldest-first, drain FIFO over arrived lots. In-transit lots pass
+    #    through at full count, flagged + inactive, so they still appear in the
+    #    lot list (status "In Transit") without counting toward on-hand.
     remaining = total_consumed
     next_out_marked = False
     for L in lots:
+        if L["is_in_transit"]:
+            L["cs_consumed"] = 0
+            L["cs_remaining"] = L["cs_produced"]
+            L["is_active"] = False
+            L["is_next_out"] = False
+            continue
         if remaining <= 0:
             L["cs_consumed"] = 0
         elif remaining >= L["cs_produced"]:

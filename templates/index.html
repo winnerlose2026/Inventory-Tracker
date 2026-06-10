@@ -1994,8 +1994,9 @@ async function loadInventory() {
                   // / cs_remaining already FIFO-applied. Fall back to L.cs if
                   // we're talking to an older server that hasn't redeployed.
                   const lotCs = lots.reduce((s, L) => s + (L.cs_produced ?? L.cs ?? 0), 0);
-                  const lotRemainingCs = lots.reduce((s, L) => s + (L.cs_remaining ?? L.cs ?? 0), 0);
-                  const activeLotCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
+                  const lotRemainingCs = lots.reduce((s, L) => s + (L.is_in_transit ? 0 : (L.cs_remaining ?? L.cs ?? 0)), 0);
+                  const lotInTransitCs = lots.reduce((s, L) => s + (L.is_in_transit ? (L.cs_produced ?? L.cs ?? 0) : 0), 0);
+                  const activeLotCount = lots.filter(L => !L.is_in_transit && (L.cs_remaining ?? L.cs ?? 0) > 0).length;
                   const hasLots = lots.length > 0;
                   const rowId = 'lots-' + Math.random().toString(36).slice(2, 10);
                   const chevron = hasLots
@@ -2011,7 +2012,7 @@ async function loadInventory() {
                     .replace(/\s{2,}/g, ' ')
                     .trim();
                   return `<tr class="sku-row">
-                    <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s), ' + fmtCs(lotRemainingCs) + ' cs counted toward on-hand (FIFO). ' + lots.length + ' lot(s) on record, ' + fmtCs(lotCs) + ' cs total.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}${lotInTransitCs > 0 ? ' <span class="badge" style="background:rgba(5,23,71,.06);color:var(--muted)" title="Produced but not yet arrived; not counted toward on-hand until the arrival date.">+' + fmtCs(lotInTransitCs) + ' in transit</span>' : ''}</td>
                     <td data-label="Qty" style="font-weight:600;${qtyCritical ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td data-label="On Order">${renderOnOrder(i)}</td>
                     <td data-label="Unit">${escHtml(i.unit)}</td>
@@ -2027,17 +2028,19 @@ async function loadInventory() {
                     // pre-computed on the server. The "Next out" lot is the
                     // oldest one with cs_remaining > 0 — that's the lot the
                     // next usage event will draw down.
-                    const lotRemaining = lots.reduce((s, L) => s + (L.cs_remaining ?? L.cs ?? 0), 0);
-                    const activeCount = lots.filter(L => (L.cs_remaining ?? L.cs ?? 0) > 0).length;
-                    const depletedCount = lots.length - activeCount;
+                    const lotRemaining = lots.reduce((s, L) => s + (L.is_in_transit ? 0 : (L.cs_remaining ?? L.cs ?? 0)), 0);
+                    const inTransitCs = lots.reduce((s, L) => s + (L.is_in_transit ? (L.cs_produced ?? L.cs ?? 0) : 0), 0);
+                    const inTransitCount = lots.filter(L => L.is_in_transit).length;
+                    const activeCount = lots.filter(L => !L.is_in_transit && (L.cs_remaining ?? L.cs ?? 0) > 0).length;
+                    const depletedCount = lots.filter(L => !L.is_in_transit && (L.cs_remaining ?? L.cs ?? 0) <= 0 && (L.cs_produced ?? 0) > 0).length;
                     return `<tr id="${rowId}" class="lot-detail-row" style="display:none;background:var(--surface-alt,#f7f7f9)">
                     <td colspan="8" style="padding:8px 16px 12px 30px">
                       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
                         <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
                         ${lots.length} lot${lots.length === 1 ? '' : 's'} &middot;
                         ${fmtCs(lotCs)} cs produced &middot;
-                        <span style="color:var(--green)">${fmtCs(lotRemaining)} cs remaining</span> &middot;
-                        ${activeCount} active${depletedCount ? ` &middot; ${depletedCount} depleted` : ''}
+                        <span style="color:var(--green)">${fmtCs(lotRemaining)} cs on-hand</span> &middot;
+                        ${activeCount} active${depletedCount ? ` &middot; ${depletedCount} depleted` : ''}${inTransitCount ? ` &middot; <span style="color:var(--accent)">${inTransitCount} in transit (${fmtCs(inTransitCs)} cs incoming)</span>` : ''}
                       </div>
                       <table style="margin:0;font-size:12px;width:auto;min-width:60%">
                         <thead><tr>
@@ -2051,19 +2054,24 @@ async function loadInventory() {
                         <tbody>
                           ${lots.map(L => {
                             const produced = L.cs_produced ?? L.cs ?? 0;
+                            const inTransit = !!L.is_in_transit;
                             const remaining = L.cs_remaining ?? produced;
                             const consumed = L.cs_consumed ?? (produced - remaining);
-                            const nextOut = !!L.is_next_out;
-                            const depleted = remaining <= 0 && produced > 0;
-                            const rowBg = nextOut ? 'background:rgba(240,179,35,.18)' : '';
-                            const statusHtml = nextOut
+                            const nextOut = !inTransit && !!L.is_next_out;
+                            const depleted = !inTransit && remaining <= 0 && produced > 0;
+                            const rowBg = nextOut ? 'background:rgba(240,179,35,.18)' : inTransit ? 'background:rgba(5,23,71,.04)' : '';
+                            const statusHtml = inTransit
+                              ? '<span class="badge badge-blue" title="Produced but not yet arrived; not counted toward on-hand until the arrival date">In Transit</span>'
+                              : nextOut
                               ? '<span class="badge badge-yellow" title="FIFO: next usage draws from this lot first">Next out</span>'
                               : depleted
                                 ? '<span class="badge badge-red" title="Lot fully consumed under FIFO">Depleted</span>'
                                 : (remaining < produced && remaining > 0)
                                   ? '<span class="badge badge-blue" title="Partially consumed under FIFO">Partial</span>'
                                   : '<span class="badge badge-green">Active</span>';
-                            const remainingStyle = depleted
+                            const remainingStyle = inTransit
+                              ? 'color:var(--muted);font-style:italic'
+                              : depleted
                               ? 'color:var(--muted);text-decoration:line-through'
                               : nextOut
                                 ? 'color:var(--accent);font-weight:700'
