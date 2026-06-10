@@ -855,6 +855,27 @@ def reverse_usage(timestamp: str) -> dict:
     }
 
 
+def _pair_on_hand_cs(warehouse: str, variety: str,
+                     inventory_snapshot: Optional[dict] = None) -> Optional[float]:
+    """Current on-hand quantity (cases) for a ``(warehouse, variety)`` pair.
+
+    Sums ``quantity`` across every inventory SKU whose warehouse matches and
+    whose name-derived variety matches. Returns ``None`` when no SKU matches
+    so the caller can fall back to the usage ledger rather than assume zero.
+    """
+    snap = inventory_snapshot if inventory_snapshot is not None else load_inventory()
+    total = 0.0
+    found = False
+    for it in (snap or {}).values():
+        if (it.get("warehouse") or "") != warehouse:
+            continue
+        if _variety_from_name(it.get("name") or "") != variety:
+            continue
+        total += float(it.get("quantity") or 0)
+        found = True
+    return total if found else None
+
+
 def compute_lot_fifo_state(warehouse: str, variety: str,
                            production_records: Optional[list] = None,
                            usage_records: Optional[list] = None,
@@ -916,8 +937,9 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
                              L["lot"]))
 
     # 3. Sum positive consumption for this pair from the usage ledger.
+    #    Retained only as a fallback for when on-hand can't be resolved.
     inv_for_lookup = None
-    total_consumed = 0.0
+    usage_consumed = 0.0
     for e in usage_records:
         if e.get("reversed"):
             continue
@@ -940,7 +962,23 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
                 it.get("name") or e.get("item_name") or "")
         if e_wh != warehouse or e_var != variety:
             continue
-        total_consumed += amt
+        usage_consumed += amt
+
+    # 3b. Reconcile to CURRENT ON-HAND. The lot ledger must total the cases
+    #     actually sitting in the warehouse. Physical recounts, vendor-truth
+    #     snapshots and distributor syncs adjust on-hand WITHOUT emitting a
+    #     per-lot usage event, so draining purely by the usage ledger lets
+    #     lot remaining drift far above reality (e.g. Ocala Asiago: 280 cs
+    #     produced, ~3 cs of usage logged, but only ~137 cs on hand). Anchor
+    #     the FIFO drain to on-hand -- consume (produced - on_hand) from the
+    #     OLDEST lots so the NEWEST cases are what remain. Fall back to the
+    #     usage-ledger sum only when the SKU can't be matched.
+    total_produced = sum(L["cs_produced"] for L in lots)
+    on_hand = _pair_on_hand_cs(warehouse, variety, inventory_snapshot)
+    if on_hand is None:
+        total_consumed = usage_consumed
+    else:
+        total_consumed = max(0.0, total_produced - on_hand)
 
     # 4. Walk oldest-first, drain FIFO.
     remaining = total_consumed

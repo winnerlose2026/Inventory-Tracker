@@ -165,6 +165,9 @@
   .badge-violet { background: rgba(124,58,237,.14); color: #6D28D9; }
   /* Neutral grey bubble for terminal/dimmed states (e.g. Cancelled). */
   .badge-gray { background: rgba(107,102,87,.12); color: var(--muted); }
+  /* OUT of stock -- solid red, flashing to pull the eye. */
+  .badge-out { background: var(--red); color: #fff; animation: badgeBlink 1.1s steps(1, end) infinite; }
+  @keyframes badgeBlink { 50% { opacity: .2; } }
 
   /* Buttons — pill primary, rounded for everything else */
   .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 18px; border-radius: var(--radius-pill); border: 1px solid transparent; cursor: pointer; font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: .02em; transition: all .15s; text-transform: uppercase; }
@@ -629,13 +632,6 @@
   @media (max-width: 1023px) {
     .inv-table .wks-full { display: none; }
     .inv-table .wks-abbr { display: inline; }
-    #low-stock-card table { width: 100% !important; }
-    #low-stock-card thead th:nth-child(1),
-    #low-stock-card thead th:nth-child(3),
-    #low-stock-card thead th:nth-child(6),
-    #low-stock-card tbody td:nth-child(1),
-    #low-stock-card tbody td:nth-child(3),
-    #low-stock-card tbody td:nth-child(6) { display: none; }
     #low-stock-card th, #low-stock-card td { padding: 9px 8px; font-size: 13px; white-space: normal; word-break: normal; }
   }
   /* ---- Mobile/tablet (<=1023px): carry the slim-table treatment to the
@@ -746,11 +742,9 @@
       <div class="card" id="low-stock-card" style="display:none;margin-bottom:20px">
         <div class="card-header">
           <span class="card-title">⚠️ Low Stock Alerts</span>
+          <span id="low-stock-count" style="color:var(--muted);font-size:12px"></span>
         </div>
-        <table>
-          <thead><tr><th>SKU</th><th>Name</th><th>Category</th><th>Qty</th><th>Threshold</th><th>Unit</th><th></th></tr></thead>
-          <tbody id="low-stock-tbody"></tbody>
-        </table>
+        <div id="low-stock-body" style="padding:0 4px 8px"></div>
       </div>
 
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
@@ -1555,31 +1549,119 @@ async function api(url, method = 'GET', body = null) {
 // -------------------------------------------------------------------------
 // Dashboard
 // -------------------------------------------------------------------------
-async function refreshLowStock() {
+function invStatusInfo(item) {
+  // Single source of truth for threshold classification, shared by the
+  // inventory table and the Low Stock Alerts card.
+  //   qty <= 0                    -> OUT   (flashing red)
+  //   weeks < 2                   -> Low   (red)
+  //   2 <= weeks < 4              -> Short (yellow)
+  //   weeks >= 4 / no usage rate  -> OK    (green / standard)
+  const qty = +(item.quantity || 0);
+  const weekly = +(item.weekly_usage || 0);
+  const weeks = weekly > 0 ? (qty / weekly) : null;
+  let key, badge;
+  if (qty <= 0) {
+    key = 'OUT';
+    badge = '<span class="badge badge-out" title="Out of stock">OUT</span>';
+  } else if (weeks !== null && weeks < 2) {
+    key = 'Low';
+    badge = '<span class="badge badge-red" title="Under 2 weeks of supply">Low</span>';
+  } else if (weeks !== null && weeks < 4) {
+    key = 'Short';
+    badge = '<span class="badge badge-yellow" title="Between 2 and 4 weeks of supply">Short</span>';
+  } else {
+    key = 'OK';
+    badge = '<span class="badge badge-green">OK</span>';
+  }
+  const weeksColor = weeks === null ? 'color:var(--muted)'
+    : weeks < 2 ? 'color:var(--red);font-weight:600'
+    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
+    : '';
+  return { key, badge, weeks, weeksColor, qty, weekly };
+}
+
+function _invDisplayName(name) {
+  return (name || '')
+    .replace(/\s*\[[^\]]*\]\s*$/, '')
+    .replace(/\s+\d+\s*oz\b/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// One alert row, matching the Inventory table's columns exactly.
+function alertRowHtml(i) {
+  const stat = invStatusInfo(i);
+  const weekly = stat.weekly, weeks = stat.weeks;
+  const qtyCritical = (stat.key === 'OUT' || stat.key === 'Low');
+  return `<tr class="sku-row">
+    <td data-label="Variety" style="font-weight:600">${escHtml(_invDisplayName(i.name))}</td>
+    <td data-label="Qty" style="font-weight:600;${qtyCritical ? 'color:var(--red)' : ''}">${(+(i.quantity || 0)).toFixed(0)}</td>
+    <td data-label="On Order">${renderOnOrder(i)}</td>
+    <td data-label="Unit">${escHtml(i.unit)}</td>
+    <td data-label="Price">${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+    <td data-label="Weekly Usage">${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+    <td data-label="Weeks Remaining" style="${stat.weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+    <td data-label="Status">${stat.badge}</td>
+  </tr>`;
+}
+
+// Low Stock Alerts: every SKU in Short / Low / OUT, grouped by warehouse,
+// using the same columns as the Inventory table. Pass the grouped data
+// (distributor -> warehouse -> items) when you already have it; otherwise
+// it fetches /api/distributors itself.
+async function refreshLowStock(groups) {
   const lowCard = document.getElementById('low-stock-card');
-  const lowTbody = document.getElementById('low-stock-tbody');
-  if (!lowCard || !lowTbody) return;
-  let report;
-  try {
-    report = await api('/api/report');
-  } catch (e) {
+  const body = document.getElementById('low-stock-body');
+  const countEl = document.getElementById('low-stock-count');
+  if (!lowCard || !body) return;
+  if (!groups) {
+    try { groups = await api('/api/distributors'); }
+    catch (e) { return; }
+  }
+  const byWh = {};
+  (groups || []).forEach(g => (g.warehouses || []).forEach(w => (w.items || []).forEach(it => {
+    const key = invStatusInfo(it).key;
+    if (key === 'Short' || key === 'Low' || key === 'OUT') {
+      (byWh[w.warehouse] = byWh[w.warehouse] || []).push(it);
+    }
+  })));
+  const warehouses = Object.keys(byWh).sort();
+  const total = warehouses.reduce((s, w) => s + byWh[w].length, 0);
+  if (total === 0) {
+    lowCard.style.display = 'none';
+    body.innerHTML = '';
+    if (countEl) countEl.textContent = '';
     return;
   }
-  if (report && Array.isArray(report.low_stock) && report.low_stock.length > 0) {
-    lowCard.style.display = '';
-    lowTbody.innerHTML = report.low_stock.map(i => `
-      <tr>
-        <td class="sku">${escHtml(i.name.toUpperCase().replace(/\s+/g,'').slice(0,8))}</td>
-        <td>${escHtml(i.name)}</td>
-        <td><span class="badge badge-purple">${escHtml(i.category)}</span></td>
-        <td style="color:var(--red);font-weight:600">${i.quantity.toFixed(0)}</td>
-        <td>${i.low_stock_threshold}</td>
-        <td>${escHtml(i.unit)}</td>
-        <td><button class="btn btn-warning btn-sm" onclick="openRestockModal('${escAttr(i.name)}')">Restock</button></td>
-      </tr>`).join('');
-  } else {
-    lowCard.style.display = 'none';
-  }
+  lowCard.style.display = '';
+  if (countEl) countEl.textContent = `· ${total} SKU${total === 1 ? '' : 's'} need attention`;
+  const sev = { OUT: 0, Low: 1, Short: 2 };
+  body.innerHTML = warehouses.map(w => {
+    const items = byWh[w].slice().sort((a, b) => {
+      const sa = invStatusInfo(a), sb = invStatusInfo(b);
+      if (sev[sa.key] !== sev[sb.key]) return sev[sa.key] - sev[sb.key];
+      const wa = sa.weeks === null ? Infinity : sa.weeks;
+      const wb = sb.weeks === null ? Infinity : sb.weeks;
+      return wa - wb;
+    });
+    return `
+      <div style="padding:14px 16px 4px">
+        <div style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent);margin-bottom:8px">${escHtml(w)}</div>
+        <table class="inv-table">
+          <colgroup>
+            <col style="width:28%"><col style="width:8%"><col style="width:13%"><col style="width:7%">
+            <col style="width:9%"><col style="width:13%"><col style="width:13%"><col style="width:9%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
+              <th>Weekly Usage</th><th><span class="wks-full">Weeks Remaining</span><span class="wks-abbr">Wks</span></th><th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${items.map(alertRowHtml).join('')}</tbody>
+        </table>
+      </div>`;
+  }).join('');
 }
 
 // Back-compat: sync, reversal, and PO-cancel flows call loadDashboard() to
@@ -1698,14 +1780,14 @@ async function loadInventory() {
   // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
   // that used to live on the Distributors tab. It also pulls the lot map
   // so each row can expand a lot-history sub-table.
-  // Inventory is the landing page now; keep the Low Stock Alerts card at the
-  // top of this page in sync on every load (fire-and-forget).
-  refreshLowStock();
+  // Inventory is the landing page now. Build the grouped data once and feed
+  // it to the Low Stock Alerts card so its rows match the table exactly.
   const [groups, lotMap] = await Promise.all([
     api('/api/distributors'),
     api('/api/production/lots-by-pair').catch(() => ({})),
   ]);
   window._lotMapByPair = lotMap || {};
+  refreshLowStock(groups);
 
   // Cache flat items for Edit/Use/Restock modal lookups.
   inventoryCache = [];
@@ -1783,14 +1865,11 @@ async function loadInventory() {
               </thead>
               <tbody>
                 ${w.items.map(i => {
-                  const low = i.quantity <= i.low_stock_threshold;
-                  const weekly = i.weekly_usage || 0;
-                  const weeks = weekly > 0 ? (i.quantity / weekly) : null;
-                  const short = weeks !== null && weeks < 4;
-                  const weeksColor = weeks === null ? 'color:var(--muted)'
-                    : weeks < 2 ? 'color:var(--red);font-weight:600'
-                    : weeks < 4 ? 'color:var(--yellow);font-weight:600'
-                    : '';
+                  const stat = invStatusInfo(i);
+                  const weekly = stat.weekly;
+                  const weeks = stat.weeks;
+                  const weeksColor = stat.weeksColor;
+                  const qtyCritical = (stat.key === 'OUT' || stat.key === 'Low');
                   const variety = (i.name || '').split(' Bagel')[0];
                   const pairKey = `${w.warehouse}|${variety}`;
                   const lots = (window._lotMapByPair && window._lotMapByPair[pairKey]) || [];
@@ -1815,14 +1894,14 @@ async function loadInventory() {
                     .replace(/\s{2,}/g, ' ')
                     .trim();
                   return `<tr class="sku-row">
-                    <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${short ? ' <span class="badge badge-red" title="Under 4 weeks of supply">&lt;4wk</span>' : ''}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
-                    <td data-label="Qty" style="font-weight:600;${low ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s) with ' + fmtCs(lotRemainingCs) + ' cs remaining (FIFO). ' + lots.length + ' lot(s) produced total, ' + fmtCs(lotCs) + ' cs across all production history.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}</td>
+                    <td data-label="Qty" style="font-weight:600;${qtyCritical ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
                     <td data-label="On Order">${renderOnOrder(i)}</td>
                     <td data-label="Unit">${escHtml(i.unit)}</td>
                     <td data-label="Price">${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
                     <td data-label="Weekly Usage">${weekly > 0 ? weekly.toFixed(1) + '/wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
                     <td data-label="Weeks Remaining" style="${weeksColor}">${weeks !== null ? weeks.toFixed(1) + ' wk' : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-                    <td data-label="Status">${low ? '<span class="badge badge-red">Low</span>' : short ? '<span class="badge badge-yellow">Short</span>' : '<span class="badge badge-green">OK</span>'}</td>
+                    <td data-label="Status">${stat.badge}</td>
                   </tr>
                   ${hasLots ? (() => {
                     // FIFO rule: each (warehouse, variety) lot list comes
