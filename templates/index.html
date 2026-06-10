@@ -147,6 +147,11 @@
   .inv-table th, .inv-table td { overflow: hidden; text-overflow: ellipsis; }
   .inv-table td:first-child { white-space: normal; }
   .inv-table td.actions-col { white-space: nowrap; overflow: visible; }
+  /* Pending POs tables: fixed layout + shared colgroup so the In Transit,
+     In Production, and main tables line up column-for-column. */
+  .po-table { table-layout: fixed; width: 100%; }
+  .po-table th, .po-table td { overflow: hidden; text-overflow: ellipsis; }
+  .po-table td:nth-child(4) { white-space: normal; }
 
   /* Stock bar */
   .bar-wrap { background: var(--border); border-radius: 4px; height: 6px; width: 100px; overflow: hidden; }
@@ -614,6 +619,7 @@
   @media (max-width: 1023px) {
     .inv-table { width: 100% !important; }
     .inv-table > colgroup { display: none; }
+    .po-table > colgroup { display: none; }
     .inv-table > thead th:nth-child(3),
     .inv-table > thead th:nth-child(4),
     .inv-table > thead th:nth-child(5),
@@ -650,11 +656,15 @@
     #pending-inprod-thead th:nth-child(2), #pending-inprod-tbody td:nth-child(2),
     #pending-inprod-thead th:nth-child(4), #pending-inprod-tbody td:nth-child(4),
     #pending-inprod-thead th:nth-child(6), #pending-inprod-tbody td:nth-child(6),
-    #pending-inprod-thead th:nth-child(8), #pending-inprod-tbody td:nth-child(8) { display: none; }
+    #pending-inprod-thead th:nth-child(7), #pending-inprod-tbody td:nth-child(7),
+    #pending-inprod-thead th:nth-child(9), #pending-inprod-tbody td:nth-child(9),
+    #pending-inprod-thead th:nth-child(10), #pending-inprod-tbody td:nth-child(10) { display: none; }
     #pending-intransit-thead th:nth-child(2), #pending-intransit-tbody td:nth-child(2),
     #pending-intransit-thead th:nth-child(4), #pending-intransit-tbody td:nth-child(4),
     #pending-intransit-thead th:nth-child(6), #pending-intransit-tbody td:nth-child(6),
-    #pending-intransit-thead th:nth-child(8), #pending-intransit-tbody td:nth-child(8) { display: none; }
+    #pending-intransit-thead th:nth-child(7), #pending-intransit-tbody td:nth-child(7),
+    #pending-intransit-thead th:nth-child(9), #pending-intransit-tbody td:nth-child(9),
+    #pending-intransit-thead th:nth-child(10), #pending-intransit-tbody td:nth-child(10) { display: none; }
     /* Pending POs - main table: keep PO#, Warehouse, Total cs, Arrival */
     #pending-thead-row th:nth-child(2), #pending-tbody td:nth-child(2),
     #pending-thead-row th:nth-child(4), #pending-tbody td:nth-child(4),
@@ -796,7 +806,8 @@
           <strong>Shipped &middot; en route to arrival</strong>
           <span id="pending-intransit-count" style="color:var(--muted);font-size:12px"></span>
         </div>
-        <table>
+        <table class="po-table">
+          <colgroup><col style="width:11%"><col style="width:11%"><col style="width:12%"><col style="width:19%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:6%"></colgroup>
           <thead>
             <tr id="pending-intransit-thead">
               <th>PO #</th>
@@ -804,8 +815,10 @@
               <th>Warehouse</th>
               <th>Items</th>
               <th style="text-align:right">Total cs</th>
+              <th>Ordered</th>
               <th>Ship Date</th>
               <th>Arrival</th>
+              <th>30-day ETA</th>
               <th>Status</th>
             </tr>
           </thead>
@@ -821,7 +834,8 @@
           <strong>Shipping within 7 days</strong>
           <span id="pending-inprod-count" style="color:var(--muted);font-size:12px"></span>
         </div>
-        <table>
+        <table class="po-table">
+          <colgroup><col style="width:11%"><col style="width:11%"><col style="width:12%"><col style="width:19%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:6%"></colgroup>
           <thead>
             <tr id="pending-inprod-thead">
               <th>PO #</th>
@@ -829,8 +843,10 @@
               <th>Warehouse</th>
               <th>Items</th>
               <th style="text-align:right">Total cs</th>
+              <th>Ordered</th>
               <th>Ship Date</th>
               <th>Arrival</th>
+              <th>30-day ETA</th>
               <th>Status</th>
             </tr>
           </thead>
@@ -874,7 +890,8 @@
             </select>
           </div>
         </div>
-        <table>
+        <table class="po-table">
+          <colgroup><col style="width:11%"><col style="width:11%"><col style="width:12%"><col style="width:19%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:8%"><col style="width:8%"><col style="width:6%"></colgroup>
           <thead>
             <tr id="pending-thead-row">
               <th class="sortable" data-sort="po_number">PO # <span class="sort-ind"></span></th>
@@ -4111,8 +4128,10 @@ function renderInProductionSection(list) {
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
       <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap">${g.ordered_at ? formatDate(g.ordered_at) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td style="white-space:nowrap;font-weight:600">${ship}</td>
       <td style="white-space:nowrap">${arrival}</td>
+      <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td>${_poTagHtml(g._state || 'in_production')}</td>
     </tr>`;
   }).join('');
@@ -4145,8 +4164,10 @@ function renderInTransitSection(list) {
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
       <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap">${g.ordered_at ? formatDate(g.ordered_at) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td style="white-space:nowrap">${ship}</td>
       <td style="white-space:nowrap;font-weight:600">${arrival}</td>
+      <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td>${_poTagHtml(g._state || 'in_transit')}</td>
     </tr>`;
   }).join('');
