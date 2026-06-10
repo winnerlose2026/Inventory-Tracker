@@ -959,6 +959,16 @@
                     padding-top:14px;border-top:1px solid var(--border)"></div>
       </div>
 
+      <!-- Lead times: PO placed -> arrival, departure -> arrival, by warehouse. -->
+      <div class="card" id="freight-leadtime-card" style="padding:14px 20px">
+        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <strong style="font-size:16px">Lead Times</strong>
+          <span class="subtitle" style="margin:0">order &rarr; arrival and departure &rarr; arrival, averaged by warehouse</span>
+        </div>
+        <div id="freight-leadtime-kpis" style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));margin-bottom:8px"></div>
+        <div id="freight-leadtime-body"></div>
+      </div>
+
       <div class="card" style="padding:14px 20px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div>
@@ -1586,7 +1596,7 @@ function refresh(page) {
   else if (page === 'distributors') showPage('inventory');
   else if (page === 'report') loadReport();
   else if (page === 'pending-pos') loadPendingPOs();
-  else if (page === 'freight') loadFreight();
+  else if (page === 'freight') { loadFreight(); loadFreightLeadTimes(); }
   else if (page === 'production') loadProduction();
   else if (page === 'traceability') initTraceability();
 }
@@ -4546,6 +4556,39 @@ function setFreightMetric(m) {
   );
   if (btn) btn.classList.add('active');
   drawFreightChart();
+}
+
+async function loadFreightLeadTimes() {
+  const kpis = document.getElementById('freight-leadtime-kpis');
+  const body = document.getElementById('freight-leadtime-body');
+  if (!kpis || !body) return;
+  let data;
+  try { data = await api('/api/freight/lead-times'); }
+  catch (e) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; body.innerHTML = ''; return; }
+  if (!data || !data.ok) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; body.innerHTML = ''; return; }
+  const o = data.overall || {};
+  const kpi = a => (a && a.n)
+    ? `${a.avg} days <span style="color:var(--muted);font-size:12px;font-weight:400">(median ${a.median}, n=${a.n})</span>`
+    : '<span style="color:var(--muted)">&mdash;</span>';
+  kpis.innerHTML = `
+    <div><div class="subtitle" style="margin-bottom:2px">PO placed &rarr; arrival</div>
+         <div style="font-size:22px;font-weight:700">${kpi(o.order_to_arrival)}</div></div>
+    <div><div class="subtitle" style="margin-bottom:2px">Departure &rarr; arrival</div>
+         <div style="font-size:22px;font-weight:700">${kpi(o.ship_to_arrival)}</div></div>`;
+  const cell = a => (a && a.n)
+    ? `${a.avg} <span style="color:var(--muted);font-size:11px">(med ${a.median}, n=${a.n})</span>`
+    : '<span style="color:var(--muted)">&mdash;</span>';
+  const rows = (data.by_warehouse || []).map(w =>
+    `<tr><td style="font-weight:600">${escHtml(w.warehouse)}</td>
+      <td style="text-align:right">${cell(w.order_to_arrival)}</td>
+      <td style="text-align:right">${cell(w.ship_to_arrival)}</td></tr>`).join('');
+  body.innerHTML = rows
+    ? `<table style="margin:0">
+        <thead><tr><th>Warehouse</th><th style="text-align:right">PO placed &rarr; arrival (days)</th><th style="text-align:right">Departure &rarr; arrival (days)</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="subtitle" style="margin:8px 0 0;font-size:11px">Order&rarr;arrival uses POs with a recorded order date; departure&rarr;arrival uses the actual freight ship date vs. recorded/expected arrival. Gaps over 120 days are excluded as noise.</div>`
+    : '<div class="subtitle">Not enough dated POs yet to compute lead times.</div>';
 }
 
 async function loadFreight() {

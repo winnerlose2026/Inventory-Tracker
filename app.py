@@ -1492,6 +1492,117 @@ def api_freight_ship_date_index():
     return jsonify({"ok": True, "index": _freight_ship_date_index()})
 
 
+@app.route("/api/freight/lead-times")
+def api_freight_lead_times():
+    """Lead-time metrics for the Freight tab.
+
+    Per PO we gather: ordered_at (from the live on_order entry), ship_date
+    (the ACTUAL Lineage freight ship date when available, else the PO's),
+    and arrival (the on_order arrival estimate, or the recorded rollover
+    timestamp once arrived). From those:
+      - order_to_arrival = arrival - ordered_at
+      - ship_to_arrival  = arrival - ship_date
+    Aggregated overall and by warehouse (avg / median / n / min / max).
+    Differences outside 0..120 days are dropped as data noise.
+    """
+    import re as _re
+    from datetime import date as _date
+    from inventory_tracker import load_inventory, load_usage
+
+    inv = load_inventory()
+    usage = load_usage()
+    freight_idx = _freight_ship_date_index()
+
+    def _d(s):
+        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", str(s or ""))
+        if not m:
+            return None
+        try:
+            return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    pos: dict = {}  # po_number -> {ordered, ship, arrival, warehouse}
+    for it in inv.values():
+        wh = it.get("warehouse") or ""
+        for e in (it.get("on_order") or []):
+            po = (e.get("po_number") or "").strip()
+            if not po:
+                continue
+            r = pos.setdefault(po, {"ordered": "", "ship": "", "arrival": "", "warehouse": wh})
+            if not r["ordered"] and e.get("ordered_at"):
+                r["ordered"] = e["ordered_at"]
+            if not r["ship"] and e.get("ship_date"):
+                r["ship"] = e["ship_date"]
+            if not r["arrival"] and e.get("arrival_date"):
+                r["arrival"] = e["arrival_date"]
+            if not r["warehouse"]:
+                r["warehouse"] = wh
+
+    meta = {k: (it.get("warehouse") or "") for k, it in inv.items()}
+    for ev in usage:
+        if (ev.get("source") or "") != "on_order_rollover" or ev.get("reversed"):
+            continue
+        po = (ev.get("po_number") or "").strip()
+        if not po:
+            continue
+        r = pos.setdefault(po, {"ordered": "", "ship": "", "arrival": "", "warehouse": ""})
+        ts = (ev.get("timestamp") or "")[:10]
+        if ts and ts > (r["arrival"] or ""):
+            r["arrival"] = ts
+        if not r["warehouse"]:
+            r["warehouse"] = meta.get(ev.get("item_key") or "", "")
+
+    # Actual freight ship date wins when present.
+    for po, r in pos.items():
+        sd = freight_idx.get(_norm_po_key(po))
+        if sd:
+            r["ship"] = sd
+
+    def _days(a, b):
+        da, db = _d(a), _d(b)
+        if not da or not db:
+            return None
+        n = (db - da).days
+        return n if 0 <= n <= 120 else None
+
+    per_po = []
+    for po, r in pos.items():
+        o2a = _days(r["ordered"], r["arrival"])
+        s2a = _days(r["ship"], r["arrival"])
+        if o2a is None and s2a is None:
+            continue
+        per_po.append({"warehouse": r["warehouse"] or "Unassigned",
+                       "order_to_arrival": o2a, "ship_to_arrival": s2a})
+
+    def _agg(vals):
+        vals = sorted(v for v in vals if v is not None)
+        if not vals:
+            return {"n": 0, "avg": None, "median": None, "min": None, "max": None}
+        n = len(vals)
+        mid = n // 2
+        med = vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2
+        return {"n": n, "avg": round(sum(vals) / n, 1), "median": round(med, 1),
+                "min": vals[0], "max": vals[-1]}
+
+    overall = {
+        "order_to_arrival": _agg([p["order_to_arrival"] for p in per_po]),
+        "ship_to_arrival": _agg([p["ship_to_arrival"] for p in per_po]),
+    }
+    by_wh: dict = {}
+    for p in per_po:
+        b = by_wh.setdefault(p["warehouse"], {"o": [], "s": []})
+        b["o"].append(p["order_to_arrival"])
+        b["s"].append(p["ship_to_arrival"])
+    by_warehouse = [{"warehouse": wh,
+                     "order_to_arrival": _agg(v["o"]),
+                     "ship_to_arrival": _agg(v["s"])}
+                    for wh, v in by_wh.items()]
+    by_warehouse.sort(key=lambda x: x["warehouse"])
+    return jsonify({"ok": True, "overall": overall,
+                    "by_warehouse": by_warehouse, "po_count": len(per_po)})
+
+
 @app.route("/api/arrived-pos")
 def api_arrived_pos():
     """List arrived inventory-side POs reconstructed from the usage log.
