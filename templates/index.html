@@ -3577,6 +3577,7 @@ let cwPendingGroups = [];
 // rolled over into quantity), so without this the Arrived view could
 // only ever show Chefs Warehouse POs.
 let arrivedInvGroups = [];
+let freightShipIndex = {};      // normalized PO key -> verified ship date (Lineage freight)
 
 // Status dropdown changed — re-render. All status slices are computed
 // client-side from the full dataset, so no reload is required.
@@ -3626,6 +3627,16 @@ async function loadPendingPOs() {
   } catch (e) {
     console.warn('Failed to load arrived inventory POs:', e);
     arrivedInvGroups = [];
+  }
+
+  // Freight ship-date index: normalized PO key -> verified ship date from a
+  // Lineage freight invoice. Non-fatal on failure.
+  try {
+    const fr = await api('/api/freight/ship-date-index');
+    freightShipIndex = (fr && fr.index) || {};
+  } catch (e) {
+    console.warn('Failed to load freight ship-date index:', e);
+    freightShipIndex = {};
   }
 
   renderPendingPOs();
@@ -3851,6 +3862,30 @@ function _poState(g, now) {
 // arrived inventory POs into one normalized list, each carrying _source
 // and a computed _state. Dedupes arrived records against any PO already
 // represented by a live (inventory / CW) group.
+// Normalize a PO/reference token for matching against the freight index.
+// Mirrors _norm_po_key() on the server (uppercase, drop HHB- prefix, strip
+// surrounding dots/space; leading zeros preserved on purpose).
+function _normPoKey(s) {
+  let t = String(s || '').trim().toUpperCase();
+  if (t.startsWith('HHB-') || t.startsWith('HHB ')) t = t.slice(4);
+  return t.replace(/^\.+|\.+$/g, '').trim();
+}
+
+// Add n days to a YYYY-MM-DD (or ISO) date, returning YYYY-MM-DD.
+function _addDaysISO(iso, n) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return iso || '';
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Green check shown when a ship date is verified by a Lineage freight invoice.
+function _shipVerifiedMark() {
+  return ' <span title="Ship date verified by a Lineage freight invoice" style="color:var(--green);font-weight:700;cursor:help">&#10003;</span>';
+}
+
 function _assemblePendingGroups() {
   let groups = _buildPoGroups(pendingCache).map(g => {
     g._source = 'inventory';
@@ -3900,6 +3935,21 @@ function _assemblePendingGroups() {
     }));
 
   groups = groups.concat(cw).concat(arrived);
+
+  // Freight verification: a matching Lineage freight invoice carries the
+  // ACTUAL ship date, so it is authoritative -- it overrides any manual
+  // entry, sets a derived arrival (ship + 7) for not-yet-arrived POs, and
+  // tags the source so the UI shows a verified check mark. Arrived POs keep
+  // their real arrival_date (the rollover timestamp).
+  groups.forEach(g => {
+    const fd = freightShipIndex[_normPoKey(g.po_number || '')];
+    if (!fd) return;
+    g.ship_date = fd;
+    g.ship_date_source = 'freight';
+    const isArrived = g.status === 'arrived' || g._source === 'arrived';
+    if (!isArrived) g.arrival_date = _addDaysISO(fd, 7);
+  });
+
   const now = new Date();
   groups.forEach(g => { g._state = _poState(g, now); });
   return groups;
@@ -3945,13 +3995,12 @@ function _pendingRowHtml(g, now) {
     : '';
   const source = g._source || 'inventory';
   const terminal = (state === 'arrived' || state === 'cancelled');
-  const shipCell = terminal
-    ? (shipISO
-        ? (formatDate(shipISO) + (g.ship_date_source === 'freight'
-            ? ' <span title="Ship date inferred from a Lineage freight invoice" style="color:var(--muted);font-size:10px;cursor:help">ƒ</span>'
-            : ''))
-        : '<span style="color:var(--muted)">—</span>')
-    : `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
+  const shipVerified = g.ship_date_source === 'freight';
+  const shipCell = shipVerified
+    ? (shipISO ? (formatDate(shipISO) + _shipVerifiedMark()) : '<span style="color:var(--muted)">&mdash;</span>')
+    : terminal
+      ? (shipISO ? formatDate(shipISO) : '<span style="color:var(--muted)">&mdash;</span>')
+      : `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
   const actionsCell = terminal
     ? '<span style="color:var(--muted)">—</span>'
     : `<button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${(g.lines || []).length}, ${(Number(g.total_cs) || 0).toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>`;
@@ -3986,7 +4035,7 @@ function renderInProductionSection(list) {
   card.style.display = '';
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
-    const ship = g.ship_date ? formatDate(g.ship_date) : '<span style="color:var(--muted)">—</span>';
+    const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">—</span>';
     const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
@@ -4020,7 +4069,7 @@ function renderInTransitSection(list) {
   card.style.display = '';
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
-    const ship = g.ship_date ? formatDate(g.ship_date) : '<span style="color:var(--muted)">&mdash;</span>';
+    const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">&mdash;</span>';
     const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>';
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>

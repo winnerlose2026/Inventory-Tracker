@@ -1331,6 +1331,16 @@ def _freight_ship_date_index() -> dict:
     return idx
 
 
+@app.route("/api/freight/ship-date-index")
+def api_freight_ship_date_index():
+    """Expose the freight ship-date index (normalized PO key -> ship_date).
+
+    The Pending POs tab uses this to mark POs whose ship date is verified by
+    an actual Lineage freight invoice, and to drive Ship/Arrival from it.
+    """
+    return jsonify({"ok": True, "index": _freight_ship_date_index()})
+
+
 @app.route("/api/arrived-pos")
 def api_arrived_pos():
     """List arrived inventory-side POs reconstructed from the usage log.
