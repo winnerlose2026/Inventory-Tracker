@@ -741,7 +741,7 @@
            at least one SKU below threshold (see refreshLowStock). -->
       <div class="card" id="low-stock-card" style="display:none;margin-bottom:20px">
         <div class="card-header">
-          <span class="card-title">⚠️ Low Stock Alerts</span>
+          <span class="card-title" style="font-size:22px">⚠️ Low Stock Alerts</span>
           <span id="low-stock-count" style="color:var(--muted);font-size:12px"></span>
         </div>
         <div id="low-stock-body" style="padding:0 4px 8px"></div>
@@ -1609,6 +1609,16 @@ function alertRowHtml(i) {
 // using the same columns as the Inventory table. Pass the grouped data
 // (distributor -> warehouse -> items) when you already have it; otherwise
 // it fetches /api/distributors itself.
+// Collapse/expand one warehouse block inside the Low Stock Alerts card.
+function toggleAlertWh(id, head) {
+  const box = document.getElementById(id);
+  if (!box) return;
+  const open = box.style.display !== 'none';
+  box.style.display = open ? 'none' : '';
+  const chev = head.querySelector('.chev');
+  if (chev) chev.textContent = open ? '▸' : '▾';
+}
+
 async function refreshLowStock(groups) {
   const lowCard = document.getElementById('low-stock-card');
   const body = document.getElementById('low-stock-body');
@@ -1636,7 +1646,7 @@ async function refreshLowStock(groups) {
   lowCard.style.display = '';
   if (countEl) countEl.textContent = `· ${total} SKU${total === 1 ? '' : 's'} need attention`;
   const sev = { OUT: 0, Low: 1, Short: 2 };
-  body.innerHTML = warehouses.map(w => {
+  body.innerHTML = warehouses.map((w, idx) => {
     const items = byWh[w].slice().sort((a, b) => {
       const sa = invStatusInfo(a), sb = invStatusInfo(b);
       if (sev[sa.key] !== sev[sb.key]) return sev[sa.key] - sev[sb.key];
@@ -1644,22 +1654,34 @@ async function refreshLowStock(groups) {
       const wb = sb.weeks === null ? Infinity : sb.weeks;
       return wa - wb;
     });
+    // Each warehouse is a collapsible dropdown (default collapsed) so the
+    // section stays compact. Count badge is red when the warehouse has any
+    // Low/OUT SKU, yellow when it's only Short.
+    const worst = items.reduce((m, it) => Math.min(m, sev[invStatusInfo(it).key]), 3);
+    const countClass = worst <= 1 ? 'badge-red' : 'badge-yellow';
+    const boxId = 'alert-wh-' + idx;
     return `
-      <div style="padding:14px 16px 4px">
-        <div style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent);margin-bottom:8px">${escHtml(w)}</div>
-        <table class="inv-table">
-          <colgroup>
-            <col style="width:28%"><col style="width:8%"><col style="width:13%"><col style="width:7%">
-            <col style="width:9%"><col style="width:13%"><col style="width:13%"><col style="width:9%">
-          </colgroup>
-          <thead>
-            <tr>
-              <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
-              <th>Weekly Usage</th><th><span class="wks-full">Weeks Remaining</span><span class="wks-abbr">Wks</span></th><th>Status</th>
-            </tr>
-          </thead>
-          <tbody>${items.map(alertRowHtml).join('')}</tbody>
-        </table>
+      <div style="border-top:1px solid var(--border)">
+        <div onclick="toggleAlertWh('${boxId}', this)" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;user-select:none">
+          <span class="chev" style="display:inline-block;width:12px;color:var(--muted)">&#9656;</span>
+          <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w)}</span>
+          <span class="badge ${countClass}" title="${items.length} SKU${items.length === 1 ? '' : 's'} need attention">${items.length}</span>
+        </div>
+        <div id="${boxId}" style="display:none;padding:0 16px 12px">
+          <table class="inv-table">
+            <colgroup>
+              <col style="width:28%"><col style="width:8%"><col style="width:13%"><col style="width:7%">
+              <col style="width:9%"><col style="width:13%"><col style="width:13%"><col style="width:9%">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
+                <th>Weekly Usage</th><th><span class="wks-full">Weeks Remaining</span><span class="wks-abbr">Wks</span></th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody>${items.map(alertRowHtml).join('')}</tbody>
+          </table>
+        </div>
       </div>`;
   }).join('');
 }
