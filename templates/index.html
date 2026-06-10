@@ -651,6 +651,10 @@
     #pending-inprod-thead th:nth-child(4), #pending-inprod-tbody td:nth-child(4),
     #pending-inprod-thead th:nth-child(6), #pending-inprod-tbody td:nth-child(6),
     #pending-inprod-thead th:nth-child(8), #pending-inprod-tbody td:nth-child(8) { display: none; }
+    #pending-intransit-thead th:nth-child(2), #pending-intransit-tbody td:nth-child(2),
+    #pending-intransit-thead th:nth-child(4), #pending-intransit-tbody td:nth-child(4),
+    #pending-intransit-thead th:nth-child(6), #pending-intransit-tbody td:nth-child(6),
+    #pending-intransit-thead th:nth-child(8), #pending-intransit-tbody td:nth-child(8) { display: none; }
     /* Pending POs - main table: keep PO#, Warehouse, Total cs, Arrival */
     #pending-thead-row th:nth-child(2), #pending-tbody td:nth-child(2),
     #pending-thead-row th:nth-child(4), #pending-tbody td:nth-child(4),
@@ -784,6 +788,31 @@
           <button class="btn btn-ghost btn-sm" id="pending-filter-pallet" onclick="setPendingFilter('pallet')" title="Total cs not a multiple of 56">Pallet mismatch</button>
           <button class="btn btn-ghost btn-sm active" id="pending-filter-all" onclick="setPendingFilter('all')">All</button>
         </div>
+      </div>
+      <!-- In Transit: POs already shipped (ship date passed) and not yet
+           arrived -- en route between ship and arrival. Surfaced on its own
+           so it's clear what's already moving vs. still to produce/ship. -->
+      <div class="card" id="pending-intransit-card" style="margin-bottom:20px;display:none">
+        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+          <span class="badge badge-blue" style="font-size:10px">In Transit</span>
+          <strong>Shipped &middot; en route to arrival</strong>
+          <span id="pending-intransit-count" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <table>
+          <thead>
+            <tr id="pending-intransit-thead">
+              <th>PO #</th>
+              <th>Distributor</th>
+              <th>Warehouse</th>
+              <th>Items</th>
+              <th style="text-align:right">Total cs</th>
+              <th>Ship Date</th>
+              <th>Arrival</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="pending-intransit-tbody"></tbody>
+        </table>
       </div>
       <!-- In Production: POs whose ship date lands within the next 7 days
            (today → +7). Independent of the Status dropdown below — these
@@ -3683,6 +3712,19 @@ function renderPendingPOs() {
     g._state !== 'arrived' && g._state !== 'cancelled' &&
     _shipInProductionWindow(g.ship_date, now)));
 
+  // --- In Transit section ---------------------------------------------
+  // POs already shipped (ship date passed) and not yet arrived -- en route
+  // between ship and arrival. Like In Production, this is window-based
+  // (independent of the Overdue tag) so a shipped-but-overdue PO still shows
+  // here. Honors the same shared distributor/warehouse/search filters.
+  renderInTransitSection(groups.filter(g => {
+    if (g._state === 'arrived' || g._state === 'cancelled') return false;
+    const ship = _poDate(g.ship_date);
+    if (!ship) return false;
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return ship < today;
+  }));
+
   // --- Main table -----------------------------------------------------
   // Status dropdown maps onto the computed tag state.
   const statusF = _currentPendingStatus();
@@ -3795,7 +3837,13 @@ function _poState(g, now) {
     if (cutoff < now) return 'overdue';
   }
   if (_shipInProductionWindow(g.ship_date, now)) return 'in_production';
-  if ((g.ship_date || '').trim()) return 'in_transit';
+  const ship = _poDate(g.ship_date);
+  if (ship) {
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    // Ship date already passed = en route between ship and arrival; a ship
+    // date still in the future = being produced to ship.
+    return ship < today ? 'in_transit' : 'in_production';
+  }
   return 'open';
 }
 
@@ -3949,6 +3997,40 @@ function renderInProductionSection(list) {
       <td style="white-space:nowrap;font-weight:600">${ship}</td>
       <td style="white-space:nowrap">${arrival}</td>
       <td>${_poTagHtml(g._state || 'in_production')}</td>
+    </tr>`;
+  }).join('');
+}
+
+// In Transit: POs already shipped (ship date passed) and not yet arrived.
+// Sorted by soonest arrival so what's landing next is on top. Arrival is the
+// emphasized column here (vs. ship date in the In Production section).
+function renderInTransitSection(list) {
+  const card = document.getElementById('pending-intransit-card');
+  const tbody = document.getElementById('pending-intransit-tbody');
+  const countEl = document.getElementById('pending-intransit-count');
+  if (!card || !tbody) return;
+  list = (list || []).slice()
+    .sort((a, b) => (a.arrival_date || a.eta || '').localeCompare(b.arrival_date || b.eta || ''));
+  if (list.length === 0) {
+    card.style.display = 'none';
+    tbody.innerHTML = '';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  card.style.display = '';
+  if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
+  tbody.innerHTML = list.map(g => {
+    const ship = g.ship_date ? formatDate(g.ship_date) : '<span style="color:var(--muted)">&mdash;</span>';
+    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>';
+    return `<tr>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td>${distributorBadge(g.distributor)}</td>
+      <td>${_poWarehouseLabel(g)}</td>
+      ${_poItemsCellHtml(g)}
+      <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span></td>
+      <td style="white-space:nowrap">${ship}</td>
+      <td style="white-space:nowrap;font-weight:600">${arrival}</td>
+      <td>${_poTagHtml(g._state || 'in_transit')}</td>
     </tr>`;
   }).join('');
 }
