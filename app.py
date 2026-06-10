@@ -1097,6 +1097,7 @@ def api_freight_scan():
     parsed_invoices: list[dict] = []
     diag_atts_seen = 0
     lineage_attachment_samples: list = []
+    raw_text_samples: list = []
     diag_zips = 0
     diag_pdfs_in_zip = 0
     diag_parse_none = 0
@@ -1249,6 +1250,12 @@ def api_freight_scan():
                                         f"({len(pb)}b) txt={_t!r}")
                                 continue
                             parsed_invoices.append(asdict(inv))
+                            if dry_run and len(raw_text_samples) < 2:
+                                try:
+                                    from integrations.lineage_freight_parser import _pdf_text as _pt
+                                    raw_text_samples.append({"file": fname, "text": _pt(pb)[:4000]})
+                                except Exception as _e:  # noqa: BLE001
+                                    raw_text_samples.append({"file": fname, "text": f"<err {_e}>"})
                 # Next page
                 list_url = page.get("@odata.nextLink")
     except urllib.error.HTTPError as exc:
@@ -1312,6 +1319,7 @@ def api_freight_scan():
             "top_sender_domains": top_domains,
             "sample_lineage_matches": lineage_subjects,
             "lineage_attachment_samples": lineage_attachment_samples,
+            "raw_text_samples": raw_text_samples,
             "diag": {
                 "pypdf_version":        (lambda:
                     __import__("pypdf").__version__ if hasattr(__import__("pypdf"), "__version__") else "?")(),
