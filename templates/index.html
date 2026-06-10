@@ -959,16 +959,6 @@
                     padding-top:14px;border-top:1px solid var(--border)"></div>
       </div>
 
-      <!-- Lead times: PO placed -> arrival, departure -> arrival, by warehouse. -->
-      <div class="card" id="freight-leadtime-card" style="padding:14px 20px">
-        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px">
-          <strong style="font-size:16px">Lead Times</strong>
-          <span class="subtitle" style="margin:0">order &rarr; arrival and departure &rarr; arrival, averaged by warehouse</span>
-        </div>
-        <div id="freight-leadtime-kpis" style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));margin-bottom:8px"></div>
-        <div id="freight-leadtime-body"></div>
-      </div>
-
       <div class="card" style="padding:14px 20px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
           <div>
@@ -986,6 +976,19 @@
         <div style="position:relative;height:340px">
           <canvas id="freight-chart"></canvas>
         </div>
+      </div>
+
+      <!-- Lead times: PO placed -> arrival (total) vs departure -> arrival (transit), by warehouse. -->
+      <div class="card" id="freight-leadtime-card" style="padding:14px 20px">
+        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <strong style="font-size:16px">Lead Times</strong>
+          <span class="subtitle" style="margin:0">PO placed &rarr; arrival (total) vs. departure &rarr; arrival (transit), by warehouse</span>
+        </div>
+        <div id="freight-leadtime-kpis" style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));margin-bottom:10px"></div>
+        <div style="position:relative;height:320px">
+          <canvas id="freight-leadtime-chart"></canvas>
+        </div>
+        <div id="freight-leadtime-note" class="subtitle" style="margin:8px 0 0;font-size:11px"></div>
       </div>
 
       <div class="card">
@@ -4538,6 +4541,7 @@ let _freightSummary    = {};
 let _freightRangeDays  = 90;           // 90 / 180 / 365 / 0 (all)
 let _freightMetric     = "total";      // total | per_pallet | per_case | pallets
 let _freightChart      = null;
+let _leadtimeChart     = null;
 
 function setFreightRange(days) {
   _freightRangeDays = days;
@@ -4560,35 +4564,48 @@ function setFreightMetric(m) {
 
 async function loadFreightLeadTimes() {
   const kpis = document.getElementById('freight-leadtime-kpis');
-  const body = document.getElementById('freight-leadtime-body');
-  if (!kpis || !body) return;
+  const note = document.getElementById('freight-leadtime-note');
+  const canvas = document.getElementById('freight-leadtime-chart');
+  if (!kpis || !canvas) return;
   let data;
   try { data = await api('/api/freight/lead-times'); }
-  catch (e) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; body.innerHTML = ''; return; }
-  if (!data || !data.ok) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; body.innerHTML = ''; return; }
+  catch (e) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; return; }
+  if (!data || !data.ok) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; return; }
   const o = data.overall || {};
-  const kpi = a => (a && a.n)
-    ? `${a.avg} days <span style="color:var(--muted);font-size:12px;font-weight:400">(median ${a.median}, n=${a.n})</span>`
-    : '<span style="color:var(--muted)">&mdash;</span>';
-  kpis.innerHTML = `
-    <div><div class="subtitle" style="margin-bottom:2px">PO placed &rarr; arrival</div>
-         <div style="font-size:22px;font-weight:700">${kpi(o.order_to_arrival)}</div></div>
-    <div><div class="subtitle" style="margin-bottom:2px">Departure &rarr; arrival</div>
-         <div style="font-size:22px;font-weight:700">${kpi(o.ship_to_arrival)}</div></div>`;
-  const cell = a => (a && a.n)
-    ? `${a.avg} <span style="color:var(--muted);font-size:11px">(med ${a.median}, n=${a.n})</span>`
-    : '<span style="color:var(--muted)">&mdash;</span>';
-  const rows = (data.by_warehouse || []).map(w =>
-    `<tr><td style="font-weight:600">${escHtml(w.warehouse)}</td>
-      <td style="text-align:right">${cell(w.order_to_arrival)}</td>
-      <td style="text-align:right">${cell(w.ship_to_arrival)}</td></tr>`).join('');
-  body.innerHTML = rows
-    ? `<table style="margin:0">
-        <thead><tr><th>Warehouse</th><th style="text-align:right">PO placed &rarr; arrival (days)</th><th style="text-align:right">Departure &rarr; arrival (days)</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-      <div class="subtitle" style="margin:8px 0 0;font-size:11px">Order&rarr;arrival uses POs with a recorded order date; departure&rarr;arrival uses the actual freight ship date vs. recorded/expected arrival. Gaps over 120 days are excluded as noise.</div>`
-    : '<div class="subtitle">Not enough dated POs yet to compute lead times.</div>';
+  const kpi = (label, a) => `<div><div class="subtitle" style="margin-bottom:2px">${label}</div>` +
+    `<div style="font-size:22px;font-weight:700">` +
+    ((a && a.n) ? `${a.avg} days <span style="color:var(--muted);font-size:12px;font-weight:400">(median ${a.median}, n=${a.n})</span>` : '<span style="color:var(--muted)">&mdash;</span>') +
+    `</div></div>`;
+  kpis.innerHTML = kpi('PO placed &rarr; arrival (total)', o.order_to_arrival) +
+                   kpi('Departure &rarr; arrival (transit)', o.ship_to_arrival);
+  const whs = (data.by_warehouse || []).filter(w => (w.order_to_arrival.n || w.ship_to_arrival.n));
+  if (_leadtimeChart) { _leadtimeChart.destroy(); _leadtimeChart = null; }
+  if (!whs.length || typeof Chart === 'undefined') {
+    if (note) note.textContent = 'Not enough dated POs yet to chart lead times.';
+    return;
+  }
+  if (note) note.textContent = 'Total lead counts from the day the PO hits our inbox to arrival (includes production + transit); transit is ship date to arrival. POs with gaps over 120 days are excluded.';
+  _leadtimeChart = new Chart(canvas.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: whs.map(w => w.warehouse),
+      datasets: [
+        { label: 'PO placed to arrival (total days)',
+          data: whs.map(w => w.order_to_arrival.avg),
+          backgroundColor: 'rgba(5, 23, 71, 0.80)' },
+        { label: 'Departure to arrival (transit days)',
+          data: whs.map(w => w.ship_to_arrival.avg),
+          backgroundColor: 'rgba(21, 101, 192, 0.75)' },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { x: { beginAtZero: true, title: { display: true, text: 'days' } } },
+      plugins: { legend: { position: 'top' } },
+    },
+  });
 }
 
 async function loadFreight() {

@@ -425,6 +425,8 @@ def _rollover_on_order(inv: dict) -> bool:
                 "qty": qty,
                 "po_number": entry.get("po_number", ""),
                 "po_revision": entry.get("po_revision", ""),
+                "ordered_at": entry.get("ordered_at", ""),
+                "ship_date": entry.get("ship_date", ""),
                 "eta": trigger.isoformat(),
                 "timestamp": now.isoformat(),
             })
@@ -594,6 +596,9 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "timestamp": audit["timestamp"],
             "po_number": audit["po_number"],
             "po_revision": audit["po_revision"],
+            "ordered_at": audit.get("ordered_at", ""),
+            "ship_date": audit.get("ship_date", ""),
+            "arrival_date": audit.get("eta", ""),
             "source": "on_order_rollover",
         })
     _PENDING_ROLLOVER_AUDIT.clear()

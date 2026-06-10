@@ -1534,8 +1534,8 @@ def api_freight_lead_times():
                 r["ordered"] = e["ordered_at"]
             if not r["ship"] and e.get("ship_date"):
                 r["ship"] = e["ship_date"]
-            if not r["arrival"] and e.get("arrival_date"):
-                r["arrival"] = e["arrival_date"]
+            if not r["arrival"] and (e.get("arrival_date") or e.get("eta")):
+                r["arrival"] = e.get("arrival_date") or e.get("eta")
             if not r["warehouse"]:
                 r["warehouse"] = wh
 
@@ -1547,17 +1547,17 @@ def api_freight_lead_times():
         if not po:
             continue
         r = pos.setdefault(po, {"ordered": "", "ship": "", "arrival": "", "warehouse": ""})
-        ts = (ev.get("timestamp") or "")[:10]
-        if ts and ts > (r["arrival"] or ""):
-            r["arrival"] = ts
+        # Use the dates preserved on the rollover row (the PO's own order /
+        # ship / arrival), NOT the processing timestamp, so transit stays
+        # coherent (arrival - ship) and order->arrival is the longer total.
+        if not r["ordered"] and ev.get("ordered_at"):
+            r["ordered"] = ev["ordered_at"]
+        if not r["ship"] and ev.get("ship_date"):
+            r["ship"] = ev["ship_date"]
+        if not r["arrival"] and ev.get("arrival_date"):
+            r["arrival"] = ev["arrival_date"]
         if not r["warehouse"]:
             r["warehouse"] = meta.get(ev.get("item_key") or "", "")
-
-    # Actual freight ship date wins when present.
-    for po, r in pos.items():
-        sd = freight_idx.get(_norm_po_key(po))
-        if sd:
-            r["ship"] = sd
 
     def _days(a, b):
         da, db = _d(a), _d(b)
@@ -1646,9 +1646,9 @@ def api_arrived_pos():
                 "po_revision":  e.get("po_revision") or "",
                 "distributor":  m.get("distributor") or "",
                 "warehouse":    m.get("warehouse") or "",
-                "ordered_at":   "",
+                "ordered_at":   e.get("ordered_at") or "",
                 "eta":          "",
-                "ship_date":    "",
+                "ship_date":    e.get("ship_date") or "",
                 "arrival_date": e.get("timestamp") or "",
                 "total_cs":     0.0,
                 "lines":        [],
