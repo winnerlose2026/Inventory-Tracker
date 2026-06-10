@@ -737,7 +737,7 @@
       <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Inventory</h1>
-          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first.</p>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first. <strong style="color:var(--green)">&#10003;&nbsp;date</strong> = confirmed arrival; <em style="color:var(--muted)">~&nbsp;date</em> = 30-day ETA estimate (On Order column).</p>
         </div>
       </div>
       <!-- Low Stock Alerts: moved here from the old Dashboard now that
@@ -3325,10 +3325,22 @@ document.addEventListener('keydown', e => {
 function renderOnOrder(item) {
   const qty = +(item.on_order_qty || 0);
   if (!qty) return '<span style="color:var(--muted)">—</span>';
-  const etaFormatted = formatDate(item.on_order_next_eta || '');
-  const tip = etaFormatted ? `next arrival ${etaFormatted}` : 'pending lead time';
-  return `<span class="badge badge-blue" title="${escAttr(tip)}">+${qty.toFixed(0)}</span>`
-       + (etaFormatted ? ` <span style="color:var(--muted);font-size:11px">${etaFormatted}</span>` : '');
+  // Prefer the operator-confirmed arrival date; fall back to the 30-day ETA
+  // placeholder. Confirmed arrivals render solid green with a check mark; ETA
+  // estimates render muted + italic with a ~ so the two read differently.
+  const dateStr = item.on_order_next_arrival || item.on_order_next_eta || '';
+  const isActual = !!item.on_order_next_is_actual;
+  const dateFormatted = formatDate(dateStr);
+  const badge = `<span class="badge badge-blue" title="${escAttr(qty.toFixed(0) + ' cs on order')}">+${qty.toFixed(0)}</span>`;
+  if (!dateFormatted) {
+    return badge + ` <span style="color:var(--muted);font-size:11px" title="pending lead time">pending</span>`;
+  }
+  if (isActual) {
+    const tip = `Confirmed arrival ${dateFormatted}`;
+    return badge + ` <span style="color:var(--green);font-weight:600;font-size:11px" title="${escAttr(tip)}">&#10003; ${dateFormatted}</span>`;
+  }
+  const tip = `Estimated 30-day ETA ${dateFormatted} - no confirmed arrival yet`;
+  return badge + ` <span style="color:var(--muted);font-style:italic;font-size:11px" title="${escAttr(tip)}">~ ${dateFormatted}</span>`;
 }
 
 // -------------------------------------------------------------------------

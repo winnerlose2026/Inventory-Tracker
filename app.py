@@ -201,13 +201,36 @@ def index():
 # ---------------------------------------------------------------------------
 
 def _enrich_on_order(item: dict) -> dict:
-    """Add convenience fields summarising pending on_order entries."""
+    """Add convenience fields summarising pending on_order entries.
+
+    The inventory On Order column surfaces the *next* arrival date. For each
+    pending entry we prefer the operator-confirmed ``arrival_date`` (set via
+    the Pending POs ship-date flow) and fall back to the placeholder 30-day
+    ``eta`` when no confirmed arrival exists yet. ``on_order_next_is_actual``
+    lets the frontend distinguish confirmed arrivals from ETA estimates.
+    """
     pending = item.get("on_order") or []
     total = round(sum(float(p.get("qty") or 0) for p in pending), 2)
+    # Placeholder-only ETA minimum, kept for backward compatibility.
     etas = [p.get("eta", "") for p in pending if p.get("eta")]
     next_eta = min(etas) if etas else ""
+    # Effective per-entry date: a confirmed arrival_date wins over the eta
+    # estimate. Track whether the soonest effective date is a real arrival.
+    effective = []
+    for p in pending:
+        arr = (p.get("arrival_date") or "").strip()
+        eta = (p.get("eta") or "").strip()
+        if arr:
+            effective.append((arr, True))
+        elif eta:
+            effective.append((eta, False))
+    next_arrival, next_is_actual = ("", False)
+    if effective:
+        next_arrival, next_is_actual = min(effective, key=lambda d: d[0])
     item["on_order_qty"] = total
     item["on_order_next_eta"] = next_eta
+    item["on_order_next_arrival"] = next_arrival
+    item["on_order_next_is_actual"] = bool(next_is_actual)
     return item
 
 
