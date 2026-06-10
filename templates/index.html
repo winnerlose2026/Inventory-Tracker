@@ -4012,14 +4012,27 @@ function _pendingRowHtml(g, now) {
   const source = g._source || 'inventory';
   const terminal = (state === 'arrived' || state === 'cancelled');
   const shipVerified = g.ship_date_source === 'freight';
-  const shipCell = shipVerified
-    ? (shipISO ? (formatDate(shipISO) + _shipVerifiedMark()) : '<span style="color:var(--muted)">&mdash;</span>')
-    : terminal
-      ? (shipISO ? formatDate(shipISO) : '<span style="color:var(--muted)">&mdash;</span>')
-      : `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
-  const actionsCell = terminal
-    ? '<span style="color:var(--muted)">—</span>'
-    : `<button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${(g.lines || []).length}, ${(Number(g.total_cs) || 0).toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>`;
+  const isArrived = state === 'arrived';
+  const isCancelled = state === 'cancelled';
+  // Freight-verified ship dates are locked (the invoice is the final word).
+  // Cancelled rows are read-only. Pending rows -- and CW Arrived rows that
+  // aren't freight-verified -- get the editable date box (CW status is
+  // date-driven, so editing/clearing it un-arrives safely). Inventory Arrived
+  // rows show a read-only date and are edited via Reopen.
+  const showShipInput = !shipVerified && !isCancelled
+    && (!terminal || (isArrived && source === 'chefs_warehouse'));
+  const shipCell = showShipInput
+    ? `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`
+    : shipISO
+      ? (formatDate(shipISO) + (shipVerified ? _shipVerifiedMark() : ''))
+      : '<span style="color:var(--muted)">&mdash;</span>';
+  const actionsCell = isCancelled
+    ? '<span style="color:var(--muted)">&mdash;</span>'
+    : (isArrived && !shipVerified)
+      ? `<button class="btn btn-ghost btn-sm" onclick="reopenPendingPO('${escAttr(g.po_number || '')}', '${escAttr(source)}', ${(Number(g.total_cs) || 0).toFixed(0)})" title="Return this PO to the active pipeline (use when it hasn't actually arrived)">Reopen</button>`
+      : terminal
+        ? '<span style="color:var(--muted)">&mdash;</span>'
+        : `<button class="btn btn-danger btn-sm" onclick="cancelPendingPO('${escAttr(g.po_number || '')}', ${(g.lines || []).length}, ${(Number(g.total_cs) || 0).toFixed(0)}, '${escAttr(source)}')" title="Remove this PO entirely (distributor canceled)">Cancel</button>`
   return `<tr${rowStyle}>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
@@ -4158,6 +4171,32 @@ function renderOnOrderBreakdown(groups) {
         </table>
       </div>
     </div>`;
+}
+
+async function reopenPendingPO(poNumber, source, totalCs) {
+  if (!poNumber) return;
+  source = source || 'inventory';
+  const isCW = source === 'chefs_warehouse';
+  const msg = isCW
+    ? `Reopen Chefs Warehouse PO ${poNumber}?\n\nThis clears its ship/arrival date so it returns to the active pipeline as pending. Inventory is not affected.`
+    : `Reopen PO ${poNumber}?\n\nThis removes the ${totalCs} cs that were added to on-hand when this PO was marked Arrived (use only if it hasn't actually arrived) and returns it to the tab as Open, awaiting a ship date.`;
+  if (!confirm(msg)) return;
+  let result;
+  try {
+    result = await api('/api/pending/reopen', 'POST', { po_number: poNumber, source });
+  } catch (e) {
+    toast('Reopen failed: ' + String(e), 'error');
+    return;
+  }
+  if (!result || !result.ok) {
+    toast('Reopen failed: ' + ((result && result.error) || 'unknown'), 'error');
+    return;
+  }
+  toast(isCW
+    ? `Reopened CW PO ${poNumber}`
+    : `Reopened PO ${poNumber} (${result.restored_lines} line${result.restored_lines === 1 ? '' : 's'}, ${result.removed_cs} cs back to pending)`);
+  await loadPendingPOs();
+  loadDashboard();
 }
 
 async function cancelPendingPO(poNumber, lineCount, totalCs, source) {

@@ -499,6 +499,111 @@ def api_admin_uncancel_po():
     })
 
 
+@app.route("/api/pending/reopen", methods=["POST"])
+def api_pending_reopen():
+    """Reopen an Arrived PO back into the active pipeline.
+
+    Body: { po_number (required), source: 'inventory'|'arrived'|'chefs_warehouse' }
+
+    - Chefs Warehouse: clear ship_date + arrival_date so the date-driven
+      status reverts to pending.
+    - Inventory (reconstructed from a rollover): reverse the
+      on_order_rollover usage rows for the PO -- removing the cases that
+      were auto-added to on-hand when it rolled over (it hasn't actually
+      arrived) -- and re-create the pending on_order entries so the PO
+      returns to the tab as Open, awaiting a ship date.
+
+    Freight-verified POs are locked in the UI and never reach here.
+    """
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    source = (body.get("source") or "inventory").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+    now_iso = datetime.now().isoformat()
+
+    if source == "chefs_warehouse":
+        from inventory_tracker import (
+            load_chefs_warehouse_pos, save_chefs_warehouse_pos,
+        )
+        recs = load_chefs_warehouse_pos()
+        hit = False
+        for r in recs:
+            if (r.get("po_number") or "").strip() == po_number:
+                r["ship_date"] = ""
+                r["arrival_date"] = ""
+                hit = True
+        if not hit:
+            return jsonify({"ok": False, "error": "CW PO not found"}), 404
+        save_chefs_warehouse_pos(recs)
+        return jsonify({"ok": True, "po_number": po_number, "source": source,
+                        "restored_lines": 0, "removed_cs": 0})
+
+    # Inventory / reconstructed-arrived: un-roll the rollover.
+    from inventory_tracker import (
+        load_inventory, save_inventory, load_usage, save_usage,
+    )
+    inv = load_inventory()
+    usage = load_usage()
+    key_norm = _norm_po_key(po_number)
+    restored = 0
+    removed_cs = 0.0
+    new_rows = []
+    for e in usage:
+        if (e.get("source") or "") != "on_order_rollover":
+            continue
+        if e.get("reversed"):
+            continue
+        if _norm_po_key(e.get("po_number") or "") != key_norm:
+            continue
+        ik = e.get("item_key") or ""
+        item = inv.get(ik)
+        qty = abs(float(e.get("amount") or 0))
+        e["reversed"] = True
+        e["reversed_at"] = now_iso
+        if item is None or qty <= 0:
+            continue
+        # Pull the auto-added cases back out of on-hand.
+        item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
+        item["updated"] = now_iso
+        # Restore the pending on_order entry (no ship date yet -> Open).
+        item.setdefault("on_order", []).append({
+            "qty":          qty,
+            "po_number":    e.get("po_number") or po_number,
+            "po_revision":  e.get("po_revision") or "",
+            "unit":         e.get("unit") or item.get("unit") or "cs",
+            "ordered_at":   "",
+            "eta":          "",
+            "ship_date":    "",
+            "arrival_date": "",
+        })
+        # Audit row (positive = reverses the original -qty restock).
+        new_rows.append({
+            "item_key":   ik,
+            "item_name":  e.get("item_name") or item.get("name") or ik,
+            "amount":     qty,
+            "unit":       e.get("unit") or item.get("unit") or "",
+            "note":       f"Reopened PO {po_number} -- un-rolled from Arrived",
+            "timestamp":  now_iso,
+            "source":     "reversal",
+            "reverses_timestamp": e.get("timestamp") or "",
+        })
+        removed_cs += qty
+        restored += 1
+    if restored:
+        usage.extend(new_rows)
+        save_inventory(inv)
+        save_usage(usage)
+    return jsonify({
+        "ok": restored > 0,
+        "po_number": po_number,
+        "source": source,
+        "restored_lines": restored,
+        "removed_cs": round(removed_cs, 2),
+        "error": None if restored else "No rolled-over lines found for this PO",
+    })
+
+
 # ---------------------------------------------------------------------------
 # API – Chefs Warehouse POs
 # ---------------------------------------------------------------------------
@@ -1370,6 +1475,8 @@ def api_arrived_pos():
     groups: dict = {}
     for e in (load_usage() or []):
         if (e.get("source") or "") != "on_order_rollover":
+            continue
+        if e.get("reversed"):
             continue
         po = (e.get("po_number") or "").strip()
         if not po:
