@@ -895,6 +895,17 @@
           <tbody id="pending-tbody"></tbody>
         </table>
       </div>
+
+      <!-- Cases On Order: production-planning rollup of every active
+           (not-arrived, not-cancelled) PO, by variety and by warehouse. -->
+      <div class="card" id="pending-onorder-card" style="margin-top:20px;display:none">
+        <div style="padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span class="card-title" style="font-size:20px">Cases On Order</span>
+          <span style="color:var(--muted);font-size:12px">production planning &middot; active POs only</span>
+          <span id="pending-onorder-total" style="margin-left:auto;font-weight:700;color:var(--accent)"></span>
+        </div>
+        <div id="pending-onorder-body" style="padding:8px 20px 16px"></div>
+      </div>
     </div>
 
     <!-- Freight Costs (Lineage outbound shipping) -->
@@ -3736,6 +3747,11 @@ function renderPendingPOs() {
     return ship < today;
   }));
 
+  // --- Cases On Order breakdown (production planning) -----------------
+  // Rollup of every active (not-arrived/cancelled) PO by variety and
+  // warehouse. Respects the shared distributor/warehouse/search filters.
+  renderOnOrderBreakdown(groups);
+
   // --- Main table -----------------------------------------------------
   // Status dropdown maps onto the computed tag state.
   const statusF = _currentPendingStatus();
@@ -4082,6 +4098,66 @@ function renderInTransitSection(list) {
       <td>${_poTagHtml(g._state || 'in_transit')}</td>
     </tr>`;
   }).join('');
+}
+
+// Cases On Order breakdown for production planning. Rolls up every active
+// (not-arrived, not-cancelled) PO by variety (what to bake) and by warehouse
+// (where it ships). Driven off the same filtered group set as the sections.
+function renderOnOrderBreakdown(groups) {
+  const card = document.getElementById('pending-onorder-card');
+  const body = document.getElementById('pending-onorder-body');
+  const totalEl = document.getElementById('pending-onorder-total');
+  if (!card || !body) return;
+  const active = (groups || []).filter(g => g._state !== 'arrived' && g._state !== 'cancelled');
+  const byVar = {}, byWh = {}, varPOs = {}, whPOs = {};
+  let totalCs = 0;
+  active.forEach(g => {
+    const wh = (g.warehouse || '').trim() || 'Unassigned';
+    let gCs = 0;
+    (g.lines || []).forEach(L => {
+      const v = (L.variety || '').trim() || '(unspecified)';
+      const cs = Number(L.qty) || 0;
+      byVar[v] = (byVar[v] || 0) + cs;
+      (varPOs[v] = varPOs[v] || new Set()).add(g.po_number || ('_' + Math.random()));
+      gCs += cs;
+    });
+    byWh[wh] = (byWh[wh] || 0) + gCs;
+    (whPOs[wh] = whPOs[wh] || new Set()).add(g.po_number || ('_' + Math.random()));
+    totalCs += gCs;
+  });
+  if (totalCs <= 0) {
+    card.style.display = 'none';
+    body.innerHTML = '';
+    if (totalEl) totalEl.textContent = '';
+    return;
+  }
+  card.style.display = '';
+  if (totalEl) totalEl.textContent =
+    `${totalCs.toFixed(0)} cs (${(totalCs / 56).toFixed(1)} pallets) \u00b7 ${Object.keys(byVar).length} varieties \u00b7 ${active.length} PO${active.length === 1 ? '' : 's'}`;
+  const varRows = Object.keys(byVar).sort((a, b) => byVar[b] - byVar[a]).map(v =>
+    `<tr><td style="font-weight:600">${escHtml(v)}</td><td style="text-align:right;font-weight:700">${byVar[v].toFixed(0)}</td><td style="text-align:right">${(byVar[v] / 56).toFixed(1)}</td><td style="text-align:right;color:var(--muted)">${varPOs[v].size}</td></tr>`).join('');
+  const whRows = Object.keys(byWh).sort((a, b) => byWh[b] - byWh[a]).map(w =>
+    `<tr><td style="font-weight:600">${escHtml(w)}</td><td style="text-align:right;font-weight:700">${byWh[w].toFixed(0)}</td><td style="text-align:right">${(byWh[w] / 56).toFixed(1)}</td><td style="text-align:right;color:var(--muted)">${whPOs[w].size}</td></tr>`).join('');
+  const totalRow = (lbl) => `<tr style="border-top:2px solid var(--border)"><td style="font-weight:700">Total</td><td style="text-align:right;font-weight:700">${totalCs.toFixed(0)}</td><td style="text-align:right;font-weight:700">${(totalCs / 56).toFixed(1)}</td><td></td></tr>`;
+  body.innerHTML = `
+    <div style="display:grid;gap:24px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+      <div>
+        <div style="font-family:var(--font-display);font-weight:700;font-size:15px;color:var(--accent);margin:4px 0 6px">By Variety <span style="color:var(--muted);font-weight:400;font-size:12px">&mdash; what to bake</span></div>
+        <table style="margin:0">
+          <thead><tr><th>Variety</th><th style="text-align:right">cs on order</th><th style="text-align:right">pallets</th><th style="text-align:right">POs</th></tr></thead>
+          <tbody>${varRows}</tbody>
+          <tfoot>${totalRow()}</tfoot>
+        </table>
+      </div>
+      <div>
+        <div style="font-family:var(--font-display);font-weight:700;font-size:15px;color:var(--accent);margin:4px 0 6px">By Warehouse <span style="color:var(--muted);font-weight:400;font-size:12px">&mdash; where it ships</span></div>
+        <table style="margin:0">
+          <thead><tr><th>Warehouse</th><th style="text-align:right">cs on order</th><th style="text-align:right">pallets</th><th style="text-align:right">POs</th></tr></thead>
+          <tbody>${whRows}</tbody>
+          <tfoot>${totalRow()}</tfoot>
+        </table>
+      </div>
+    </div>`;
 }
 
 async function cancelPendingPO(poNumber, lineCount, totalCs, source) {
