@@ -51,7 +51,9 @@ jobs:
           HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
           if [ -n "$HOOK" ]; then
-            curl -fsS "$HOOK" >/dev/null && echo "Render deploy triggered."
+            # Pin the exact commit: a bare hook deploys Render's (sometimes
+            # stale) cached branch tip, so always pass ref=<this commit SHA>.
+            curl -fsS "$HOOK&ref=$GITHUB_SHA" >/dev/null && echo "Render deploy triggered for $GITHUB_SHA."
           else
             echo "RENDER_DEPLOY_HOOK_URL not set - skipping CI-driven deploy."
             echo "Add it under repo Settings -> Secrets and variables -> Actions"
