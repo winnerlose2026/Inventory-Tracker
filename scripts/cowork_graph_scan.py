@@ -436,13 +436,14 @@ def run(argv: list[str] | None = None) -> int:
                 client_id = v
             elif k == "MS365_CLIENT_SECRET" and not client_secret:
                 client_secret = v
-    missing = [k for k, v in {
-        "MS365_TENANT_ID": tenant,
-        "MS365_CLIENT_ID": client_id,
-        "MS365_CLIENT_SECRET": client_secret,
-        "APP_URL": args.app_url,
-        "INVENTORY_API_TOKEN": args.api_token,
-    }.items() if not v]
+    _present = {
+        "MS365_TENANT_ID": bool(tenant),
+        "MS365_CLIENT_ID": bool(client_id),
+        "MS365_CLIENT_SECRET": bool(client_secret),
+        "APP_URL": bool(args.app_url),
+        "INVENTORY_API_TOKEN": bool(args.api_token),
+    }
+    missing = [name for name, ok in _present.items() if not ok]
     if missing:
         print(f"ERROR: missing creds: {', '.join(missing)}", file=sys.stderr)
         return 2

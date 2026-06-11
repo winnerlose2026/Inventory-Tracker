@@ -72,8 +72,8 @@ def html_check(path: Path) -> list[str]:
     errors: list[str] = []
 
     # 1) Script tag balance — the failure mode that black-screened the app.
-    opens = len(re.findall(r"<script\b[^>]*>", src))
-    closes = len(re.findall(r"</script>", src))
+    opens = len(re.findall(r"<script\b[^>]*>", src, re.IGNORECASE))
+    closes = len(re.findall(r"</script>", src, re.IGNORECASE))
     if opens != closes:
         errors.append(
             f"<script> tags unbalanced: {opens} open vs {closes} close "
@@ -85,7 +85,7 @@ def html_check(path: Path) -> list[str]:
     # confuse the parser.
     pat = re.compile(
         r"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script>",
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
     )
     for i, m in enumerate(pat.finditer(src)):
         if "src=" in (m.group("attrs") or ""):

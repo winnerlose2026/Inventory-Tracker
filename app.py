@@ -149,10 +149,13 @@ def api_auth_check():
 def login():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or "/"
-    # Same-site paths only: must start with a single "/", and reject
-    # protocol-relative ("//"), backslash ("/\\" or any "\\"), and CR/LF
-    # tricks that browsers can normalise into an off-site redirect.
-    if (not next_url.startswith("/")
+    # Same-site paths only. Parse the value and reject anything with a scheme
+    # or host (absolute / protocol-relative URL), plus backslash / CR-LF tricks
+    # browsers can normalise into an off-site redirect.
+    from urllib.parse import urlparse as _urlparse
+    _nu = _urlparse(next_url)
+    if (_nu.scheme or _nu.netloc
+            or not next_url.startswith("/")
             or next_url.startswith("//")
             or "\\" in next_url
             or "\n" in next_url or "\r" in next_url):
@@ -1198,7 +1201,7 @@ def api_freight_scan():
                             f"/users/{user}/messages/{urllib.parse.quote(mid)}/attachments"
                             "?$select=id,name,contentType,size")
                     except urllib.error.HTTPError as exc:
-                        errors.append(f"{mid[:12]}.. list-att: HTTP {exc.code}")
+                        errors.append(f"{mid[:12]}.. list-att failed")
                         continue
                     for a in (atts_resp.get("value") or []):
                         diag_atts_seen += 1
@@ -1223,7 +1226,7 @@ def api_freight_scan():
                                 f"/users/{user}/messages/{urllib.parse.quote(mid)}"
                                 f"/attachments/{urllib.parse.quote(a.get('id') or '')}/$value")
                         except urllib.error.HTTPError as exc:
-                            errors.append(f"{mid[:12]}.. fetch-att: HTTP {exc.code}")
+                            errors.append(f"{mid[:12]}.. fetch-att failed")
                             continue
                         pdfs: list[tuple[str, bytes]] = []
                         if aname.endswith(".zip") or actype in ("application/zip",
@@ -1271,7 +1274,7 @@ def api_freight_scan():
     except urllib.error.HTTPError as exc:
         return jsonify({
             "ok": False,
-            "error": f"Graph HTTP {exc.code}: {exc.reason}",
+            "error": _safe_err(exc, "graph"),
             "errors": errors,
         }), 200
     except Exception as exc:  # noqa: BLE001
@@ -1997,7 +2000,7 @@ def api_report_toast_sales():
             new_rows = toast_api.fetch_product_mix_batch(
                 missing, max_workers=6, timeout_s=28.0)
         except Exception as ex:
-            meta["fetch_error"] = f"{type(ex).__name__}: {ex}"
+            meta["fetch_error"] = _safe_err(ex, "toast fetch")
             return all_rows, meta
         if not new_rows:
             # No orders for any of the missing (guid, date) pairs is a
@@ -2032,7 +2035,7 @@ def api_report_toast_sales():
             rows, fetch_meta = _ensure_bucket_cached(rows, end_date_q,
                                                     location_q)
         except Exception as ex:
-            fetch_meta["fetch_error"] = f"{type(ex).__name__}: {ex}"
+            fetch_meta["fetch_error"] = _safe_err(ex, "toast fetch")
 
     # Apply the location filter (after the live fetch so newly-pulled
     # rows are visible).
@@ -4361,8 +4364,8 @@ def api_email_send():
             except Exception:  # noqa: BLE001
                 detail = ""
             return jsonify({"ok": False,
-                            "error": f"Graph send failed: HTTP {exc.code} {exc.reason}",
-                            "detail": detail}), 200
+                            "error": _safe_err(exc, "graph send"),
+                            "detail": ""}), 200
 
         return jsonify({"ok": True, "sent": True, "dry_run": False,
                         "from": sender, "to": to, "cc": cc,

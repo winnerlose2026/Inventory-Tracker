@@ -284,7 +284,7 @@ _HEADER_RE = re.compile(
 # present; this fallback only fires when the body header didn't yield a
 # warehouse.
 _SUBJECT_WAREHOUSE_RE = re.compile(
-    r"daily\s+production\s+(.+?)\s*[.\s]\s*PO\s*[.\s]\s*[A-Z0-9]+",
+    r"daily\s{1,3}production\s{1,3}(.{1,80}?)\s{0,3}[.\s]\s{0,3}PO\s{0,3}[.\s]\s{0,3}[A-Z0-9]+",
     re.IGNORECASE,
 )
 
