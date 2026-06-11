@@ -36,3 +36,24 @@ jobs:
           test_on_order_dedup.py
           test_cheney_inventory_report.py
           test_usfoods_inventory_report.py
+
+  # Deterministic deploy: trigger Render via a Deploy Hook once tests pass,
+  # instead of relying on Render's GitHub auto-deploy webhook (which has been
+  # delivering late / dropping pushes). Dormant until the RENDER_DEPLOY_HOOK_URL
+  # repo secret is set (Render dashboard -> the service -> Settings -> Deploy Hook).
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy (if hook configured)
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$HOOK" ]; then
+            curl -fsS "$HOOK" >/dev/null && echo "Render deploy triggered."
+          else
+            echo "RENDER_DEPLOY_HOOK_URL not set - skipping CI-driven deploy."
+            echo "Add it under repo Settings -> Secrets and variables -> Actions"
+            echo "to deploy automatically after tests pass."
+          fi
