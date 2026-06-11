@@ -81,8 +81,10 @@ def _cors_preflight(_any):
 # cron jobs and scripts. A write request is authorised if EITHER:
 #   1. The browser session has session["user"] set (humans), OR
 #   2. The request carries the right X-Inventory-Token header (cron/scripts).
-# Reads on /api/* stay open so embedded widgets (Shopify storefront, etc.)
-# can keep loading data without a session cookie.
+# Both reads and writes require auth: a browser session (humans) or the
+# X-Inventory-Token header (cron/scripts). The only open endpoints are the
+# login flow, static files, the /api/auth/check probe, and the Graph webhook
+# (which authenticates via its own clientState, not our token).
 # ---------------------------------------------------------------------------
 
 def _user_logged_in() -> bool:
@@ -112,17 +114,32 @@ def _safe_err(exc, ctx=""):
     return "internal error" + (f" ({ctx})" if ctx else "")
 
 
+# Endpoints reachable without authentication: the login flow, static assets,
+# the auth-status probe the login page calls, and the Graph webhook (which
+# authenticates via its own clientState, since Graph won't send our token).
+_OPEN_ENDPOINTS = {
+    "login", "logout", "static", "api_auth_check",
+    "graph_webhook_notifications",
+}
+
+
 @app.before_request
-def _gate_writes():
-    # OPTIONS preflight, login flow, and static files are always open.
+def _gate_requests():
+    # CORS preflight is always allowed.
     if request.method == "OPTIONS":
         return
-    if request.endpoint in ("login", "logout", "static"):
+    if request.endpoint in _OPEN_ENDPOINTS:
         return
-    # Writes to /api/* require either a session or the API token.
-    if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
-        if not _is_authenticated():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+    # Everything else -- pages plus /api/* reads and writes -- requires a
+    # logged-in session or a valid API token.
+    if _is_authenticated():
+        return
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    # Unauthenticated browser hitting an HTML page -> the login screen,
+    # preserving the intended destination.
+    nxt = request.full_path if request.query_string else request.path
+    return redirect(url_for("login", next=nxt))
 
 
 @app.route("/api/auth/check")
@@ -4036,7 +4053,7 @@ def api_report_status():
 
 @app.route("/report-status")
 def report_status_page():
-    """Mobile-friendly weekly-report status page (read-only, no login)."""
+    """Mobile-friendly weekly-report status page (read-only; requires login)."""
     from flask import Response
     from integrations import report_status as _rs
     force = request.args.get("refresh") in ("1", "true", "yes", "on")
@@ -4289,7 +4306,7 @@ def api_email_send():
     Uses the same app-only client-credentials token the mailbox scan uses
     (EmailInboxClient._ms365_token), so the app registration must have the
     **Mail.Send** application permission with admin consent. Protected by the
-    global _gate_writes() before_request hook: any POST to /api/* requires a
+    global _gate_requests() before_request hook: any POST to /api/* requires a
     browser session or the X-Inventory-Token header.
 
     Body:
