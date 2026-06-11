@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inventory Tracker with Usage History"""
 
+import copy
 import json
 import os
 import sys
@@ -18,31 +19,70 @@ USAGE_FILE = DATA_DIR / "usage.json"
 # Storage helpers
 # ---------------------------------------------------------------------------
 
-def _load(path: Path) -> dict | list:
-    if path.exists():
+# In-process cache of parsed JSON files, keyed on (mtime_ns, size) so a write
+# from this or another worker invalidates it automatically. Callers always get
+# a deep copy, so they may mutate freely without disturbing the cache or other
+# readers. This turns "parse the whole file on every request" into a stat() on
+# the hot path (inventory, usage, freight, production, sales).
+_FILE_CACHE: dict = {}
+
+
+def _read_json(path: Path, default):
+    try:
+        st = path.stat()
+    except OSError:
+        return copy.deepcopy(default)
+    sig = (st.st_mtime_ns, st.st_size)
+    key = str(path)
+    cached = _FILE_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return copy.deepcopy(cached[1])
+    try:
         with open(path) as f:
-            return json.load(f)
-    return {} if path == INVENTORY_FILE else []
+            data = json.load(f)
+    except Exception:
+        return copy.deepcopy(default)
+    _FILE_CACHE[key] = (sig, data)
+    return copy.deepcopy(data)
 
 
-def _save(path: Path, data):
+def _load(path: Path) -> "dict | list":
+    return _read_json(path, {} if path == INVENTORY_FILE else [])
+
+
+def _write_json(path: Path, data):
+    """Write JSON and refresh the cache entry, so any reader in this process
+    sees the new data immediately regardless of filesystem mtime granularity."""
     DATA_DIR.mkdir(exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+    try:
+        st = path.stat()
+        _FILE_CACHE[str(path)] = ((st.st_mtime_ns, st.st_size), copy.deepcopy(data))
+    except OSError:
+        _FILE_CACHE.pop(str(path), None)
 
 
-def load_inventory() -> dict:
+def _save(path: Path, data):
+    _write_json(path, data)
+
+
+def reconcile_inventory() -> dict:
+    """Run the on_order normalization + rollover passes and persist any change.
+    Idempotent. load_inventory() calls this on every read (the dedup/rollover
+    on read is an intentional safety net), and it is exposed so a write path or
+    cron can invoke it explicitly too.
+
+    The order of these passes matters:
+      1. Rebase ordered_at on legacy entries (uses the email subject as a proxy
+         for the PO date when the parser didn't supply one).
+      2. Collapse cross-revision dupes — keep only the highest po_revision per
+         (SKU, po_number).
+      3. Dedup identical (po, rev, qty) entries on the same SKU.
+      4. Rollover entries whose eta is in the past into the SKU's quantity.
+         Must run AFTER rebase.
+    """
     inv = _load(INVENTORY_FILE)
-    # The order of these passes matters:
-    #   1. Rebase ordered_at on legacy entries (uses email subject as a
-    #      proxy for the PO date when the parser didn't supply one).
-    #   2. Collapse cross-revision dupes — keeps only the highest
-    #      po_revision per (SKU, po_number). Catches data that landed
-    #      before the apply-path supersede logic existed.
-    #   3. Dedup identical (po, rev, qty) entries on the same SKU.
-    #   4. Rollover entries whose newly-correct eta is in the past
-    #      into the SKU's quantity. Must run AFTER rebase, otherwise
-    #      backlogged POs would stay pending until ingest_time + 30d.
     rebased = _rebase_ordered_at_from_subject(inv)
     rev_collapsed = _collapse_revision_dupes(inv)
     deduped = _dedup_on_order(inv)
@@ -55,6 +95,14 @@ def load_inventory() -> dict:
         if rolled:
             _save(USAGE_FILE, usage)
     return inv
+
+
+def load_inventory() -> dict:
+    """Current inventory state, reconciled (dedup/rollover) on read. Reads are
+    now backed by the in-process file cache (_read_json), so the hot path is a
+    stat() + cheap in-memory passes instead of re-parsing the whole file on
+    every request; a write only happens when a pass actually changes data."""
+    return reconcile_inventory()
 
 
 def save_inventory(inv: dict):
@@ -75,16 +123,11 @@ PRODUCTION_FILE = DATA_DIR / "production.json"
 
 
 def load_production() -> list:
-    if PRODUCTION_FILE.exists():
-        with open(PRODUCTION_FILE) as f:
-            return json.load(f)
-    return []
+    return _read_json(PRODUCTION_FILE, [])
 
 
 def save_production(records: list):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(PRODUCTION_FILE, "w") as f:
-        json.dump(records, f, indent=2)
+    _write_json(PRODUCTION_FILE, records)
 
 
 # Bakery labor — feeds the $PLH report on the Report page. One entry per
@@ -181,19 +224,11 @@ def load_freight_invoices() -> list:
         cost_per_pallet, cost_per_case,
         source, source_message_id, source_subject, pdf_filename, ingested_at
     """
-    if FREIGHT_INVOICES_FILE.exists():
-        with open(FREIGHT_INVOICES_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
+    return _read_json(FREIGHT_INVOICES_FILE, [])
 
 
 def save_freight_invoices(records: list) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(FREIGHT_INVOICES_FILE, "w") as f:
-        json.dump(records, f, indent=2)
+    _write_json(FREIGHT_INVOICES_FILE, records)
 
 # Toast POS sales — per-location, per-day, per-item product mix.
 # One entry per (restaurant_guid, business_date, item_guid).
@@ -250,19 +285,11 @@ TOAST_RETAIL_LOCATIONS: list[dict] = [
 
 
 def load_sales() -> list:
-    if SALES_FILE.exists():
-        with open(SALES_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
+    return _read_json(SALES_FILE, [])
 
 
 def save_sales(entries: list):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(SALES_FILE, "w") as f:
-        json.dump(entries, f, indent=2)
+    _write_json(SALES_FILE, entries)
 
 
 # Bakery weekly sales -- fed from the weekly "Bakery Model - Sales v. Labor"
@@ -275,19 +302,11 @@ BAKERY_SALES_FILE = DATA_DIR / "bakery_sales.json"
 
 
 def load_bakery_sales() -> list:
-    if BAKERY_SALES_FILE.exists():
-        with open(BAKERY_SALES_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
+    return _read_json(BAKERY_SALES_FILE, [])
 
 
 def save_bakery_sales(entries: list):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(BAKERY_SALES_FILE, "w") as f:
-        json.dump(entries, f, indent=2)
+    _write_json(BAKERY_SALES_FILE, entries)
 
 
 
