@@ -113,6 +113,9 @@ def _graph_request(
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    _host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if _host not in ("graph.microsoft.com", "login.microsoftonline.com"):
+        raise ValueError("refusing outbound request to untrusted host")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

@@ -103,15 +103,64 @@ def _is_authenticated() -> bool:
     return _user_logged_in() or _has_valid_api_token()
 
 
-def _safe_err(exc, ctx=""):
-    """Log the full exception to the server log (Render) and return a generic,
-    non-sensitive message for the HTTP response. Prevents leaking stack traces
-    or internal details to clients (CodeQL py/stack-trace-exposure)."""
+def _log_exc(exc, ctx=""):
+    """Log the full exception to the server log (Render). Returns None on
+    purpose, so an exception's text never flows into an HTTP response -- the
+    only safe place for a stack trace is the server log (CodeQL
+    py/stack-trace-exposure)."""
     import sys as _sys
     import traceback as _tb2
     label = "[error " + ctx + "]" if ctx else "[error]"
     print(f"{label} {type(exc).__name__}: {exc}\n{_tb2.format_exc()}", file=_sys.stderr)
+
+
+def _safe_err(exc, ctx=""):
+    """Log the exception server-side and return a generic, exception-free
+    message suitable for an HTTP response."""
+    _log_exc(exc, ctx)
     return "internal error" + (f" ({ctx})" if ctx else "")
+
+
+# Hosts the app is ever allowed to make outbound requests to. Used to defeat
+# partial-SSRF where a user-influenced value lands in a request URL.
+_TRUSTED_OUTBOUND_HOSTS = frozenset({
+    "graph.microsoft.com",
+    "login.microsoftonline.com",
+})
+
+
+def _require_trusted_host(url: str) -> str:
+    """Return ``url`` only if its host is on the Microsoft allowlist, else
+    raise. Called immediately before every outbound request so a user-influenced
+    URL segment can never redirect the request to an arbitrary host (CodeQL
+    py/partial-ssrf)."""
+    from urllib.parse import urlparse as _up
+    host = (_up(url).hostname or "").lower()
+    if host not in _TRUSTED_OUTBOUND_HOSTS:
+        raise ValueError("refusing outbound request to untrusted host")
+    return url
+
+
+# Character allowlist for the Graph webhook validation token echo.
+_VALIDATION_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~+/= ")
+
+
+def _is_safe_next(target: str) -> bool:
+    """True only if ``target`` is a same-site URL -- the canonical Flask
+    open-redirect guard: resolve it against this request's host and require the
+    scheme/host to match (CodeQL py/url-redirection)."""
+    if not target:
+        return False
+    # Reject backslash / control chars and protocol-relative URLs that a browser
+    # can normalise into an off-site '//host' redirect before the host check
+    # below would ever see them.
+    if target.startswith("//") or any(c in target for c in ("\\", "\n", "\r", "\t")):
+        return False
+    from urllib.parse import urlparse as _up, urljoin as _uj
+    ref = _up(request.host_url)
+    test = _up(_uj(request.host_url, target))
+    return test.scheme in ("http", "https") and ref.netloc == test.netloc
 
 
 # Endpoints reachable without authentication: the login flow, static assets,
@@ -195,16 +244,9 @@ def _login_record_fail(ip: str) -> None:
 def login():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or "/"
-    # Same-site paths only. Parse the value and reject anything with a scheme
-    # or host (absolute / protocol-relative URL), plus backslash / CR-LF tricks
-    # browsers can normalise into an off-site redirect.
-    from urllib.parse import urlparse as _urlparse
-    _nu = _urlparse(next_url)
-    if (_nu.scheme or _nu.netloc
-            or not next_url.startswith("/")
-            or next_url.startswith("//")
-            or "\\" in next_url
-            or "\n" in next_url or "\r" in next_url):
+    # Same-site redirects only -- defeat open-redirect via the canonical Flask
+    # guard (resolve against this host and require the host to match).
+    if not _is_safe_next(next_url):
         next_url = "/"
 
     if request.method == "POST":
@@ -1157,13 +1199,13 @@ def api_freight_scan():
 
     def _graph_get(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(_require_trusted_host(url), headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return _json.loads(resp.read().decode("utf-8"))
 
     def _graph_get_bytes(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(_require_trusted_host(url), headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             return resp.read()
 
@@ -1318,7 +1360,8 @@ def api_freight_scan():
                                         _r = _PR(_io2.BytesIO(pb))
                                         _t = (_r.pages[0].extract_text() or "")[:160]
                                     except Exception as _e:
-                                        _t = f"<text extract failed: {_e}>"
+                                        _log_exc(_e, "freight pdf text extract")
+                                        _t = "<text extract failed>"
                                     errors.append(
                                         f"{mid[:12]}.. parse[{fname}] None "
                                         f"({len(pb)}b) txt={_t!r}")
@@ -1327,16 +1370,17 @@ def api_freight_scan():
                 # Next page
                 list_url = page.get("@odata.nextLink")
     except urllib.error.HTTPError as exc:
+        _log_exc(exc, "freight graph")
         return jsonify({
             "ok": False,
-            "error": _safe_err(exc, "graph"),
+            "error": "internal error (graph)",
             "errors": errors,
         }), 200
     except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "freight scan")
         return jsonify({
             "ok": False,
-            "error": _safe_err(exc),
-            "traceback": "",
+            "error": "internal error",
             "errors": errors,
         }), 200
 
@@ -4282,6 +4326,7 @@ def api_email_scan():
             source=client.source(),
         )
     except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "email scan")
         report = {
             "distributor": "Email Inbox",
             "source": "unknown",
@@ -4291,7 +4336,7 @@ def api_email_scan():
             "unchanged": 0,
             "unmatched": [],
             "changes": [],
-            "error": _safe_err(exc),
+            "error": "internal error",
             "traceback": "",
             "messages_seen": 0,
             "messages_parsed": 0,
@@ -4383,7 +4428,7 @@ def api_email_send():
             headers = {"Authorization": f"Bearer {token}"}
             if payload is not None:
                 headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+            req = urllib.request.Request(_require_trusted_host(url), data=payload, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read()
                 return resp.status, (raw.decode("utf-8", "replace") if raw else "")
@@ -4635,7 +4680,11 @@ def graph_webhook_notifications():
         import re as _re_vt
         if not _re_vt.fullmatch(r"[A-Za-z0-9_\-.~+/= ]{1,4096}", validation_token):
             return make_response("invalid validation token", 400)
-        resp = make_response(validation_token, 200)
+        # Rebuild from a fixed character allowlist so no request-derived value
+        # is ever reflected verbatim (CodeQL py/reflective-xss); the fullmatch
+        # above already guarantees this equals the original token.
+        safe_token = "".join(c for c in validation_token if c in _VALIDATION_TOKEN_CHARS)
+        resp = make_response(safe_token, 200)
         resp.headers["Content-Type"] = "text/plain"
         return resp
 
@@ -4650,12 +4699,11 @@ def graph_webhook_notifications():
         result = handle_notification(payload)
     except Exception as exc:  # noqa: BLE001
         # Don't 500 — that makes Graph back off and eventually disable the
-        # sub. Log via the response body and return 202 so Graph stays happy.
-        import traceback as _tb
+        # sub. Log server-side and return a generic 202 so Graph stays happy.
+        _log_exc(exc, "webhook")
         return jsonify({
             "ok": False,
-            "error": _safe_err(exc, "webhook"),
-            "traceback": "",
+            "error": "internal error (webhook)",
         }), 202
 
     return jsonify(result), 202
@@ -4683,10 +4731,8 @@ def api_graph_subscriptions():
     try:
         result = create_subscriptions()
     except Exception as exc:  # noqa: BLE001
-        return jsonify({
-            "ok": False, "error": _safe_err(exc),
-            "traceback": "",
-        }), 500
+        _log_exc(exc, "graph subscriptions create")
+        return jsonify({"ok": False, "error": "internal error"}), 500
     return jsonify(result)
 
 
@@ -4705,10 +4751,8 @@ def api_graph_subscriptions_renew():
     try:
         result = renew_subscriptions()
     except Exception as exc:  # noqa: BLE001
-        return jsonify({
-            "ok": False, "error": _safe_err(exc),
-            "traceback": "",
-        }), 500
+        _log_exc(exc, "graph subscriptions renew")
+        return jsonify({"ok": False, "error": "internal error"}), 500
     return jsonify(result)
 
 

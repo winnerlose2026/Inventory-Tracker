@@ -247,7 +247,9 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
     try:
         token = _token()
     except Exception as exc:  # noqa: BLE001
-        result["error"] = f"Graph token error: {type(exc).__name__}: {exc}"
+        import sys as _sys
+        print(f"[report_status token] {type(exc).__name__}: {exc}", file=_sys.stderr)
+        result["error"] = "Graph token error (see server log)"
         return result
 
     rep_wh = _rep_to_warehouses()
@@ -333,9 +335,11 @@ def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
     try:
         data = compute_report_status()
     except Exception as exc:  # noqa: BLE001
+        import sys as _sys
+        print(f"[report_status compute] {type(exc).__name__}: {exc}", file=_sys.stderr)
         data = {"generated_at": "", "configured": False, "warehouses": [],
                 "received": 0, "missing": 0, "scanned": 0,
-                "error": f"{type(exc).__name__}: {exc}"}
+                "error": "error computing report status (see server log)"}
     if not data.get("error"):
         _CACHE.update(at=now, data=data)
         _write_disk(data)

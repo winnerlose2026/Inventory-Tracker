@@ -73,7 +73,7 @@ def html_check(path: Path) -> list[str]:
 
     # 1) Script tag balance — the failure mode that black-screened the app.
     opens = len(re.findall(r"<script\b[^>]*>", src, re.IGNORECASE))
-    closes = len(re.findall(r"</script>", src, re.IGNORECASE))
+    closes = len(re.findall(r"</script\s*>", src, re.IGNORECASE))
     if opens != closes:
         errors.append(
             f"<script> tags unbalanced: {opens} open vs {closes} close "
@@ -84,7 +84,7 @@ def html_check(path: Path) -> list[str]:
     # `node --check` on it. Jinja expressions get stubbed so they don't
     # confuse the parser.
     pat = re.compile(
-        r"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script>",
+        r"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>",
         re.DOTALL | re.IGNORECASE,
     )
     for i, m in enumerate(pat.finditer(src)):
