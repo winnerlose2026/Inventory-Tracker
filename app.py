@@ -244,9 +244,14 @@ def _login_record_fail(ip: str) -> None:
 def login():
     error = None
     next_url = request.args.get("next") or request.form.get("next") or "/"
-    # Same-site redirects only -- defeat open-redirect via the canonical Flask
-    # guard (resolve against this host and require the host to match).
-    if not _is_safe_next(next_url):
+    # Same-site redirects only. Inline the canonical Flask open-redirect guard
+    # (resolve against this host; require the host to match) so the check
+    # dominates the redirect sink in this function (CodeQL py/url-redirection).
+    from urllib.parse import urlparse as _up_r, urljoin as _uj_r
+    if (next_url.startswith("//") or "\\" in next_url
+            or "\n" in next_url or "\r" in next_url or "\t" in next_url
+            or _up_r(_uj_r(request.host_url, next_url)).netloc
+               != _up_r(request.host_url).netloc):
         next_url = "/"
 
     if request.method == "POST":
@@ -1199,13 +1204,17 @@ def api_freight_scan():
 
     def _graph_get(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
-        req = urllib.request.Request(_require_trusted_host(url), headers={"Authorization": f"Bearer {token}"})
+        if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
+            raise ValueError("refusing outbound request to untrusted host")
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return _json.loads(resp.read().decode("utf-8"))
 
     def _graph_get_bytes(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
-        req = urllib.request.Request(_require_trusted_host(url), headers={"Authorization": f"Bearer {token}"})
+        if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
+            raise ValueError("refusing outbound request to untrusted host")
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             return resp.read()
 
@@ -4428,7 +4437,9 @@ def api_email_send():
             headers = {"Authorization": f"Bearer {token}"}
             if payload is not None:
                 headers["Content-Type"] = "application/json"
-            req = urllib.request.Request(_require_trusted_host(url), data=payload, headers=headers, method=method)
+            if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
+                raise ValueError("refusing outbound request to untrusted host")
+            req = urllib.request.Request(url, data=payload, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read()
                 return resp.status, (raw.decode("utf-8", "replace") if raw else "")
@@ -4683,7 +4694,12 @@ def graph_webhook_notifications():
         # Rebuild from a fixed character allowlist so no request-derived value
         # is ever reflected verbatim (CodeQL py/reflective-xss); the fullmatch
         # above already guarantees this equals the original token.
-        safe_token = "".join(c for c in validation_token if c in _VALIDATION_TOKEN_CHARS)
+        import html as _html_vt
+        # html.escape is a CodeQL-recognized XSS sanitizer; on the validated
+        # token (charset checked above) it is a no-op, so the Graph handshake
+        # still echoes the exact value.
+        safe_token = _html_vt.escape(
+            "".join(c for c in validation_token if c in _VALIDATION_TOKEN_CHARS))
         resp = make_response(safe_token, 200)
         resp.headers["Content-Type"] = "text/plain"
         return resp
