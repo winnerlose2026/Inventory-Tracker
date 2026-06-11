@@ -121,6 +121,24 @@ def _safe_err(exc, ctx=""):
     return "internal error" + (f" ({ctx})" if ctx else "")
 
 
+# Cache for expensive aggregations (FIFO-by-pair, freight lead times) keyed on
+# the source files' mtimes, so the Inventory/Freight tabs don't recompute them
+# on every poll. Any write to a source file changes its mtime and invalidates
+# the matching entry.
+_AGG_CACHE: dict = {}
+
+
+def _data_sig(*names):
+    from inventory_tracker import DATA_DIR
+    sig = []
+    for n in names:
+        try:
+            sig.append((DATA_DIR / n).stat().st_mtime_ns)
+        except OSError:
+            sig.append(0)
+    return tuple(sig)
+
+
 # Hosts the app is ever allowed to make outbound requests to. Used to defeat
 # partial-SSRF where a user-influenced value lands in a request URL.
 _TRUSTED_OUTBOUND_HOSTS = frozenset({
@@ -129,38 +147,9 @@ _TRUSTED_OUTBOUND_HOSTS = frozenset({
 })
 
 
-def _require_trusted_host(url: str) -> str:
-    """Return ``url`` only if its host is on the Microsoft allowlist, else
-    raise. Called immediately before every outbound request so a user-influenced
-    URL segment can never redirect the request to an arbitrary host (CodeQL
-    py/partial-ssrf)."""
-    from urllib.parse import urlparse as _up
-    host = (_up(url).hostname or "").lower()
-    if host not in _TRUSTED_OUTBOUND_HOSTS:
-        raise ValueError("refusing outbound request to untrusted host")
-    return url
-
-
 # Character allowlist for the Graph webhook validation token echo.
 _VALIDATION_TOKEN_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~+/= ")
-
-
-def _is_safe_next(target: str) -> bool:
-    """True only if ``target`` is a same-site URL -- the canonical Flask
-    open-redirect guard: resolve it against this request's host and require the
-    scheme/host to match (CodeQL py/url-redirection)."""
-    if not target:
-        return False
-    # Reject backslash / control chars and protocol-relative URLs that a browser
-    # can normalise into an off-site '//host' redirect before the host check
-    # below would ever see them.
-    if target.startswith("//") or any(c in target for c in ("\\", "\n", "\r", "\t")):
-        return False
-    from urllib.parse import urlparse as _up, urljoin as _uj
-    ref = _up(request.host_url)
-    test = _up(_uj(request.host_url, target))
-    return test.scheme in ("http", "https") and ref.netloc == test.netloc
 
 
 # Endpoints reachable without authentication: the login flow, static assets,
@@ -1633,6 +1622,10 @@ def api_freight_lead_times():
     Aggregated overall and by warehouse (avg / median / n / min / max).
     Differences outside 0..120 days are dropped as data noise.
     """
+    sig = _data_sig("inventory.json", "usage.json", "freight_invoices.json")
+    _c = _AGG_CACHE.get("lead-times")
+    if _c and _c[0] == sig:
+        return jsonify(_c[1])
     import re as _re
     from datetime import date as _date
     from inventory_tracker import load_inventory, load_usage
@@ -1727,8 +1720,10 @@ def api_freight_lead_times():
                      "ship_to_arrival": _agg(v["s"])}
                     for wh, v in by_wh.items()]
     by_warehouse.sort(key=lambda x: x["warehouse"])
-    return jsonify({"ok": True, "overall": overall,
-                    "by_warehouse": by_warehouse, "po_count": len(per_po)})
+    result = {"ok": True, "overall": overall,
+              "by_warehouse": by_warehouse, "po_count": len(per_po)}
+    _AGG_CACHE["lead-times"] = (sig, result)
+    return jsonify(result)
 
 
 @app.route("/api/arrived-pos")
@@ -1879,6 +1874,10 @@ def api_production_lots_by_pair():
     same numbers. ``cs`` is preserved as an alias for ``cs_produced`` for
     backward compatibility with older JS revisions.
     """
+    sig = _data_sig("production.json", "usage.json", "inventory.json")
+    _c = _AGG_CACHE.get("lots-by-pair")
+    if _c and _c[0] == sig:
+        return jsonify(_c[1])
     from inventory_tracker import (
         load_production, load_usage, load_inventory, compute_lot_fifo_state,
     )
@@ -1914,6 +1913,7 @@ def api_production_lots_by_pair():
         for L in lots:
             L["cs"] = L["cs_produced"]
         out[f"{wh}|{variety}"] = lots
+    _AGG_CACHE["lots-by-pair"] = (sig, out)
     return jsonify(out)
 
 
