@@ -145,6 +145,35 @@ def api_auth_check():
     return jsonify({"required": True, "authorized": False})
 
 
+# ---------------------------------------------------------------------------
+# Login throttling: in-memory per-IP failed-attempt lockout (per gunicorn
+# worker; enough to blunt password brute force on a small internal tool).
+# ---------------------------------------------------------------------------
+_LOGIN_FAILS: dict = {}        # ip -> [monotonic timestamps of recent failures]
+_LOGIN_WINDOW_S = 900          # 15-minute sliding window
+_LOGIN_MAX_FAILS = 8           # lock after this many failures within the window
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or "?"
+
+
+def _login_locked(ip: str) -> bool:
+    import time as _t
+    now = _t.monotonic()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _LOGIN_FAILS[ip] = fails
+    return len(fails) >= _LOGIN_MAX_FAILS
+
+
+def _login_record_fail(ip: str) -> None:
+    import time as _t
+    _LOGIN_FAILS.setdefault(ip, []).append(_t.monotonic())
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
@@ -162,6 +191,13 @@ def login():
         next_url = "/"
 
     if request.method == "POST":
+        ip = _client_ip()
+        if _login_locked(ip):
+            return render_template(
+                "login.html",
+                error="Too many failed attempts. Please wait a few minutes and try again.",
+                next_url=next_url,
+            ), 429
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         # Allowed users come from INVENTORY_USERNAMES (comma-separated) with
@@ -179,11 +215,13 @@ def login():
         if allowed and expected_pass \
                 and username.lower() in allowed \
                 and secrets.compare_digest(password, expected_pass):
+            _LOGIN_FAILS.pop(ip, None)
             session.permanent = True
             # Preserve the casing the user typed so the header chip reads
             # "Jay" / "JD" the way they signed in, not the env-var spelling.
             session["user"] = username
             return redirect(next_url)
+        _login_record_fail(ip)
         error = "Invalid username or password."
 
     return render_template("login.html", error=error, next_url=next_url)

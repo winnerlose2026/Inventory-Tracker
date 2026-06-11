@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Syntax gate (byte-compile all sources)
+        run: python -m compileall -q .
+
+      - name: Run tests
+        # test_po_revision.py is a stale manual script that asserts the old
+        # "PO email immediately restocks on-hand" behavior; POs now flow through
+        # on-order -> arrival, so it is intentionally excluded pending a rewrite.
+        run: >
+          python -m pytest -q
+          test_on_order_dedup.py
+          test_cheney_inventory_report.py
+          test_usfoods_inventory_report.py

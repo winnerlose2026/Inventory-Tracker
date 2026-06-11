@@ -197,21 +197,29 @@ def test_rebase_keeps_recent_po_pending_with_corrected_dates():
 
         target = "plain bagel 4oz [usf - manassas]"
         inv = it._load(it.INVENTORY_FILE)
+        # Dates relative to "now" so the PO is always inside the 30-day
+        # window -- otherwise it rolls over once real time passes the
+        # hard-coded eta and this test rots.
+        from datetime import datetime as _dtt, timedelta as _tdd
+        po_date = _dtt.now() - _tdd(days=6)
+        subj = po_date.strftime("%m/%d/%y")
+        exp_ordered = po_date.strftime("%Y-%m-%d")
+        exp_eta = (po_date + _tdd(days=30)).strftime("%Y-%m-%d")
         inv[target]["on_order"] = [{
             "qty": 24.0, "unit": "cs",
-            "eta": "2026-06-12T00:00:00",
-            "ordered_at": "2026-05-13T20:00:00",
+            "eta": (po_date + _tdd(days=38)).strftime("%Y-%m-%dT00:00:00"),
+            "ordered_at": (po_date + _tdd(days=8)).strftime("%Y-%m-%dT20:00:00"),
             "po_number": "TESTPO2", "po_revision": "0000001",
             "source": "Email Inbox",
-            "source_subject": "USF PO 888888 5O/2125 05/05/26 ...",
+            "source_subject": f"USF PO 888888 5O/2125 {subj} ...",
         }]
         it.save_inventory(inv)
 
         reloaded = it.load_inventory()
         pending = reloaded[target]["on_order"]
         assert len(pending) == 1
-        assert pending[0]["ordered_at"].startswith("2026-05-05")
-        assert pending[0]["eta"].startswith("2026-06-04")
+        assert pending[0]["ordered_at"].startswith(exp_ordered)
+        assert pending[0]["eta"].startswith(exp_eta)
 
 
 def test_collapse_keeps_highest_revision_for_same_po():
