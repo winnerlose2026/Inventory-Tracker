@@ -4350,6 +4350,17 @@ def api_email_scan():
             "messages_seen": 0,
             "messages_parsed": 0,
         }
+    # Strip any exception-derived text the scanner surfaced into report["error"]
+    # before returning; full detail is in the server log. Keeps exception text
+    # out of the HTTP response (CodeQL py/stack-trace-exposure, inline barrier).
+    _scan_err = report.get("error")
+    if _scan_err:
+        import sys as _sys
+        print(f"[email scan errors] {_scan_err}", file=_sys.stderr)
+        report["error"] = (
+            "scan completed with errors (see server log)"
+            if report.get("status") == "ok" else "internal error"
+        )
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 

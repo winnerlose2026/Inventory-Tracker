@@ -58,6 +58,15 @@ from .email_scanner import EmailInboxClient, GRAPH_BASE
 # We renew well before that — 68h asked, daily cron PATCHes back up to 68h.
 SUBSCRIPTION_LIFETIME_HOURS = 68
 
+
+def _log_exc_gs(exc, ctx=""):
+    """Log the full exception to the server log so its text never flows into
+    an HTTP response (CodeQL py/stack-trace-exposure). Returns None on purpose."""
+    import sys as _sys
+    import traceback as _tb
+    label = "[graph_subscriptions " + ctx + "]" if ctx else "[graph_subscriptions]"
+    print(f"{label} {type(exc).__name__}: {exc}\n{_tb.format_exc()}", file=_sys.stderr)
+
 # Where we persist subscription metadata. Lives alongside inventory.json
 # on the Render persistent disk so it survives cold starts.
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -219,7 +228,8 @@ def create_subscriptions() -> dict:
                 "POST", f"{GRAPH_BASE}/subscriptions", token, body=body,
             )
         except Exception as exc:  # noqa: BLE001
-            results.append({"user": user, "ok": False, "error": str(exc)})
+            _log_exc_gs(exc, "create_subscriptions")
+            results.append({"user": user, "ok": False, "error": "subscribe failed (see server log)"})
             continue
         rec = {
             "id": resp.get("id"),
@@ -277,6 +287,7 @@ def renew_subscriptions() -> dict:
             by_user[user] = sub
             results.append({"user": user, "ok": True, "subscription": sub})
         except Exception as exc:  # noqa: BLE001
+            _log_exc_gs(exc, "renew_subscriptions patch")
             msg = str(exc)
             if "404" in msg or "ResourceNotFound" in msg:
                 # Subscription expired or was deleted server-side. Recreate.
@@ -306,12 +317,13 @@ def renew_subscriptions() -> dict:
                         "note": "recreated after 404",
                     })
                 except Exception as exc2:  # noqa: BLE001
+                    _log_exc_gs(exc2, "renew_subscriptions recreate")
                     results.append({
                         "user": user, "ok": False,
-                        "error": f"renew 404, recreate failed: {exc2}",
+                        "error": "renew 404, recreate failed (see server log)",
                     })
             else:
-                results.append({"user": user, "ok": False, "error": msg})
+                results.append({"user": user, "ok": False, "error": "renew failed (see server log)"})
 
     # Create subscriptions for mailboxes we don't yet cover.
     for user in missing_users:
@@ -340,7 +352,8 @@ def renew_subscriptions() -> dict:
                 "note": "newly covered mailbox",
             })
         except Exception as exc:  # noqa: BLE001
-            results.append({"user": user, "ok": False, "error": str(exc)})
+            _log_exc_gs(exc, "renew_subscriptions add mailbox")
+            results.append({"user": user, "ok": False, "error": "subscribe failed (see server log)"})
 
     state["subscriptions"] = list(by_user.values())
     _save_state(state)
@@ -461,7 +474,8 @@ def handle_notification(payload: dict) -> dict:
     try:
         token = client._ms365_token()
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"token failed: {exc}"}
+        _log_exc_gs(exc, "handle_notification token")
+        return {"ok": False, "error": "token failed (see server log)"}
 
     ingested = 0
     skipped = 0
@@ -486,7 +500,8 @@ def handle_notification(payload: dict) -> dict:
         try:
             msg = _fetch_message(user, msg_id, token)
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"fetch {msg_id}: {exc}")
+            _log_exc_gs(exc, "handle_notification fetch")
+            errors.append(f"fetch {msg_id}: failed (see server log)")
             continue
 
         subject = msg.get("subject") or ""
@@ -515,7 +530,8 @@ def handle_notification(payload: dict) -> dict:
         try:
             pdf_bytes = _fetch_first_pdf(user, msg_id, token)
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{subject[:60]!r}: fetch-att failed: {exc}")
+            _log_exc_gs(exc, "handle_notification fetch-att")
+            errors.append(f"{subject[:60]!r}: fetch-att failed (see server log)")
             continue
         if not pdf_bytes:
             errors.append(f"{subject[:60]!r}: no PDF attachment")
@@ -524,7 +540,8 @@ def handle_notification(payload: dict) -> dict:
         try:
             sheet = parse_production_pdf(pdf_bytes, subject=subject)
         except Exception as exc:  # noqa: BLE001
-            errors.append(f"{subject[:60]!r}: parse failed: {exc}")
+            _log_exc_gs(exc, "handle_notification parse")
+            errors.append(f"{subject[:60]!r}: parse failed (see server log)")
             continue
 
         now_iso = datetime.now(timezone.utc).isoformat()
