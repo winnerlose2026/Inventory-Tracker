@@ -92,38 +92,12 @@ def _cors_preflight(_any):
 # (which authenticates via its own clientState, not our token).
 # ---------------------------------------------------------------------------
 
-def _user_logged_in() -> bool:
-    return bool(session.get("user"))
-
-
-def _has_valid_api_token() -> bool:
-    expected = os.environ.get("INVENTORY_API_TOKEN", "").strip()
-    if not expected:
-        return False
-    got = (request.headers.get("X-Inventory-Token") or "").strip()
-    return bool(got) and secrets.compare_digest(got, expected)
-
-
-def _is_authenticated() -> bool:
-    return _user_logged_in() or _has_valid_api_token()
-
-
-def _log_exc(exc, ctx=""):
-    """Log the full exception to the server log (Render). Returns None on
-    purpose, so an exception's text never flows into an HTTP response -- the
-    only safe place for a stack trace is the server log (CodeQL
-    py/stack-trace-exposure)."""
-    import sys as _sys
-    import traceback as _tb2
-    label = "[error " + ctx + "]" if ctx else "[error]"
-    print(f"{label} {type(exc).__name__}: {exc}\n{_tb2.format_exc()}", file=_sys.stderr)
-
-
-def _safe_err(exc, ctx=""):
-    """Log the exception server-side and return a generic, exception-free
-    message suitable for an HTTP response."""
-    _log_exc(exc, ctx)
-    return "internal error" + (f" ({ctx})" if ctx else "")
+# Shared helpers live in core/ now (incremental refactor — see REFACTOR_PLAN.md)
+# so blueprints can import them without importing this module.
+from core.auth import (  # noqa: E402
+    _user_logged_in, _has_valid_api_token, _is_authenticated, _OPEN_ENDPOINTS,
+)
+from core.errors import _log_exc, _safe_err  # noqa: E402
 
 
 # Cache for expensive aggregations (FIFO-by-pair, freight lead times) keyed on
@@ -160,10 +134,7 @@ _VALIDATION_TOKEN_CHARS = frozenset(
 # Endpoints reachable without authentication: the login flow, static assets,
 # the auth-status probe the login page calls, and the Graph webhook (which
 # authenticates via its own clientState, since Graph won't send our token).
-_OPEN_ENDPOINTS = {
-    "login", "logout", "static", "api_auth_check",
-    "graph_webhook_notifications", "health.healthz",
-}
+# (_OPEN_ENDPOINTS is imported from core.auth above.)
 
 
 @app.before_request
