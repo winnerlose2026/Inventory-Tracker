@@ -380,7 +380,9 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
         try:
             mm, dd, yyyy = raw.split("/")
             sheet.production_date = f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
-        except Exception:
+        except ValueError:
+            # Only a malformed date string (bad split / int) should fall back to
+            # the raw value; anything else is a real bug and should surface.
             sheet.production_date = raw
     else:
         dates_from_lots = sorted(_dates_from_lot_numbers(text))

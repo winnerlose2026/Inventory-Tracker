@@ -157,8 +157,20 @@ _VALIDATION_TOKEN_CHARS = frozenset(
 # authenticates via its own clientState, since Graph won't send our token).
 _OPEN_ENDPOINTS = {
     "login", "logout", "static", "api_auth_check",
-    "graph_webhook_notifications",
+    "graph_webhook_notifications", "healthz",
 }
+
+
+@app.route("/healthz")
+def healthz():
+    """Open, unauthenticated liveness probe for uptime monitors / load
+    balancers. Returns 200 with a tiny JSON body; touches no data stores."""
+    import time as _t
+    return jsonify({
+        "ok": True,
+        "service": "inventory-tracker",
+        "time": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+    })
 
 
 @app.before_request
