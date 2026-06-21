@@ -14,7 +14,7 @@ from flask import request, session
 # blueprint-qualified endpoint names (e.g. "health.healthz").
 _OPEN_ENDPOINTS = {
     "login", "logout", "static", "api_auth_check",
-    "graph_webhook_notifications", "health.healthz",
+    "webhooks.graph_webhook_notifications", "health.healthz",
 }
 
 

@@ -20,7 +20,9 @@ app = Flask(__name__)
 # Blueprints (incremental refactor of this monolith — see REFACTOR_PLAN.md).
 # Imported after `app` exists; blueprint modules must not import this module.
 from blueprints.health import health_bp  # noqa: E402
+from blueprints.webhooks import webhooks_bp  # noqa: E402
 app.register_blueprint(health_bp)
+app.register_blueprint(webhooks_bp)
 
 # Session config — 30-day signed cookies. SECRET_KEY should come from Render's
 # environment (otherwise sessions reset on every redeploy when the random
@@ -126,9 +128,7 @@ _TRUSTED_OUTBOUND_HOSTS = frozenset({
 })
 
 
-# Character allowlist for the Graph webhook validation token echo.
-_VALIDATION_TOKEN_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~+/= ")
+# _VALIDATION_TOKEN_CHARS moved to blueprints/webhooks.py
 
 
 # Endpoints reachable without authentication: the login flow, static assets,
@@ -4638,7 +4638,7 @@ def api_email_ingest_events():
 
 
 # ---------------------------------------------------------------------------
-# Microsoft Graph change-notification subscriptions for Daily Production.
+# Microsoft Graph webhook/subscription routes — moved to blueprints/webhooks.py.
 #
 # These three routes turn the Daily Production pipeline into a push model:
 #   - /webhooks/graph/notifications   Graph -> us. New-message pings; we
@@ -4656,107 +4656,7 @@ def api_email_ingest_events():
 # GRAPH_SUB_CLIENT_STATE) which the handler verifies.
 # ---------------------------------------------------------------------------
 
-@app.route("/webhooks/graph/notifications", methods=["POST"])
-def graph_webhook_notifications():
-    """Microsoft Graph -> us. Either a validation handshake or a real
-    notification batch.
-
-    Graph requires:
-      - The validation handshake (a one-time GET-or-POST with
-        ``?validationToken=…``) returns the token verbatim as
-        ``text/plain``. Anything else fails the subscription create.
-      - A regular notification POST returns 2xx within 10 seconds, or
-        Graph backs off and eventually disables the subscription.
-    """
-    # 1. Validation handshake — Graph sends this once when a subscription
-    #    is created. The body is empty; the token comes via query string.
-    validation_token = request.args.get("validationToken")
-    if validation_token:
-        # Echo the token back verbatim for the Graph handshake, but only if it
-        # matches the safe opaque-token shape Graph sends (no HTML metachars),
-        # so arbitrary request input can never be reflected (CodeQL reflective-xss).
-        import re as _re_vt
-        if not _re_vt.fullmatch(r"[A-Za-z0-9_\-.~+/= ]{1,4096}", validation_token):
-            return make_response("invalid validation token", 400)
-        # Rebuild from a fixed character allowlist so no request-derived value
-        # is ever reflected verbatim (CodeQL py/reflective-xss); the fullmatch
-        # above already guarantees this equals the original token.
-        import html as _html_vt
-        # html.escape is a CodeQL-recognized XSS sanitizer; on the validated
-        # token (charset checked above) it is a no-op, so the Graph handshake
-        # still echoes the exact value.
-        safe_token = _html_vt.escape(
-            "".join(c for c in validation_token if c in _VALIDATION_TOKEN_CHARS))
-        resp = make_response(safe_token, 200)
-        resp.headers["Content-Type"] = "text/plain"
-        return resp
-
-    # 2. Real notification batch.
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-    except Exception:  # noqa: BLE001
-        payload = {}
-
-    try:
-        from integrations.graph_subscriptions import handle_notification
-        result = handle_notification(payload)
-    except Exception as exc:  # noqa: BLE001
-        # Don't 500 — that makes Graph back off and eventually disable the
-        # sub. Log server-side and return a generic 202 so Graph stays happy.
-        _log_exc(exc, "webhook")
-        return jsonify({
-            "ok": False,
-            "error": "internal error (webhook)",
-        }), 202
-
-    return jsonify(result), 202
-
-
-@app.route("/api/graph/subscriptions", methods=["GET", "POST"])
-def api_graph_subscriptions():
-    """GET = list locally-tracked subscriptions.
-    POST = create a subscription per mailbox in MS365_USER.
-
-    POST returns the Graph response (id + expirationDateTime per mailbox).
-    Run this once after deploying or if you ever delete the sub list.
-    """
-    import traceback as _tb
-    try:
-        from integrations.graph_subscriptions import (
-            create_subscriptions, list_subscriptions,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": _safe_err(exc, "import")}), 500
-
-    if request.method == "GET":
-        return jsonify({"ok": True, "subscriptions": list_subscriptions()})
-
-    try:
-        result = create_subscriptions()
-    except Exception as exc:  # noqa: BLE001
-        _log_exc(exc, "graph subscriptions create")
-        return jsonify({"ok": False, "error": "internal error"}), 500
-    return jsonify(result)
-
-
-@app.route("/api/graph/subscriptions/renew", methods=["POST"])
-def api_graph_subscriptions_renew():
-    """Renew every tracked subscription. Called daily by a Render cron.
-
-    If a subscription is missing on Graph's side (404), this recreates it
-    so coverage doesn't silently lapse.
-    """
-    import traceback as _tb
-    try:
-        from integrations.graph_subscriptions import renew_subscriptions
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": _safe_err(exc, "import")}), 500
-    try:
-        result = renew_subscriptions()
-    except Exception as exc:  # noqa: BLE001
-        _log_exc(exc, "graph subscriptions renew")
-        return jsonify({"ok": False, "error": "internal error"}), 500
-    return jsonify(result)
+# Graph webhook + subscription routes now live in blueprints/webhooks.py.
 
 
 @app.route("/api/export.xlsx")
