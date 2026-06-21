@@ -17,6 +17,11 @@ from inventory_tracker import (
 
 app = Flask(__name__)
 
+# Blueprints (incremental refactor of this monolith — see REFACTOR_PLAN.md).
+# Imported after `app` exists; blueprint modules must not import this module.
+from blueprints.health import health_bp  # noqa: E402
+app.register_blueprint(health_bp)
+
 # Session config — 30-day signed cookies. SECRET_KEY should come from Render's
 # environment (otherwise sessions reset on every redeploy when the random
 # fallback regenerates).
@@ -157,20 +162,8 @@ _VALIDATION_TOKEN_CHARS = frozenset(
 # authenticates via its own clientState, since Graph won't send our token).
 _OPEN_ENDPOINTS = {
     "login", "logout", "static", "api_auth_check",
-    "graph_webhook_notifications", "healthz",
+    "graph_webhook_notifications", "health.healthz",
 }
-
-
-@app.route("/healthz")
-def healthz():
-    """Open, unauthenticated liveness probe for uptime monitors / load
-    balancers. Returns 200 with a tiny JSON body; touches no data stores."""
-    import time as _t
-    return jsonify({
-        "ok": True,
-        "service": "inventory-tracker",
-        "time": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
-    })
 
 
 @app.before_request
