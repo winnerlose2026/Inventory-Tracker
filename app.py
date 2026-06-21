@@ -102,30 +102,10 @@ from core.auth import (  # noqa: E402
 from core.errors import _log_exc, _safe_err  # noqa: E402
 
 
-# Cache for expensive aggregations (FIFO-by-pair, freight lead times) keyed on
-# the source files' mtimes, so the Inventory/Freight tabs don't recompute them
-# on every poll. Any write to a source file changes its mtime and invalidates
-# the matching entry.
-_AGG_CACHE: dict = {}
-
-
-def _data_sig(*names):
-    from inventory_tracker import DATA_DIR
-    sig = []
-    for n in names:
-        try:
-            sig.append((DATA_DIR / n).stat().st_mtime_ns)
-        except OSError:
-            sig.append(0)
-    return tuple(sig)
-
-
-# Hosts the app is ever allowed to make outbound requests to. Used to defeat
-# partial-SSRF where a user-influenced value lands in a request URL.
-_TRUSTED_OUTBOUND_HOSTS = frozenset({
-    "graph.microsoft.com",
-    "login.microsoftonline.com",
-})
+# Shared cache + outbound-host helpers live in core/ now (refactor — see
+# REFACTOR_PLAN.md). _AGG_CACHE is mutated by item assignment, never rebound.
+from core.cache import _AGG_CACHE, _data_sig  # noqa: E402
+from core.http import _TRUSTED_OUTBOUND_HOSTS  # noqa: E402
 
 
 # _VALIDATION_TOKEN_CHARS moved to blueprints/webhooks.py
