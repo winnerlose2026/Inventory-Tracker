@@ -753,6 +753,13 @@ def _apply_events(events: list,
     is performed here.
     """
     errors = list(errors or [])
+    # Log raw error detail server-side only; never let it reach the HTTP
+    # response (CodeQL py/stack-trace-exposure — sanitize at the source so
+    # every _apply_events caller's report is exception-text-free).
+    if errors:
+        import sys as _sys
+        print('[apply_events] ' + str(len(errors)) + ' parse error(s): '
+              + '; '.join(str(e) for e in errors[:10]), file=_sys.stderr)
     report = {
         "distributor": "Email Inbox",
         "source": source,
@@ -762,7 +769,7 @@ def _apply_events(events: list,
         "unchanged": 0,
         "unmatched": [],
         "changes": [],
-        "error": "; ".join(errors[:5]) if errors else None,
+        "error": (str(len(errors)) + " parse error(s) (see server log)") if errors else None,
         "messages_seen": messages_seen,
         "messages_parsed": messages_parsed,
         "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
