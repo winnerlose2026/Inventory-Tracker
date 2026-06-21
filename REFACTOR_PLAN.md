@@ -1,9 +1,12 @@
 # Blueprint + JS extraction refactor (#8) — plan
 
-**Status:** in progress on branch `refactor/blueprints-and-js`. First slice
-(health blueprint) landed as the proof-of-pattern. Everything else is staged
-below. This branch is **never merged directly to `main` without review** — each
-slice is its own CI-gated PR.
+**Status: ✅ COMPLETE (2026-06-21).** The full refactor shipped to `main` in
+behavior-preserving, CI-gated slices (PRs #8–#17): `app.py` went 4,827 → 446
+lines (a thin shell), logic now lives in `core/` + 9 domain blueprints
+(health, webhooks, freight, production, pos, inventory, admin, email,
+reporting), and the inline front-end JS was extracted to `static/app.js`.
+CodeQL is clean (0 open alerts). The plan below is retained as the record of
+how it was done.
 
 ## Why
 `app.py` (~4.8k lines) and `templates/index.html` (~5.7k lines of inline JS/CSS)
