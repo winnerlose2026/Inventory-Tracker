@@ -58,12 +58,17 @@ def api_email_scan():
             since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             # Graph wants ISO 8601 with a Z suffix, no microseconds.
             iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            # Mirror cowork_graph_scan: pre-filter to attachment-bearing
-            # messages so the page budget isn't burned on non-PO mail.
-            # Graph rejects hasAttachments + $orderby (InefficientFilter),
-            # so _scan_ms365_mailbox drops orderby when the filter
-            # contains "hasAttachments".
-            filter_override = f"hasAttachments eq true and receivedDateTime ge {iso}"
+            # Bound the sweep by date only -- deliberately NOT by
+            # hasAttachments. A hasAttachments filter drops body-pasted
+            # reports server-side (e.g. the US Foods Zebulon weekly inventory
+            # report, whose only "attachment" is an inline signature image),
+            # so those never reached the parser. _scan_ms365_mailbox
+            # pre-qualifies every listed message by sender/recipient (known
+            # distributor domain or mapped report/worksheet rep) before
+            # downloading any MIME, so dropping hasAttachments widens coverage
+            # without ballooning the gunicorn budget. A plain receivedDateTime
+            # filter also keeps $orderby working (no InefficientFilter).
+            filter_override = f"receivedDateTime ge {iso}"
 
         client = EmailInboxClient()
         try:
@@ -384,6 +389,7 @@ def api_email_ingest_events():
                 po_number=str(e.get("po_number") or ""),
                 po_revision=str(e.get("po_revision") or ""),
                 po_order_date=str(e.get("po_order_date") or ""),
+                count_date=str(e.get("count_date") or ""),
             ))
         except (TypeError, ValueError, KeyError) as exc:
             build_errors.append(f"events[{idx}]: error")

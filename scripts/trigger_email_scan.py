@@ -23,17 +23,18 @@ def main() -> int:
     token = os.environ.get("INVENTORY_API_TOKEN", "").strip()
     endpoint = f"{app_url}/api/email/scan"
     # Ask the web service for a wider sweep than the defaults: 14-day
-    # lookback restricted to attachment-bearing messages, with a per-
-    # mailbox budget of 200. The default (max_messages=60, no lookback)
-    # only walks the 60 most-recent messages -- which biases the scan
-    # against slow-arrival senders (Chefs Warehouse drops 1-2 POs a
-    # week; if other senders pile in 60+ attachment messages between
-    # cron runs, CW emails fall off the top of the list and never get
-    # parsed). 14 days at a couple hundred attachment messages per
-    # mailbox fits comfortably in the 180s gunicorn budget, the PO
-    # revision-replace logic in _apply_events makes re-scanning the
-    # same message idempotent, and CW POs land via the parallel
-    # cw_pos channel.
+    # lookback with a per-mailbox budget of 200. The scan bounds the sweep
+    # by date only (NOT hasAttachments) and pre-qualifies each message by
+    # sender/recipient before downloading MIME, so body-pasted reports
+    # (e.g. the US Foods Zebulon weekly inventory report) are caught too.
+    # The default (max_messages=60, no lookback) only walks the 60
+    # most-recent messages -- which biases the scan against slow-arrival
+    # senders (Chefs Warehouse drops 1-2 POs a week; if other senders pile
+    # in 60+ messages between cron runs, CW emails fall off the top of the
+    # list and never get parsed). 14 days fits comfortably in the 180s
+    # gunicorn budget, the PO revision-replace logic in _apply_events makes
+    # re-scanning the same message idempotent, and CW POs land via the
+    # parallel cw_pos channel.
     body = json.dumps({
         "dry_run": False,
         "lookback_days": 14,

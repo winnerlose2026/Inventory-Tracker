@@ -182,6 +182,12 @@ class EmailEvent:
     # when we happened to scan it), so the 30-day rollover into quantity
     # tracks the real lead time even for backlogged messages.
     po_order_date: str = ""
+    # ISO datetime (or YYYY-MM-DD) of when the count was actually taken at the
+    # warehouse -- in practice the report email's sent date. Lets
+    # _apply_email_event stamp last_count_at / last_usage_report_at with the
+    # true count date instead of the scan/ingest time, so the 7-day freshness
+    # / chaser logic measures the real gap since the last warehouse count.
+    count_date: str = ""
 
 
 @dataclass
@@ -248,6 +254,37 @@ def _distributor_from_sender(from_header: str) -> Optional[str]:
         if domain == known or domain.endswith("." + known):
             return name
     return None
+
+
+def _msg_event_candidate(m: dict) -> bool:
+    """True if a Graph message-list entry is from/to a sender whose mail can
+    produce events: a known distributor domain (US Foods, Cheney, Chefs
+    Warehouse, Lineage) OR a mapped inventory-report / worksheet rep.
+
+    Used by _scan_ms365_mailbox to bound MIME downloads on a wide lookback:
+    only candidates get their full body fetched and parsed. Checks the sender
+    plus every To/Cc recipient, so a distributor PDF riding along on an H&H
+    reply still qualifies. Attachment-agnostic by design, so a DC rep's
+    body-pasted weekly inventory report (no data attachment -- e.g. Zebulon)
+    qualifies exactly like an attachment-bearing PO.
+    """
+    addresses = []
+    sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "")
+    if sender:
+        addresses.append(sender)
+    for collection in ("toRecipients", "ccRecipients"):
+        for r in (m.get(collection) or []):
+            a = ((r.get("emailAddress") or {}).get("address") or "")
+            if a:
+                addresses.append(a)
+    for a in addresses:
+        if _distributor_from_sender(a):
+            return True
+        if _report_warehouse_for_sender(a)[1]:
+            return True
+        if _worksheet_warehouse_for_sender(a)[1]:
+            return True
+    return False
 
 
 def _text_body(msg: Message) -> str:
@@ -700,6 +737,25 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
     return events, errors
 
 
+def _msg_date_iso(msg) -> str:
+    """Best-effort ISO timestamp for when a message was sent (its Date header).
+
+    Used as the "count as of" date for inventory reports: a rep sends the
+    report when the count is taken, so the sent date is the closest uniform
+    proxy for when the warehouse count was completed. Returns "" if the Date
+    header is missing or unparseable.
+    """
+    raw = msg.get("Date") if hasattr(msg, "get") else None
+    if not raw:
+        return ""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return ""
+    return dt.isoformat() if dt is not None else ""
+
+
 def parse_message_with_errors(msg):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
@@ -719,6 +775,7 @@ def parse_message_with_errors(msg):
     subject = str(msg.get("Subject", ""))
     msg_id = str(msg.get("Message-ID", ""))
     from_hdr = str(msg.get("From", ""))
+    sent_iso = _msg_date_iso(msg)
 
     body = _text_body(msg)
     body_tags = {m.group(1).lower(): m.group(2).strip()
@@ -857,6 +914,14 @@ def parse_message_with_errors(msg):
                 source_message_id=msg_id,
                 source_subject=subject,
             ))
+
+    # Stamp the count "as of" date (the report email's sent date) onto on-hand
+    # and usage-rate events so the apply path records last_count_at /
+    # last_usage_report_at as the true count date, not the scan/ingest time.
+    if sent_iso:
+        for _e in events:
+            if _e.event_type in ("on_hand", "usage_rate") and not _e.count_date:
+                _e.count_date = sent_iso
 
     return events, errors, cw_pos
 
@@ -1040,7 +1105,12 @@ class EmailInboxClient:
                     f"?{urllib.parse.urlencode(q)}")
 
         fetched = 0
-        while list_url and fetched < max_messages:
+        pages = 0
+        # Page ceiling so a date-only lookback over a high-volume mailbox can't
+        # walk unbounded metadata pages (80 * $top<=50 ~= 4000 messages
+        # screened per mailbox, well beyond any real lookback window).
+        while list_url and fetched < max_messages and pages < 80:
+            pages += 1
             raw, _ = self._graph_get(list_url, token)
             page = json.loads(raw.decode("utf-8"))
             messages = page.get("value", [])
@@ -1051,40 +1121,24 @@ class EmailInboxClient:
                 if not mid:
                     continue
                 result.messages_seen += 1
-                # When the filter is restricting to a wide attachment-bearing
-                # backfill, pre-qualify by sender domain so we don't burn
-                # gunicorn's worker budget downloading MIME for every PDF
-                # attachment in the mailbox (invoices, statements, etc.).
-                # The metadata $select already includes `from`, so this is a
-                # free check against an already-fetched field.
+                # Pre-qualify each listed message by sender/recipient before
+                # downloading its MIME, on ANY bounded lookback (filt set) --
+                # not only attachment-only sweeps. We qualify if the sender or
+                # any To/Cc recipient maps to a known distributor domain or a
+                # mapped inventory-report / worksheet rep (see
+                # _msg_event_candidate). This keeps the gunicorn budget bounded
+                # to mail that can actually produce events, while letting the
+                # listing include body-pasted reports a `hasAttachments` filter
+                # would have hidden server-side (e.g. the US Foods Zebulon
+                # weekly inventory report -- its only attachment is an inline
+                # signature image).
                 #
-                # Crucially: when the pre-qualifier rejects a message we
-                # `continue` BEFORE incrementing `fetched`, so max_messages
-                # bounds the count of QUALIFIED (MIME-fetched) messages
-                # rather than the count of pages scanned. That lets a
-                # wide-lookback backfill page deeper through Graph to find
-                # older PO mail without ballooning gunicorn budget on
-                # non-PO attachments.
-                if filt and "hasAttachments" in filt:
-                    # Build a list of every address on the message — sender
-                    # plus every To/Cc recipient. We qualify if ANY of them
-                    # match a known distributor domain. Captures both the
-                    # direct distributor-outbound case (sender = USF) and
-                    # the reply-chain case (sender = info@hhbagels.com,
-                    # recipient = USF) where the same PDF rides along on
-                    # H&H's confirmation back to the distributor.
-                    addresses = []
-                    sender = (((m.get("from") or {}).get("emailAddress") or {})
-                              .get("address") or "")
-                    if sender:
-                        addresses.append(sender)
-                    for collection in ("toRecipients", "ccRecipients"):
-                        for r in (m.get(collection) or []):
-                            a = ((r.get("emailAddress") or {}).get("address") or "")
-                            if a:
-                                addresses.append(a)
-                    if not any(_distributor_from_sender(f"<{a}>") for a in addresses):
-                        continue
+                # Crucially: rejected messages `continue` BEFORE incrementing
+                # `fetched`, so max_messages bounds the count of QUALIFIED
+                # (MIME-fetched) messages, not pages scanned -- a wide lookback
+                # can page deep through Graph without ballooning the budget.
+                if filt and not _msg_event_candidate(m):
+                    continue
                 fetched += 1
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
                 try:

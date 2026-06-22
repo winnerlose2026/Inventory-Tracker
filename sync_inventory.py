@@ -490,7 +490,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         wu_changed = (new_wu is not None
                       and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
         if not dry_run:
-            item["last_usage_report_at"] = now
+            item["last_usage_report_at"] = getattr(evt, "count_date", "") or now
         if not wu_changed:
             report["unchanged"] += 1
             return
@@ -527,7 +527,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # even when the numbers match last week's. Drives the per-warehouse
         # freshness indicator on the Inventory page.
         if not dry_run:
-            item["last_count_at"] = now
+            # Record the count's true "as of" date (the report email's sent
+            # date), not the scan/ingest time, so per-warehouse freshness and
+            # the email chasers measure the real gap since the last count.
+            item["last_count_at"] = getattr(evt, "count_date", "") or now
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
@@ -873,7 +876,12 @@ def _apply_events(events: list,
         for evt in grp:
             _apply_email_event(evt, inv, usage, now, report, dry_run)
 
-    for evt in non_po_events:
+    # Apply non-PO events (on_hand, usage_rate, body usage) oldest-count
+    # first, so when several reports for the same warehouse land in one scan
+    # the NEWEST report's date is written last and wins for last_count_at.
+    # Events without a count_date sort first (treated as oldest).
+    for evt in sorted(non_po_events,
+                      key=lambda e: getattr(e, "count_date", "") or ""):
         _apply_email_event(evt, inv, usage, now, report, dry_run)
 
     if not dry_run:

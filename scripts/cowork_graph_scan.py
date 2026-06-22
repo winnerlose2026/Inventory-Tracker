@@ -526,6 +526,7 @@ def run(argv: list[str] | None = None) -> int:
                 "subject": subject,
                 "sender": sender,
                 "distributor": dist,
+                "received": m.get("receivedDateTime") or "",
             })
 
     if not qualifying:
@@ -545,6 +546,7 @@ def run(argv: list[str] | None = None) -> int:
         mb, mid, subject, dist, sender = (
             q["mailbox"], q["id"], q["subject"], q["distributor"], q["sender"],
         )
+        received_iso = q.get("received", "")
         events_before = len(events_out)
         try:
             atts = _list_message_attachments(token, mb, mid, verbose=args.verbose)
@@ -682,6 +684,16 @@ def run(argv: list[str] | None = None) -> int:
                     events_out.append(asdict(e))
                 for er in b_errs:
                     error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+
+        # Stamp the count "as of" date (this report email's received date)
+        # onto on_hand / usage_rate events produced for THIS message, so the
+        # apply path records last_count_at as the true count date rather than
+        # the ingest time -- matching the server-side scan's behavior.
+        if received_iso:
+            for _d in events_out[events_before:]:
+                if (_d.get("event_type") in ("on_hand", "usage_rate")
+                        and not _d.get("count_date")):
+                    _d["count_date"] = received_iso
 
         if any_pdf or len(events_out) > events_before:
             msgs_parsed += 1
