@@ -97,6 +97,31 @@ def api_email_scan():
             dry_run=dry_run,
             source=client.source(),
         )
+        # Persist a scan-health heartbeat + capture recognized-but-unparsed
+        # distributor mail (real runs only) so a missed warehouse or parser
+        # gap is observable on /api/scan/health (roadmap #2/#5/#6).
+        if not dry_run:
+            try:
+                from inventory_tracker import (
+                    save_scan_health, record_unparsed_reports,
+                )
+                _unparsed = list(getattr(scan, "unparsed", []) or [])
+                if _unparsed:
+                    record_unparsed_reports(_unparsed)
+                save_scan_health({
+                    "ts": datetime.now().isoformat(),
+                    "source": report.get("source"),
+                    "status": report.get("status"),
+                    "messages_seen": report.get("messages_seen"),
+                    "messages_parsed": report.get("messages_parsed"),
+                    "updated": report.get("updated"),
+                    "unchanged": report.get("unchanged"),
+                    "by_event_type": report.get("by_event_type"),
+                    "had_errors": bool(report.get("error")),
+                    "unparsed_count": len(_unparsed),
+                })
+            except Exception as exc:  # noqa: BLE001 — health is best-effort
+                _log_exc(exc, "scan health persist")
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "email scan")
         report = {
@@ -125,6 +150,47 @@ def api_email_scan():
             if report.get("status") == "ok" else "internal error"
         )
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@email_bp.route("/api/scan/health")
+def api_scan_health():
+    """Scan heartbeat + per-warehouse count freshness (alerting / dashboard).
+
+    Returns the last real scan's summary, every warehouse's days-since-count
+    with a stale flag (older than STALE_COUNT_DAYS or never counted), and the
+    queue of recognized-but-unparsed distributor messages. Read-only; gated by
+    the global auth hook (browser session or X-Inventory-Token).
+    """
+    try:
+        from inventory_tracker import (
+            load_scan_health, warehouse_freshness, load_unparsed_reports,
+            STALE_COUNT_DAYS,
+        )
+        health = load_scan_health()
+        fresh = warehouse_freshness()
+        stale = [r for r in fresh if r.get("stale")]
+        scan_age_hours = None
+        last_ts = health.get("ts") if health else None
+        if last_ts:
+            try:
+                dt = datetime.fromisoformat(last_ts)
+                scan_age_hours = round(
+                    (datetime.now() - dt).total_seconds() / 3600.0, 1)
+            except ValueError:
+                pass
+        return jsonify({
+            "ok": True,
+            "last_scan": health or None,
+            "last_scan_age_hours": scan_age_hours,
+            "stale_count_days": STALE_COUNT_DAYS,
+            "stale_warehouse_count": len(stale),
+            "warehouses": fresh,
+            "stale_warehouses": stale,
+            "unparsed_reports": load_unparsed_reports(),
+        })
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "scan health")
+        return jsonify({"ok": False, "error": "internal error"}), 500
 
 
 @email_bp.route("/api/email/send", methods=["POST"])

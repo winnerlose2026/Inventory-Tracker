@@ -36,6 +36,7 @@ jobs:
           test_on_order_dedup.py
           test_cheney_inventory_report.py
           test_usfoods_inventory_report.py
+          test_scan_health.py
 
   # Deterministic deploy: trigger Render via a Deploy Hook once tests pass,
   # instead of relying on Render's GitHub auto-deploy webhook (which has been

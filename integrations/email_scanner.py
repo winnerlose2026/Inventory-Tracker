@@ -203,6 +203,11 @@ class ScanResult:
     # than being modeled as EmailEvents. Each entry is the dict form
     # of a ChefsWarehousePO (see chefs_warehouse_po_parser).
     cw_pos: list[dict] = field(default_factory=list)
+    # Distributor-sent messages that were recognized (sender is a known
+    # distributor/rep) but produced ZERO events -- a likely format change or
+    # parser gap. Surfaced on /api/scan/health so a silent miss can't hide.
+    # Each entry: {id, mailbox, sender, subject, received}.
+    unparsed: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1166,6 +1171,23 @@ class EmailInboxClient:
                             result.errors.append(
                                 f"ms365 mark-read failed for {upn}:{mid}: {exc}"
                             )
+                else:
+                    # Recognized distributor/rep SENDER but nothing parsed --
+                    # a likely format change or parser gap. Record it so the
+                    # silent miss shows up on /api/scan/health instead of just
+                    # being a number that never appeared.
+                    _snd = (((m.get("from") or {}).get("emailAddress") or {})
+                            .get("address") or "")
+                    if (_distributor_from_sender(_snd)
+                            or _report_warehouse_for_sender(_snd)[1]
+                            or _worksheet_warehouse_for_sender(_snd)[1]):
+                        result.unparsed.append({
+                            "id": m.get("internetMessageId") or mid,
+                            "mailbox": upn,
+                            "sender": _snd,
+                            "subject": m.get("subject") or "",
+                            "received": m.get("receivedDateTime") or "",
+                        })
             list_url = page.get("@odata.nextLink")
 
     def _scan_imap(self, result, max_messages):

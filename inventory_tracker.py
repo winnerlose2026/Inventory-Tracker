@@ -130,6 +130,89 @@ def save_production(records: list):
     _write_json(PRODUCTION_FILE, records)
 
 
+# ---------------------------------------------------------------------------
+# Scan health & observability (roadmap #2/#5/#6)
+# ---------------------------------------------------------------------------
+SCAN_HEALTH_FILE = DATA_DIR / "scan_health.json"
+UNPARSED_REPORTS_FILE = DATA_DIR / "unparsed_reports.json"
+
+# A warehouse whose most-recent count is older than this many days is "stale"
+# and should be chased. Mirrors the weekly report cadence + 0 slack.
+STALE_COUNT_DAYS = 7
+
+
+def load_scan_health() -> dict:
+    """Last real email-scan summary (heartbeat). {} if never recorded."""
+    return _read_json(SCAN_HEALTH_FILE, {})
+
+
+def save_scan_health(rec: dict):
+    _write_json(SCAN_HEALTH_FILE, rec)
+
+
+def load_unparsed_reports() -> list:
+    return _read_json(UNPARSED_REPORTS_FILE, [])
+
+
+def record_unparsed_reports(new_items: list, *, cap: int = 50) -> list:
+    """Merge newly-seen unparsed distributor messages (deduped by id),
+    newest-first, capped. Returns the stored list."""
+    existing = load_unparsed_reports()
+    if not new_items:
+        return existing
+    seen = {r.get("id") for r in existing if r.get("id")}
+    merged = list(existing)
+    for it in new_items:
+        if it.get("id") and it["id"] in seen:
+            continue
+        merged.insert(0, it)
+        if it.get("id"):
+            seen.add(it["id"])
+    merged = merged[:cap]
+    _write_json(UNPARSED_REPORTS_FILE, merged)
+    return merged
+
+
+def warehouse_freshness(now: Optional[datetime] = None,
+                        stale_days: int = STALE_COUNT_DAYS,
+                        inv: Optional[dict] = None) -> list:
+    """Per-warehouse count freshness for alerting / dashboards.
+
+    One row per (distributor, warehouse): the most recent ``last_count_at``
+    across its SKUs, days since that count, and a ``stale`` flag (older than
+    ``stale_days`` or never counted). Pure read; pass ``inv`` to test without
+    touching disk.
+    """
+    from collections import defaultdict
+    if inv is None:
+        inv = load_inventory()
+    now = now or datetime.now()
+    latest: dict = defaultdict(str)
+    for item in inv.values():
+        wh = (item.get("distributor") or "", item.get("warehouse") or "")
+        lc = item.get("last_count_at") or ""
+        if lc > latest[wh]:
+            latest[wh] = lc
+    rows = []
+    for (dist, wh), lc in sorted(latest.items()):
+        days = None
+        if lc:
+            try:
+                dt = datetime.fromisoformat(lc.replace("Z", "+00:00"))
+                ref = now if dt.tzinfo is None else datetime.now(dt.tzinfo)
+                days = round((ref - dt).total_seconds() / 86400.0, 1)
+            except ValueError:
+                days = None
+        rows.append({
+            "distributor": dist,
+            "warehouse": wh,
+            "last_count_at": lc or None,
+            "days_since_count": days,
+            "stale": (not lc) or (days is not None and days > stale_days),
+        })
+    return rows
+
+
 # Bakery labor — feeds the $PLH report on the Report page. One entry per
 # date {date: YYYY-MM-DD, hours: float, dollars: float, source: str}.
 # `source` is informational (e.g. "toast:mvt-dc", "manual-upload") so we
