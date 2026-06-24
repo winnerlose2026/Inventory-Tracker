@@ -4,8 +4,8 @@ reference views. Extracted from app.py (refactor — see REFACTOR_PLAN.md)."""
 from flask import Blueprint, jsonify, request
 
 from inventory_tracker import (
-    add_item, load_inventory, load_usage, record_usage, remove_item,
-    restock, reverse_usage, update_item,
+    add_item, load_inventory, load_inventory_audit, load_usage, record_usage,
+    remove_item, restock, reverse_usage, update_item,
 )
 
 inventory_bp = Blueprint("inventory", __name__)
@@ -259,3 +259,18 @@ def api_distributors():
             "warehouses": warehouses,
         })
     return jsonify(summary)
+
+
+@inventory_bp.route("/api/inventory/audit")
+def api_inventory_audit():
+    """Recent inventory change audit trail (roadmap #9), newest-first.
+
+    Query: ?limit=N (default 200, max 5000). Read-only; gated by the global
+    auth hook (browser session or X-Inventory-Token).
+    """
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 5000))
+    return jsonify({"ok": True, "limit": limit, "audit": load_inventory_audit(limit)})

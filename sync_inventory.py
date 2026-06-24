@@ -887,6 +887,23 @@ def _apply_events(events: list,
     if not dry_run:
         save_inventory(inv)
         save_usage(usage)
+        # Append an audit trail of every applied change (roadmap #9) so a bad
+        # ingest can be diffed / rolled back. Best-effort; never blocks a save.
+        try:
+            from inventory_tracker import append_inventory_audit
+            append_inventory_audit([
+                {
+                    "ts": now, "source": source,
+                    "name": c.get("name"), "warehouse": c.get("warehouse"),
+                    "event_type": c.get("event_type"),
+                    "old_quantity": c.get("old_quantity"),
+                    "new_quantity": c.get("new_quantity"),
+                    "delta": c.get("delta"),
+                }
+                for c in (report.get("changes") or []) if isinstance(c, dict)
+            ])
+        except Exception:  # noqa: BLE001 — audit is best-effort
+            pass
     return report
 
 

@@ -135,6 +135,7 @@ def save_production(records: list):
 # ---------------------------------------------------------------------------
 SCAN_HEALTH_FILE = DATA_DIR / "scan_health.json"
 UNPARSED_REPORTS_FILE = DATA_DIR / "unparsed_reports.json"
+INVENTORY_AUDIT_FILE = DATA_DIR / "inventory_audit.json"
 
 # A warehouse whose most-recent count is older than this many days is "stale"
 # and should be chased. Mirrors the weekly report cadence + 0 slack.
@@ -171,6 +172,24 @@ def record_unparsed_reports(new_items: list, *, cap: int = 50) -> list:
     merged = merged[:cap]
     _write_json(UNPARSED_REPORTS_FILE, merged)
     return merged
+
+
+def load_inventory_audit(limit: int = 200) -> list:
+    """Recent inventory change audit entries, newest-first (roadmap #9)."""
+    rows = _read_json(INVENTORY_AUDIT_FILE, [])
+    return rows[:limit] if limit else rows
+
+
+def append_inventory_audit(entries: list, *, cap: int = 5000):
+    """Prepend applied-change entries (newest-first), capped. Best-effort."""
+    entries = [e for e in (entries or []) if e]
+    if not entries:
+        return
+    existing = _read_json(INVENTORY_AUDIT_FILE, [])
+    merged = entries + existing
+    if len(merged) > cap:
+        merged = merged[:cap]
+    _write_json(INVENTORY_AUDIT_FILE, merged)
 
 
 def warehouse_freshness(now: Optional[datetime] = None,

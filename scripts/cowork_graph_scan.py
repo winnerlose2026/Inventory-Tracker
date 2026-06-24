@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Cowork-direct mailbox scan via Microsoft Graph.
 
+STATUS (2026-06): SECONDARY / FALLBACK PATH. The canonical, always-on
+ingest is the Render web service POST /api/email/scan (run every 6h by
+the bagel-inventory-6h-scan cron via scripts/trigger_email_scan.py) --
+that runs the DEPLOYED code and is what keeps the site fresh. This
+script is kept in parity (same parsers, count_date stamping, body-only
+handling) as a manual / offline fallback. If you change ingest logic,
+change /api/email/scan first, then mirror it here.
+
 Replaces the Outlook-MCP path used by the `inventory-mailbox-scan-4h` Cowork
 scheduled task. The Outlook MCP that ships with Claude Cowork does not surface
 attachment bytes (its `read_resource` URI scheme has no `/attachments` path),

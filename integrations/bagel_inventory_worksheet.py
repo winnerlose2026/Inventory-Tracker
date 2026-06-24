@@ -63,6 +63,10 @@ def warehouse_for_sender(from_header: str) -> tuple[Optional[str], Optional[str]
     if not m:
         return None, None
     email_addr = m.group(0).lower()
+    from integrations.rep_map import sender_overrides
+    ov = sender_overrides()
+    if email_addr in ov:
+        return ov[email_addr]
     return REP_EMAIL_TO_WAREHOUSE.get(email_addr, (None, None))
 
 

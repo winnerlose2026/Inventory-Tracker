@@ -83,6 +83,46 @@ def test_warehouse_freshness_flags_stale_and_missing():
     assert rows["Fresh"]["days_since_count"] == 2.0
 
 
+def test_rep_map_override_resolves_without_code_change(tmpfile=None):
+    import os, json, tempfile
+    from integrations import rep_map
+    from integrations.usfoods_inventory_report import warehouse_for_sender as usf_wfs
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        json.dump({"NewRep@usfoods.com": ["US Foods", "Tampa, FL"]}, open(path, "w"))
+        os.environ["REP_MAP_FILE"] = path
+        rep_map._CACHE["key"] = None  # bust cache for the test
+        assert usf_wfs("New Rep <newrep@usfoods.com>") == ("US Foods", "Tampa, FL")
+        # a hardcoded rep still resolves (override only ADDS)
+        assert usf_wfs("maria.hernandez@usfoods.com") == ("US Foods", "Zebulon, NC")
+    finally:
+        os.environ.pop("REP_MAP_FILE", None)
+        rep_map._CACHE["key"] = None
+        os.unlink(path)
+
+
+def test_inventory_audit_append_and_cap():
+    import tempfile, os
+    from pathlib import Path as _P
+    import inventory_tracker as it
+    fd, path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+    orig = it.INVENTORY_AUDIT_FILE
+    it.INVENTORY_AUDIT_FILE = _P(path)
+    try:
+        it._FILE_CACHE.pop(str(path), None)
+        it.append_inventory_audit([{"ts": "t1", "name": "A", "delta": 1}])
+        it.append_inventory_audit([{"ts": "t2", "name": "B", "delta": 2}])
+        rows = it.load_inventory_audit()
+        assert rows[0]["ts"] == "t2", "newest first"
+        assert len(rows) == 2
+        it.append_inventory_audit([{"ts": "t%d" % i} for i in range(10)], cap=5)
+        assert len(it.load_inventory_audit()) == 5, "capped"
+    finally:
+        it.INVENTORY_AUDIT_FILE = orig
+        os.unlink(path)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
