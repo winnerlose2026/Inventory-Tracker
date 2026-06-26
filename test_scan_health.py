@@ -123,6 +123,21 @@ def test_inventory_audit_append_and_cap():
         os.unlink(path)
 
 
+def test_reconcile_po_list_splits_present_and_missing():
+    from inventory_tracker import reconcile_po_list
+    expected = [
+        {"po_number": "3690064C", "warehouse": "La Mirada, CA"},
+        {"po_number": " 014511715932 ", "warehouse": "Riviera Beach, FL"},
+        {"po_number": "1087448", "warehouse": "Bronx"},
+    ]
+    present_set = {"014511715932", "1087448", "8513015G"}
+    present, missing = reconcile_po_list(expected, present_set)
+    assert [p["po_number"] for p in present] == ["014511715932", "1087448"]
+    assert [m["po_number"] for m in missing] == ["3690064C"]
+    # input normalized (whitespace stripped) and metadata preserved
+    assert present[0]["warehouse"] == "Riviera Beach, FL"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

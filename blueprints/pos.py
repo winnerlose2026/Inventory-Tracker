@@ -574,3 +574,56 @@ def api_arrived_pos():
              reverse=True)
     return jsonify({"ok": True, "count": len(out),
                     "ship_date_backfilled": backfilled, "pos": out})
+
+
+def _present_po_numbers() -> set:
+    """Every PO number visible on the Pending POs dashboard: on_order (pending
+    USF/Cheney) + on_order_rollover usage rows (arrived USF/Cheney) + the Chefs
+    Warehouse store (all statuses). Read-only."""
+    from inventory_tracker import (
+        load_inventory, load_usage, load_chefs_warehouse_pos,
+    )
+    present = set()
+    for item in load_inventory().values():
+        for o in (item.get("on_order") or []):
+            po = str(o.get("po_number") or "").strip()
+            if po:
+                present.add(po)
+    for e in (load_usage() or []):
+        if (e.get("source") or "") == "on_order_rollover" and not e.get("reversed"):
+            po = str(e.get("po_number") or "").strip()
+            if po:
+                present.add(po)
+    for r in load_chefs_warehouse_pos():
+        po = str(r.get("po_number") or "").strip()
+        if po:
+            present.add(po)
+    return present
+
+
+@pos_bp.route("/api/pos/reconcile", methods=["POST"])
+def api_pos_reconcile():
+    """Read-only PO gap check / reconciliation (missing-PO alert).
+
+    POST {"pos": [{"po_number", "distributor", "warehouse", "date"}, ...]} -- the
+    EXPECTED set of POs (e.g. parsed from H&H's net-chef invoice PDFs). Returns
+    which expected POs are already on the Pending POs dashboard (pending,
+    arrived, or in the Chefs Warehouse store) and which are MISSING (slipped
+    through). Ingests nothing and never modifies data -- it only flags gaps so
+    they can be reconciled.
+    """
+    from inventory_tracker import reconcile_po_list
+    body = request.json or {}
+    expected = body.get("pos") or []
+    if not isinstance(expected, list):
+        return jsonify({"ok": False, "error": "pos must be a list"}), 400
+    present_set = _present_po_numbers()
+    present, missing = reconcile_po_list(expected, present_set)
+    return jsonify({
+        "ok": True,
+        "expected_count": len(expected),
+        "present_count": len(present),
+        "missing_count": len(missing),
+        "missing": missing,
+        "dashboard_po_count": len(present_set),
+    })

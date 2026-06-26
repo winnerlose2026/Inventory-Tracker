@@ -192,6 +192,20 @@ def append_inventory_audit(entries: list, *, cap: int = 5000):
     _write_json(INVENTORY_AUDIT_FILE, merged)
 
 
+def reconcile_po_list(expected: list, present_set: set) -> tuple:
+    """Split an EXPECTED PO list into (present, missing) against the set of PO
+    numbers already on the dashboard. Pure / order-preserving. `expected` is a
+    list of dicts with at least 'po_number'; `present_set` is stripped strings.
+    Powers the missing-PO reconciliation check (so a slipped-through PO is
+    flagged instead of silently absent)."""
+    present, missing = [], []
+    for po in expected:
+        num = str((po or {}).get("po_number") or "").strip()
+        rec = dict(po or {}); rec["po_number"] = num
+        (present if (num and num in present_set) else missing).append(rec)
+    return present, missing
+
+
 def warehouse_freshness(now: Optional[datetime] = None,
                         stale_days: int = STALE_COUNT_DAYS,
                         inv: Optional[dict] = None) -> list:
