@@ -627,3 +627,177 @@ def api_pos_reconcile():
         "missing": missing,
         "dashboard_po_count": len(present_set),
     })
+
+
+# ---------------------------------------------------------------------------
+# Canonical PO ledger (Phase 2 of the data consolidation / production planner).
+# ONE record per PO assembled from every source the dashboard unions today:
+# pending USF/Cheney (inventory on_order), arrived USF/Cheney (usage rollover),
+# and the Chefs Warehouse store -- plus canceled/override status, freight
+# actual ship dates, provenance, and the warehouse transfer group. Read-only;
+# the single source-of-truth VIEW the planner consumes. Write paths are
+# unchanged (Phase 2b will migrate them onto this ledger and retire the
+# fragments).
+# ---------------------------------------------------------------------------
+
+def _ledger_variety(name: str) -> str:
+    name = name or ""
+    return name.split(" Bagel")[0].strip() if " Bagel" in name else name
+
+
+def _date_le(iso_s: str, now) -> bool:
+    iso_s = (iso_s or "").strip()
+    if not iso_s:
+        return False
+    try:
+        return datetime.fromisoformat(iso_s) <= now
+    except ValueError:
+        return False
+
+
+def build_po_ledger() -> list:
+    """Assemble one canonical record per PO across all sources. Pure read."""
+    from inventory_tracker import (
+        load_inventory, load_usage, load_chefs_warehouse_pos,
+        load_canceled_pos, load_status_overrides,
+    )
+    from integrations.planning_config import transfer_group_for
+
+    now = datetime.now()
+    canceled = load_canceled_pos() or {}
+    overrides = load_status_overrides() or {}
+    freight_idx = _freight_ship_date_index()
+    recs: dict = {}
+
+    def _rec(po):
+        return recs.setdefault(po, {
+            "po_number": po, "po_revision": "", "distributor": "", "warehouse": "",
+            "ordered_at": "", "eta": "", "ship_date": "", "ship_date_source": "",
+            "arrival_date": "", "total_cs": 0.0, "lines": [], "sources": set(),
+            "_pending": False, "_arrived": False, "_canceled": False,
+        })
+
+    # 1) pending USF/Cheney -- inventory on_order
+    inv = load_inventory()
+    for key, item in inv.items():
+        for o in (item.get("on_order") or []):
+            po = (o.get("po_number") or "").strip()
+            if not po:
+                continue
+            r = _rec(po); r["sources"].add("on_order"); r["_pending"] = True
+            r["distributor"] = r["distributor"] or (item.get("distributor") or "")
+            r["warehouse"] = r["warehouse"] or (item.get("warehouse") or "")
+            r["po_revision"] = r["po_revision"] or (o.get("po_revision") or "")
+            r["ordered_at"] = r["ordered_at"] or (o.get("ordered_at") or "")
+            r["eta"] = r["eta"] or (o.get("eta") or "")
+            if o.get("ship_date") and not r["ship_date"]:
+                r["ship_date"] = o["ship_date"]; r["ship_date_source"] = "operator"
+            if o.get("arrival_date") and not r["arrival_date"]:
+                r["arrival_date"] = o["arrival_date"]
+            qty = float(o.get("qty") or 0); r["total_cs"] += qty
+            r["lines"].append({"variety": _ledger_variety(item.get("name") or key),
+                               "qty": qty, "unit": o.get("unit") or "cs"})
+
+    # 2) arrived USF/Cheney -- usage rollover rows grouped by PO
+    meta = {k: {"distributor": it.get("distributor") or "",
+                "warehouse": it.get("warehouse") or "",
+                "name": it.get("name") or k} for k, it in inv.items()}
+    arr: dict = {}
+    for e in (load_usage() or []):
+        if (e.get("source") or "") != "on_order_rollover" or e.get("reversed"):
+            continue
+        po = (e.get("po_number") or "").strip()
+        if not po:
+            continue
+        m = meta.get(e.get("item_key") or "", {})
+        g = arr.setdefault(po, {"distributor": "", "warehouse": "",
+                                "ordered_at": e.get("ordered_at") or "",
+                                "arrival_date": "", "total_cs": 0.0, "lines": []})
+        qty = abs(float(e.get("amount") or 0)); g["total_cs"] += qty
+        g["lines"].append({"variety": _ledger_variety(m.get("name") or ""),
+                           "qty": qty, "unit": e.get("unit") or "cs"})
+        g["distributor"] = g["distributor"] or m.get("distributor") or ""
+        g["warehouse"] = g["warehouse"] or m.get("warehouse") or ""
+        ts = e.get("timestamp") or ""
+        if ts > g["arrival_date"]:
+            g["arrival_date"] = ts
+    for po, g in arr.items():
+        r = _rec(po); r["sources"].add("usage_rollover"); r["_arrived"] = True
+        r["distributor"] = r["distributor"] or g["distributor"]
+        r["warehouse"] = r["warehouse"] or g["warehouse"]
+        r["ordered_at"] = r["ordered_at"] or g["ordered_at"]
+        r["arrival_date"] = r["arrival_date"] or g["arrival_date"]
+        if not r["_pending"]:   # use the arrived snapshot only if not still pending
+            r["total_cs"] = g["total_cs"]; r["lines"] = g["lines"]
+
+    # 3) Chefs Warehouse store
+    for cw in load_chefs_warehouse_pos():
+        sm = _cw_po_summary(cw)
+        po = (sm.get("po_number") or "").strip()
+        if not po:
+            continue
+        r = _rec(po); r["sources"].add("cw_store")
+        r["distributor"] = "Chefs Warehouse"
+        r["warehouse"] = r["warehouse"] or sm.get("warehouse") or ""
+        r["po_revision"] = r["po_revision"] or sm.get("po_revision") or ""
+        r["ordered_at"] = r["ordered_at"] or sm.get("ordered_at") or ""
+        r["eta"] = r["eta"] or sm.get("eta") or ""
+        if sm.get("ship_date") and not r["ship_date"]:
+            r["ship_date"] = sm["ship_date"]; r["ship_date_source"] = "operator"
+        if sm.get("arrival_date") and not r["arrival_date"]:
+            r["arrival_date"] = sm["arrival_date"]
+        r["total_cs"] = sm.get("total_cs") or r["total_cs"]
+        r["lines"] = sm.get("lines") or r["lines"]
+        if cw.get("canceled"):
+            r["_canceled"] = True
+
+    # 4) freight actual ship dates (authoritative) + status + transfer group
+    out = []
+    for po, r in recs.items():
+        sd = freight_idx.get(_norm_po_key(po))
+        if sd:
+            r["ship_date"] = sd; r["ship_date_source"] = "freight"; r["sources"].add("freight")
+        ov = overrides.get(po)
+        if r["_canceled"] or po in canceled or ov in ("cancelled", "canceled"):
+            status = "canceled"
+        elif ov:
+            status = ov
+        elif r["_arrived"] or _date_le(r.get("arrival_date"), now):
+            status = "arrived"
+        elif r.get("ship_date"):
+            status = "in_transit"
+        else:
+            status = "pending"
+        r["status"] = status
+        r["transfer_group"] = transfer_group_for(r.get("warehouse") or "")
+        r["total_cs"] = round(float(r.get("total_cs") or 0), 2)
+        r["sources"] = sorted(r["sources"])
+        for k in ("_pending", "_arrived", "_canceled"):
+            r.pop(k, None)
+        out.append(r)
+    out.sort(key=lambda x: (x.get("status") or "", x.get("ordered_at") or "", x.get("po_number") or ""))
+    return out
+
+
+@pos_bp.route("/api/pos/ledger")
+def api_pos_ledger():
+    """Canonical PO ledger -- one record per PO across pending (on_order),
+    arrived (usage rollover), and the Chefs Warehouse store, with status,
+    provenance, freight-actual ship dates, and transfer group. Optional
+    ?status= and ?distributor= filters. Read-only; gated by the auth hook."""
+    ledger = build_po_ledger()
+    by_status = {}
+    by_distributor = {}
+    for r in ledger:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+        d = r.get("distributor") or "?"
+        by_distributor[d] = by_distributor.get(d, 0) + 1
+    status = (request.args.get("status") or "").strip().lower() or None
+    dist = (request.args.get("distributor") or "").strip().lower() or None
+    if status:
+        ledger = [r for r in ledger if (r.get("status") or "").lower() == status]
+    if dist:
+        ledger = [r for r in ledger if (r.get("distributor") or "").lower() == dist]
+    return jsonify({"ok": True, "count": len(ledger),
+                    "by_status": by_status, "by_distributor": by_distributor,
+                    "pos": ledger})
