@@ -2132,6 +2132,8 @@ let arrivedInvGroups = [];
 let freightShipIndex = {};      // normalized PO key -> verified ship date (Lineage freight)
 let statusOverrides = {};       // normalized PO key -> manual status override
 let modifyPoMap = {};           // po_number -> modify-modal info
+let modifyPoOrder = [];         // PO numbers in display order (for the filter list)
+let modifySelectedPo = '';      // currently selected PO in the Modify modal
 
 // Status dropdown changed — re-render. All status slices are computed
 // client-side from the full dataset, so no reload is required.
@@ -2725,13 +2727,12 @@ function renderOnOrderBreakdown(groups) {
 }
 
 function openModifyModal(presetPo) {
-  const sel = document.getElementById('modify-po-select');
-  if (!sel) return;
   const groups = _assemblePendingGroups()
     .filter(g => (g.po_number || '').trim())
     .sort((a, b) => (a.po_number || '').localeCompare(b.po_number || ''));
   modifyPoMap = {};
-  sel.innerHTML = groups.map(g => {
+  modifyPoOrder = [];
+  groups.forEach(g => {
     modifyPoMap[g.po_number] = {
       source: g._source || 'inventory',
       total_cs: Number(g.total_cs) || 0,
@@ -2739,64 +2740,120 @@ function openModifyModal(presetPo) {
       ship_date: (g.ship_date || '').slice(0, 10),
       ship_date_source: g.ship_date_source || '',
       override: g._stateOverride || '',
+      state: g._state || '',
+      distributor: g.distributor || '',
+      warehouse: g.warehouse || '',
     };
-    const tag = (PENDING_TAGS[g._state] || PENDING_TAGS.open).label;
-    return `<option value="${escAttr(g.po_number)}">${escHtml(g.po_number)} - ${escHtml(g.distributor || '')} - ${escHtml(g.warehouse || '')} [${tag}]</option>`;
-  }).join('');
-  if (!groups.length) {
-    sel.innerHTML = '<option value="">No POs</option>';
-  }
-  if (presetPo && modifyPoMap[presetPo]) sel.value = presetPo;
+    modifyPoOrder.push(g.po_number);
+  });
+  modifySelectedPo = (presetPo && modifyPoMap[presetPo]) ? presetPo : (modifyPoOrder[0] || '');
+  const f = document.getElementById('modify-po-filter');
+  if (f) f.value = '';
+  renderModifyList('');
   onModifyPoSelect();
   document.getElementById('modify-po-modal').classList.add('open');
 }
 
+// Type-to-filter the PO list by PO #, distributor, warehouse, status, or date.
+function onModifyPoFilter() {
+  const el = document.getElementById('modify-po-filter');
+  renderModifyList(((el && el.value) || '').trim().toLowerCase());
+}
+
+function renderModifyList(q) {
+  const box = document.getElementById('modify-po-list');
+  const empty = document.getElementById('modify-po-empty');
+  if (!box) return;
+  const rows = modifyPoOrder.filter(po => {
+    if (!q) return true;
+    const i = modifyPoMap[po] || {};
+    const tag = (PENDING_TAGS[i.state] || {}).label || '';
+    return [po, i.distributor, i.warehouse, i.state, tag, i.ship_date]
+      .join(' ').toLowerCase().indexOf(q) !== -1;
+  });
+  if (modifySelectedPo && rows.indexOf(modifySelectedPo) === -1) {
+    modifySelectedPo = rows[0] || '';
+    onModifyPoSelect();
+  }
+  if (empty) empty.style.display = rows.length ? 'none' : '';
+  box.innerHTML = rows.map(po => {
+    const i = modifyPoMap[po] || {};
+    const tag = (PENDING_TAGS[i.state] || PENDING_TAGS.open || {}).label || '';
+    const sel = po === modifySelectedPo;
+    const ship = i.ship_date ? formatDate(i.ship_date) : '\u2014';
+    return `<div onclick="selectModifyPo('${escAttr(po)}')" role="option" aria-selected="${sel}" style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--border);${sel ? 'background:var(--surface2)' : ''}">
+        <span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(po)}</span>
+        <span style="color:var(--muted);font-size:11px"> &middot; ${escHtml(i.distributor || '')} &middot; ${escHtml(i.warehouse || '')} &middot; ${escHtml(tag)} &middot; ship ${escHtml(ship)}</span>
+      </div>`;
+  }).join('');
+}
+
+function selectModifyPo(po) {
+  modifySelectedPo = po;
+  const el = document.getElementById('modify-po-filter');
+  renderModifyList(((el && el.value) || '').trim().toLowerCase());
+  onModifyPoSelect();
+}
+
 function onModifyPoSelect() {
-  const po = document.getElementById('modify-po-select').value;
+  const po = modifySelectedPo;
   const info = modifyPoMap[po] || {};
   const statusSel = document.getElementById('modify-po-status');
   const shipInput = document.getElementById('modify-po-ship');
   const note = document.getElementById('modify-po-ship-note');
-  if (statusSel) statusSel.value = info.override || '';
   const verified = info.ship_date_source === 'freight';
+  const invArrived = (info.source !== 'chefs_warehouse') && (info.state === 'arrived');
+  const locked = verified || invArrived;
+  if (statusSel) statusSel.value = info.override || '';
   if (shipInput) {
     shipInput.value = info.ship_date || '';
-    shipInput.disabled = !!verified;
+    shipInput.disabled = !!locked;
   }
   if (note) note.textContent = verified
     ? 'Ship date is verified by a freight invoice and is locked.'
-    : 'Arrival auto-sets to ship + 7 days. Leave blank to use the 30-day ETA.';
+    : invArrived
+      ? 'This PO has already arrived \u2014 use Reopen on its row to change it.'
+      : 'Arrival auto-sets to ship + 7 days. Leave blank to use the 30-day ETA.';
 }
 
 async function saveModifyPO() {
-  const po = document.getElementById('modify-po-select').value;
+  const po = modifySelectedPo;
   if (!po) { closeModal('modify-po-modal'); return; }
   const info = modifyPoMap[po] || {};
   const newStatus = document.getElementById('modify-po-status').value;
   const shipInput = document.getElementById('modify-po-ship');
   const newShip = shipInput ? shipInput.value : '';
+  const verified = info.ship_date_source === 'freight';
+  const invArrived = (info.source !== 'chefs_warehouse') && (info.state === 'arrived');
+  let changed = false;
   try {
     if ((newStatus || '') !== (info.override || '')) {
       await api('/api/pending/set-status', 'POST', { po_number: po, status: newStatus });
+      changed = true;
     }
-    if (info.ship_date_source !== 'freight' && (newShip || '') !== (info.ship_date || '')) {
+    if (!verified && !invArrived && (newShip || '') !== (info.ship_date || '')) {
       const isCW = info.source === 'chefs_warehouse';
-      await api(isCW ? '/api/chefs-warehouse/ship-date' : '/api/on-order/ship-date', 'POST',
+      const r = await api(isCW ? '/api/chefs-warehouse/ship-date' : '/api/on-order/ship-date', 'POST',
                 isCW ? { po_number: po, ship_date: newShip || '' }
                      : { po_number: po, ship_date: newShip || null });
+      if (!isCW && r && r.entries_updated === 0) {
+        toast(`No pending lines for PO ${po} \u2014 ship date unchanged (it may have already arrived; use Reopen).`, 'error');
+      } else {
+        changed = true;
+      }
     }
   } catch (e) {
     toast('Save failed: ' + String(e), 'error');
     return;
   }
-  toast(`Updated PO ${po}`);
+  toast(changed ? `Updated PO ${po}` : `No changes for PO ${po}`);
   closeModal('modify-po-modal');
   await loadPendingPOs();
   loadDashboard();
 }
 
 async function cancelModifyPO() {
-  const po = document.getElementById('modify-po-select').value;
+  const po = modifySelectedPo;
   if (!po) return;
   const info = modifyPoMap[po] || {};
   closeModal('modify-po-modal');
