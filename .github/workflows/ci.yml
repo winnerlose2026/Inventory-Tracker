@@ -39,6 +39,7 @@ jobs:
           test_scan_health.py
           test_planning_config.py
           test_po_ledger.py
+          test_demand_model.py
 
   # Deterministic deploy: trigger Render via a Deploy Hook once tests pass,
   # instead of relying on Render's GitHub auto-deploy webhook (which has been
