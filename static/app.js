@@ -4276,39 +4276,41 @@ async function loadProductionGuide() {
   catch (e) { sum.innerHTML = '<div style="color:var(--red)">Failed to load guide: ' + escHtml(String(e)) + '</div>'; return; }
   if (!g || !g.ok) { sum.innerHTML = '<div style="color:var(--red)">Guide unavailable.</div>'; return; }
   const s = g.summary || {}, cap = g.capacity || {}, ba = g.buildahead || {};
-  const chip = (label, val, color) => `<span class="badge ${color || 'badge-gray'}" style="font-size:12px;margin-right:6px">${escHtml(label)}: ${escHtml(String(val))}</span>`;
+  const chip = (l, v, c) => `<span class="badge ${c || 'badge-gray'}" style="font-size:12px;margin-right:6px">${escHtml(l)}: ${escHtml(String(v))}</span>`;
   sum.innerHTML = `<div class="card" style="padding:14px 18px">
     <div style="margin-bottom:8px">
-      ${chip('Produce now', s.produce_now || 0, (s.produce_now ? 'badge-red' : 'badge-green'))}
-      ${chip('Watch', s.watch || 0, 'badge-yellow')}
-      ${chip('OK', s.ok || 0, 'badge-green')}
-      ${chip('Top-4 to produce', s.produce_now_top4 || 0, (s.produce_now_top4 ? 'badge-red' : 'badge-green'))}
+      ${chip('Bake now', (s.produce_now_cs || 0) + ' cs / ' + (s.produce_now_pos || 0) + ' POs', (s.produce_now_cs ? 'badge-red' : 'badge-green'))}
+      ${chip('Top-4', (s.produce_now_top4_cs || 0) + ' cs', 'badge-yellow')}
+      ${chip('Buffer watch', s.buffer_watch || 0, (s.buffer_watch ? 'badge-yellow' : 'badge-green'))}
     </div>
-    <div style="font-size:13px">Capacity: <strong>${cap.committed_cs || 0}</strong> cs committed / ${cap.weekly_dependable_cs || 0} dependable (${cap.utilization_pct_of_dependable || 0}%) &mdash; ${escHtml(cap.note || '')}</div>
-    <div style="font-size:13px;margin-top:4px">Build-ahead spare (max wk): <strong>${ba.spare_capacity_pallets_this_week || 0}</strong> pallets, within ${ba.freezer_pallet_cap || '—'}-pallet freezer.</div>
+    <div style="font-size:13px">Capacity: <strong>${cap.committed_cs || 0}</strong> cs (${cap.committed_pallets || 0} pallets) / ${cap.weekly_dependable_cs || 0} dependable (${cap.utilization_pct_of_dependable || 0}%) &mdash; ${escHtml(cap.note || '')}</div>
+    <div style="font-size:13px;margin-top:4px">Build-ahead spare: <strong>${ba.spare_capacity_pallets_max || 0}</strong> pallets (within ${ba.freezer_pallet_cap || '—'}-pallet freezer).</div>
     ${g.toast_note ? `<div style="font-size:13px;margin-top:6px;color:var(--accent)">&#128200; ${escHtml(g.toast_note)}</div>` : ''}
   </div>`;
-  const recs = g.recommendations || [];
-  const rowsFor = arr => arr.map(r => `<tr>
-      <td>${distributorBadge(r.distributor)}</td>
-      <td>${escHtml(r.unit)}${r.is_pool ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td>
-      <td>${escHtml(r.variety)}${r.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td>
-      <td style="text-align:right">${Number(r.on_hand || 0).toFixed(0)}</td>
-      <td style="text-align:right">${r.cover_days_with_incoming == null ? '&mdash;' : r.cover_days_with_incoming + 'd'}</td>
-      <td style="text-align:right">${Number(r.incoming_cs || 0).toFixed(0)}</td>
-      <td style="text-align:right;font-weight:600">${Number(r.recommend_cs || 0).toFixed(0)}</td>
-      <td style="white-space:nowrap">${r.produce_by || '&mdash;'}</td>
-    </tr>`).join('');
-  const tbl = (title, arr, color) => arr.length ? `<div class="card" style="margin-bottom:16px">
-      <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge ${color}" style="font-size:10px">${title}</span> <strong>${arr.length}</strong></div>
-      <table class="table"><thead><tr><th>Dist</th><th>Unit</th><th>Variety</th><th style="text-align:right">On-hand</th><th style="text-align:right">Cover</th><th style="text-align:right">Incoming</th><th style="text-align:right">Produce cs</th><th>By</th></tr></thead><tbody>${rowsFor(arr)}</tbody></table>
-    </div>` : '';
-  const produce = recs.filter(r => r.status === 'produce');
-  const watch = recs.filter(r => r.status === 'watch');
-  const nod = recs.filter(r => r.status === 'no-demand-data');
-  body.innerHTML =
-    tbl('PRODUCE NOW', produce, 'badge-red') +
-    tbl('WATCH', watch, 'badge-yellow') +
-    (nod.length ? `<div class="card" style="padding:10px 16px;margin-bottom:16px"><span class="badge badge-gray" style="font-size:10px">NO DEMAND DATA</span> ${nod.length} SKU(s) with no usage signal &mdash; verify they're still stocked.</div>` : '') +
-    (produce.length === 0 ? '<div style="color:var(--muted);padding:8px">Nothing to produce this cycle &mdash; all warehouses/pools above their buffer floor.</div>' : '');
+  const q = g.production_queue || [];
+  const qTbl = q.length ? `<div class="card" style="margin-bottom:16px">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge badge-red" style="font-size:10px">PRODUCTION QUEUE</span> <strong>${q.length}</strong> open PO(s) to bake &middot; ${g.summary.produce_now_cs || 0} cs</div>
+    <table class="table"><thead><tr><th>PO</th><th>Dist</th><th>Warehouse</th><th style="text-align:right">Cases</th><th>Produce by</th><th>Status</th></tr></thead><tbody>${
+      q.map(r => `<tr>
+        <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(r.po_number)}${r.has_top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td>
+        <td>${distributorBadge(r.distributor)}</td>
+        <td>${escHtml(r.warehouse)}${r.transfer_group ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td>
+        <td style="text-align:right;font-weight:600">${Number(r.total_cs || 0).toFixed(0)}</td>
+        <td style="white-space:nowrap">${r.produce_by || '<span style="color:var(--accent)">ASAP</span>'}</td>
+        <td><span class="badge badge-gray" style="font-size:10px">${escHtml(r.status)}</span></td>
+      </tr>`).join('')
+    }</tbody></table></div>` : '<div style="color:var(--muted);padding:8px">No open POs to bake &mdash; production queue is clear.</div>';
+  const bake = g.bake_by_variety || [];
+  const bakeTbl = bake.length ? `<div class="card" style="margin-bottom:16px">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><strong>Bake this cycle &mdash; by variety</strong></div>
+    <table class="table"><thead><tr><th>Variety</th><th style="text-align:right">Cases</th><th style="text-align:right">Pallets</th></tr></thead><tbody>${
+      bake.map(b => `<tr><td>${escHtml(b.variety)}${b.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td><td style="text-align:right;font-weight:600">${b.cs}</td><td style="text-align:right">${b.pallets}</td></tr>`).join('')
+    }</tbody></table></div>` : '';
+  const bw = g.buffer_watch || [];
+  const bwTbl = bw.length ? `<div class="card" style="margin-bottom:16px">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge badge-yellow" style="font-size:10px">BUFFER WATCH</span> <strong>${bw.length}</strong> depleting with no open PO</div>
+    <table class="table"><thead><tr><th>Dist</th><th>Unit</th><th>Variety</th><th style="text-align:right">On-hand</th><th style="text-align:right">Cover</th></tr></thead><tbody>${
+      bw.map(r => `<tr><td>${distributorBadge(r.distributor)}</td><td>${escHtml(r.unit)}${r.is_pool ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td><td>${escHtml(r.variety)}${r.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td><td style="text-align:right">${r.on_hand}</td><td style="text-align:right">${r.cover_days}d</td></tr>`).join('')
+    }</tbody></table></div>` : '';
+  body.innerHTML = qTbl + bakeTbl + bwTbl;
 }
