@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import urllib.error
 import urllib.request
 
@@ -34,7 +35,20 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+# gunicorn configures its own loggers but not arbitrary ones, so a bare logger
+# defaults to WARNING and drops our INFO lines (the "started" confirmation and
+# each run's POST result). Attach a stderr handler at INFO once and don't
+# propagate, so the scheduler's activity is visible in Render logs without
+# double-printing under the root/gunicorn loggers.
 log = logging.getLogger("inproc-scheduler")
+if not any(isinstance(h, logging.StreamHandler) for h in log.handlers):
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [inproc-scheduler] [%(levelname)s] %(message)s")
+    )
+    log.addHandler(_handler)
+log.setLevel(logging.INFO)
+log.propagate = False
 
 # APScheduler 3.x requires a pytz timezone (its 3.x internals reject a plain
 # zoneinfo tzinfo with "Only timezones from the pytz library are supported").
