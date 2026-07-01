@@ -1,40 +1,27 @@
-# Render Blueprint — source of truth for the whole Inventory-Tracker
-# family: the bagel-inventory web service plus its three crons
-# (6h mailbox scan, daily Graph-subscription renew, daily forecast
-# decrement).
+# Render Blueprint — source of truth for the Inventory-Tracker family:
+# the bagel-inventory web service plus the 6-hour mailbox-scan cron.
 #
-# Region: every service is pinned to `virginia` so the family is
-# co-located with the web service's persistent disk (which can't move
-# regions) and close to H&H's East-Coast ops + MS365 mailboxes. The
-# graph-sub-renew and forecast-daily crons previously omitted `region:`
-# and so defaulted to Oregon — pinning them here is what brings the
-# family back together. NOTE: Render regions are immutable, so the two
-# Oregon crons must be deleted and recreated by this blueprint to land
-# in Virginia; adoption alone can't relocate an existing service.
+# In-process daily jobs: the two lightweight daily jobs that used to be their
+# own cron services — the forecast decrement (was 05:05 UTC) and the Graph
+# subscription renew (was 09:00 UTC) — now run INSIDE the web service via
+# scheduler.py, which gunicorn starts once from its arbiter (see
+# gunicorn.conf.py, when_ready). Both jobs only POST an empty body to this
+# service's own idempotent endpoints, so moving them in-process removes two
+# services with no behavior change. Toggle with INPROCESS_SCHEDULER (default
+# on). The two former cron services should be deleted in the dashboard after
+# the scheduler is confirmed running (blueprint re-sync won't delete them).
 #
-# Runtime: Python is pinned via the repo's .python-version (3.14.3, the
-# version these services already run) so builds are reproducible and
-# don't silently drift when Render bumps its native-runtime default.
+# Region: every service is pinned to `virginia` so the family is co-located
+# with the web service's persistent disk (which can't move regions) and close
+# to H&H's East-Coast ops + MS365 mailboxes.
 #
-# Adoption: open Render -> Blueprints -> New Blueprint Instance, point it
-# at this repo on branch `main`. For each service Render will detect the
-# matching existing service by name and offer to adopt it rather than
-# create a duplicate (web=bagel-inventory, cron=bagel-inventory-6h-scan,
-# both already in Virginia). After adoption, any commit to main that
-# touches render.yaml auto-syncs to the dashboard.
+# Runtime: Python is pinned via the repo's .python-version so builds are
+# reproducible and don't silently drift when Render bumps its native-runtime
+# default.
 #
-# Why each piece exists:
-#   - Web service: serves the Flask app + dashboard, persists inventory.json
-#     and usage.json on the mounted disk.
-#   - 6h-scan cron: scripts/cowork_graph_scan.py talks to Microsoft Graph
-#     directly, fetches PO PDFs from JD@/info@, parses out-of-process, and
-#     POSTs to /api/email/ingest-events. Out-of-process so the gunicorn
-#     worker isn't blocked on big attachment fetches.
-#
-# Secrets (sync:false) are NOT carried in this file. Set them once on
-# each service in the dashboard; Render preserves them across blueprint
-# re-syncs. Only non-secret values (schedules, mailbox list, etc.) live
-# here.
+# Secrets (sync:false) are NOT carried in this file. Set them once on each
+# service in the dashboard; Render preserves them across blueprint re-syncs.
+# Only non-secret values (schedules, mailbox list, etc.) live here.
 
 services:
   - type: web
@@ -44,7 +31,9 @@ services:
     branch: main
     region: virginia
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers 2 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT app:app
+    # gunicorn.conf.py holds workers/threads/timeout/bind AND starts the
+    # in-process scheduler once via its when_ready hook.
+    startCommand: gunicorn -c gunicorn.conf.py app:app
     disk:
       name: inventory-data
       mountPath: /opt/render/project/src/data
@@ -52,6 +41,10 @@ services:
     envVars:
       - key: INVENTORY_API_TOKEN
         sync: false
+      # In-process scheduler on/off (default on). Set to "off" to disable the
+      # daily forecast-decrement + Graph-renew jobs without a code change.
+      - key: INPROCESS_SCHEDULER
+        value: "on"
       - key: MS365_TENANT_ID
         sync: false
       - key: MS365_CLIENT_ID
@@ -100,9 +93,11 @@ services:
     # the per-cron-container .cowork_seen_ids.txt is a nice-to-have
     # message-level shortcut but is not required for safety.
     #
-    # cowork_graph_scan.py imports integrations.email_scanner (which pulls
-    # in pypdf for PDF parsing), so the cron service needs the full
-    # requirements.txt installed in its build.
+    # This scan stays a SEPARATE cron on purpose: it does heavy outbound Graph
+    # fetches and pypdf parsing (plus a 90-day Lineage sweep) that we don't
+    # want running inside the web dyno. cowork_graph_scan.py imports
+    # integrations.email_scanner (which pulls in pypdf), so the cron service
+    # needs the full requirements.txt installed in its build.
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
     # USF/Cheney/CW POs: 24h is plenty since the inbox refresh is fast and
@@ -123,46 +118,3 @@ services:
         sync: false
       - key: MAILBOXES
         value: JD@ms.hhbagels.com,info@ms.hhbagels.com
-
-
-  - type: cron
-    name: bagel-inventory-graph-sub-renew
-    runtime: python
-    plan: starter
-    branch: main
-    region: virginia
-    # Mail change-notification subscriptions cap at ~71 hours. Renew daily
-    # at 09:00 UTC (~04:00 ET) so we always have well over a day of
-    # headroom even if a renewal fails. The renew endpoint also recreates
-    # any subscription Graph has already dropped, so this is the recovery
-    # path if the webhook ever goes silent.
-    schedule: "0 9 * * *"
-    buildCommand: "true"
-    startCommand: python scripts/renew_graph_subscriptions.py
-    envVars:
-      - key: APP_URL
-        sync: false  # https://bagel-inventory.onrender.com
-      - key: INVENTORY_API_TOKEN
-        sync: false
-
-  - type: cron
-    name: bagel-inventory-forecast-daily
-    runtime: python
-    plan: starter
-    branch: main
-    region: virginia
-    # Bridge from weekly_usage (a forecast rate stamped on every SKU) into
-    # the usage ledger so FIFO lot consumption actually burns down. Each
-    # run posts weekly_usage/7 as a positive usage event per SKU with
-    # source="forecast-daily"; the endpoint is idempotent per (SKU, UTC
-    # date), so re-runs the same day are no-ops. Weekly true-ups against
-    # vendor on-hand snapshots reverse these entries when ground truth
-    # arrives — see /api/forecast/true-up.
-    schedule: "5 5 * * *"
-    buildCommand: "true"
-    startCommand: python scripts/forecast_decrement.py
-    envVars:
-      - key: APP_URL
-        sync: false  # https://bagel-inventory.onrender.com
-      - key: INVENTORY_API_TOKEN
-        sync: false

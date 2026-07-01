@@ -5,3 +5,8 @@ gunicorn>=21.2
 # tokens), which breaks our Lineage freight + USF / Cheney PO parsers.
 # Pin to the 3.17 line which produces well-spaced output our regexes rely on.
 pypdf>=3.17,<4.0
+# In-process scheduler (scheduler.py) for the two lightweight daily jobs that
+# were standalone Render crons. APScheduler 3.x needs a pytz timezone — its 3.x
+# API rejects a plain zoneinfo tzinfo — so pytz is pinned alongside it.
+APScheduler>=3.10,<4
+pytz>=2024.1
