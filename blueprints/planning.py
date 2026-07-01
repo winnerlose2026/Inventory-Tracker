@@ -35,3 +35,25 @@ def api_planning_demand():
         "stale_count": sum(1 for r in wd if r.get("stale")),
         "sku_count": len(wd),
     })
+
+
+@planning_bp.route("/api/planning/guide")
+def api_planning_guide():
+    """The weekly production guide -- depletion, incoming-net, produce-by,
+    priority (top-4 & US Foods/Cheney first), capacity rollup, build-ahead,
+    and the Toast note. Combines config + PO ledger + demand + inventory.
+    Read-only."""
+    from inventory_tracker import load_inventory, load_sales
+    from integrations.production_planner import build_production_guide
+    from integrations.demand_model import warehouse_demand, toast_demand_trend
+    from blueprints.pos import build_po_ledger
+    cfg = load_planning_config()
+    inv = load_inventory()
+    guide = build_production_guide(
+        inv=inv,
+        ledger=build_po_ledger(),
+        demand_rows=warehouse_demand(inv),
+        config=cfg,
+        toast_trend=toast_demand_trend(load_sales() or []),
+    )
+    return jsonify({"ok": True, **guide})
