@@ -674,6 +674,7 @@ def build_po_ledger() -> list:
             "po_number": po, "po_revision": "", "distributor": "", "warehouse": "",
             "ordered_at": "", "eta": "", "ship_date": "", "ship_date_source": "",
             "arrival_date": "", "total_cs": 0.0, "lines": [], "sources": set(),
+            "dc_code": "",
             "_pending": False, "_arrived": False, "_canceled": False,
         })
 
@@ -748,6 +749,7 @@ def build_po_ledger() -> list:
             r["arrival_date"] = sm["arrival_date"]
         r["total_cs"] = sm.get("total_cs") or r["total_cs"]
         r["lines"] = sm.get("lines") or r["lines"]
+        r["dc_code"] = r["dc_code"] or (sm.get("dc_code") or "")
         if cw.get("canceled"):
             r["_canceled"] = True
 
@@ -769,6 +771,11 @@ def build_po_ledger() -> list:
         else:
             status = "pending"
         r["status"] = status
+        r["override"] = ov or ""
+        _ss = r["sources"]
+        r["source_kind"] = ("chefs_warehouse" if "cw_store" in _ss
+                             else "arrived" if ("usage_rollover" in _ss and "on_order" not in _ss)
+                             else "inventory")
         r["transfer_group"] = transfer_group_for(r.get("warehouse") or "")
         r["total_cs"] = round(float(r.get("total_cs") or 0), 2)
         r["sources"] = sorted(r["sources"])

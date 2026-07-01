@@ -725,6 +725,9 @@
       <div class="nav-item" onclick="showPage('pending-pos')">
         <span class="nav-icon">🚛</span> Pending POs
       </div>
+      <div class="nav-item" onclick="showPage('planner')">
+        <span class="nav-icon">📋</span> Production Planner
+      </div>
       <div class="nav-item" onclick="showPage('production')">
         <span class="nav-icon">🥯</span> Daily Production
       </div>
@@ -1040,6 +1043,18 @@
     </div>
 
     <!-- Daily Production -->
+    <div class="page" id="page-planner">
+      <div class="page-header">
+        <div>
+          <h1 style="margin-bottom:6px">Production Planner</h1>
+          <p class="subtitle" style="margin-bottom:0">Weekly guide: what to bake, how much, by when &mdash; top-4 and US&nbsp;Foods/Cheney first; Cheney&nbsp;FL judged as one transfer pool. Read-only.</p>
+        </div>
+        <div class="btn-group"><button class="btn btn-ghost btn-sm" onclick="loadProductionGuide()">&#8635; Refresh</button></div>
+      </div>
+      <div id="planner-summary" style="margin-bottom:16px"></div>
+      <div id="planner-body"></div>
+    </div>
+
     <div class="page" id="page-production">
       <div class="page-header">
         <div>

@@ -64,6 +64,11 @@ def _run():
         assert led["CW-ARR"]["status"] == "arrived"              # arrival in past
         assert led["CW-PEND"]["status"] == "pending"
         assert led["CW-CANX"]["status"] == "canceled"
+        # Phase 2b enrichment for the frontend read-flip
+        assert led["CW-ARR"]["source_kind"] == "chefs_warehouse"
+        assert led["ARR-USF"]["source_kind"] == "arrived"
+        assert led["PEND-USF"]["source_kind"] == "inventory"
+        assert "override" in led["PEND-USF"] and "dc_code" in led["CW-ARR"]
         assert "IGNORED" not in led                               # non-rollover usage ignored
         print("ok: all PO-ledger merge assertions passed")
         return 0

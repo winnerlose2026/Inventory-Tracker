@@ -71,6 +71,7 @@ function refresh(page) {
   else if (page === 'pending-pos') loadPendingPOs();
   else if (page === 'freight') { loadFreight(); loadFreightLeadTimes(); }
   else if (page === 'production') loadProduction();
+  else if (page === 'planner') loadProductionGuide();
   else if (page === 'traceability') initTraceability();
 }
 
@@ -2124,6 +2125,8 @@ function onPendingSortClick(key) {
 // (status=all) once and filter client-side so the Status dropdown and
 // the In Production section can both work off one dataset.
 let cwPendingGroups = [];
+let ledgerGroups = [];        // Phase 2b: records from /api/pos/ledger (single source)
+let usingLedger = false;      // true when the ledger read succeeded (else legacy fallback)
 // Arrived inventory-side POs (USF/Cheney) reconstructed from the usage
 // log by /api/arrived-pos. These no longer live in `on_order` (they
 // rolled over into quantity), so without this the Arrived view could
@@ -2153,6 +2156,14 @@ async function loadPendingPOs() {
   if (wSel.options.length <= 1) {
     populateWarehouseSelect(wSel, '', '', true);
   }
+  // Phase 2b: read the canonical PO ledger as the single source. Fall
+  // back to the legacy multi-source stitch only if the ledger read fails.
+  usingLedger = false; ledgerGroups = [];
+  try {
+    const lg = await api('/api/pos/ledger');
+    if (lg && lg.ok && Array.isArray(lg.pos)) { ledgerGroups = lg.pos; usingLedger = true; }
+  } catch (e) { console.warn('PO ledger fetch failed; using legacy sources:', e); }
+  if (!usingLedger) {
   const items = await api('/api/inventory');
   const pairs = [];
   items.forEach(item => {
@@ -2202,6 +2213,7 @@ async function loadPendingPOs() {
     console.warn('Failed to load status overrides:', e);
     statusOverrides = {};
   }
+  }  // end legacy fallback
 
   renderPendingPOs();
 }
@@ -2456,6 +2468,40 @@ function _shipVerifiedMark() {
 }
 
 function _assemblePendingGroups() {
+  // Phase 2b: prefer the canonical ledger (one source). Rendering below is
+  // unchanged -- _poState still computes the display state from the same
+  // date fields -- so this only swaps the DATA SOURCE.
+  if (usingLedger) return _groupsFromLedger(ledgerGroups);
+  return _assemblePendingGroupsLegacy();
+}
+
+function _groupsFromLedger(records) {
+  const now = new Date();
+  return (records || []).map(r => {
+    const src = (r.source_kind === 'chefs_warehouse') ? 'chefs_warehouse'
+              : (r.source_kind === 'arrived') ? 'arrived' : 'inventory';
+    const g = {
+      po_number: r.po_number || '', po_revision: r.po_revision || '',
+      distributor: r.distributor || '', warehouse: r.warehouse || '',
+      dc_code: r.dc_code || '', ordered_at: r.ordered_at || '', eta: r.eta || '',
+      ship_date: r.ship_date || '', ship_date_source: r.ship_date_source || '',
+      arrival_date: r.arrival_date || '', total_cs: Number(r.total_cs) || 0,
+      status: r.status || '', transfer_group: r.transfer_group || null,
+      lines: (r.lines || []).map(L => ({ variety: L.variety || '', qty: Number(L.qty) || 0,
+                                         unit: L.unit || 'cs', name: L.name || L.variety || '' })),
+      _source: src,
+    };
+    // Match the legacy freight behavior: a freight-verified ship date on a
+    // not-yet-arrived PO implies arrival = ship + 7.
+    if (g.ship_date_source === 'freight' && src !== 'arrived' && g.status !== 'arrived')
+      g.arrival_date = _addDaysISO(g.ship_date, 7);
+    g._stateOverride = r.override || '';
+    g._state = g._stateOverride || _poState(g, now);
+    return g;
+  });
+}
+
+function _assemblePendingGroupsLegacy() {
   let groups = _buildPoGroups(pendingCache).map(g => {
     g._source = 'inventory';
     return g;
@@ -4216,3 +4262,53 @@ async function loadToastSales() {
   }).join('');
 }
 
+// -------------------------------------------------------------------------
+// Production Planning tab -- renders /api/planning/guide (Phase 4 output).
+// -------------------------------------------------------------------------
+async function loadProductionGuide() {
+  const sum = document.getElementById('planner-summary');
+  const body = document.getElementById('planner-body');
+  if (!sum || !body) return;
+  sum.innerHTML = '<div style="color:var(--muted)">Loading the weekly guide…</div>';
+  body.innerHTML = '';
+  let g;
+  try { g = await api('/api/planning/guide'); }
+  catch (e) { sum.innerHTML = '<div style="color:var(--red)">Failed to load guide: ' + escHtml(String(e)) + '</div>'; return; }
+  if (!g || !g.ok) { sum.innerHTML = '<div style="color:var(--red)">Guide unavailable.</div>'; return; }
+  const s = g.summary || {}, cap = g.capacity || {}, ba = g.buildahead || {};
+  const chip = (label, val, color) => `<span class="badge ${color || 'badge-gray'}" style="font-size:12px;margin-right:6px">${escHtml(label)}: ${escHtml(String(val))}</span>`;
+  sum.innerHTML = `<div class="card" style="padding:14px 18px">
+    <div style="margin-bottom:8px">
+      ${chip('Produce now', s.produce_now || 0, (s.produce_now ? 'badge-red' : 'badge-green'))}
+      ${chip('Watch', s.watch || 0, 'badge-yellow')}
+      ${chip('OK', s.ok || 0, 'badge-green')}
+      ${chip('Top-4 to produce', s.produce_now_top4 || 0, (s.produce_now_top4 ? 'badge-red' : 'badge-green'))}
+    </div>
+    <div style="font-size:13px">Capacity: <strong>${cap.committed_cs || 0}</strong> cs committed / ${cap.weekly_dependable_cs || 0} dependable (${cap.utilization_pct_of_dependable || 0}%) &mdash; ${escHtml(cap.note || '')}</div>
+    <div style="font-size:13px;margin-top:4px">Build-ahead spare (max wk): <strong>${ba.spare_capacity_pallets_this_week || 0}</strong> pallets, within ${ba.freezer_pallet_cap || '—'}-pallet freezer.</div>
+    ${g.toast_note ? `<div style="font-size:13px;margin-top:6px;color:var(--accent)">&#128200; ${escHtml(g.toast_note)}</div>` : ''}
+  </div>`;
+  const recs = g.recommendations || [];
+  const rowsFor = arr => arr.map(r => `<tr>
+      <td>${distributorBadge(r.distributor)}</td>
+      <td>${escHtml(r.unit)}${r.is_pool ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td>
+      <td>${escHtml(r.variety)}${r.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td>
+      <td style="text-align:right">${Number(r.on_hand || 0).toFixed(0)}</td>
+      <td style="text-align:right">${r.cover_days_with_incoming == null ? '&mdash;' : r.cover_days_with_incoming + 'd'}</td>
+      <td style="text-align:right">${Number(r.incoming_cs || 0).toFixed(0)}</td>
+      <td style="text-align:right;font-weight:600">${Number(r.recommend_cs || 0).toFixed(0)}</td>
+      <td style="white-space:nowrap">${r.produce_by || '&mdash;'}</td>
+    </tr>`).join('');
+  const tbl = (title, arr, color) => arr.length ? `<div class="card" style="margin-bottom:16px">
+      <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge ${color}" style="font-size:10px">${title}</span> <strong>${arr.length}</strong></div>
+      <table class="table"><thead><tr><th>Dist</th><th>Unit</th><th>Variety</th><th style="text-align:right">On-hand</th><th style="text-align:right">Cover</th><th style="text-align:right">Incoming</th><th style="text-align:right">Produce cs</th><th>By</th></tr></thead><tbody>${rowsFor(arr)}</tbody></table>
+    </div>` : '';
+  const produce = recs.filter(r => r.status === 'produce');
+  const watch = recs.filter(r => r.status === 'watch');
+  const nod = recs.filter(r => r.status === 'no-demand-data');
+  body.innerHTML =
+    tbl('PRODUCE NOW', produce, 'badge-red') +
+    tbl('WATCH', watch, 'badge-yellow') +
+    (nod.length ? `<div class="card" style="padding:10px 16px;margin-bottom:16px"><span class="badge badge-gray" style="font-size:10px">NO DEMAND DATA</span> ${nod.length} SKU(s) with no usage signal &mdash; verify they're still stocked.</div>` : '') +
+    (produce.length === 0 ? '<div style="color:var(--muted);padding:8px">Nothing to produce this cycle &mdash; all warehouses/pools above their buffer floor.</div>' : '');
+}
