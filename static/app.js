@@ -2093,6 +2093,7 @@ let pendingSortKey = 'ordered_at';
 let pendingSortDir = 1;        // earliest first by default
 let pendingFilterMode = 'all'; // 'all' | 'overdue' | 'noship' | 'pallet'
 let pendingCache = [];          // flat list of {entry, item} pairs
+let editingPos = new Set();     // PO#s ticked into inline-edit via the row checkbox
 let pendingSearchQuery = '';    // PO# substring filter (full or partial)
 
 function onPendingSearchInput() {
@@ -2597,6 +2598,12 @@ function _poWarehouseLabel(g) {
     : escHtml(g.warehouse || '');
 }
 
+function togglePoRowEdit(po) {
+  if (!po) return;
+  if (editingPos.has(po)) editingPos.delete(po); else editingPos.add(po);
+  renderPendingPOs();
+}
+
 function _pendingRowHtml(g, now) {
   now = now || new Date();
   const state = g._state || _poState(g, now);
@@ -2622,15 +2629,26 @@ function _pendingRowHtml(g, now) {
   // aren't freight-verified -- get the editable date box (CW status is
   // date-driven, so editing/clearing it un-arrives safely). Inventory Arrived
   // rows show a read-only date and are edited via Reopen.
-  const showShipInput = !shipVerified && !isCancelled
+  // Editability: freight-verified + cancelled are locked; inventory-arrived is
+  // changed via Reopen; CW-arrived (date-driven) stays editable. The date box
+  // appears only when this PO's row checkbox is ticked (opt-in per PO).
+  const editable = !shipVerified && !isCancelled
     && (!terminal || (isArrived && source === 'chefs_warehouse'));
-  const shipCell = showShipInput
-    ? `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`
-    : shipISO
+  const editing = editingPos.has(g.po_number || '');
+  let shipCell;
+  if (editable && editing) {
+    shipCell = `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
+  } else {
+    const disp = shipISO
       ? (formatDate(shipISO) + (shipVerified ? _shipVerifiedMark() : ''))
       : '<span style="color:var(--muted)">&mdash;</span>';
+    const hint = (editing && !editable)
+      ? ' <span title="Freight-verified or already arrived; use Reopen to change" style="cursor:help">&#128274;</span>'
+      : '';
+    shipCell = disp + hint;
+  }
   return `<tr${rowStyle}>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="Tick to modify this PO ship date" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${escAttr(g.po_number || '')}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span></td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
