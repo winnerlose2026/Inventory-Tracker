@@ -2637,7 +2637,7 @@ function _pendingRowHtml(g, now) {
   const editing = editingPos.has(g.po_number || '');
   let shipCell;
   if (editable && editing) {
-    shipCell = `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
+    shipCell = `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onclick="try{this.showPicker()}catch(e){}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
   } else {
     const disp = shipISO
       ? (formatDate(shipISO) + (shipVerified ? _shipVerifiedMark() : ''))
