@@ -326,6 +326,107 @@ def api_email_send():
                         "traceback": ""}), 200
 
 
+@email_bp.route("/api/email/cheney-stock-images", methods=["GET"])
+def api_cheney_stock_images():
+    """Serve Michael Ross's Cheney on-hand STOCK images straight from the
+    mailbox, so a scheduled task can OCR them without needing the raw email
+    attachments (the mail connector won't hand over binary xlsx headlessly).
+
+    Ross pastes on-hand counts as an image in each weekly per-facility
+    "Usage&Stock" .xlsx; the app's Graph credentials let the server fetch those
+    attachments, pull out the embedded image + the report's period-end date, and
+    return them base64-encoded. This stays lightweight (zip + openpyxl, already
+    deps) -- the OCR itself runs client-side in the scheduled task, off this web
+    service. Read-only against the mailbox.
+
+    Query: lookback_days (default 9), sender (default mross@cheneybrothers.com).
+    Returns {ok, facilities:[{warehouse, filename, count_date, received,
+    image_content_type, image_b64}], errors:[...]}.
+    """
+    import base64
+    import json as _json
+    import urllib.parse
+    from datetime import timezone
+    try:
+        expected = os.environ.get("INVENTORY_API_TOKEN", "")
+        if expected and request.headers.get("X-Inventory-Token") != expected:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        from integrations.email_scanner import EmailInboxClient, GRAPH_BASE
+        from integrations.cheney_inventory_report import extract_stock_image
+        try:
+            lookback = int(request.args.get("lookback_days") or 9)
+        except (TypeError, ValueError):
+            lookback = 9
+        lookback = max(1, min(lookback, 60))
+        sender = (request.args.get("sender") or "mross@cheneybrothers.com").strip().lower()
+
+        client = EmailInboxClient()
+        if not client._has_ms365_credentials():
+            return jsonify({"ok": False, "error": "MS365 not configured",
+                            "facilities": []}), 200
+        token = client._ms365_token()
+        since = (datetime.now(timezone.utc) - timedelta(days=lookback)) \
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
+
+        # Target Ross directly (avoids the general scan's problem of PO
+        # confirmations crowding out the report). $orderby is on the same
+        # property that is range-filtered, so Graph won't reject it.
+        qsender = sender.replace("'", "''")
+        filt = urllib.parse.quote(
+            f"from/emailAddress/address eq '{qsender}' "
+            f"and hasAttachments eq true and receivedDateTime ge {since}")
+        facilities, errors = {}, []
+        for user in users:
+            uq = urllib.parse.quote(user)
+            list_url = (f"{GRAPH_BASE}/users/{uq}/messages?$filter={filt}"
+                        f"&$orderby=receivedDateTime%20desc"
+                        f"&$select=id,subject,receivedDateTime&$top=25")
+            try:
+                raw, _ = client._graph_get(list_url, token)
+                msgs = _json.loads(raw).get("value", [])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{user}: list: {_safe_err(exc)}")
+                continue
+            for m in msgs:
+                mid = m.get("id") or ""
+                recv = m.get("receivedDateTime", "") or ""
+                aurl = (f"{GRAPH_BASE}/users/{uq}/messages/{urllib.parse.quote(mid)}"
+                        f"/attachments?$select=id,name,contentType,contentBytes")
+                try:
+                    raw2, _ = client._graph_get(aurl, token)
+                    atts = _json.loads(raw2).get("value", [])
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{user}/{mid[:8]}: att: {_safe_err(exc)}")
+                    continue
+                for a in atts:
+                    name = a.get("name", "") or ""
+                    if not name.lower().endswith(".xlsx"):
+                        continue
+                    cb = a.get("contentBytes")
+                    if not cb:
+                        continue
+                    try:
+                        wh, cd, img, ctype = extract_stock_image(base64.b64decode(cb), name)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{name}: parse: {_safe_err(exc)}")
+                        continue
+                    if not wh or not img:
+                        continue
+                    prev = facilities.get(wh)
+                    if prev is None or recv > prev["received"]:
+                        facilities[wh] = {
+                            "warehouse": wh, "filename": name, "count_date": cd,
+                            "received": recv, "image_content_type": ctype,
+                            "image_b64": base64.b64encode(img).decode("ascii"),
+                        }
+        return jsonify({"ok": True, "lookback_days": lookback, "sender": sender,
+                        "facilities": list(facilities.values()), "errors": errors})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "cheney-stock-images")
+        return jsonify({"ok": False, "error": _safe_err(exc), "facilities": []}), 200
+
+
 @email_bp.route("/api/email/ingest-events", methods=["POST"])
 def api_email_ingest_events():
     """Accept externally-parsed EmailEvents and apply them through the same

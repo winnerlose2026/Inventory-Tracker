@@ -202,6 +202,38 @@ def test_count_date_from_filename_when_no_range():
     print("OK test_count_date_from_filename_when_no_range")
 
 
+def test_extract_stock_image():
+    """A Cheney file with an embedded stock image -> extract_stock_image returns
+    that image bytes, the warehouse, and the Date Range end as count_date."""
+    import io as _io, tempfile, os
+    from openpyxl.drawing.image import Image as XLImage
+    from PIL import Image as PILImage
+    from integrations.cheney_inventory_report import extract_stock_image
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws["A1"] = "Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"
+    ws["A2"] = "Products"; ws["E2"] = "Full Cases"; ws["E3"] = 100
+    tmp = os.path.join(tempfile.gettempdir(), "_stockimg.png")
+    PILImage.new("RGB", (40, 20), (123, 200, 50)).save(tmp)
+    ws.add_image(XLImage(tmp), "H2")
+    b = _io.BytesIO(); wb.save(b)
+    wh, cd, img, ctype = extract_stock_image(b.getvalue(), "HHOcalaUsage&Stock.xlsx")
+    assert wh == "Ocala, FL", wh
+    assert cd == "2026-06-27", cd
+    assert img and len(img) > 0 and ctype == "image/png", (bool(img), ctype)
+    print("OK test_extract_stock_image")
+
+
+def test_extract_stock_image_none_when_no_image():
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws["A1"] = "no image here"
+    import io as _io
+    from integrations.cheney_inventory_report import extract_stock_image
+    b = _io.BytesIO(); wb.save(b)
+    wh, cd, img, ctype = extract_stock_image(b.getvalue(), "HHRVBUsage&Stock.xlsx")
+    assert wh == "Riviera Beach, FL" and img is None, (wh, bool(img))
+    print("OK test_extract_stock_image_none_when_no_image")
+
+
 if __name__ == "__main__":
     test_warehouse_from_filename()
     test_parse_mfg_format()
@@ -212,4 +244,6 @@ if __name__ == "__main__":
     test_combined_usage_and_stock_workbook()
     test_combined_usage_and_stock_one_sheet()
     test_count_date_from_filename_when_no_range()
+    test_extract_stock_image()
+    test_extract_stock_image_none_when_no_image()
     print("ALL CHENEY PARSER TESTS PASSED")

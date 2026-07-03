@@ -454,4 +454,46 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
     return events, errors
 
 
-__all__ = ["parse_report_xlsx", "warehouse_from_filename", "DISTRIBUTOR"]
+def extract_stock_image(xlsx_bytes: bytes, filename: str):
+    """Return (warehouse, count_date_iso, image_bytes, content_type) for a
+    Cheney per-facility 'Usage&Stock' workbook.
+
+    Ross pastes the current on-hand counts as an IMAGE to the right of the usage
+    grid, so the numbers live in xl/media/*, not in cells. This returns the
+    LARGEST embedded raster (the stock-table screenshot; a small logo, if any,
+    is ignored) for OCR downstream, plus the report period-end date taken from
+    the usage grid's "Date Range" (falling back to the filename). Returns
+    (warehouse, count_date, None, "") when the file has no embedded image.
+    """
+    warehouse = warehouse_from_filename(filename)
+    count_date = ""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+        try:
+            rows_by_sheet = [
+                [[_cell_str(c) for c in row] for row in ws.iter_rows(values_only=True)]
+                for ws in wb.worksheets
+            ]
+        finally:
+            wb.close()
+        count_date = _report_as_of(rows_by_sheet, filename)
+    except Exception:  # noqa: BLE001 -- a bad workbook still may carry an image
+        pass
+    image, ctype = None, ""
+    try:
+        import zipfile
+        z = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+        media = [(n, z.read(n)) for n in z.namelist()
+                 if n.lower().startswith("xl/media/")
+                 and n.lower().endswith((".png", ".jpg", ".jpeg"))]
+        if media:
+            name, data = max(media, key=lambda kv: len(kv[1]))  # largest raster
+            image = data
+            ctype = "image/png" if name.lower().endswith(".png") else "image/jpeg"
+    except Exception:  # noqa: BLE001
+        pass
+    return warehouse, count_date, image, ctype
+
+
+__all__ = ["parse_report_xlsx", "warehouse_from_filename", "extract_stock_image", "DISTRIBUTOR"]
