@@ -834,6 +834,7 @@ def parse_message_with_errors(msg):
                     item=SyncItem(**d["item"]),
                     source_message_id=msg_id,
                     source_subject=subject,
+                    count_date=d.get("count_date", ""),
                 ))
             errors.extend(c_errs)
 

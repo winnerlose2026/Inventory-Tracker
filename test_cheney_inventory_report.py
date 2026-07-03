@@ -15,6 +15,21 @@ def _wb(rows):
     return b.getvalue()
 
 
+def _wb_multi(sheets):
+    """sheets: list of (title, rows). First entry reuses the default sheet."""
+    wb = openpyxl.Workbook()
+    first = True
+    for title, rows in sheets:
+        ws = wb.active if first else wb.create_sheet()
+        ws.title = title
+        for r in rows:
+            ws.append(r)
+        first = False
+    b = io.BytesIO()
+    wb.save(b)
+    return b.getvalue()
+
+
 def test_warehouse_from_filename():
     assert warehouse_from_filename("H&HRVBMay272026.xlsx") == "Riviera Beach, FL"
     assert warehouse_from_filename("H&HOcalaMay272026.xlsx") == "Ocala, FL"
@@ -106,6 +121,59 @@ def test_parse_case_movement_usage():
     print("OK test_parse_case_movement_usage")
 
 
+def test_combined_usage_and_stock_workbook():
+    """Ross's current 'Usage&Stock' export: the usage (case-movement) grid AND
+    the on-hand stock grid live in ONE workbook on separate sheets. BOTH must
+    parse, and every event must carry the report's END date (6/27) as
+    count_date -- not the range start (6/22) or the email/scan time."""
+    usage = [
+        ["Report Creation Date : 6/28/2026"],
+        ["Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"],
+        ["DSRGroup =MICHAEL ROSS-8564, DC =01 RIVIERA,"],
+        ["Products", "Pack", "Dist Item #", "Mfq.Product Code", "GTIN", "Full Cases"],
+        ["Sum of All Products Activity", "", "", "", "", 400],
+        ["BAGEL EVERYTHING PARBAKED", "1:60 CT", "10153048", "1158", "", 56],
+        ["BAGEL PLAIN PARBAKED", "1:60 CT", "10153018", "1150", "", 63],
+    ]
+    stock = [
+        ["Riviera Beach"],
+        ["08564 MICHAEL ROSS"],
+        ["Item #", "Description", "Brand", "Pack", "Size", "UOM", "Stock"],
+        ["FROZEN GROCERY"],
+        ["10153048", "BAGEL EVERYTHING PARBAKED", "H & H", 1, "60CT", "cs", 184],
+        ["10153018", "BAGEL PLAIN PARBAKED", "H & H", 1, "60CT", "cs", 181],
+    ]
+    b = _wb_multi([("Usage", usage), ("Stock", stock)])
+    ev, err = parse_report_xlsx(
+        b, "HHRivieraBeachUsage&StockJune22-June272026.xlsx")
+    types = sorted({e["event_type"] for e in ev})
+    assert types == ["on_hand", "usage_rate"], (types, err)
+    oh = {e["item"]["variety"]: e["item"]["quantity"]
+          for e in ev if e["event_type"] == "on_hand"}
+    assert oh == {"Everything": 184, "Plain": 181}, (oh, err)
+    ur = {e["item"]["variety"] for e in ev if e["event_type"] == "usage_rate"}
+    assert ur == {"Everything", "Plain"}, (ur, err)
+    assert all(e.get("count_date") == "2026-06-27" for e in ev), (
+        [e.get("count_date") for e in ev])
+    assert all(it["warehouse"] == "Riviera Beach, FL"
+               for it in (e["item"] for e in ev))
+    print("OK test_combined_usage_and_stock_workbook")
+
+
+def test_count_date_from_filename_when_no_range():
+    """A stock-only sheet has no Date Range line -> fall back to the filename
+    date (here 6-8-2026)."""
+    rows = [
+        ["Item #", "Description", "Brand", "Pack", "Size", "UOM", "Stock"],
+        ["10153018", "BAGEL PLAIN PARBAKED", "H & H", 1, "60CT", "cs", 100],
+    ]
+    ev, err = parse_report_xlsx(_wb(rows), "HHBagRVB6-8-2026.xlsx")
+    assert ev, err
+    assert all(e.get("count_date") == "2026-06-08" for e in ev), (
+        [e.get("count_date") for e in ev], err)
+    print("OK test_count_date_from_filename_when_no_range")
+
+
 if __name__ == "__main__":
     test_warehouse_from_filename()
     test_parse_mfg_format()
@@ -113,4 +181,6 @@ if __name__ == "__main__":
     test_unknown_warehouse_filename()
     test_parse_stock_inventory_format()
     test_parse_case_movement_usage()
+    test_combined_usage_and_stock_workbook()
+    test_count_date_from_filename_when_no_range()
     print("ALL CHENEY PARSER TESTS PASSED")

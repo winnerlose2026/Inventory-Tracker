@@ -202,6 +202,65 @@ def _span_days(rows: list) -> tuple:
     return 30, "", "", "no usable date range found; defaulted span to 30 days"
 
 
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+_FN_NUM_DATE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})")
+_FN_MON_DATE = re.compile(
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*"
+    r"(\d{1,2})\D{0,4}(20\d{2})", re.IGNORECASE)
+
+
+def _range_end_date(rows: list):
+    """Return the end (``<= hi``) date from a 'Date Range' line, or None."""
+    for r in rows:
+        for c in r:
+            if c and "date range" in c.lower():
+                found = _DATE_RE.findall(c)
+                if len(found) >= 2:
+                    try:
+                        mo, dy, yr = (int(x) for x in found[1].split("/"))
+                        return date(yr, mo, dy)
+                    except ValueError:
+                        pass
+    return None
+
+
+def _filename_date(name: str):
+    """Best-effort report date from a Cheney filename. Prefers the LAST date
+    token (the range end). Handles 'M-D-YYYY' and 'MonthDDYYYY'."""
+    cand = None
+    for m in _FN_NUM_DATE.finditer(name or ""):
+        try:
+            cand = date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            pass
+    for m in _FN_MON_DATE.finditer(name or ""):
+        mo = _MONTHS.get(m.group(1).lower())
+        if mo:
+            try:
+                cand = date(int(m.group(3)), mo, int(m.group(2)))
+            except ValueError:
+                pass
+    return cand
+
+
+def _report_as_of(rows_by_sheet: list, filename: str) -> str:
+    """Report 'as of' end date as ISO (YYYY-MM-DD), or ''. Prefers the
+    case-movement 'Date Range' end; falls back to the filename date."""
+    best = None
+    for rows in rows_by_sheet:
+        d = _range_end_date(rows)
+        if d and (best is None or d > best):
+            best = d
+    if best is None:
+        best = _filename_date(filename)
+    return best.isoformat() if best else ""
+
+
 def _find_cm_header(rows: list):
     """Locate a case-movement header: a 'Full Cases' column plus a
     'Dist Item #' or 'Mfq.Product Code' column. Returns
@@ -299,18 +358,27 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
         except Exception:  # noqa: BLE001
             pass
 
-    # Case-movement (usage) export -> usage_rate events. Ross sends this
-    # SEPARATELY from the on-hand stock sheet; it has a "Full Cases" total over
-    # a date range and NO cases-on-hand, so it must not be read as on_hand.
-    for rows in rows_by_sheet:
-        cm_events, cm_errors = _parse_case_movement(rows, warehouse, filename, distributor)
-        if cm_events or cm_errors:
-            return cm_events, cm_errors
-
-    # On-hand stock grid.
+    # A combined "Usage&Stock" workbook (Ross's current format) carries the
+    # case-movement (usage) grid and the on-hand stock grid on SEPARATE sheets.
+    # Parse per-sheet and accumulate BOTH: a usage sheet yields usage_rate
+    # events, a stock sheet yields on_hand events. (Previously the parser
+    # returned as soon as it found the usage sheet, so the on-hand sheet was
+    # never read and last_count_at froze at the prior week's date.)
+    as_of_iso = _report_as_of(rows_by_sheet, filename)
     headers_seen: list[str] = []
     idx = 0
     for rows in rows_by_sheet:
+        # Usage (case-movement) sheet -> usage_rate events. Detected by a
+        # "Full Cases" total column; it has no cases-on-hand, so it must not be
+        # read as on_hand. When this sheet IS the usage grid, take it and move
+        # on to the next sheet (do NOT return -- the on-hand sheet may follow).
+        cm_events, cm_errors = _parse_case_movement(rows, warehouse, filename, distributor)
+        if cm_events or cm_errors:
+            events.extend(cm_events)
+            errors.extend(cm_errors)
+            continue
+
+        # On-hand stock grid on this sheet.
         hdr = _find_header(rows)
         if not hdr:
             for r in rows[:6]:
@@ -371,6 +439,15 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
                 "po_number": "",
                 "po_revision": "",
             })
+
+    # Stamp the report's true "as of" date (its period end -- e.g. the "week
+    # ending 6/27" of a Usage&Stock export) onto every event, so the apply path
+    # records last_count_at / last_usage_report_at as when the count was
+    # actually taken rather than the scan/email time. Left unset when no date is
+    # discoverable, so the caller's email-date fallback still applies.
+    if as_of_iso:
+        for e in events:
+            e["count_date"] = as_of_iso
 
     if not events and not errors:
         seen = ("; ".join(headers_seen)) or "no non-empty rows"
