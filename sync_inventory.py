@@ -514,6 +514,17 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         return
 
     if evt.event_type == "on_hand":
+        # Never let an OLDER report overwrite a newer count. A re-sent or
+        # out-of-order report (e.g. a re-scanned 6/22 sheet arriving after the
+        # 6/29 one) would otherwise regress BOTH the on-hand quantities and the
+        # freshness date. Skip when this event's count_date predates the item's
+        # current last_count_at (compared by calendar day). Only guards when
+        # both dates are known, so first-ever counts still land.
+        _evt_cd = (getattr(evt, "count_date", "") or "")[:10]
+        _cur_cd = (item.get("last_count_at") or "")[:10]
+        if _evt_cd and _cur_cd and _evt_cd < _cur_cd:
+            report["unchanged"] += 1
+            return
         # An inventory worksheet carries both the on-hand count and the rep's
         # average weekly usage. Treat the event as a no-op only when NEITHER
         # changed, so a weekly-usage refresh still lands even if cases on hand

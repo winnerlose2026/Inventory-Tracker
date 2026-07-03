@@ -160,6 +160,34 @@ def test_combined_usage_and_stock_workbook():
     print("OK test_combined_usage_and_stock_workbook")
 
 
+def test_combined_usage_and_stock_one_sheet():
+    """Ross's 'Usage&Stock' export with the usage grid and the on-hand grid
+    STACKED on a single sheet. Both must parse (usage_rate + on_hand) and every
+    event must carry the report end date (6/27)."""
+    rows = [
+        ["Report Creation Date : 6/28/2026"],
+        ["Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"],
+        ["Products", "Pack", "Dist Item #", "Mfq.Product Code", "GTIN", "Full Cases"],
+        ["Sum of All Products Activity", "", "", "", "", 400],
+        ["BAGEL EVERYTHING PARBAKED", "1:60 CT", "10153048", "1158", "", 56],
+        ["BAGEL PLAIN PARBAKED", "1:60 CT", "10153018", "1150", "", 63],
+        ["", "", "", "", "", ""],
+        ["", "", "", "", "", ""],
+        ["Item #", "Description", "Brand", "Pack", "Size", "UOM", "Stock"],
+        ["10153048", "BAGEL EVERYTHING PARBAKED", "H & H", 1, "60CT", "cs", 184],
+        ["10153018", "BAGEL PLAIN PARBAKED", "H & H", 1, "60CT", "cs", 181],
+    ]
+    ev, err = parse_report_xlsx(_wb(rows), "HHRivieraBeachUsage&StockJune22-June272026.xlsx")
+    oh = {e["item"]["variety"]: e["item"]["quantity"]
+          for e in ev if e["event_type"] == "on_hand"}
+    ur = {e["item"]["variety"] for e in ev if e["event_type"] == "usage_rate"}
+    assert oh == {"Everything": 184, "Plain": 181}, (oh, err)
+    assert ur == {"Everything", "Plain"}, (ur, err)
+    assert all(e.get("count_date") == "2026-06-27" for e in ev), (
+        [e.get("count_date") for e in ev])
+    print("OK test_combined_usage_and_stock_one_sheet")
+
+
 def test_count_date_from_filename_when_no_range():
     """A stock-only sheet has no Date Range line -> fall back to the filename
     date (here 6-8-2026)."""
@@ -182,5 +210,6 @@ if __name__ == "__main__":
     test_parse_stock_inventory_format()
     test_parse_case_movement_usage()
     test_combined_usage_and_stock_workbook()
+    test_combined_usage_and_stock_one_sheet()
     test_count_date_from_filename_when_no_range()
     print("ALL CHENEY PARSER TESTS PASSED")

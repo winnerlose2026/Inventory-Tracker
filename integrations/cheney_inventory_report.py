@@ -153,7 +153,7 @@ def _is_sku(h: str) -> bool:
 def _find_header(rows: list) -> Optional[tuple]:
     """Return (header_row_index, roles) for the first row that looks like a
     data-grid header (a quantity column + a variety-or-Mfg column)."""
-    for i, row in enumerate(rows[:40]):
+    for i, row in enumerate(rows[:80]):
         hnorms = [(_cell_str(c) or "").lower() for c in row]
         roles: dict = {}
         for j, h in enumerate(hnorms):
@@ -265,7 +265,7 @@ def _find_cm_header(rows: list):
     """Locate a case-movement header: a 'Full Cases' column plus a
     'Dist Item #' or 'Mfq.Product Code' column. Returns
     (header_idx, col_cases, col_mfg, col_item) or None."""
-    for i, row in enumerate(rows[:40]):
+    for i, row in enumerate(rows[:80]):
         h = [(_cell_str(c) or "").lower() for c in row]
         col_cases = next((k for k, x in enumerate(h) if "full cases" in x), None)
         if col_cases is None:
@@ -358,27 +358,25 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
         except Exception:  # noqa: BLE001
             pass
 
-    # A combined "Usage&Stock" workbook (Ross's current format) carries the
-    # case-movement (usage) grid and the on-hand stock grid on SEPARATE sheets.
-    # Parse per-sheet and accumulate BOTH: a usage sheet yields usage_rate
-    # events, a stock sheet yields on_hand events. (Previously the parser
-    # returned as soon as it found the usage sheet, so the on-hand sheet was
-    # never read and last_count_at froze at the prior week's date.)
+    # Ross's "Usage&Stock" export carries BOTH a case-movement (usage) grid and
+    # an on-hand stock grid. They may sit on separate sheets OR be stacked on a
+    # single sheet. Parse EVERY sheet for BOTH so neither is dropped:
+    #   - usage grid  -> usage_rate events (detected by a "Full Cases" column)
+    #   - stock grid  -> on_hand events    (detected by a Stock / Cases-On-Hand
+    #                                        column, a distinct header)
+    # (Previously the parser returned after the usage grid, so a combined file
+    # never yielded on_hand and last_count_at froze at the prior week's date.)
     as_of_iso = _report_as_of(rows_by_sheet, filename)
     headers_seen: list[str] = []
     idx = 0
     for rows in rows_by_sheet:
-        # Usage (case-movement) sheet -> usage_rate events. Detected by a
-        # "Full Cases" total column; it has no cases-on-hand, so it must not be
-        # read as on_hand. When this sheet IS the usage grid, take it and move
-        # on to the next sheet (do NOT return -- the on-hand sheet may follow).
+        # Usage (case-movement) block on this sheet -> usage_rate events.
         cm_events, cm_errors = _parse_case_movement(rows, warehouse, filename, distributor)
-        if cm_events or cm_errors:
-            events.extend(cm_events)
-            errors.extend(cm_errors)
-            continue
+        events.extend(cm_events)
+        errors.extend(cm_errors)
 
-        # On-hand stock grid on this sheet.
+        # On-hand stock grid on this sheet -- attempted even when a usage block
+        # was found above, since the two can be stacked in one workbook/sheet.
         hdr = _find_header(rows)
         if not hdr:
             for r in rows[:6]:

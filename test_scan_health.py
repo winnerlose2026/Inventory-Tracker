@@ -49,13 +49,39 @@ def test_on_hand_uses_count_date_not_ingest_time():
                  "warehouse": "Zebulon, NC", "distributor": "US Foods",
                  "variety": "Plain", "unit": "cs", "case_size": 60, "price": 0.0,
                  "case_cost": 27.0, "weekly_usage": 0.0, "on_order": [],
-                 "updated": "", "last_synced": "", "last_count_at": "2026-06-22T16:00:00"}}
+                 "updated": "", "last_synced": "", "last_count_at": ""}}
     report = {"unmatched": [], "changes": [], "updated": 0, "unchanged": 0}
     _apply_email_event(evt, inv, [], "2026-06-22T23:59:59", report, dry_run=False)
     it = inv[key]
     assert report["unmatched"] == [], "event should have matched"
     assert it["last_count_at"] == "2026-06-15T14:38:19+00:00", it["last_count_at"]
     assert it["last_synced"] == "2026-06-22T23:59:59", "sync time stays ingest time"
+
+
+def test_on_hand_does_not_regress_older_count():
+    """A re-sent / out-of-order OLDER report must not overwrite a newer count
+    (nor its quantities). Guards against the cross-scan regression where a
+    re-scanned 6/22 sheet clobbered the already-applied 6/29 count."""
+    evt = EmailEvent(
+        event_type="on_hand",
+        item=SyncItem(quantity=42.0, distributor="US Foods", variety="Plain",
+                      warehouse="Zebulon, NC", name="Plain Bagel 4oz [USF - Zebulon]",
+                      unit="cs", case_size=60, price=0.0, case_cost=27.0,
+                      weekly_usage=None),
+        count_date="2026-06-15T14:38:19+00:00",   # OLDER than the item's count
+    )
+    key = "plain bagel 4oz [usf - zebulon]"
+    inv = {key: {"name": "Plain Bagel 4oz [USF - Zebulon]", "quantity": 999.0,
+                 "warehouse": "Zebulon, NC", "distributor": "US Foods",
+                 "variety": "Plain", "unit": "cs", "case_size": 60, "price": 0.0,
+                 "case_cost": 27.0, "weekly_usage": 0.0, "on_order": [],
+                 "updated": "", "last_synced": "", "last_count_at": "2026-06-22T16:00:00"}}
+    report = {"unmatched": [], "changes": [], "updated": 0, "unchanged": 0}
+    _apply_email_event(evt, inv, [], "2026-06-22T23:59:59", report, dry_run=False)
+    it = inv[key]
+    assert it["last_count_at"] == "2026-06-22T16:00:00", it["last_count_at"]
+    assert it["quantity"] == 999.0, "older report must not overwrite newer qty"
+    assert report["unchanged"] == 1, report
 
 
 def test_newest_report_wins_ordering():
