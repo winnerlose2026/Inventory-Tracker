@@ -791,6 +791,25 @@ def _msg_date_iso(msg) -> str:
     return dt.isoformat() if dt is not None else ""
 
 
+def _decode_subject(raw) -> str:
+    """Decode an RFC 2047-encoded MIME Subject header to plain text.
+
+    Outlook encodes the whole subject as an encoded-word (e.g.
+    "=?utf-8?B?...?=") whenever it contains a non-ASCII character such as the
+    em-dash in "Weekly Bagel Inventory & Usage Report — H&H Bagels - 6/29/26".
+    The raw header (what msg.get returns under the compat32 parser) is then
+    unreadable, which hid the report's count date from _count_date_from_subject
+    and the worksheet heuristic. Decode + unfold so both see real text.
+    """
+    if not raw:
+        return ""
+    try:
+        from email.header import decode_header, make_header
+        return str(make_header(decode_header(str(raw)))).replace("\n", " ").replace("\r", " ")
+    except Exception:  # noqa: BLE001 -- fall back to the raw header
+        return str(raw)
+
+
 def parse_message_with_errors(msg):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
@@ -807,7 +826,7 @@ def parse_message_with_errors(msg):
     Returns (events, errors, cw_pos). ``cw_pos`` is a list of CW PO
     dicts; empty for non-CW messages.
     """
-    subject = str(msg.get("Subject", ""))
+    subject = _decode_subject(msg.get("Subject", ""))
     msg_id = str(msg.get("Message-ID", ""))
     from_hdr = str(msg.get("From", ""))
     sent_iso = _msg_date_iso(msg)

@@ -442,6 +442,21 @@ def test_count_date_uses_subject_not_late_send():
     print("ok: subject count date beats a late send date")
 
 
+def test_count_date_survives_rfc2047_encoded_subject():
+    # Outlook RFC2047-encodes the whole subject because of the em-dash; the
+    # scanner must decode it before reading the count date (regression: the
+    # encoded header hid the date, so count_date fell back to the send time).
+    from email.header import Header
+    enc = Header("Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels - 6/8/26", "utf-8").encode(maxlinelen=500)
+    msg = _mime_dated(enc, "Tue, 09 Jun 2026 13:52:32 +0000", html=_html(), text=_text())
+    events, errors, _ = parse_message_with_errors(msg)
+    assert errors == [], errors
+    assert events, "expected on_hand events"
+    for e in events:
+        assert (e.count_date or "")[:10] == "2026-06-08", e.count_date
+    print("ok: count date decoded from an RFC2047-encoded subject")
+
+
 def test_count_date_falls_back_to_send_when_no_subject_date():
     msg = _mime_dated("RE: Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels",
                       "Tue, 09 Jun 2026 13:52:32 +0000", html=_html(), text=_text())
@@ -474,4 +489,5 @@ if __name__ == "__main__":
     test_count_date_from_subject_helper()
     test_count_date_uses_subject_not_late_send()
     test_count_date_falls_back_to_send_when_no_subject_date()
+    test_count_date_survives_rfc2047_encoded_subject()
     print("\nAll usfoods_inventory_report tests passed.")
