@@ -1,0 +1,6 @@
+# Dependencies for scripts/cheney_stock_ocr.py ONLY (Cowork routine / manual use).
+# Deliberately kept OUT of requirements.txt so the Render web service build stays
+# lean and never loads an OCR engine at request time (OOM risk on the starter plan).
+rapidocr-onnxruntime>=1.3
+pillow>=10
+numpy>=1.24
