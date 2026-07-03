@@ -401,8 +401,11 @@ def api_cheney_stock_images():
                 recv = m.get("receivedDateTime", "") or ""
                 if recv and recv < since:   # older than the lookback window
                     continue
+                # No $select: contentBytes lives on the fileAttachment subtype,
+                # not the base attachment type, so selecting it 400s. The full
+                # listing returns contentBytes for file attachments by default.
                 aurl = (f"{GRAPH_BASE}/users/{uq}/messages/{urllib.parse.quote(mid)}"
-                        f"/attachments?$select=id,name,contentType,contentBytes")
+                        f"/attachments")
                 try:
                     raw2, _ = client._graph_get(aurl, token)
                     atts = _json.loads(raw2).get("value", [])
