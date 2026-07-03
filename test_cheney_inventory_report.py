@@ -206,8 +206,12 @@ def test_extract_stock_image():
     """A Cheney file with an embedded stock image -> extract_stock_image returns
     that image bytes, the warehouse, and the Date Range end as count_date."""
     import io as _io, tempfile, os
+    import pytest
     from openpyxl.drawing.image import Image as XLImage
-    from PIL import Image as PILImage
+    # Pillow is only needed to synthesize the embedded test image; it isn't a
+    # web-service runtime dep, so skip cleanly where it's absent (e.g. CI)
+    # instead of failing and blocking the deploy pipeline.
+    PILImage = pytest.importorskip("PIL.Image")
     from integrations.cheney_inventory_report import extract_stock_image
     wb = openpyxl.Workbook(); ws = wb.active
     ws["A1"] = "Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"
