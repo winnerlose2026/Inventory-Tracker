@@ -94,6 +94,18 @@ def _warehouse_last_count(wh_items):
     return best
 
 
+def _effective_last_count(stamped, derived):
+    """The count date to display for a warehouse.
+
+    The stamped count date (from the report's own date, else the rep's send
+    date) is authoritative. The usage-derived value is the ingest / scan time,
+    so it's only a fallback for legacy items that predate last_count_at
+    stamping -- it must never override a real stamped date, which showed the
+    scan day (e.g. "Counted Jul 3") instead of the true count day.
+    """
+    return stamped or derived or None
+
+
 def _last_count_by_warehouse(inv):
     """Latest 'inventory received' timestamp per warehouse, derived from the
     usage history. A receipt is a rep/vendor on-hand report (usage note starts
@@ -234,10 +246,8 @@ def api_distributors():
             wh_groups.setdefault(i.get("warehouse") or "Unassigned", []).append(i)
         warehouses = []
         for wh_name, wh_items in sorted(wh_groups.items()):
-            _lc = _warehouse_last_count(wh_items)
-            _dc = derived_counts.get(wh_name)
-            if _dc and (not _lc or _dc > _lc):
-                _lc = _dc
+            _lc = _effective_last_count(_warehouse_last_count(wh_items),
+                                        derived_counts.get(wh_name))
             warehouses.append({
                 "warehouse": wh_name,
                 "last_count_at": _lc,

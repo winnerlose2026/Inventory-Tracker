@@ -164,6 +164,21 @@ def test_reconcile_po_list_splits_present_and_missing():
     assert present[0]["warehouse"] == "Riviera Beach, FL"
 
 
+def test_effective_last_count_prefers_stamped_over_derived_ingest_time():
+    """Regression: the inventory-page warehouse chip was showing the scan day
+    ("Counted Jul 3") because a usage-derived ingest timestamp overrode the
+    real stamped count date whenever it was newer. Stamped must win; derived
+    is a fallback only for legacy items with no stamped date."""
+    from blueprints.inventory import _effective_last_count
+    assert _effective_last_count("2026-06-29T19:10:28+00:00",
+                                 "2026-07-03T05:06:26") == "2026-06-29T19:10:28+00:00"
+    assert _effective_last_count("2026-06-29", "2026-07-03T05:06:26") == "2026-06-29"
+    # fallback only when nothing is stamped
+    assert _effective_last_count(None, "2026-07-03T05:06:26") == "2026-07-03T05:06:26"
+    assert _effective_last_count("", "2026-07-01") == "2026-07-01"
+    assert _effective_last_count(None, None) is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
