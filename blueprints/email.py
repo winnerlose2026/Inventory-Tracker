@@ -346,6 +346,7 @@ def api_cheney_stock_images():
     import base64
     import json as _json
     import urllib.parse
+    import urllib.request
     from datetime import timezone
     try:
         expected = os.environ.get("INVENTORY_API_TOKEN", "")
@@ -372,27 +373,34 @@ def api_cheney_stock_images():
         # Target Ross directly (avoids the general scan's problem of PO
         # confirmations crowding out the report). $orderby is on the same
         # property that is range-filtered, so Graph won't reject it.
-        qsender = sender.replace("'", "''")
-        filt = urllib.parse.quote(
-            f"from/emailAddress/address eq '{qsender}' "
-            f"and hasAttachments eq true and receivedDateTime ge {since}")
+        # Target Ross directly with $search (KQL). A from-address $filter
+        # combined with a date range trips Graph's "InefficientFilter"; $search
+        # avoids that. $search needs the ConsistencyLevel: eventual header and
+        # can't combine with $filter/$orderby, so date + attachments are
+        # filtered in code below.
+        search = urllib.parse.quote(f'"from:{sender}"')
         facilities, errors = {}, []
         for user in users:
             uq = urllib.parse.quote(user)
-            # NB: no $orderby -- Graph rejects orderby combined with a
-            # from-address $filter (InefficientFilter). We sort/dedupe by
-            # receivedDateTime in code below instead.
-            list_url = (f"{GRAPH_BASE}/users/{uq}/messages?$filter={filt}"
-                        f"&$select=id,subject,receivedDateTime&$top=25")
+            list_url = (f"{GRAPH_BASE}/users/{uq}/messages?$search={search}"
+                        f"&$select=id,subject,receivedDateTime,hasAttachments&$top=25")
             try:
-                raw, _ = client._graph_get(list_url, token)
-                msgs = _json.loads(raw).get("value", [])
+                _req = urllib.request.Request(list_url, method="GET", headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "ConsistencyLevel": "eventual"})
+                with urllib.request.urlopen(_req, timeout=30) as _r:
+                    msgs = _json.loads(_r.read()).get("value", [])
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{user}: list: {_safe_err(exc)}")
                 continue
             for m in msgs:
+                if not m.get("hasAttachments"):
+                    continue
                 mid = m.get("id") or ""
                 recv = m.get("receivedDateTime", "") or ""
+                if recv and recv < since:   # older than the lookback window
+                    continue
                 aurl = (f"{GRAPH_BASE}/users/{uq}/messages/{urllib.parse.quote(mid)}"
                         f"/attachments?$select=id,name,contentType,contentBytes")
                 try:
