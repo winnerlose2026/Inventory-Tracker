@@ -108,9 +108,51 @@ def _ocr_rows(png_bytes: bytes) -> "list[dict]":
     return out
 
 
+def events_from_image(png_bytes, warehouse, count_date, *, source="cheney-stock-image"):
+    """OCR ONE embedded stock image into on_hand event dicts for a warehouse.
+    Reusable by both the .xlsx path (extract_facility) and the scheduled task
+    that pulls images from /api/email/cheney-stock-images. Returns
+    (events, warnings, notes); warnings are blocking (unresolved row, under-read
+    image, missing date, duplicate variety), notes are informational."""
+    events, warnings, notes = [], [], []
+    for row in _ocr_rows(png_bytes):
+        desc, item, stock = row["desc"], row["item"], row["stock"]
+        # Item # OCRs cleanly and is deterministic via the crosswalk -> it is the
+        # authoritative variety key. Description tokenizes messily (e.g. "WHOLE
+        # WHEAT EVERYTHING" splits), so it is only a soft cross-check.
+        v_item = HH_MFG_CODE_TO_VARIETY.get(CHENEY_ITEM_NO_TO_MFG.get(item, "")) if item else ""
+        v_desc = _variety("", desc, "")
+        variety = v_item or v_desc
+        if not variety:
+            warnings.append(f"{warehouse}: unresolved row desc={desc!r} item={item!r}")
+            continue
+        if v_item and v_desc and v_item != v_desc:
+            notes.append(f"{warehouse}: item#{item}->{v_item} but description->{v_desc} "
+                         f"(using item#; description OCR is noisy)")
+        item_dict = {"quantity": float(stock), "distributor": DISTRIBUTOR,
+                     "variety": variety, "warehouse": warehouse, "unit": "cs",
+                     "case_size": DEFAULT_CASE_SIZE}
+        if item:
+            item_dict["distributor_sku"] = item
+        events.append({"event_type": "on_hand", "item": item_dict,
+                       "source_message_id": f"{source}:{warehouse}",
+                       "source_subject": f"Cheney on-hand stock (OCR image): {warehouse}",
+                       "count_date": count_date, "_min_score": row["min_score"]})
+    v = [e["item"]["variety"] for e in events]
+    dups = {x for x in v if v.count(x) > 1}
+    if dups:
+        warnings.append(f"{warehouse}: duplicate varieties OCR'd: {sorted(dups)}")
+    if len(events) < 10:
+        warnings.append(f"{warehouse}: only {len(events)} rows read from image (expected ~12) "
+                        f"-- image likely under-read")
+    if not count_date:
+        warnings.append(f"{warehouse}: no count date")
+    return events, warnings, notes
+
+
 def extract_facility(xlsx_bytes: bytes, filename: str):
-    """Return (warehouse, count_date, events, warnings)."""
-    warnings = []
+    """Return (warehouse, count_date, events, warnings, notes) for a Cheney
+    per-facility 'Usage&Stock' .xlsx (usage cells + an embedded stock image)."""
     warehouse = warehouse_from_filename(filename)
     if not warehouse:
         return "", "", [], [f"{filename}: cannot determine warehouse from filename"], []
@@ -118,42 +160,11 @@ def extract_facility(xlsx_bytes: bytes, filename: str):
     pngs = _extract_pngs(xlsx_bytes)
     if not pngs:
         return warehouse, count_date, [], [f"{warehouse}: no embedded stock image found"], []
-    events, notes = [], []
+    events, warnings, notes = [], [], []
     for png in pngs:
-        for row in _ocr_rows(png):
-            desc, item, stock = row["desc"], row["item"], row["stock"]
-            # Item # OCRs cleanly and is deterministic via the crosswalk -> it is
-            # the authoritative variety key. Description text tokenizes messily
-            # (e.g. "WHOLE WHEAT EVERYTHING" splits), so it is only a soft check.
-            v_item = HH_MFG_CODE_TO_VARIETY.get(CHENEY_ITEM_NO_TO_MFG.get(item, "")) if item else ""
-            v_desc = _variety("", desc, "")
-            variety = v_item or v_desc
-            if not variety:
-                warnings.append(f"{warehouse}: unresolved row desc={desc!r} item={item!r}")
-                continue
-            if v_item and v_desc and v_item != v_desc:
-                notes.append(f"{warehouse}: item#{item}->{v_item} but description->{v_desc} "
-                             f"(using item#; description OCR is noisy)")
-            item_dict = {"quantity": float(stock), "distributor": DISTRIBUTOR,
-                         "variety": variety, "warehouse": warehouse, "unit": "cs",
-                         "case_size": DEFAULT_CASE_SIZE}
-            if item:
-                item_dict["distributor_sku"] = item
-            events.append({"event_type": "on_hand", "item": item_dict,
-                           "source_message_id": f"cheney-stock-image:{filename}",
-                           "source_subject": f"Cheney on-hand stock (OCR image): {filename}",
-                           "count_date": count_date, "_min_score": row["min_score"],
-                           "_note": None})
-    # completeness guards
-    vars = [e["item"]["variety"] for e in events]
-    dups = {v for v in vars if vars.count(v) > 1}
-    if dups:
-        warnings.append(f"{warehouse}: duplicate varieties OCR'd: {sorted(dups)}")
-    if len(events) < 10:
-        warnings.append(f"{warehouse}: only {len(events)} rows read from image (expected ~12) "
-                        f"-- image likely under-read")
-    if not count_date:
-        warnings.append(f"{warehouse}: no count date (Date Range) found in usage grid")
+        ev, w, n = events_from_image(png, warehouse, count_date,
+                                     source=f"cheney-stock-image:{filename}")
+        events += ev; warnings += w; notes += n
     return warehouse, count_date, events, warnings, notes
 
 
