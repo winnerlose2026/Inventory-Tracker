@@ -603,6 +603,36 @@ def _looks_like_inventory_worksheet(subject: str) -> bool:
     return "inventory" in s and ("usage" in s or "weekly" in s)
 
 
+_SUBJECT_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
+
+
+def _count_date_from_subject(subject: str) -> str:
+    """Extract the report's own count date from an inventory-report subject.
+
+    US Foods reps title the weekly report with the count date, e.g.
+    "Weekly Bagel Inventory & Usage Report - H&H Bagels - 6/29/26". That date
+    -- not when the rep happened to email it -- is the true "as of" date, so a
+    report sent a day late (subject 6/8, emailed 6/9) still records 6/8. The
+    trailing date wins if several appear. Returns ISO "YYYY-MM-DD", or "" when
+    the subject carries no date (Cheney sheets and reply threads then fall
+    back to the send date upstream).
+    """
+    if not _looks_like_inventory_worksheet(subject):
+        return ""
+    last = None
+    for last in _SUBJECT_DATE_RE.finditer(subject or ""):
+        pass
+    if not last:
+        return ""
+    mo, da, yr = (int(g) for g in last.groups())
+    if yr < 100:
+        yr += 2000
+    try:
+        return datetime(yr, mo, da).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
 def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
     """Parse a "Bagel Inventory and Weekly Usage" .xlsx into on_hand events.
 
@@ -924,10 +954,15 @@ def parse_message_with_errors(msg):
     # Stamp the count "as of" date (the report email's sent date) onto on-hand
     # and usage-rate events so the apply path records last_count_at /
     # last_usage_report_at as the true count date, not the scan/ingest time.
-    if sent_iso:
+    # Prefer the count date the rep put in the report subject (US Foods titles
+    # each report with it, e.g. "... - 6/29/26"); fall back to the email's sent
+    # date only when the subject has none. This keeps a late-sent report dated
+    # to its count day, not its delivery day.
+    _count_iso = _count_date_from_subject(subject) or sent_iso
+    if _count_iso:
         for _e in events:
             if _e.event_type in ("on_hand", "usage_rate") and not _e.count_date:
-                _e.count_date = sent_iso
+                _e.count_date = _count_iso
 
     return events, errors, cw_pos
 

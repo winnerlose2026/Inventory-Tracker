@@ -407,6 +407,52 @@ def test_scanner_assortment_tool_cobb_known_rep():
     print("ok: scanner ingests Cobb's Assortment Management Tool .xlsx -> Alcoa, TN")
 
 
+def _mime_dated(subject, date_hdr, html=None, text=None, sender=SENDER):
+    msg = email.message.EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f'"Hernandez, Maria" <{sender}>'
+    msg["To"] = "JD Gross <JD@hhbagels.com>"
+    msg["Date"] = date_hdr
+    msg["Message-ID"] = "<test-report-dated@usfoods.com>"
+    msg.set_content(text or "see html")
+    if html is not None:
+        msg.add_alternative(html, subtype="html")
+    return email.message_from_bytes(bytes(msg))
+
+
+def test_count_date_from_subject_helper():
+    from integrations.email_scanner import _count_date_from_subject as f
+    assert f("Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels - 6/29/26") == "2026-06-29"
+    assert f("Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels - 6/8/26") == "2026-06-08"
+    assert f("Re: Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels") == ""   # no date
+    assert f("USF PO 899412 5O 06/17/26 H&H BAGELS") == ""                          # not a worksheet
+    print("ok: _count_date_from_subject parses the trailing report date")
+
+
+def test_count_date_uses_subject_not_late_send():
+    # Rep counts for Monday 6/8 but emails it Tuesday 6/9 -> count date must be
+    # 6/8 (subject), not 6/9 (send).
+    msg = _mime_dated("Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels - 6/8/26",
+                      "Tue, 09 Jun 2026 13:52:32 +0000", html=_html(), text=_text())
+    events, errors, _ = parse_message_with_errors(msg)
+    assert errors == [], errors
+    assert events, "expected on_hand events"
+    for e in events:
+        assert (e.count_date or "")[:10] == "2026-06-08", e.count_date
+    print("ok: subject count date beats a late send date")
+
+
+def test_count_date_falls_back_to_send_when_no_subject_date():
+    msg = _mime_dated("RE: Weekly Bagel Inventory & Usage Report \u2014 H&H Bagels",
+                      "Tue, 09 Jun 2026 13:52:32 +0000", html=_html(), text=_text())
+    events, errors, _ = parse_message_with_errors(msg)
+    assert errors == [], errors
+    assert events
+    for e in events:
+        assert (e.count_date or "").startswith("2026-06-09"), e.count_date
+    print("ok: falls back to send date when subject has no date")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -425,4 +471,7 @@ if __name__ == "__main__":
     test_sender_resolves_to_alcoa()
     test_xlsx_assortment_management_tool_parser()
     test_scanner_assortment_tool_cobb_known_rep()
+    test_count_date_from_subject_helper()
+    test_count_date_uses_subject_not_late_send()
+    test_count_date_falls_back_to_send_when_no_subject_date()
     print("\nAll usfoods_inventory_report tests passed.")

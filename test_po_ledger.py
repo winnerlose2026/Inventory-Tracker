@@ -4,10 +4,15 @@ import sys
 sys.path.insert(0, ".")
 import inventory_tracker as it
 import blueprints.pos as pos
+from datetime import datetime as _dt, timedelta as _td
 
 
 def _setup(monkey):
     # pending USF (Zebulon) + pending Cheney (Punta Gorda, transfer pool)
+    # in_transit = shipped (past) but arrival still in the future, relative
+    # to today so the state does not drift as real time advances.
+    _cb_ship = (_dt.now() - _td(days=4)).strftime("%Y-%m-%dT00:00:00")
+    _cb_arr = (_dt.now() + _td(days=7)).strftime("%Y-%m-%dT00:00:00")
     inv = {
         "plain bagel 4oz [usf - zebulon]": {
             "name": "Plain Bagel 4oz [USF - Zebulon]", "distributor": "US Foods",
@@ -18,7 +23,7 @@ def _setup(monkey):
             "name": "Everything Bagel 4oz [CB - Punta Gorda]", "distributor": "Cheney Brothers",
             "warehouse": "Punta Gorda, FL",
             "on_order": [{"po_number": "PEND-CB", "qty": 56, "ordered_at": "2026-06-22",
-                          "ship_date": "2026-06-26T00:00:00", "arrival_date": "2026-07-03T00:00:00"}]},
+                          "ship_date": _cb_ship, "arrival_date": _cb_arr}]},
         "sesame bagel 4oz [usf - alcoa]": {
             "name": "Sesame Bagel 4oz [USF - Alcoa]", "distributor": "US Foods",
             "warehouse": "Alcoa, TN", "on_order": []},
