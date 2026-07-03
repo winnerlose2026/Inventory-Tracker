@@ -379,8 +379,10 @@ def api_cheney_stock_images():
         facilities, errors = {}, []
         for user in users:
             uq = urllib.parse.quote(user)
+            # NB: no $orderby -- Graph rejects orderby combined with a
+            # from-address $filter (InefficientFilter). We sort/dedupe by
+            # receivedDateTime in code below instead.
             list_url = (f"{GRAPH_BASE}/users/{uq}/messages?$filter={filt}"
-                        f"&$orderby=receivedDateTime%20desc"
                         f"&$select=id,subject,receivedDateTime&$top=25")
             try:
                 raw, _ = client._graph_get(list_url, token)
