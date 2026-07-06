@@ -468,6 +468,44 @@ def test_count_date_falls_back_to_send_when_no_subject_date():
     print("ok: falls back to send date when subject has no date")
 
 
+def _manassas_metric_source_xlsx_bytes():
+    """New 'Customer Metric Source' layout (seen 7/6/26): singular 'Case on
+    Hand' header, explicit 'Mfg Code' column, 'APN #' item column."""
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Customer Metric Source "
+    ws.append(["Customer Name (#)", "Product Description", "APN #",
+               "Pack Size", "Mfg Code", "Cases", "Case on Hand "])
+    for row in [
+        ("HH BAGELS (91634139)", "BAGEL, EVTHG 4 Z UNSL PARBK", "7309056", "10/6/4.25 OZ", "1158", "17", "32"),
+        ("HH BAGELS (91634139)", "BAGEL, PLN 4.25 Z UNSL PARBK", "7095637", "10/6/4.25 OZ", "1150", "12", "29"),
+        ("HH BAGELS (91634139)", "BAGEL, SESME 4.25 Z UNSL PARBK", "6950804", "10/6/4.25 OZ", "1153", "6", "12"),
+    ]:
+        ws.append(list(row))
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def test_xlsx_case_on_hand_metric_source_layout():
+    # Regression: 'Case on Hand' (singular) was not recognized as an on-hand
+    # column, so Manassas' 7/6 'Customer Metric Source' report parsed to
+    # nothing and sat in the unparsed queue. Now it parses; variety resolves
+    # from the explicit Mfg Code column.
+    rep = R.parse_report_xlsx(_manassas_metric_source_xlsx_bytes(),
+                              distributor="US Foods", warehouse="Manassas, VA")
+    assert rep is not None, "Case on Hand / Mfg Code layout must parse"
+    assert rep.unmapped_codes == [], rep.unmapped_codes
+    bv = {L.variety: L for L in rep.lines}
+    assert bv["Everything"].cases_on_hand == 32
+    assert bv["Everything"].weekly_usage == 17     # "Cases" = cases used
+    assert bv["Everything"].mfg_code == "1158"
+    assert bv["Plain"].cases_on_hand == 29
+    print("ok: xlsx 'Case on Hand' / 'Mfg Code' Metric Source layout parses")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -486,6 +524,7 @@ if __name__ == "__main__":
     test_sender_resolves_to_alcoa()
     test_xlsx_assortment_management_tool_parser()
     test_scanner_assortment_tool_cobb_known_rep()
+    test_xlsx_case_on_hand_metric_source_layout()
     test_count_date_from_subject_helper()
     test_count_date_uses_subject_not_late_send()
     test_count_date_falls_back_to_send_when_no_subject_date()

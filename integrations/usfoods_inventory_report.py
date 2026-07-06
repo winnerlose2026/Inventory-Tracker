@@ -458,8 +458,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         # Explicit set only, so "Pot Forecast on Hand" / "Pot weeks OH" /
         # "WOH plus next PO" on the La Mirada sheet aren't mistaken for it.
         # "onhandquantity" is the Assortment Management Tool on-hand column.
-        return n in ("currentonhand", "casesonhand", "curroh", "onhand",
-                     "onhandquantity")
+        return n in ("currentonhand", "casesonhand", "caseonhand", "curroh",
+                     "onhand", "onhandquantity")
 
     def _is_usage(n):
         # Manassas weekly "Cases"; La Mirada weekly "Forecast"; Assortment
