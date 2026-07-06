@@ -603,3 +603,79 @@ def api_email_ingest_events():
         }), 500
 
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@email_bp.route("/api/ingest/cheney-inventory-csv", methods=["POST"])
+def api_ingest_cheney_inventory_csv():
+    """Ingest a Cheney Brothers daily on-hand CSV (the SFTP feed) over HTTPS.
+
+    Render can't host an SFTP server, so this is the receiving side of the
+    feed: whatever picks up Cheney's daily drop (a scheduled Cowork routine, a
+    small relay, or a manual upload) POSTs the CSV here and it lands through
+    the same apply pipeline as the mailbox scan. Accepts the CSV as the raw
+    request body (text/csv), a multipart ``file`` field, or JSON {"csv": ...}.
+    Gated by the global auth hook (X-Inventory-Token / session). Pass
+    ``?dry_run=1`` to parse + report without applying. source="cheney-sftp-csv".
+    """
+    try:
+        from integrations import EmailEvent, SyncItem
+        from integrations.cheney_csv_inventory import parse_inventory_csv
+        from sync_inventory import _apply_events
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": _safe_err(exc, "import")}), 500
+
+    dry_run = str(request.args.get("dry_run") or "").lower() in ("1", "true", "yes")
+    filename = request.args.get("filename") or "cheney_inventory.csv"
+    csv_text = ""
+    up = request.files.get("file") if request.files else None
+    if up is not None:
+        csv_text = up.read().decode("utf-8-sig", "replace")
+    elif request.is_json:
+        body = request.get_json(silent=True) or {}
+        csv_text = str(body.get("csv") or "")
+        if str(body.get("dry_run")).lower() in ("1", "true", "yes"):
+            dry_run = True
+        if body.get("filename"):
+            filename = str(body["filename"])
+    else:
+        csv_text = request.get_data(as_text=True) or ""
+
+    events_d, errors = parse_inventory_csv(csv_text, filename=filename)
+    built = []
+    for e in events_d:
+        it = e.get("item") or {}
+        built.append(EmailEvent(
+            event_type=e.get("event_type") or "on_hand",
+            item=SyncItem(
+                quantity=float(it.get("quantity") or 0),
+                distributor=str(it.get("distributor") or ""),
+                name=it.get("name"),
+                variety=it.get("variety"),
+                warehouse=it.get("warehouse"),
+                unit=it.get("unit"),
+                distributor_sku=it.get("distributor_sku"),
+                case_cost=(float(it["case_cost"]) if it.get("case_cost") is not None else None),
+                case_size=(int(it["case_size"]) if it.get("case_size") is not None else None),
+                weekly_usage=(float(it["weekly_usage"]) if it.get("weekly_usage") is not None else None),
+            ),
+            source_message_id=str(e.get("source_message_id") or ""),
+            source_subject=str(e.get("source_subject") or ""),
+            po_number="",
+            po_revision="",
+            count_date=str(e.get("count_date") or ""),
+        ))
+
+    try:
+        report = _apply_events(
+            events=built, messages_seen=1, messages_parsed=1 if built else 0,
+            errors=list(errors), dry_run=dry_run, source="cheney-sftp-csv",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"dry_run": dry_run, "reports": [{
+            "distributor": "Cheney Brothers", "source": "cheney-sftp-csv",
+            "status": "error", "fetched": len(built), "updated": 0,
+            "unchanged": 0, "unmatched": [], "changes": [],
+            "error": _safe_err(exc), "messages_seen": 1, "messages_parsed": 1,
+        }]}), 500
+
+    return jsonify({"dry_run": dry_run, "reports": [report]})
