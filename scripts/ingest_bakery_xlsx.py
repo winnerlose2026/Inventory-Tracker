@@ -197,7 +197,15 @@ def parse_sheet(ws, week_start):
 
 
 def parse_workbook(path: Path):
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    # NB: read_only=False is deliberate. The workbook has one sheet per ISO
+    # week and grows ~52 sheets/year (260+ as of 2026-07). parse_sheet()
+    # reads cells by address (ws["B10"] etc.), and openpyxl's read-only
+    # worksheets re-scan on every such random access -- across hundreds of
+    # sheets that pushed a full parse past 2 minutes and timed out the daily
+    # auto-ingest. A normal (eager) load parses the whole ~1-2 MB file once
+    # and gives O(1) cell access, finishing in ~5s. data_only=True still
+    # returns Excel's cached values, so the parsed result is identical.
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
     labor_entries = []
     bakery_weeks = []
     drift_notes = []
