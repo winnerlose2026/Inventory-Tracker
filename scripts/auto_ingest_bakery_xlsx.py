@@ -45,21 +45,26 @@ Usage
 
 Exit codes
 ----------
-    0  success (either ran a fresh ingest, skipped because unchanged,
-       or deferred because the workbook is mid-sync)
+    0  success (ran a fresh ingest -- possibly after auto-recovering a
+       truncated workbook -- skipped because unchanged, or deferred
+       because the workbook is still mid-sync)
     2  xlsx not found / config error
     3  ingest subprocess failed (output is forwarded to stderr)
+    4  workbook is truncated/corrupt and could not be auto-recovered
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import os
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 
 DEFAULT_XLSX = Path(__file__).resolve().parents[2] / "Bakery Model - Sales v. Labor.xlsx"
@@ -149,6 +154,75 @@ def _wait_for_complete_workbook(path: Path, *, quiet: bool) -> bool:
         time.sleep(SYNC_WAIT_INTERVAL_SEC)
 
 
+def _file_size_stable(path: Path, *, settle_sec: float = 4.0) -> bool:
+    """True if the file size is unchanged across a short window.
+
+    Distinguishes a genuine mid-sync (Dropbox still streaming the file down,
+    so its size keeps growing) from a truncated write that has finished and
+    is simply short. We only attempt ZIP recovery once the size has settled.
+    """
+    try:
+        s1 = path.stat().st_size
+    except OSError:
+        return False
+    time.sleep(settle_sec)
+    try:
+        s2 = path.stat().st_size
+    except OSError:
+        return False
+    return s1 == s2
+
+
+def _reconstruct_truncated_xlsx(src: Path) -> Optional[Path]:
+    """Recover a workbook whose ZIP tail was chopped off by a bad Dropbox write.
+
+    Dropbox occasionally persists the workbook a few bytes short, dropping the
+    End-Of-Central-Directory record (and sometimes the last central-directory
+    entries). The compressed member data is all still there, so we keep every
+    central-directory entry that is fully present, synthesize a matching EOCD,
+    and validate the result end-to-end (CRC of every kept member plus presence
+    of the essential workbook parts).
+
+    Returns the path to a repaired temp copy, or None when the file can't be
+    safely recovered -- e.g. the central directory hasn't been written at all,
+    which means it's a genuine mid-sync rather than a truncation.
+    """
+    try:
+        data = src.read_bytes()
+    except OSError:
+        return None
+    c0 = data.find(b"PK\x01\x02")          # first central-directory header
+    if c0 < 0:
+        return None                          # no central dir yet -> still syncing
+    pos, end, entries = c0, c0, 0
+    while pos + 46 <= len(data) and data[pos:pos + 4] == b"PK\x01\x02":
+        fnlen, exlen, cmlen = struct.unpack("<HHH", data[pos + 28:pos + 34])
+        nxt = pos + 46 + fnlen + exlen + cmlen
+        if nxt > len(data):                  # this entry is the truncated one
+            break
+        entries += 1
+        end = nxt
+        pos = nxt
+    if entries == 0:
+        return None
+    cd_size = end - c0
+    eocd = b"PK\x05\x06" + struct.pack(
+        "<HHHHIIH", 0, 0, entries, entries, cd_size, c0, 0
+    )
+    repaired = Path(tempfile.gettempdir()) / f"{src.stem}.recovered.xlsx"
+    try:
+        repaired.write_bytes(bytes(data[:end]) + eocd)
+        with zipfile.ZipFile(repaired) as zf:
+            if zf.testzip() is not None:
+                return None
+            names = set(zf.namelist())
+        if not {"[Content_Types].xml", "xl/workbook.xml"} <= names:
+            return None
+    except (zipfile.BadZipFile, OSError, struct.error):
+        return None
+    return repaired
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--xlsx", type=Path, default=DEFAULT_XLSX,
@@ -190,27 +264,55 @@ def main() -> int:
         print(f"ERROR: ingest script missing at {ingest}", file=sys.stderr)
         return 2
 
-    # Guard against mid-sync Dropbox snapshots. If the workbook isn't a
-    # readable zip yet, briefly wait it out and then bail clean -- the
-    # next cron tick will pick it up once Dropbox finishes writing.
+    # Guard against mid-sync Dropbox snapshots, and self-heal the truncated
+    # writes Dropbox occasionally leaves behind. If the workbook isn't a
+    # readable zip, first give any in-progress sync a moment to finish. If
+    # it's still unreadable but the file size has stopped changing, it isn't
+    # mid-sync -- it's a truncated write, so rebuild the ZIP tail from the
+    # intact entries and ingest the recovered copy instead of deferring
+    # forever (which is how a bad write once sat unnoticed for days).
+    ingest_target = xlsx
+    recovered: Optional[Path] = None
     if not _wait_for_complete_workbook(xlsx, quiet=args.quiet):
-        if not args.quiet:
+        if not _file_size_stable(xlsx):
+            if not args.quiet:
+                print(
+                    f"workbook at {xlsx} is still syncing (size changing); "
+                    "deferring to next run",
+                    file=sys.stderr,
+                )
+            # Genuine mid-sync -- do NOT bump the stamp; retry next run.
+            return 0
+        recovered = _reconstruct_truncated_xlsx(xlsx)
+        if recovered is None:
             print(
-                f"workbook at {xlsx} looks mid-sync (no ZIP EOCD); skipping",
+                f"ERROR: workbook at {xlsx} is truncated/corrupt and could not "
+                "be auto-recovered (ZIP central directory missing or damaged). "
+                "Re-save the workbook and let Dropbox finish syncing.",
                 file=sys.stderr,
             )
-        # Deliberately do NOT bump the stamp -- we want to retry next run.
-        return 0
+            return 4
+        print(
+            f"workbook was truncated (bad Dropbox write); recovered it from "
+            f"intact ZIP entries and ingesting the repaired copy",
+            file=sys.stderr,
+        )
+        ingest_target = recovered
 
     old_tag = (last_sha[:12] + "...") if last_sha else "none"
     print(f"file changed (sha256: {old_tag} -> {current_sha[:12]}...) -- running ingest")
     env = dict(os.environ)
     env["INVENTORY_API_TOKEN"] = args.token
     proc = subprocess.run(
-        [sys.executable, str(ingest), "--xlsx", str(xlsx),
+        [sys.executable, str(ingest), "--xlsx", str(ingest_target),
          "--api-base", args.api_base],
         env=env,
     )
+    if recovered is not None:
+        try:
+            recovered.unlink()
+        except OSError:
+            pass
     if proc.returncode != 0:
         print(f"ingest exited {proc.returncode}", file=sys.stderr)
         return 3
