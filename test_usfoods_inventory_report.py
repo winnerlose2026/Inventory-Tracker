@@ -506,6 +506,15 @@ def test_xlsx_case_on_hand_metric_source_layout():
     print("ok: xlsx 'Case on Hand' / 'Mfg Code' Metric Source layout parses")
 
 
+def test_manassas_mdc_customercontact_sender_maps():
+    # The Manassas "Product Usage Report" now comes from the USF Sales-
+    # Coordination alias (Stephanie Warfle, MDC). It must resolve to Manassas
+    # so the weekly report ingests instead of sitting unparsed.
+    dist, wh = R.warehouse_for_sender('"Warfle, Stephanie" <usfcustomercontact@usfoods.com>')
+    assert (dist, wh) == ("US Foods", "Manassas, VA"), (dist, wh)
+    print("ok: usfcustomercontact alias maps to Manassas")
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
@@ -525,6 +534,7 @@ if __name__ == "__main__":
     test_xlsx_assortment_management_tool_parser()
     test_scanner_assortment_tool_cobb_known_rep()
     test_xlsx_case_on_hand_metric_source_layout()
+    test_manassas_mdc_customercontact_sender_maps()
     test_count_date_from_subject_helper()
     test_count_date_uses_subject_not_late_send()
     test_count_date_falls_back_to_send_when_no_subject_date()

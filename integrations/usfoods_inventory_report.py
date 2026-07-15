@@ -78,6 +78,11 @@ REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
     # from the team alias rather than a named coordinator.
     "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
+    # Manassas (MDC) weekly "Product Usage Report" now arrives from the USF
+    # Sales-Coordination customer-contact alias (Salesforce-generated; signed
+    # by Stephanie Warfle, Sales Coordination Manager - AMA/MDC), and Thomas
+    # Paxson forwards it. Route the alias to Manassas so the report ingests.
+    "usfcustomercontact@usfoods.com": ("US Foods", "Manassas, VA"),
     "sam.travlos@usfoods.com": ("US Foods", "La Mirada, CA"),
     "ozzy.corut@usfoods.com": ("US Foods", "La Mirada, CA"),
     # Knoxville market (DC 6H, 2270) -- delivered as the USF "Assortment
