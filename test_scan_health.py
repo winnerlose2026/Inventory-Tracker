@@ -12,7 +12,7 @@ sys.path.insert(0, ".")
 
 from integrations.email_scanner import (
     _msg_event_candidate, _msg_date_iso, parse_message_with_errors, EmailEvent,
-    _carries_report_payload, _is_auto_reply,
+    _carries_report_payload, _is_auto_reply, _is_report_shaped,
 )
 from integrations.email_scanner import SyncItem  # re-exported
 from sync_inventory import _apply_email_event
@@ -226,6 +226,33 @@ def test_real_report_payloads_still_enter_unparsed_queue():
     assert _carries_report_payload(pasted, pasted["Subject"]) is True
 
 
+def test_only_report_shaped_distributor_mail_reaches_the_queue():
+    """Regression: a distributor domain alone queued PO confirmations,
+    vendor-portal invoices, statement reminders and delivery-appointment threads
+    -- 40+ entries deep, hiding the one genuinely missed weekly report. Those
+    already surface as scan errors, so they stay out of the report queue."""
+    not_reports = [
+        ("NoReply@usfoods.com", "Confirm USF PO 256295 5G 07/22/26 H&H BAGELS"),
+        ("noreply@usfoods.com", "US Foods Vendor Portal Invoice"),
+        ("Statements.Shared@usfoods.com", "Reminder - Statement Request - 0000670701"),
+        ("Liz.Cantillo@usfoods.com", "Re: Due 7/23 - Missing DEL APPTs - PO#2055126H"),
+        ("Ari.Gonzales@usfoods.com", "RE: US Foods Austin Onboarding Request ID# 35078882"),
+        ("JDoyle@chefswarehouse.com", "RE: H&H Bagels - Past Due invoice"),
+        ("Matthew.Greene@usfoods.com", "RE: Bagels"),
+    ]
+    for sender, subject in not_reports:
+        assert _is_report_shaped(sender, subject) is False, (sender, subject)
+
+    # A mapped report rep always qualifies -- their format changes are exactly
+    # what the queue exists to surface, whatever they title the mail.
+    assert _is_report_shaped("Kimberly.Cobb@usfoods.com", "July 27 Report") is True
+    # An unmapped sender still qualifies on a report-shaped subject/filename,
+    # so a new DC rep's first report is never silently dropped.
+    assert _is_report_shaped("newrep@usfoods.com", "HH Bagels Product Usage Report") is True
+    assert _is_report_shaped("newrep@usfoods.com", "FW: numbers",
+                             ["Customer Metric Source (7).xlsx"]) is True
+
+
 def test_prune_unparsed_drops_self_healed_and_aged_out_entries():
     """The queue is a to-do list, not a log: an entry clears once its warehouse
     counts after the unreadable message, or once it ages out."""
@@ -263,6 +290,46 @@ def test_prune_unparsed_drops_self_healed_and_aged_out_entries():
 
     assert [e["id"] for e in kept] == ["open", "unknown"], kept
     assert stored["data"] == kept
+
+
+def test_prune_unparsed_clears_non_report_backlog_and_own_count():
+    """The historical backlog must clear itself: entries queued before the
+    scanner could classify them are re-judged from sender + subject. And an
+    entry whose own report supplied the count (stamped with its send time, so
+    equal not newer) is healed -- an off-by-one here kept it queued forever."""
+    import inventory_tracker as it
+
+    now = datetime(2026, 7, 28, 17, 40, tzinfo=timezone.utc)
+    entries = [
+        {"id": "po", "sender": "NoReply@usfoods.com",
+         "subject": "Confirm USF PO 256295 5G 07/22/26 H&H BAGELS",
+         "received": "2026-07-27T16:43:49Z"},
+        {"id": "invoice", "sender": "noreply@usfoods.com",
+         "subject": "US Foods Vendor Portal Invoice",
+         "received": "2026-07-23T16:45:02Z"},
+        {"id": "ooo", "sender": "mross@cheneybrothers.com",
+         "subject": "Automatic reply: Weekly Bagel Inventory & Usage Report",
+         "received": "2026-07-20T15:39:11Z"},
+        # its own report supplied Manassas' count -> equal timestamps -> healed
+        {"id": "own-count", "sender": "Jasmin.Gomez@usfoods.com",
+         "subject": "HH Bagels Report", "received": "2026-07-27T14:18:13Z"},
+        {"id": "live", "sender": "Kimberly.Cobb@usfoods.com",
+         "subject": "July 27 Report", "received": "2026-07-28T16:00:00Z"},
+    ]
+    freshness = [
+        {"warehouse": "Manassas, VA", "last_count_at": "2026-07-27T14:18:13Z"},
+        {"warehouse": "Alcoa, TN", "last_count_at": "2026-07-27T19:03:46+00:00"},
+    ]
+
+    orig_load, orig_write = it.load_unparsed_reports, it._write_json
+    try:
+        it.load_unparsed_reports = lambda: list(entries)
+        it._write_json = lambda path, data: None
+        kept = it.prune_unparsed_reports(now=now, freshness=freshness)
+    finally:
+        it.load_unparsed_reports, it._write_json = orig_load, orig_write
+
+    assert [e["id"] for e in kept] == ["live"], kept
 
 
 if __name__ == "__main__":

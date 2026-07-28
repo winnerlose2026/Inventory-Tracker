@@ -325,6 +325,43 @@ def _is_auto_reply(msg: Message, subject: str) -> bool:
     return bool(msg.get("X-Autoreply") or msg.get("X-Autorespond"))
 
 
+# Subjects that are transactional / administrative distributor mail, not a
+# warehouse inventory report: PO + order confirmations, invoices, statements,
+# delivery-appointment threads, account onboarding. These already surface any
+# parse failure through scan errors, so they must not crowd the report queue.
+_NON_REPORT_SUBJECT_RE = re.compile(
+    r"\b(invoice|statement|vendor portal|remittance|credit memo|past due"
+    r"|del appts?|delivery appointment|onboarding request|order confirmation"
+    r"|confirm usf po|usf po \d|po#? ?\d)", re.I)
+
+# Subjects/filenames that mark an actual inventory or usage report.
+_REPORT_SUBJECT_RE = re.compile(
+    r"\b(inventory|usage|stock|on ?hand|product usage|metric source"
+    r"|assortment)", re.I)
+
+
+def _is_report_shaped(sender: str, subject: str, filenames=()) -> bool:
+    """Is this plausibly a warehouse inventory/usage report we failed to read?
+
+    Gates what lands in the unparsed-report queue on /api/scan/health. Being
+    from a distributor domain is not enough: PO confirmations, vendor-portal
+    invoices, statement reminders and delivery-appointment threads all are, and
+    they buried the queue 40-deep so a genuinely missed weekly report was
+    invisible. PO/invoice parse failures already raise scan errors, so nothing
+    is lost by keeping them out of here.
+
+    A mapped report/worksheet rep always qualifies -- that is exactly the
+    sender whose format change we need to hear about.
+    """
+    if _report_warehouse_for_sender(sender)[1] or \
+            _worksheet_warehouse_for_sender(sender)[1]:
+        return True
+    blob = " ".join([subject or ""] + [f or "" for f in filenames])
+    if _NON_REPORT_SUBJECT_RE.search(blob):
+        return False
+    return bool(_REPORT_SUBJECT_RE.search(blob))
+
+
 def _carries_report_payload(msg: Message, subject: str) -> bool:
     """Could this message plausibly contain a report/PO we failed to parse?
 
@@ -1284,11 +1321,14 @@ class EmailInboxClient:
                     # being a number that never appeared.
                     _snd = (((m.get("from") or {}).get("emailAddress") or {})
                             .get("address") or "")
+                    _subj = m.get("subject") or ""
                     _known = (_distributor_from_sender(_snd)
                               or _report_warehouse_for_sender(_snd)[1]
                               or _worksheet_warehouse_for_sender(_snd)[1])
-                    if _known and _carries_report_payload(
-                            msg, m.get("subject") or ""):
+                    _fnames = [f for f, _p in _attachments(msg)]
+                    if (_known
+                            and _is_report_shaped(_snd, _subj, _fnames)
+                            and _carries_report_payload(msg, _subj)):
                         result.unparsed.append({
                             "id": m.get("internetMessageId") or mid,
                             "mailbox": upn,

@@ -228,12 +228,18 @@ def prune_unparsed_reports(now: Optional[datetime] = None,
                            freshness: Optional[list] = None) -> list:
     """Drop queue entries that no longer represent an open ingest gap.
 
-    Two ways an entry stops being actionable:
+    Three ways an entry stops being actionable:
 
-    * **Self-healed** -- the sender's warehouse has since recorded a count
-      NEWER than the message we couldn't read. Whatever that message was, the
-      warehouse is current, so there is nothing left to wire up. (Reps often
-      resend a readable copy, or a second rep covers the same DC.)
+    * **Not a report** -- transactional distributor mail (PO or order
+      confirmations, vendor-portal invoices, statement reminders,
+      delivery-appointment threads) and out-of-office auto-replies. These were
+      queued before the scanner learned to classify them, and their parse
+      failures already surface as scan errors. Re-judged from the stored
+      sender + subject so the historical backlog clears itself.
+    * **Self-healed** -- the sender's warehouse has since recorded a count at
+      or after the message we couldn't read. Either that very message applied
+      (the count is stamped with its own send time) or a readable copy followed,
+      so there is nothing left to wire up.
     * **Aged out** -- older than ``max_age_days``. The count it carried is
       superseded; leaving it in place only hides live gaps.
 
@@ -251,18 +257,31 @@ def prune_unparsed_reports(now: Optional[datetime] = None,
         (r.get("warehouse") or ""): (r.get("last_count_at") or "")
         for r in freshness
     }
+    try:
+        from integrations.email_scanner import (
+            _is_report_shaped, _AUTO_REPLY_SUBJECT_RE,
+        )
+    except Exception:  # noqa: BLE001 -- reclassification is best-effort
+        _is_report_shaped = None
+        _AUTO_REPLY_SUBJECT_RE = None
+
     kept = []
     for e in entries:
+        sender, subject = e.get("sender") or "", e.get("subject") or ""
+        if _AUTO_REPLY_SUBJECT_RE is not None and \
+                _AUTO_REPLY_SUBJECT_RE.match(subject):
+            continue  # out-of-office / bounce: never a report
+        if _is_report_shaped is not None and not _is_report_shaped(sender, subject):
+            continue  # PO / invoice / statement / admin mail, not a report
         received = e.get("received") or ""
         recv_dt = _parse_iso_utc(received)
         if recv_dt is not None and (now - recv_dt).days > max_age_days:
             continue  # aged out
-        _dist, wh = _unparsed_sender_warehouse(e.get("sender") or "")
+        _dist, wh = _unparsed_sender_warehouse(sender)
         if wh and received:
-            counted = latest_count.get(wh) or ""
-            c_dt, r_dt = _parse_iso_utc(counted), recv_dt
-            if c_dt is not None and r_dt is not None and c_dt > r_dt:
-                continue  # self-healed: warehouse counted after this message
+            c_dt = _parse_iso_utc(latest_count.get(wh) or "")
+            if c_dt is not None and recv_dt is not None and c_dt >= recv_dt:
+                continue  # self-healed: counted at/after this message
         kept.append(e)
     if len(kept) != len(entries):
         _write_json(UNPARSED_REPORTS_FILE, kept)
