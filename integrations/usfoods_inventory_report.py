@@ -42,8 +42,8 @@ Two delivery shapes are understood, both handled here:
     ``US Foods Number`` / ``CURR OH`` / ``Forecast``), and the Alcoa/Knoxville
     "Assortment Management Tool" export (``APN`` / ``Manufacturer Product
     Number`` / ``On Hand Quantity`` / ``On Order Quantity`` / ``Weekly Average
-    Demand``), whose grid sits on a later sheet behind a stack of single-cell
-    summary sheets. All three differ from the CS OH / WKLY USE worksheet
+    Demand``, since renamed ``8 Week Average Shipped``), whose grid may sit on
+    a later sheet behind a stack of single-cell summary sheets. All three differ from the CS OH / WKLY USE worksheet
     handled by ``bagel_inventory_worksheet``.
 
 The report never names the warehouse; the *sending rep's email address*
@@ -468,8 +468,17 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
 
     def _is_usage(n):
         # Manassas weekly "Cases"; La Mirada weekly "Forecast"; Assortment
-        # Management Tool "Weekly Average Demand (Last 4 Weeks)".
-        return n in ("cases", "forecast") or n.startswith("weeklyaveragedemand")
+        # Management Tool "Weekly Average Demand (Last 4 Weeks)", which USF
+        # renamed to "8 Week Average Shipped" (same meaning: average cases
+        # shipped per week). Accept any "<N> Week Average ..." heading and any
+        # "... Average Shipped" heading so the next rename doesn't silently
+        # drop the usage rate again -- on-hand parses either way, so a missed
+        # usage column produces no error, just a stale usage figure.
+        if n in ("cases", "forecast") or n.startswith("weeklyaveragedemand"):
+            return True
+        if re.match(r"^\d+week(ly)?average", n):
+            return True
+        return "averageshipped" in n
 
     def _find_header(sheet_rows):
         for i, row in enumerate(sheet_rows):

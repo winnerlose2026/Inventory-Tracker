@@ -292,6 +292,57 @@ def _msg_event_candidate(m: dict) -> bool:
     return False
 
 
+# Data-file extensions that could plausibly carry a distributor report or PO.
+_REPORT_ATTACHMENT_EXTS = (".xlsx", ".xls", ".xlsm", ".csv", ".tsv", ".pdf")
+
+# Body markers that mean "there is a report table pasted in here." Kept narrow
+# so ordinary correspondence doesn't match: each is a column heading the DC
+# reps' own report templates emit.
+_REPORT_BODY_MARKERS = (
+    "current on hand", "cases on hand", "case on hand", "curr oh",
+    "on hand quantity", "product usage", "weekly usage", "cs oh", "wkly use",
+)
+
+_AUTO_REPLY_SUBJECT_RE = re.compile(
+    r"^\s*(automatic reply|auto(matic)?[- ]?reply|out of office|undeliverable"
+    r"|delivery status notification|read:)\b", re.I)
+
+
+def _is_auto_reply(msg: Message, subject: str) -> bool:
+    """True for out-of-office / bounce / read-receipt mail.
+
+    These carry no report and can never be "wired up", so they must not enter
+    the unparsed queue -- Kimberly Cobb's OOO auto-reply sat in it for weeks
+    looking like a parser gap.
+    """
+    if _AUTO_REPLY_SUBJECT_RE.match(subject or ""):
+        return True
+    auto = (msg.get("Auto-Submitted") or "").strip().lower()
+    if auto and auto != "no":
+        return True
+    if (msg.get("X-Auto-Response-Suppress") or "").strip():
+        return True
+    return bool(msg.get("X-Autoreply") or msg.get("X-Autorespond"))
+
+
+def _carries_report_payload(msg: Message, subject: str) -> bool:
+    """Could this message plausibly contain a report/PO we failed to parse?
+
+    Gates the unparsed queue on /api/scan/health. A recognized distributor
+    address alone is far too loose -- reps reply "thanks", "sending Monday
+    afternoons", "I sent it over yesterday?" on the standing report thread, and
+    every one of those looked like a parser gap. Require an actual payload: a
+    data-file attachment, or a report table pasted into the body.
+    """
+    if _is_auto_reply(msg, subject):
+        return False
+    for fname, payload in _attachments(msg):
+        if payload and fname.lower().endswith(_REPORT_ATTACHMENT_EXTS):
+            return True
+    blob = f"{_text_body(msg)}\n{_html_body(msg)}".lower()
+    return any(mark in blob for mark in _REPORT_BODY_MARKERS)
+
+
 def _text_body(msg: Message) -> str:
     if msg.is_multipart():
         for part in msg.walk():
@@ -1233,9 +1284,11 @@ class EmailInboxClient:
                     # being a number that never appeared.
                     _snd = (((m.get("from") or {}).get("emailAddress") or {})
                             .get("address") or "")
-                    if (_distributor_from_sender(_snd)
-                            or _report_warehouse_for_sender(_snd)[1]
-                            or _worksheet_warehouse_for_sender(_snd)[1]):
+                    _known = (_distributor_from_sender(_snd)
+                              or _report_warehouse_for_sender(_snd)[1]
+                              or _worksheet_warehouse_for_sender(_snd)[1])
+                    if _known and _carries_report_payload(
+                            msg, m.get("subject") or ""):
                         result.unparsed.append({
                             "id": m.get("internetMessageId") or mid,
                             "mailbox": upn,

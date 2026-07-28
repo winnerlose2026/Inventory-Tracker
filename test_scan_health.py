@@ -5,12 +5,14 @@ All offline -- no network, no Graph, no disk inventory required.
 """
 import sys
 from datetime import datetime, timedelta, timezone
+import email
 from email.message import EmailMessage
 
 sys.path.insert(0, ".")
 
 from integrations.email_scanner import (
     _msg_event_candidate, _msg_date_iso, parse_message_with_errors, EmailEvent,
+    _carries_report_payload, _is_auto_reply,
 )
 from integrations.email_scanner import SyncItem  # re-exported
 from sync_inventory import _apply_email_event
@@ -177,6 +179,90 @@ def test_effective_last_count_prefers_stamped_over_derived_ingest_time():
     assert _effective_last_count(None, "2026-07-03T05:06:26") == "2026-07-03T05:06:26"
     assert _effective_last_count("", "2026-07-01") == "2026-07-01"
     assert _effective_last_count(None, None) is None
+
+
+def _msg(subject, body="", *, headers=None, attach=None):
+    m = EmailMessage()
+    m["From"] = "rep@usfoods.com"
+    m["To"] = "JD@hhbagels.com"
+    m["Subject"] = subject
+    for k, v in (headers or {}).items():
+        m[k] = v
+    m.set_content(body or "Thanks!")
+    if attach:
+        fname, payload = attach
+        m.add_attachment(payload, maintype="application",
+                         subtype="octet-stream", filename=fname)
+    return email.message_from_bytes(m.as_bytes())
+
+
+def test_report_less_rep_replies_do_not_enter_unparsed_queue():
+    """Regression: reps replying on the standing report thread ("I sent it over
+    yesterday?", "this will be sent Mondays afternoons") were queued on
+    /api/scan/health as parser gaps, burying the entries that mattered."""
+    chatter = _msg("Re: Weekly Bagel Inventory & Usage Report - H&H Bagels",
+                   "I sent it over yesterday?\n\nKim Cobb | Major Account Executive")
+    assert _carries_report_payload(chatter, chatter["Subject"]) is False
+
+    ooo = _msg("Automatic reply: Weekly Bagel Inventory & Usage Report",
+               "I am currently out of office returning Tuesday.")
+    assert _is_auto_reply(ooo, ooo["Subject"]) is True
+    assert _carries_report_payload(ooo, ooo["Subject"]) is False
+
+    header_ooo = _msg("Re: bagels", "Away.", headers={"Auto-Submitted": "auto-replied"})
+    assert _is_auto_reply(header_ooo, header_ooo["Subject"]) is True
+
+
+def test_real_report_payloads_still_enter_unparsed_queue():
+    """The queue must still catch genuine misses: a data attachment we could
+    not read, or a report table pasted into the body."""
+    with_xlsx = _msg("HH Bagels Report", "Please see attached report. Ty",
+                     attach=("Customer Metric Source (7).xlsx", b"PK\x03\x04junk"))
+    assert _carries_report_payload(with_xlsx, with_xlsx["Subject"]) is True
+
+    pasted = _msg("Weekly Bagel Inventory & Usage Report - 7/20/26",
+                  "ITEM\tVendor#\tDescription\tCURRENT ON HAND\tON ORDER 8/5\n"
+                  "1055010\t1184\tBAGEL, EGG\t23\t16")
+    assert _carries_report_payload(pasted, pasted["Subject"]) is True
+
+
+def test_prune_unparsed_drops_self_healed_and_aged_out_entries():
+    """The queue is a to-do list, not a log: an entry clears once its warehouse
+    counts after the unreadable message, or once it ages out."""
+    import inventory_tracker as it
+
+    now = datetime(2026, 7, 28, 16, 0, tzinfo=timezone.utc)
+    entries = [
+        # self-healed: Manassas counted 7/27 18:00, after this 14:18 message
+        {"id": "healed", "sender": "Jasmin.Gomez@usfoods.com",
+         "subject": "HH Bagels Report", "received": "2026-07-27T14:18:13Z"},
+        # aged out: 30 days old
+        {"id": "old", "sender": "maria.hernandez@usfoods.com",
+         "subject": "RE: report", "received": "2026-06-28T15:00:00Z"},
+        # still open: recent, and Zebulon's last count predates it
+        {"id": "open", "sender": "maria.hernandez@usfoods.com",
+         "subject": "Weekly Bagel Inventory & Usage Report",
+         "received": "2026-07-28T15:28:22Z"},
+        # unmapped sender, recent -> keep (can't prove it healed)
+        {"id": "unknown", "sender": "someone@cheneybrothers.com",
+         "subject": "stock sheet", "received": "2026-07-28T09:00:00Z"},
+    ]
+    freshness = [
+        {"warehouse": "Manassas, VA", "last_count_at": "2026-07-27T18:00:00+00:00"},
+        {"warehouse": "Zebulon, NC", "last_count_at": "2026-07-20T18:25:21+00:00"},
+    ]
+
+    stored = {}
+    orig_load, orig_write = it.load_unparsed_reports, it._write_json
+    try:
+        it.load_unparsed_reports = lambda: list(entries)
+        it._write_json = lambda path, data: stored.setdefault("data", data)
+        kept = it.prune_unparsed_reports(now=now, freshness=freshness)
+    finally:
+        it.load_unparsed_reports, it._write_json = orig_load, orig_write
+
+    assert [e["id"] for e in kept] == ["open", "unknown"], kept
+    assert stored["data"] == kept
 
 
 if __name__ == "__main__":

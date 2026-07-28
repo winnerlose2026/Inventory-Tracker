@@ -5,7 +5,7 @@ import copy
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -141,6 +141,12 @@ INVENTORY_AUDIT_FILE = DATA_DIR / "inventory_audit.json"
 # and should be chased. Mirrors the weekly report cadence + 0 slack.
 STALE_COUNT_DAYS = 7
 
+# How long an unparsed-report queue entry stays actionable. The queue is a
+# to-do list of "a rep sent something we couldn't read"; past this window the
+# report is history (the count it carried is long superseded), so keeping it
+# only buries the entries that still matter.
+UNPARSED_MAX_AGE_DAYS = 21
+
 
 def load_scan_health() -> dict:
     """Last real email-scan summary (heartbeat). {} if never recorded."""
@@ -149,6 +155,25 @@ def load_scan_health() -> dict:
 
 def save_scan_health(rec: dict):
     _write_json(SCAN_HEALTH_FILE, rec)
+
+
+def _parse_iso_utc(value: str) -> Optional[datetime]:
+    """Tolerant ISO-8601 -> tz-aware UTC datetime; None if unparseable.
+
+    Timestamps in play come from three places with three shapes: Graph
+    receivedDateTime ("...Z"), a report's stamped count date (offset-aware, or
+    a bare "YYYY-MM-DD"), and locally-written naive timestamps. Naive values are
+    read as UTC so comparisons never raise on mixed awareness.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None \
+        else dt.astimezone(timezone.utc)
 
 
 def load_unparsed_reports() -> list:
@@ -172,6 +197,76 @@ def record_unparsed_reports(new_items: list, *, cap: int = 50) -> list:
     merged = merged[:cap]
     _write_json(UNPARSED_REPORTS_FILE, merged)
     return merged
+
+
+def _unparsed_sender_warehouse(sender: str):
+    """(distributor, warehouse) for a queue entry's sender, or (None, None).
+
+    Lazy import so this data-layer module never hard-depends on integrations/.
+    """
+    try:
+        from integrations.usfoods_inventory_report import (
+            warehouse_for_sender as _usf_wh,
+        )
+        from integrations.bagel_inventory_worksheet import (
+            warehouse_for_sender as _ws_wh,
+        )
+    except Exception:  # noqa: BLE001 -- pruning is best-effort
+        return None, None
+    for resolve in (_usf_wh, _ws_wh):
+        try:
+            dist, wh = resolve(sender or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if wh:
+            return dist, wh
+    return None, None
+
+
+def prune_unparsed_reports(now: Optional[datetime] = None,
+                           max_age_days: int = UNPARSED_MAX_AGE_DAYS,
+                           freshness: Optional[list] = None) -> list:
+    """Drop queue entries that no longer represent an open ingest gap.
+
+    Two ways an entry stops being actionable:
+
+    * **Self-healed** -- the sender's warehouse has since recorded a count
+      NEWER than the message we couldn't read. Whatever that message was, the
+      warehouse is current, so there is nothing left to wire up. (Reps often
+      resend a readable copy, or a second rep covers the same DC.)
+    * **Aged out** -- older than ``max_age_days``. The count it carried is
+      superseded; leaving it in place only hides live gaps.
+
+    Without this the queue was append-only: entries from resolved parser gaps
+    and from ordinary rep chatter accumulated to the 50-entry cap and every
+    health check re-reported them as work to do. Returns the stored list.
+    """
+    entries = load_unparsed_reports()
+    if not entries:
+        return entries
+    now = now or datetime.now(timezone.utc)
+    if freshness is None:
+        freshness = warehouse_freshness()
+    latest_count = {
+        (r.get("warehouse") or ""): (r.get("last_count_at") or "")
+        for r in freshness
+    }
+    kept = []
+    for e in entries:
+        received = e.get("received") or ""
+        recv_dt = _parse_iso_utc(received)
+        if recv_dt is not None and (now - recv_dt).days > max_age_days:
+            continue  # aged out
+        _dist, wh = _unparsed_sender_warehouse(e.get("sender") or "")
+        if wh and received:
+            counted = latest_count.get(wh) or ""
+            c_dt, r_dt = _parse_iso_utc(counted), recv_dt
+            if c_dt is not None and r_dt is not None and c_dt > r_dt:
+                continue  # self-healed: warehouse counted after this message
+        kept.append(e)
+    if len(kept) != len(entries):
+        _write_json(UNPARSED_REPORTS_FILE, kept)
+    return kept
 
 
 def load_inventory_audit(limit: int = 200) -> list:

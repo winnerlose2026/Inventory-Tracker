@@ -104,10 +104,18 @@ def api_email_scan():
             try:
                 from inventory_tracker import (
                     save_scan_health, record_unparsed_reports,
+                    prune_unparsed_reports,
                 )
                 _unparsed = list(getattr(scan, "unparsed", []) or [])
                 if _unparsed:
                     record_unparsed_reports(_unparsed)
+                # Retire entries whose gap has closed (the warehouse counted
+                # after the message we couldn't read) or that have aged out, so
+                # the queue stays a live to-do list instead of an append-only
+                # log that buries real misses. Runs after this scan's events
+                # are applied, so a report ingested just now clears its own
+                # earlier failures.
+                prune_unparsed_reports()
                 save_scan_health({
                     "ts": datetime.now().isoformat(),
                     "source": report.get("source"),
