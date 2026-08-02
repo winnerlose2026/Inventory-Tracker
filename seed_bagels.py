@@ -13,12 +13,13 @@ house our bagels):
     - Ocala, FL
     - Punta Gorda, FL
 
-  US Foods (5 warehouses)
+  US Foods (6 warehouses)
     - Manassas, VA
     - Zebulon, NC
     - La Mirada, CA
     - Chicago, IL
     - Alcoa, TN
+    - Houston, TX
 
 Case economics (set on every SKU so they sync through reports and exports):
   - Cheney Brothers case cost:  $26.50
@@ -29,7 +30,7 @@ Quantities, thresholds, and weekly_usage are all stored in CASES (unit="cs")
 so they line up with PO parser output and case-priced reordering. Multiply
 by case_size when you need a per-bagel figure.
 
-12 varieties x 8 warehouses = 96 SKUs.
+12 varieties x 9 warehouses = 108 SKUs.
 
 Usage:
     python seed_bagels.py          # add missing items, skip existing
@@ -63,6 +64,11 @@ VARIETIES = [
 ]
 
 # Distributor -> [(warehouse label, short tag, stock multiplier)]
+#
+# The warehouse label is canonical: it must match the values in
+# usfoods_po_parser.USF_DC_CITY_TO_WAREHOUSE / cheney_po_parser exactly, or
+# POs for that DC are parsed and then dropped. test_usfoods_houston_po.py
+# asserts the US Foods side of that invariant.
 WAREHOUSES = {
     "Cheney Brothers": [
         ("Riviera Beach, FL", "Riviera Beach", 1.0),
@@ -75,6 +81,7 @@ WAREHOUSES = {
         ("La Mirada, CA",     "La Mirada",     1.1),
         ("Chicago, IL",       "Chicago",       1.3),  # largest USF DC
         ("Alcoa, TN",         "Alcoa",         0.8),
+        ("Houston, TX",       "Houston",       1.0),  # NW Houston DC B2 (2026-07)
     ],
 }
 
