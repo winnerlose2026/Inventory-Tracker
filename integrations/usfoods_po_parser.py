@@ -59,12 +59,22 @@ USF_ITEM_TO_VARIETY: dict[str, str] = _HH_MFG_MAP
 
 # City (uppercase) seen on USF ship-to labels -> canonical "<City>, <ST>"
 # used by seed_bagels.py. Extend as new DCs appear on POs.
+#
+# INVARIANT: this must stay in sync with seed_bagels.WAREHOUSES["US Foods"].
+# A DC seeded but not mapped here silently drops every PO line for that DC;
+# a DC mapped but not seeded produces restock events that match no SKU.
+# test_usfoods_houston_po.py asserts the two sets are equal.
 USF_DC_CITY_TO_WAREHOUSE: dict[str, str] = {
     "MANASSAS":  "Manassas, VA",
     "ZEBULON":   "Zebulon, NC",
     "LA MIRADA": "La Mirada, CA",
     "CHICAGO":   "Chicago, IL",
     "ALCOA":     "Alcoa, TN",
+    # NW Houston (DC B2, 13400 Hollister Rd) -- opened on the H&H account
+    # 2026-07 with PO 305202B2. Confirmations route through
+    # CENTRALCONFIRMATIONS.SHARED@USFOODS.COM; area buyer is Tom Foley.
+    # Ship-to block prints "3350 NW HOUSTON/B2" with city "HOUSTON".
+    "HOUSTON":   "Houston, TX",
 }
 
 # Pack size → count of units per case. USF uses two patterns on H&H POs:
@@ -158,7 +168,13 @@ _ARRIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _VENDOR_RE = re.compile(r"\bVENDOR\s+(?P<vendor>\d+)\b")
-_BUYER_RE = re.compile(r"BUYER:\s*\d+\s*(?P<buyer>[A-Z][A-Z \.]+)")
+# The buyer cell is followed on the SAME line by the REMARKS column on some
+# DC layouts (Houston prints "BUYER: 152 T X FOLEY      INFO@HHBAGELS.COM").
+# Only single spaces are allowed inside the name so the match stops at the
+# 2+ space column gutter instead of swallowing the remark text.
+_BUYER_RE = re.compile(
+    r"BUYER:\s*\d+\s+(?P<buyer>[A-Z][A-Z.]*(?: [A-Z][A-Z.]*)*)"
+)
 
 # "CITY  ST 12345" — used with findall so we can pick the RIGHTMOST match
 # on the address line. Mail-to is on the left, ship-to on the right.
