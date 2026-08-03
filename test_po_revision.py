@@ -191,3 +191,40 @@ def test_replaying_the_stale_reprint_afterwards_is_ignored(tmp_path):
     pending = inv[key]["on_order"]
     assert len(pending) == 1
     assert pending[0]["qty"] == 168.0, "stale REPRINT clobbered the correction"
+
+
+def test_two_copies_in_one_batch_keep_the_newer_even_when_qty_is_lower(tmp_path):
+    """Greene's REPRINT and Foley's rev 0000003 arrive in the SAME scan batch.
+
+    The per-SKU dedup used to keep max qty across the batch, so Foley's
+    REDUCTION of Plain (176 -> 168) lost to the stale 176 and Houston booked
+    1128 cs against a 1120 cs PO. The newest document must win outright.
+    """
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    import test_on_order_dedup as T
+    from integrations.base import SyncItem
+    from integrations.email_scanner import EmailEvent
+
+    it, sync = T._setup_temp_inventory(tmp_path)
+    T._seed(it)
+
+    def evt(qty, rev, received):
+        return EmailEvent(
+            event_type="restock",
+            item=SyncItem(quantity=qty, distributor="US Foods", variety="Plain",
+                          warehouse="La Mirada, CA", unit="cases"),
+            source_message_id="m", source_subject="US Foods Houston PO: 305202B2",
+            po_number="305202B2", po_revision=rev, source_received_at=received,
+        )
+
+    # Both copies in ONE batch, stale REPRINT listed first and with the
+    # LARGER quantity -- the exact shape that defeated max-qty dedup.
+    sync._apply_events([evt(176.0, "REPRINT", GREENE),
+                        evt(168.0, "0000003", FOLEY)], dry_run=False)
+
+    inv = it._load(it.INVENTORY_FILE)
+    pending = inv["plain bagel 4oz [usf - la mirada]"]["on_order"]
+    assert len(pending) == 1, f"expected 1 pending, got {len(pending)}"
+    assert pending[0]["qty"] == 168.0, "max-qty dedup kept the stale copy"
+    assert pending[0]["po_revision"] == "0000003"

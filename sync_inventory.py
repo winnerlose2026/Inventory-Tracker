@@ -863,10 +863,41 @@ def _apply_events(events: list,
         # rule kept BOTH — and the SKU got double-counted (e.g., PO
         # 6454635G shipped 16 cs of Onion but stored as 8 + 16 = 24,
         # inflating the PO total from 448 to 456 cs). Fix: collapse to
-        # one event per (variety, warehouse, distributor) and keep the
-        # MAX qty across all messages. The max is the right pick because
-        # stale forwarded versions of a PO are typically partial (smaller
-        # qtys); the largest qty represents the canonical / latest order.
+        # one event per (variety, warehouse, distributor).
+        #
+        # FIRST narrow to the NEWEST document for this PO. Two different
+        # copies of a PO routinely land in the same scan batch (Greene's
+        # 305202B2 REPRINT at 15:57 and Foley's rev 0000003 at 19:05), and
+        # picking max-qty across them is wrong whenever an amendment REDUCES
+        # a line -- Foley cut Plain from 176 to 168, so max kept the stale
+        # 176 and Houston booked 1128 cs against a 1120 cs PO. The revision
+        # ordering below never got a chance to run, because both copies were
+        # merged into one group first.
+        #
+        # Once narrowed to a single document, max-qty dedup is safe: what
+        # remains is the same PDF delivered to both JD@ and info@, or
+        # re-attached on a reply, so the qtys agree.
+        newest_rev, newest_received, _seen_doc = None, "", False
+        for _evt in grp:
+            _r = getattr(_evt, "po_revision", "") or ""
+            _rc = getattr(_evt, "source_received_at", "") or ""
+            if not _seen_doc or _po_doc_is_newer(_r, _rc, newest_rev,
+                                                newest_received):
+                newest_rev, newest_received, _seen_doc = _r, _rc, True
+        _older = [
+            _evt for _evt in grp
+            if _po_doc_is_newer(newest_rev, newest_received,
+                                getattr(_evt, "po_revision", "") or "",
+                                getattr(_evt, "source_received_at", "") or "")
+        ]
+        if _older:
+            grp = [_evt for _evt in grp if _evt not in _older]
+            report.setdefault("dedup_dropped", []).append(
+                f"PO {po_num}: dropped {len(_older)} line(s) from an older "
+                f"copy in the same batch (kept rev "
+                f"{newest_rev or '(none)'} @ {newest_received or 'no date'})."
+            )
+
         best: dict[tuple, "EmailEvent"] = {}
         for _evt in grp:
             sku_key = (
