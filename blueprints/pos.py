@@ -713,7 +713,8 @@ def build_po_ledger() -> list:
         m = meta.get(e.get("item_key") or "", {})
         g = arr.setdefault(po, {"distributor": "", "warehouse": "",
                                 "ordered_at": e.get("ordered_at") or "",
-                                "arrival_date": "", "total_cs": 0.0, "lines": []})
+                                "arrival_date": "", "ship_date": "", "eta": "",
+                                "total_cs": 0.0, "lines": []})
         qty = abs(float(e.get("amount") or 0)); g["total_cs"] += qty
         g["lines"].append({"variety": _ledger_variety(m.get("name") or ""),
                            "qty": qty, "unit": e.get("unit") or "cs"})
@@ -722,12 +723,23 @@ def build_po_ledger() -> list:
         ts = e.get("timestamp") or ""
         if ts > g["arrival_date"]:
             g["arrival_date"] = ts
+        # The rollover row carries the ship date the PO was booked with, and the
+        # trigger date it arrived on. Without these the Pending POs tab renders
+        # an arrived PO with an arrival date but a blank Ship column, even though
+        # /api/arrived-pos has always surfaced both from the same rows.
+        if not g["ship_date"] and e.get("ship_date"):
+            g["ship_date"] = e["ship_date"]
+        if not g["eta"]:
+            g["eta"] = (e.get("arrival_date") or "").strip()
     for po, g in arr.items():
         r = _rec(po); r["sources"].add("usage_rollover"); r["_arrived"] = True
         r["distributor"] = r["distributor"] or g["distributor"]
         r["warehouse"] = r["warehouse"] or g["warehouse"]
         r["ordered_at"] = r["ordered_at"] or g["ordered_at"]
         r["arrival_date"] = r["arrival_date"] or g["arrival_date"]
+        r["eta"] = r["eta"] or g["eta"]
+        if g["ship_date"] and not r["ship_date"]:
+            r["ship_date"] = g["ship_date"]; r["ship_date_source"] = "operator"
         if not r["_pending"]:   # use the arrived snapshot only if not still pending
             r["total_cs"] = g["total_cs"]; r["lines"] = g["lines"]
 

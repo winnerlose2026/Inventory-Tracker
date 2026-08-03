@@ -605,6 +605,30 @@ def save_status_overrides(data: dict):
 _PENDING_ROLLOVER_AUDIT: list = []
 
 
+# A PO date parsed off a PDF can come out with a nonsense year (PO 8513015G
+# carried eta "0002-07-17"). datetime.fromisoformat happily accepts it, so it
+# became a rollover trigger in the year 2 -- forever in the past, i.e. an
+# instant promotion -- and then surfaced as the PO's ETA on the dashboard. Bound
+# year to a sane window so a bad parse is treated as "no usable date" and the
+# entry stays pending for an operator instead.
+_MIN_SANE_YEAR = 2020
+_MAX_SANE_YEAR = 2100
+
+
+def _parse_sane_dt(raw: str) -> "datetime | None":
+    """Parse an ISO date/datetime, rejecting out-of-range years."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if not (_MIN_SANE_YEAR <= dt.year <= _MAX_SANE_YEAR):
+        return None
+    return dt
+
+
 def _rollover_trigger(entry: dict) -> "datetime | None":
     """Resolve the effective rollover trigger for a pending on_order entry.
 
@@ -614,21 +638,11 @@ def _rollover_trigger(entry: dict) -> "datetime | None":
          ETA rule.
       2. ``eta`` otherwise — the default ordered_at + lead_days date.
 
-    Returns the parsed datetime, or None if neither field is parseable.
+    Returns the parsed datetime, or None if neither field is parseable or
+    either carries an implausible year (see _parse_sane_dt).
     """
-    arrival = (entry.get("arrival_date") or "").strip()
-    if arrival:
-        try:
-            return datetime.fromisoformat(arrival)
-        except ValueError:
-            pass
-    eta = (entry.get("eta") or "").strip()
-    if eta:
-        try:
-            return datetime.fromisoformat(eta)
-        except ValueError:
-            pass
-    return None
+    return (_parse_sane_dt(entry.get("arrival_date") or "")
+            or _parse_sane_dt(entry.get("eta") or ""))
 
 
 def _rollover_on_order(inv: dict) -> bool:

@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -32,6 +33,8 @@ from inventory_tracker import (
 # Must match the naming convention in seed_bagels.py
 DISTRIBUTOR_TAG = {"Cheney Brothers": "CB", "US Foods": "USF"}
 
+
+_ROLLOVER_ETA_RE = re.compile(r"ETA (\d{4}-\d{2}-\d{2})")
 
 # --- on_hand integrity + source trust -------------------------------------
 # A distributor's on-hand count and H&H's internal mfg codes (1150-1189) live
@@ -77,6 +80,45 @@ _ONHAND_SOURCE_RANKS = (
     ("cheney-stock-ocr", 20),
 )
 _DEFAULT_ONHAND_RANK = 40
+
+
+def _rollover_arrival(e: dict) -> str:
+    """Effective arrival date (YYYY-MM-DD) of an on_order_rollover usage row."""
+    a = (e.get("arrival_date") or "").strip()[:10]
+    if a:
+        return a
+    # Older rows predate the arrival_date field; the ETA is in the note.
+    m = _ROLLOVER_ETA_RE.search(e.get("note") or "")
+    return m.group(1) if m else (e.get("timestamp") or "")[:10]
+
+
+def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
+    """Cases received for this SKU whose ARRIVAL postdates ``count_date``.
+
+    A reported on-hand figure is the truth at the moment it was counted -- it
+    cannot know about a delivery that landed afterwards. Re-applying the raw
+    count would silently erase that receipt, which is exactly what happened on
+    2026-08-03: PO 2055126H (Alcoa, 112 cs) rolled in at 13:34, then the
+    July 27 report was re-scanned at 14:15 and reset on-hand to its 7/27 level,
+    wiping 104 of the 112 cases. Nine POs across five warehouses showed the same
+    fingerprint.
+
+    Compared on ARRIVAL date, not the row's posting timestamp: a wide-lookback
+    backfill posts long-past arrivals "now", and those genuinely ARE already
+    inside a later count -- re-adding them would double-count.
+    """
+    cd = (count_date or "")[:10]
+    if not cd or not item_key:
+        return 0.0
+    total = 0.0
+    for e in usage:
+        if (e.get("source") or "") != "on_order_rollover" or e.get("reversed"):
+            continue
+        if (e.get("item_key") or "") != item_key:
+            continue
+        if _rollover_arrival(e) > cd:
+            total += abs(float(e.get("amount") or 0))
+    return total
 
 
 def _onhand_source_rank(*texts) -> int:
@@ -656,7 +698,13 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # happen to match.
         new_wu = evt.item.weekly_usage
         old_wu = item.get("weekly_usage")
-        qty_changed = abs(amount - old_qty) >= 1e-9
+        # The count is authoritative only up to its own count_date. Add back any
+        # PO receipt that arrived AFTER it, so re-reading an older report can't
+        # erase a delivery. Derived from immutable inputs (reported count +
+        # recorded receipts), so re-applying the same report is idempotent.
+        _receipts = _receipts_after_count(usage, key, _evt_cd)
+        _target_qty = amount + _receipts
+        qty_changed = abs(_target_qty - old_qty) >= 1e-9
         wu_changed = (new_wu is not None
                       and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
         # Record that a fresh count was received for this warehouse today,
@@ -674,9 +722,15 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
-        new_qty = amount
+        new_qty = _target_qty
         delta_usage = round(old_qty - new_qty, 2)  # positive = consumed
         note = f"Email on-hand sync (subject: {evt.source_subject[:60]})"
+        if _receipts:
+            note += f" +{_receipts:g} cs received after {_evt_cd}"
+            report.setdefault("receipts_preserved", []).append(
+                f"{item['name']}: reported {amount:g} cs as of {_evt_cd}, "
+                f"+{_receipts:g} cs arrived after that date -> {new_qty:g} cs"
+            )
     elif evt.event_type == "restock":
         new_qty = old_qty + amount
         delta_usage = -round(amount, 2)  # negative = restock in the log
