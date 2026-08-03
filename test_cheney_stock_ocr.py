@@ -153,6 +153,13 @@ def test_ocr_rows_prefers_stock_over_mfg_code_column():
     """End-to-end through the token reconstruction: a row laid out
     Pack | Dist Item # | Mfq.Product Code | Stock must yield Stock -- including
     when Stock is 1, the value the old filter discarded."""
+    import pytest
+    # numpy + Pillow are OCR-only deps (requirements-ocr.txt), not web-service
+    # runtime deps, so skip cleanly where they're absent (e.g. CI) rather than
+    # failing and blocking the deploy pipeline -- same pattern as
+    # test_cheney_inventory_report.test_extract_stock_image.
+    pytest.importorskip("numpy")
+    _Image = pytest.importorskip("PIL.Image")
     _restore()
 
     def fake_engine(arr):
@@ -167,7 +174,6 @@ def test_ocr_rows_prefers_stock_over_mfg_code_column():
         return toks, None
     C._engine = lambda: fake_engine
     import io as _io
-    from PIL import Image as _Image
     buf = _io.BytesIO()
     _Image.new("RGB", (600, 40), "white").save(buf, format="PNG")
     rows, texts = C._ocr_page(buf.getvalue())
