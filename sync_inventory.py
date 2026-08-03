@@ -32,6 +32,61 @@ from inventory_tracker import (
 # Must match the naming convention in seed_bagels.py
 DISTRIBUTOR_TAG = {"Cheney Brothers": "CB", "US Foods": "USF"}
 
+
+# --- on_hand integrity + source trust -------------------------------------
+# A distributor's on-hand count and H&H's internal mfg codes (1150-1189) live
+# in adjacent columns on Cheney's exports. A parser that grabs the wrong column
+# writes a mfg code into the quantity field, which looks like a plausible case
+# count to every other check. No real on-hand figure has ever approached 1150
+# cases at a Cheney facility (the all-time high is 453), so treat an exact match
+# against a mfg code as a parser fault and refuse the write, whatever the
+# source. Belt-and-braces backstop for scripts/cheney_stock_ocr.py, the cron and
+# any future ingest path.
+try:
+    from integrations.hh_mfg_codes import HH_MFG_CODE_TO_VARIETY as _MFG_CODES
+except ImportError:  # pragma: no cover - standalone use
+    _MFG_CODES = {}
+
+
+def _is_mfg_code_quantity(amount) -> bool:
+    """True when an on_hand quantity is exactly an H&H mfg code."""
+    try:
+        f = float(amount)
+    except (TypeError, ValueError):
+        return False
+    if f <= 0 or abs(f - round(f)) > 1e-9:
+        return False
+    return str(int(round(f))) in _MFG_CODES
+
+
+# Higher rank wins. Cheney's weekly workbook is stamped with its period-end
+# date, so the cell-grid read and an OCR read of the SAME file carry the SAME
+# count_date -- a date comparison alone can't order them and whichever applies
+# last wins. Rank makes that deterministic: a screenshot OCR can never
+# overwrite a figure read straight out of the cells.
+_ONHAND_SOURCE_RANKS = (
+    ("manual-correction", 100),      # a human explicitly fixing a number
+    ("admin", 100),
+    ("restore", 100),
+    ("cheney-xlsx", 60),             # Stock column read from worksheet cells
+    ("usfoods-xlsx", 60),
+    ("inventory-csv", 60),
+    ("bagel-worksheet", 60),
+    ("cheney-stock-image", 20),      # OCR of an embedded screenshot
+    ("cheney-stock-endpoint", 20),
+    ("cheney-stock-ocr", 20),
+)
+_DEFAULT_ONHAND_RANK = 40
+
+
+def _onhand_source_rank(*texts) -> int:
+    """Trust rank for an on_hand write, from its source id / ingest source."""
+    blob = " ".join(str(t or "") for t in texts).lower()
+    for needle, rank in _ONHAND_SOURCE_RANKS:
+        if needle in blob:
+            return rank
+    return _DEFAULT_ONHAND_RANK
+
 # Incoming POs are booked to on_order with this lead time before promoting
 # into quantity. Overridable via env var for testing.
 def _po_lead_days() -> int:
@@ -549,17 +604,51 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         return
 
     if evt.event_type == "on_hand":
-        # Never let an OLDER report overwrite a newer count. A re-sent or
-        # out-of-order report (e.g. a re-scanned 6/22 sheet arriving after the
-        # 6/29 one) would otherwise regress BOTH the on-hand quantities and the
-        # freshness date. Skip when this event's count_date predates the item's
-        # current last_count_at (compared by calendar day). Only guards when
-        # both dates are known, so first-ever counts still land.
-        _evt_cd = (getattr(evt, "count_date", "") or "")[:10]
-        _cur_cd = (item.get("last_count_at") or "")[:10]
-        if _evt_cd and _cur_cd and _evt_cd < _cur_cd:
-            report["unchanged"] += 1
+        # Refuse an on-hand figure that is exactly an H&H mfg code -- always a
+        # column-mapping fault upstream, never a real count. Rejected loudly so
+        # the bad row surfaces instead of landing silently.
+        if _is_mfg_code_quantity(amount):
+            report.setdefault("rejected", []).append(
+                f"{item['name']}: on_hand {amount!r} equals H&H mfg code "
+                f"{int(float(amount))} ({_MFG_CODES.get(str(int(float(amount))), '?')}) "
+                f"- parser column fault, refused "
+                f"(source: {getattr(evt, 'source_message_id', '') or '?'})"
+            )
             return
+        # Never let an OLDER or LESS TRUSTWORTHY report overwrite a good count.
+        # Ordering, in precedence:
+        #   1. count_date -- compared in FULL, not truncated to the calendar
+        #      day, so several reports landing on one day still order correctly.
+        #   2. source rank -- same count_date, lower-trust source loses. This is
+        #      what stops an OCR'd screenshot clobbering a cell-grid read of the
+        #      very same workbook (both are stamped with its period-end date).
+        #   3. source_received_at -- same date and same rank, later email wins.
+        # Each step only engages when both sides are known, so first-ever counts
+        # and pre-field rows still land.
+        _evt_cd = getattr(evt, "count_date", "") or ""
+        _cur_cd = item.get("last_count_at") or ""
+        _evt_rank = _onhand_source_rank(
+            getattr(evt, "source_message_id", ""), report.get("source", ""))
+        _cur_rank = item.get("last_count_rank")
+        _evt_rcv = getattr(evt, "source_received_at", "") or ""
+        _cur_rcv = item.get("last_count_received_at") or ""
+        if _evt_cd and _cur_cd:
+            if _evt_cd < _cur_cd:
+                report["unchanged"] += 1
+                return
+            if _evt_cd == _cur_cd:
+                if _cur_rank is not None and _evt_rank < int(_cur_rank):
+                    report.setdefault("stale_skipped", []).append(
+                        f"{item['name']}: on_hand from a lower-trust source "
+                        f"(rank {_evt_rank} < {int(_cur_rank)}) for the same "
+                        f"count_date {_evt_cd} - skipped"
+                    )
+                    report["unchanged"] += 1
+                    return
+                if ((_cur_rank is None or _evt_rank == int(_cur_rank))
+                        and _evt_rcv and _cur_rcv and _evt_rcv < _cur_rcv):
+                    report["unchanged"] += 1
+                    return
         # An inventory worksheet carries both the on-hand count and the rep's
         # average weekly usage. Treat the event as a no-op only when NEITHER
         # changed, so a weekly-usage refresh still lands even if cases on hand
@@ -577,6 +666,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
             # date), not the scan/ingest time, so per-warehouse freshness and
             # the email chasers measure the real gap since the last count.
             item["last_count_at"] = getattr(evt, "count_date", "") or now
+            # Remember HOW this count arrived, so a later same-dated write from
+            # a weaker source can be rejected rather than silently winning.
+            item["last_count_rank"] = _evt_rank
+            item["last_count_received_at"] = _evt_rcv
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
