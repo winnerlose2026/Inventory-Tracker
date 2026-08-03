@@ -57,19 +57,36 @@ except ImportError:  # standalone / test use
 
 USF_ITEM_TO_VARIETY: dict[str, str] = _HH_MFG_MAP
 
-# City (uppercase) seen on USF ship-to labels -> canonical "<City>, <ST>"
-# used by seed_bagels.py. Extend as new DCs appear on POs.
+# Ship-to CITY (uppercase, as printed in the PO's SHIP TO address block) ->
+# canonical warehouse label used by seed_bagels.py.
 #
-# INVARIANT: this must stay in sync with seed_bagels.WAREHOUSES["US Foods"].
-# A DC seeded but not mapped here silently drops every PO line for that DC;
-# a DC mapped but not seeded produces restock events that match no SKU.
-# test_usfoods_houston_po.py asserts the two sets are equal.
+# Read the ship-to ADDRESS, never the SHIPPING POINT label: the label is the
+# metro name ("US FOODS-CHICAGO") while the address is the actual town
+# ("BENSENVILLE IL"). Getting that backwards is what hid every Chicago PO.
+#
+# INVARIANT: the VALUES here must match seed_bagels.WAREHOUSES["US Foods"]
+# exactly. A DC seeded but not mapped here silently drops every PO line for
+# that DC; a DC mapped but not seeded produces restock events that match no
+# SKU. test_usfoods_houston_po.py asserts the two sets are equal. Several
+# cities may legitimately share one warehouse label (see Chicago below).
 USF_DC_CITY_TO_WAREHOUSE: dict[str, str] = {
     "MANASSAS":  "Manassas, VA",
     "ZEBULON":   "Zebulon, NC",
     "LA MIRADA": "La Mirada, CA",
-    "CHICAGO":   "Chicago, IL",
     "ALCOA":     "Alcoa, TN",
+    # --- Chicago metro: TWO physical DCs, ONE logical warehouse -------------
+    # "CHICAGO" never appears as a ship-to city, which is why no Chicago PO
+    # had ever ingested -- both DCs parsed fine and then had every line
+    # dropped, the same failure as Houston:
+    #   3T/2088  US FOODS-AURORA   2810 Duke Pkwy,  AURORA IL 60502
+    #   3Y/2099  US FOODS-CHICAGO  800 Supreme Dr,  BENSENVILLE IL 60106
+    # Per JD (2026-08-03) these roll up to a single "Chicago, IL" warehouse:
+    # Bensenville is being replaced by Aurora, so stock never sits in both at
+    # once and pooling is safe. Bensenville stays mapped so its historical POs
+    # (e.g. 843051, 391 cs, 02/05/26) resolve on a backfill scan.
+    "AURORA":      "Chicago, IL",
+    "BENSENVILLE": "Chicago, IL",
+    "CHICAGO":     "Chicago, IL",  # never seen as a ship-to city; safety net
     # NW Houston (DC B2, 13400 Hollister Rd) -- opened on the H&H account
     # 2026-07 with PO 305202B2. Confirmations route through
     # CENTRALCONFIRMATIONS.SHARED@USFOODS.COM; area buyer is Tom Foley.
@@ -169,9 +186,10 @@ _ARRIVE_RE = re.compile(
 )
 _VENDOR_RE = re.compile(r"\bVENDOR\s+(?P<vendor>\d+)\b")
 # The buyer cell is followed on the SAME line by the REMARKS column on some
-# DC layouts (Houston prints "BUYER: 152 T X FOLEY      INFO@HHBAGELS.COM").
-# Only single spaces are allowed inside the name so the match stops at the
-# 2+ space column gutter instead of swallowing the remark text.
+# DC layouts (Houston prints "BUYER: 152 T X FOLEY      INFO@HHBAGELS.COM",
+# Aurora prints "BUYER: 966 G X GARCIA      APPROVED"). Only single spaces are
+# allowed inside the name so the match stops at the 2+ space column gutter
+# instead of swallowing the remark text.
 _BUYER_RE = re.compile(
     r"BUYER:\s*\d+\s+(?P<buyer>[A-Z][A-Z.]*(?: [A-Z][A-Z.]*)*)"
 )
