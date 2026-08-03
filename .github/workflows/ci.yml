@@ -28,21 +28,13 @@ jobs:
         run: python -m compileall -q .
 
       - name: Run tests
-        # test_po_revision.py is a stale manual script that asserts the old
-        # "PO email immediately restocks on-hand" behavior; POs now flow through
-        # on-order -> arrival, so it is intentionally excluded pending a rewrite.
-        run: >
-          python -m pytest -q
-          test_on_order_dedup.py
-          test_cheney_inventory_report.py
-          test_usfoods_inventory_report.py
-          test_scan_health.py
-          test_planning_config.py
-          test_po_ledger.py
-          test_demand_model.py
-          test_production_planner.py
-          test_cheney_csv_inventory.py
-          test_edi_810.py
+        # Whole suite, deliberately NOT a hand-maintained file list. The old
+        # allow-list silently excluded every test file added after it was
+        # written, so the Houston / Chicago DC regression tests never ran in
+        # CI -- the same drift that let those bugs reach production in the
+        # first place. Anything that needs heavy optional deps should skip
+        # itself (test_cheney_stock_ocr.py mocks its OCR layer).
+        run: python -m pytest -q
 
   # Deterministic deploy: trigger Render via a Deploy Hook once tests pass,
   # instead of relying on Render's GitHub auto-deploy webhook (which has been
