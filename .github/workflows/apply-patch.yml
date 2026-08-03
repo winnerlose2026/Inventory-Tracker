@@ -1,0 +1,88 @@
+name: Apply patch
+
+# One-shot, manual-dispatch helper for landing a patches/*.patch file on main.
+#
+# The patches/ directory exists because those changes were authored in an
+# environment that had no git push credentials. Rather than round-tripping
+# large files through the GitHub contents API, the diff is committed as a
+# patch and applied here -- through the same gates a local push would face:
+# byte-compile, the FULL test suite (not CI's allow-list), and safe_push.py.
+#
+# Nothing is committed unless every gate passes, so main cannot end up
+# half-patched. The patch file is deleted in the same commit that applies it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: 'Path to the patch file, relative to the repo root'
+        required: true
+        default: 'patches/0002-po-date-tiebreaker-and-cron-guard.patch'
+      delete_patch:
+        description: 'Delete the patch file after applying it'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Confirm the patch exists
+        run: |
+          test -f "${{ github.event.inputs.patch }}" \
+            || { echo "::error::patch not found: ${{ github.event.inputs.patch }}"; exit 1; }
+
+      - name: Baseline (informational -- may be red, that's the point)
+        continue-on-error: true
+        run: python -m pytest -q
+
+      - name: Check the patch applies cleanly
+        run: git apply --check --verbose "${{ github.event.inputs.patch }}"
+
+      - name: Apply the patch
+        run: git apply "${{ github.event.inputs.patch }}"
+
+      - name: Syntax gate (byte-compile all sources)
+        run: python -m compileall -q .
+
+      - name: Full test suite (all files, not CI's allow-list)
+        run: python -m pytest -q
+
+      - name: safe_push validator
+        run: python scripts/safe_push.py
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.delete_patch }}" = "true" ]; then
+            git rm -q "${{ github.event.inputs.patch }}"
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit - patch was already applied."
+            exit 0
+          fi
+          git commit -m "Apply ${{ github.event.inputs.patch }}
+
+          Applied by the apply-patch workflow after byte-compile, the full
+          test suite and scripts/safe_push.py all passed."
+          git push
