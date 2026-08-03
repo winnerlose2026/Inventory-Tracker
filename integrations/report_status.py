@@ -39,6 +39,12 @@ GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 # Multiple reps can cover one warehouse; any one of them sending a genuine
 # report clears it. Cheney: Michael Ross sends ONE report (per-facility sheets)
 # covering all three FL facilities, so his address is listed against each.
+#
+# ``no_chase: True`` means "still watch this rep, never nudge them." Their mail
+# is searched exactly as before and still clears the warehouse, but the weekly
+# chaser must not email them. Used for reps who manage their own send reminder.
+# A warehouse whose every rep is no_chase is watch-only: it can still read
+# MISSING on the status page, and JD follows up by hand.
 WAREHOUSE_REPS: "dict[str, list[dict]]" = {
     "Manassas, VA": [
         {"name": "Thomas Paxson", "email": "thomas.paxson@usfoods.com"},
@@ -56,9 +62,14 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
     "Chicago, IL": [
         {"name": "Michael Via", "email": "michael.via@usfoods.com"},
     ],
+    # Alcoa is watch-only. Kim asked on 2026-08-03 to stop receiving the
+    # automated chasers -- she has her own Monday reminder to send the report --
+    # so we keep reading her mail but never nudge her. Christy Dunn was never a
+    # covering rep (Kim owns Alcoa, per her 2026-07-07 note); she stays listed
+    # only so a report forwarded by her still clears the warehouse.
     "Alcoa, TN": [
-        {"name": "Kimberly Cobb", "email": "kimberly.cobb@usfoods.com"},
-        {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com"},
+        {"name": "Kim Cobb", "email": "kimberly.cobb@usfoods.com", "no_chase": True},
+        {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com", "no_chase": True},
     ],
     "Riviera Beach, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
     "Ocala, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
@@ -284,9 +295,11 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
     result["scanned"] = scanned
     for wh, reps in WAREHOUSE_REPS.items():
         detail = best.get(wh)
+        chase = [r for r in reps if not r.get("no_chase")]
         result["warehouses"].append({
             "warehouse": wh, "distributor": DISTRIBUTOR_OF.get(wh, ""),
-            "reps": reps, "status": "received" if detail else "missing",
+            "reps": reps, "chase_reps": chase, "watch_only": not chase,
+            "status": "received" if detail else "missing",
             "detail": detail,
         })
         result["received" if detail else "missing"] += 1
@@ -383,9 +396,16 @@ def render_html(status: dict) -> str:
                     f'{esc(d.get("format") or "report")}')
         else:
             badge = '<span class="no">❌ missing</span>'
-            chasing = ", ".join(esc(r["name"]) for r in wh.get("reps", [])
+            chase = wh.get("chase_reps", wh.get("reps", []))
+            chasing = ", ".join(esc(r["name"]) for r in chase
                                 if not r["name"].startswith("USF "))
-            note = f'<span class="muted">chasing: {chasing}</span>'
+            if chasing:
+                note = f'<span class="muted">chasing: {chasing}</span>'
+            else:
+                sends = ", ".join(esc(r["name"]) for r in wh.get("reps", [])
+                                  if not r["name"].startswith("USF "))
+                note = ('<span class="muted">no chaser — self-reports'
+                        + (f' ({sends})' if sends else "") + '; follow up by hand</span>')
         rows.append(f'<tr><td class="wh">{esc(wh.get("warehouse") or "")}</td>'
                     f'<td class="st">{badge}</td><td class="dt">{note}</td></tr>')
     rows_html = "\n".join(rows)
