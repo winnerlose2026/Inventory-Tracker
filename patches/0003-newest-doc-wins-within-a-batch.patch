@@ -1,0 +1,95 @@
+diff --git a/sync_inventory.py b/sync_inventory.py
+index e7fe3d0..8e98a0d 100644
+--- a/sync_inventory.py
++++ b/sync_inventory.py
+@@ -863,10 +863,41 @@ def _apply_events(events: list,
+         # rule kept BOTH — and the SKU got double-counted (e.g., PO
+         # 6454635G shipped 16 cs of Onion but stored as 8 + 16 = 24,
+         # inflating the PO total from 448 to 456 cs). Fix: collapse to
+-        # one event per (variety, warehouse, distributor) and keep the
+-        # MAX qty across all messages. The max is the right pick because
+-        # stale forwarded versions of a PO are typically partial (smaller
+-        # qtys); the largest qty represents the canonical / latest order.
++        # one event per (variety, warehouse, distributor).
++        #
++        # FIRST narrow to the NEWEST document for this PO. Two different
++        # copies of a PO routinely land in the same scan batch (Greene's
++        # 305202B2 REPRINT at 15:57 and Foley's rev 0000003 at 19:05), and
++        # picking max-qty across them is wrong whenever an amendment REDUCES
++        # a line -- Foley cut Plain from 176 to 168, so max kept the stale
++        # 176 and Houston booked 1128 cs against a 1120 cs PO. The revision
++        # ordering below never got a chance to run, because both copies were
++        # merged into one group first.
++        #
++        # Once narrowed to a single document, max-qty dedup is safe: what
++        # remains is the same PDF delivered to both JD@ and info@, or
++        # re-attached on a reply, so the qtys agree.
++        newest_rev, newest_received, _seen_doc = None, "", False
++        for _evt in grp:
++            _r = getattr(_evt, "po_revision", "") or ""
++            _rc = getattr(_evt, "source_received_at", "") or ""
++            if not _seen_doc or _po_doc_is_newer(_r, _rc, newest_rev,
++                                                newest_received):
++                newest_rev, newest_received, _seen_doc = _r, _rc, True
++        _older = [
++            _evt for _evt in grp
++            if _po_doc_is_newer(newest_rev, newest_received,
++                                getattr(_evt, "po_revision", "") or "",
++                                getattr(_evt, "source_received_at", "") or "")
++        ]
++        if _older:
++            grp = [_evt for _evt in grp if _evt not in _older]
++            report.setdefault("dedup_dropped", []).append(
++                f"PO {po_num}: dropped {len(_older)} line(s) from an older "
++                f"copy in the same batch (kept rev "
++                f"{newest_rev or '(none)'} @ {newest_received or 'no date'})."
++            )
++
+         best: dict[tuple, "EmailEvent"] = {}
+         for _evt in grp:
+             sku_key = (
+diff --git a/test_po_revision.py b/test_po_revision.py
+index cbf4248..a1b2c3d 100644
+--- a/test_po_revision.py
++++ b/test_po_revision.py
+@@ -186,3 +186,40 @@ def test_replaying_the_stale_reprint_afterwards_is_ignored(tmp_path):
+     pending = inv[key]["on_order"]
+     assert len(pending) == 1
+     assert pending[0]["qty"] == 168.0, "stale REPRINT clobbered the correction"
++
++
++def test_two_copies_in_one_batch_keep_the_newer_even_when_qty_is_lower(tmp_path):
++    """Greene's REPRINT and Foley's rev 0000003 arrive in the SAME scan batch.
++
++    The per-SKU dedup used to keep max qty across the batch, so Foley's
++    REDUCTION of Plain (176 -> 168) lost to the stale 176 and Houston booked
++    1128 cs against a 1120 cs PO. The newest document must win outright.
++    """
++    import sys, pathlib
++    sys.path.insert(0, str(pathlib.Path(__file__).parent))
++    import test_on_order_dedup as T
++    from integrations.base import SyncItem
++    from integrations.email_scanner import EmailEvent
++
++    it, sync = T._setup_temp_inventory(tmp_path)
++    T._seed(it)
++
++    def evt(qty, rev, received):
++        return EmailEvent(
++            event_type="restock",
++            item=SyncItem(quantity=qty, distributor="US Foods", variety="Plain",
++                          warehouse="La Mirada, CA", unit="cases"),
++            source_message_id="m", source_subject="US Foods Houston PO: 305202B2",
++            po_number="305202B2", po_revision=rev, source_received_at=received,
++        )
++
++    # Both copies in ONE batch, stale REPRINT listed first and with the
++    # LARGER quantity -- the exact shape that defeated max-qty dedup.
++    sync._apply_events([evt(176.0, "REPRINT", GREENE),
++                        evt(168.0, "0000003", FOLEY)], dry_run=False)
++
++    inv = it._load(it.INVENTORY_FILE)
++    pending = inv["plain bagel 4oz [usf - la mirada]"]["on_order"]
++    assert len(pending) == 1, f"expected 1 pending, got {len(pending)}"
++    assert pending[0]["qty"] == 168.0, "max-qty dedup kept the stale copy"
++    assert pending[0]["po_revision"] == "0000003"
