@@ -421,7 +421,13 @@ def test_reprint_supersedes_numeric_revision():
 def test_apply_path_supersedes_numeric_with_reprint():
     """When events with rev='REPRINT' arrive AFTER events with rev='0000004'
     in /api/email/ingest-events, the apply path must supersede the
-    numeric revision (treat REPRINT as latest)."""
+    numeric revision.
+
+    US Foods amends a PO without bumping the number, re-sending it as
+    REVISED/REPRINT, so "later" is established by the source email's received
+    time -- not by the token (see integrations/po_revision). The REPRINT here
+    carries a later source_received_at, which is what every real ingest now
+    supplies."""
     from datetime import datetime
     from integrations.base import SyncItem
     from integrations.email_scanner import EmailEvent
@@ -433,7 +439,7 @@ def test_apply_path_supersedes_numeric_with_reprint():
         target_variety = "Plain"
         target = "plain bagel 4oz [usf - la mirada]"
 
-        def make_evt(qty, rev):
+        def make_evt(qty, rev, received=""):
             return EmailEvent(
                 event_type="restock",
                 item=SyncItem(quantity=qty, distributor="US Foods",
@@ -441,16 +447,17 @@ def test_apply_path_supersedes_numeric_with_reprint():
                               unit="cases"),
                 source_message_id="m", source_subject="USF PO 5334574C",
                 po_number="5334574C", po_revision=rev,
+                source_received_at=received,
             )
 
         # First wave: apply rev 0000004 with qty=80
-        sync._apply_events([make_evt(80.0, "0000004")], dry_run=False)
+        sync._apply_events([make_evt(80.0, "0000004", "2026-08-01T12:00:00Z")], dry_run=False)
         inv = it._load(it.INVENTORY_FILE)
         assert inv[target]["on_order"][0]["qty"] == 80.0
 
         # Second wave: apply REPRINT with qty=136 (USF re-issue at a
         # corrected quantity). Must supersede.
-        sync._apply_events([make_evt(136.0, "REPRINT")], dry_run=False)
+        sync._apply_events([make_evt(136.0, "REPRINT", "2026-08-02T12:00:00Z")], dry_run=False)
         inv = it._load(it.INVENTORY_FILE)
         pending = inv[target]["on_order"]
         assert len(pending) == 1, f"expected exactly 1 pending after supersede; got {len(pending)}"

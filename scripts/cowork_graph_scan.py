@@ -546,6 +546,12 @@ def run(argv: list[str] | None = None) -> int:
     cw_pos_out: list[dict] = []     # Chefs Warehouse -> /api/chefs-warehouse/ingest-pos
     freight_out: list[dict] = []    # Lineage Freight  -> /api/freight/ingest
     error_strs: list[str] = []
+    # POs whose PDF parsed cleanly but yielded ZERO events -- i.e. every line
+    # was dropped because the ship-to DC or an item code isn't wired up yet.
+    # This is the failure mode that hid Houston (305202B2) for two days across
+    # five cron runs, and both Chicago DCs for months: the run still exited 0
+    # and read "OK" because the only trace was a line in `errors`.
+    blocked_pos: list[str] = []
     msgs_parsed = 0
 
     XLSX_CTYPE = ("application/vnd.openxmlformats-officedocument"
@@ -612,18 +618,24 @@ def run(argv: list[str] | None = None) -> int:
                             error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
                 elif dist == "US Foods":
                     events, errors = _usfoods_po_to_events(
-                        pdf_bytes, dist, mid, subject)
+                        pdf_bytes, dist, mid, subject,
+                        received_at=received_iso)
                     for e in events:
                         events_out.append(asdict(e))
                     for er in errors:
                         error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                    if errors and not events:
+                        blocked_pos.append(f"{dist} | {subject} | {errors[0]}")
                 elif dist == "Cheney Brothers":
                     events, errors = _cheney_po_to_events(
-                        pdf_bytes, dist, mid, subject)
+                        pdf_bytes, dist, mid, subject,
+                        received_at=received_iso)
                     for e in events:
                         events_out.append(asdict(e))
                     for er in errors:
                         error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                    if errors and not events:
+                        blocked_pos.append(f"{dist} | {subject} | {errors[0]}")
                 elif dist == "Chefs Warehouse":
                     record, errors = _chefs_warehouse_po_to_record(
                         pdf_bytes, mid, subject)
@@ -851,6 +863,22 @@ def run(argv: list[str] | None = None) -> int:
         if cw_report:
             _vlog(True, "CW report:")
             _vlog(True, json.dumps(cw_report, indent=2))
+
+    # A PO PDF that parses but emits no events is a wiring gap, not a blip:
+    # the order is real, it is sitting in the inbox, and on_order will stay
+    # wrong until someone adds the DC or item code. Fail the run so it is
+    # visible outside the log tail. Everything successfully parsed has already
+    # been applied by this point, and the apply path is idempotent, so failing
+    # here loses nothing and the next run re-processes safely.
+    if blocked_pos:
+        print(
+            f"PO DROPPED: {len(blocked_pos)} purchase order(s) parsed but "
+            f"produced no events -- on_order is understated until wired up:",
+            file=sys.stderr,
+        )
+        for b in blocked_pos:
+            print(f"  - {b}", file=sys.stderr)
+        return 2
     return 0
 
 

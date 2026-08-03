@@ -577,6 +577,7 @@ def api_email_ingest_events():
                 po_number=str(e.get("po_number") or ""),
                 po_revision=str(e.get("po_revision") or ""),
                 po_order_date=str(e.get("po_order_date") or ""),
+                source_received_at=str(e.get("source_received_at") or ""),
                 count_date=str(e.get("count_date") or ""),
             ))
         except (TypeError, ValueError, KeyError) as exc:
