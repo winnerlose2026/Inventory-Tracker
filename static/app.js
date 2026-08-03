@@ -122,7 +122,40 @@ async function api(url, method = 'GET', body = null) {
     }, 800);
     return {};
   }
-  return r.json();
+  // Never call r.json() blind. A Render 502, a Flask 500 traceback page, an
+  // nginx error page or an empty body are all non-JSON, and parsing them threw
+  //   SyntaxError: Unexpected token '<' ... is not valid JSON
+  // which told the operator nothing about what actually failed and masked
+  // every 5xx behind a "json error" toast. (Reported against the Pending POs
+  // ship-date box, 2026-08-03.)
+  //
+  // Deliberately compatible: a JSON body is still returned as-is for ANY
+  // status, so the 34 call sites that inspect `r.ok` / `r.error` keep working.
+  // Only the case that already threw now throws -- with a usable message.
+  const raw = await r.text();
+  const ctype = (r.headers.get('content-type') || '').toLowerCase();
+  if (ctype.includes('json') && raw.trim()) {
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      // Content-Type lied, or the body was truncated mid-flight.
+    }
+  }
+  if (r.ok && !raw.trim()) return {};   // 204 / empty success
+  const snippet = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  const where = `${method} ${url}`;
+  const status = `HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''}`;
+  if (r.status === 502 || r.status === 503 || r.status === 504) {
+    throw new Error(`${where} -> ${status}. The server is restarting or `
+      + `overloaded; wait a few seconds and retry.`);
+  }
+  throw new Error(`${where} -> ${status} (non-JSON response)`
+    + (snippet ? `: ${snippet}` : ''));
 }
 
 // -------------------------------------------------------------------------
@@ -3883,7 +3916,8 @@ async function onShipDateChange(poNumber, shipDate, source) {
       }
       loadPendingPOs();
     } else {
-      toast('Failed to update ship date', 'error');
+      toast('Failed to update ship date'
+            + (r && r.error ? ': ' + r.error : ''), 'error');
     }
   } catch (exc) {
     toast('Error: ' + exc.message, 'error');
