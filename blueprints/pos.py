@@ -70,10 +70,20 @@ def api_on_order_ship_date():
                   is to update every SKU's on_order list that carries
                   this PO. Per-PO is the common case because a PO ships
                   as a whole — every line item arrives together.
+      arrival_date (optional) the real delivery date, ISO. Overrides the
+                  ship_date + 7 day guess and also sets eta, so the
+                  Pending POs tab shows the date the operator was
+                  actually given. Ignored when clearing ship_date.
 
     Behavior:
       - Stores ship_date on each matching entry.
-      - Computes arrival_date = ship_date + 7 days and stores it.
+      - Computes arrival_date = ship_date + 7 days and stores it, UNLESS
+        an explicit arrival_date is supplied. The +7 is only a transit
+        guess, and a wrong guess silently moves stock: on 2026-08-03 a
+        7/27 ship date derived an 8/3 arrival and auto-promoted PO
+        2055126H's 112 cs into Alcoa's on-hand a day before the truck
+        actually landed (8/4). An operator who knows the real date has
+        to be able to say so.
       - Clearing ship_date (empty string / null) also clears
         arrival_date, returning the entry to the default 30-day-from-
         ordered_at rollover.
@@ -90,6 +100,8 @@ def api_on_order_ship_date():
         return jsonify({"ok": False, "error": "po_number required"}), 400
     item_key = (body.get("item_key") or "").strip().lower() or None
     ship_raw = body.get("ship_date")
+    arrival_raw = body.get("arrival_date")
+    arrival_explicit = False
 
     # Empty value clears.
     if ship_raw is None or (isinstance(ship_raw, str) and not ship_raw.strip()):
@@ -105,6 +117,16 @@ def api_on_order_ship_date():
             }), 400
         ship_iso = ship_dt.isoformat()
         arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+        if arrival_raw is not None and str(arrival_raw).strip():
+            try:
+                arrival_iso = datetime.fromisoformat(
+                    str(arrival_raw).strip()).isoformat()
+            except ValueError:
+                return jsonify({
+                    "ok": False,
+                    "error": "arrival_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
+                }), 400
+            arrival_explicit = True
 
     inv = load_inventory()
     updated = 0
@@ -118,6 +140,11 @@ def api_on_order_ship_date():
                 continue
             entry["ship_date"] = ship_iso
             entry["arrival_date"] = arrival_iso
+            if arrival_explicit:
+                # Surface the operator's date as the ETA too -- the ledger
+                # reads eta off the on_order entry for the Pending POs tab.
+                entry["eta"] = arrival_iso
+                entry["arrival_source"] = "operator"
             updated += 1
             if item.get("name") not in touched_items:
                 touched_items.append(item.get("name") or key)
@@ -127,9 +154,30 @@ def api_on_order_ship_date():
         "po_number": po_number,
         "ship_date": ship_iso,
         "arrival_date": arrival_iso,
+        "arrival_source": "operator" if arrival_explicit else "ship+7",
         "entries_updated": updated,
         "items": touched_items,
     })
+
+
+def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
+    """Is this rollover's qty still a SEPARATE addend sitting on top of on-hand?
+
+    A reported on-hand count is absolute, not a delta. Once a count dated
+    at-or-after the receipt's arrival has been synced, on-hand IS that count and
+    the delivery is baked into it -- ``sync_inventory._receipts_after_count``
+    only re-adds receipts that postdate the count. Subtracting the rollover in
+    that state double-removes the cases and clamps the SKU toward zero.
+
+    2026-08-03 is the case in point: Alcoa sat at 93 cs on a 17:46 count while
+    PO 2055126H's 112 cs were still in transit (real arrival 8/4). An
+    unconditional reopen would have driven the whole warehouse to ~0.
+    """
+    from sync_inventory import _rollover_arrival
+    count_date = (item.get("last_count_at") or "")[:10]
+    if not count_date:
+        return True          # never counted -> the rollover is all on-hand has
+    return _rollover_arrival(row) > count_date
 
 
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
@@ -196,8 +244,14 @@ def api_pending_reopen():
         e["reversed_at"] = now_iso
         if item is None or qty <= 0:
             continue
-        # Pull the auto-added cases back out of on-hand.
-        item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
+        # Pull the auto-added cases back out of on-hand -- but only while they
+        # are still a separate addend there. If a count has since superseded the
+        # rollover, on-hand already excludes these cases and subtracting would
+        # remove them twice. See _rollover_still_in_onhand.
+        still_in_onhand = _rollover_still_in_onhand(e, item)
+        if still_in_onhand:
+            item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
+            removed_cs += qty
         item["updated"] = now_iso
         # Restore the pending on_order entry (no ship date yet -> Open).
         item.setdefault("on_order", []).append({
@@ -210,18 +264,23 @@ def api_pending_reopen():
             "ship_date":    "",
             "arrival_date": "",
         })
-        # Audit row (positive = reverses the original -qty restock).
+        # Audit row (positive = reverses the original -qty restock). When a
+        # count already superseded the rollover nothing moves, so the row
+        # records 0 and says why -- the reversal is metadata-only.
         new_rows.append({
             "item_key":   ik,
             "item_name":  e.get("item_name") or item.get("name") or ik,
-            "amount":     qty,
+            "amount":     qty if still_in_onhand else 0.0,
             "unit":       e.get("unit") or item.get("unit") or "",
-            "note":       f"Reopened PO {po_number} -- un-rolled from Arrived",
+            "note":       (f"Reopened PO {po_number} -- un-rolled from Arrived"
+                           if still_in_onhand else
+                           f"Reopened PO {po_number} -- on-hand left on the "
+                           f"{(item.get('last_count_at') or '')[:10]} count, "
+                           f"which already excludes these {qty:g} cs"),
             "timestamp":  now_iso,
             "source":     "reversal",
             "reverses_timestamp": e.get("timestamp") or "",
         })
-        removed_cs += qty
         restored += 1
     if restored:
         usage.extend(new_rows)
