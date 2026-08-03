@@ -242,3 +242,67 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn(); print("ok", name)
     print("ALL ON-HAND GUARD TESTS PASSED")
+
+
+# --- provenance survives the real scan path -------------------------------
+
+def test_scan_path_carries_parser_provenance_so_cellgrid_outranks_ocr():
+    """The live scan overwrites source_message_id with the Graph message id, so
+    without parser_source a cell-grid read ranked only by the DEFAULT tier and
+    every rescan logged a bogus "lower-trust" skip against itself."""
+    import sync_inventory as sync
+    from integrations.email_scanner import EmailEvent
+    from integrations.base import SyncItem
+
+    def evt(parser_source):
+        return EmailEvent(
+            event_type="on_hand",
+            item=SyncItem(quantity=60.0, distributor="Cheney Brothers",
+                          variety="Plain", warehouse="Ocala, FL", unit="cs"),
+            source_message_id="AAMkAD-graph-message-id-not-a-parser-id",
+            source_subject="Usage / Stock",
+            count_date="2026-08-01",
+            parser_source=parser_source,
+        )
+
+    cell = sync._onhand_source_rank(
+        getattr(evt("cheney-xlsx:HHBagelsOcala.xlsx#8"), "parser_source", ""),
+        "AAMkAD-graph-message-id-not-a-parser-id", "ms365")
+    ocr = sync._onhand_source_rank(
+        "cheney-stock-endpoint:Ocala, FL", "", "cheney-stock-ocr/endpoint")
+    bare = sync._onhand_source_rank("", "AAMkAD-graph-message-id", "ms365")
+
+    assert cell == 60, cell
+    assert ocr == 20, ocr
+    assert ocr < cell, "OCR must never outrank a cell-grid read"
+    assert bare == sync._DEFAULT_ONHAND_RANK
+    # and the field really is plumbed onto the dataclass
+    assert evt("cheney-xlsx:x#1").parser_source == "cheney-xlsx:x#1"
+
+
+def test_cellgrid_rescan_of_the_same_count_date_is_not_self_skipped():
+    """Rescanning the same workbook must be a clean no-op, not a rank skip."""
+    with TemporaryDirectory() as td:
+        sys.path.insert(0, str(Path(__file__).parent))
+        it, sync = _setup_temp_inventory(Path(td))
+        _seed(it)
+        from integrations.email_scanner import EmailEvent
+        from integrations.base import SyncItem
+
+        def scan_evt():
+            return EmailEvent(
+                event_type="on_hand",
+                item=SyncItem(quantity=60.0, distributor="Cheney Brothers",
+                              variety="Plain", warehouse="Ocala, FL", unit="cs"),
+                source_message_id="AAMkAD-graph-id",
+                source_subject="Usage / Stock",
+                count_date="2026-08-01",
+                parser_source="cheney-xlsx:HHBagelsOcala.xlsx#8",
+            )
+
+        sync._apply_events([scan_evt()], dry_run=False)
+        assert it._load(it.INVENTORY_FILE)[KEY_PLAIN_OCALA]["quantity"] == 60
+        r = sync._apply_events([scan_evt()], dry_run=False)
+        assert not r.get("stale_skipped"), r.get("stale_skipped")
+        assert r["unchanged"] == 1, r
+        assert it._load(it.INVENTORY_FILE)[KEY_PLAIN_OCALA]["quantity"] == 60

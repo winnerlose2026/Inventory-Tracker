@@ -628,6 +628,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         _evt_cd = getattr(evt, "count_date", "") or ""
         _cur_cd = item.get("last_count_at") or ""
         _evt_rank = _onhand_source_rank(
+            getattr(evt, "parser_source", ""),
             getattr(evt, "source_message_id", ""), report.get("source", ""))
         _cur_rank = item.get("last_count_rank")
         _evt_rcv = getattr(evt, "source_received_at", "") or ""

@@ -193,6 +193,13 @@ class EmailEvent:
     # true count date instead of the scan/ingest time, so the 7-day freshness
     # / chaser logic measures the real gap since the last warehouse count.
     count_date: str = ""
+    # WHICH parser produced this event, e.g. "cheney-xlsx:<file>#3" (Stock read
+    # from worksheet cells) vs "cheney-stock-endpoint:<wh>" (OCR of an embedded
+    # screenshot). source_message_id carries the Graph message id -- useful for
+    # dedup and audit, but it says nothing about how the number was extracted.
+    # sync_inventory._onhand_source_rank uses this to stop a low-confidence
+    # extraction overwriting a high-confidence one for the same count_date.
+    parser_source: str = ""
 
 
 @dataclass
@@ -1014,6 +1021,10 @@ def parse_message_with_errors(msg):
                     source_message_id=msg_id,
                     source_subject=subject,
                     count_date=d.get("count_date", ""),
+                    # Keep the parser's provenance ("cheney-xlsx:<file>#N"):
+                    # this on-hand figure came out of the worksheet CELLS, which
+                    # outranks an OCR'd screenshot of the same workbook.
+                    parser_source=d.get("source_message_id", ""),
                 ))
             errors.extend(c_errs)
 
