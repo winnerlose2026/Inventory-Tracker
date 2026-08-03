@@ -1,0 +1,408 @@
+diff --git a/blueprints/email.py b/blueprints/email.py
+index 2559679..34ac403 100644
+--- a/blueprints/email.py
++++ b/blueprints/email.py
+@@ -577,6 +577,7 @@ def api_email_ingest_events():
+                 po_number=str(e.get("po_number") or ""),
+                 po_revision=str(e.get("po_revision") or ""),
+                 po_order_date=str(e.get("po_order_date") or ""),
++                source_received_at=str(e.get("source_received_at") or ""),
+                 count_date=str(e.get("count_date") or ""),
+             ))
+         except (TypeError, ValueError, KeyError) as exc:
+diff --git a/integrations/email_scanner.py b/integrations/email_scanner.py
+index e7609d1..dc91854 100644
+--- a/integrations/email_scanner.py
++++ b/integrations/email_scanner.py
+@@ -182,6 +182,11 @@ class EmailEvent:
+     # when we happened to scan it), so the 30-day rollover into quantity
+     # tracks the real lead time even for backlogged messages.
+     po_order_date: str = ""
++    # ISO datetime the SOURCE EMAIL was received. US Foods amends a PO without
++    # bumping the revision number (re-sending it as "REVISED"/"REPRINT"), so
++    # the revision token alone can't order two copies -- see
++    # integrations/po_revision.is_newer. Populated by every scan path.
++    source_received_at: str = ""
+     # ISO datetime (or YYYY-MM-DD) of when the count was actually taken at the
+     # warehouse -- in practice the report email's sent date. Lets
+     # _apply_email_event stamp last_count_at / last_usage_report_at with the
+@@ -486,7 +491,38 @@ def _iso_from_cheney_date(s: str) -> str:
+     return f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+ 
+ 
+-def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
++def _received_at_from_message(msg) -> str:
++    """ISO-8601 UTC of the message's Date header, or "" if unusable.
++
++    Ordering signal for two copies of the same PO -- US Foods amends without
++    bumping the revision number, so the token alone can't decide which is
++    later. See integrations/po_revision.
++    """
++    raw = ""
++    try:
++        raw = msg.get("Date") or ""
++    except Exception:  # noqa: BLE001 -- never let this break a scan
++        return ""
++    if not raw:
++        return ""
++    try:
++        from email.utils import parsedate_to_datetime
++        dt = parsedate_to_datetime(raw)
++    except Exception:  # noqa: BLE001
++        return ""
++    if dt is None:
++        return ""
++    try:
++        from datetime import timezone as _tz
++        if dt.tzinfo is None:
++            dt = dt.replace(tzinfo=_tz.utc)
++        return dt.astimezone(_tz.utc).isoformat().replace("+00:00", "Z")
++    except Exception:  # noqa: BLE001
++        return ""
++
++
++def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
++                          received_at=""):
+     """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
+ 
+     Returns (events, errors). Errors are strings suitable for
+@@ -535,12 +571,14 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject):
+             po_number=po.po_number or "",
+             po_revision=po.po_revision or "",
+             po_order_date=_iso_from_usf_date(po.order_date),
++            source_received_at=received_at or "",
+         ))
+ 
+     return events, errors
+ 
+ 
+-def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject):
++def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
++                         received_at=""):
+     """Parse a Cheney Brothers PO PDF and convert each line to a restock
+     EmailEvent.
+ 
+@@ -592,6 +630,7 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject):
+             po_number=po.po_number or "",
+             po_revision="",
+             po_order_date=_iso_from_cheney_date(po.order_date),
++            source_received_at=received_at or "",
+         ))
+ 
+     return events, errors
+@@ -931,18 +970,21 @@ def parse_message_with_errors(msg):
+     cw_pos: list[dict] = []
+ 
+     # 1) Distributor PO PDF attachments (real POs arrive as PDFs, not CSVs).
++    # The Date header orders two copies of the same PO -- USF amends without
++    # bumping the revision number (see integrations/po_revision).
++    received_at = _received_at_from_message(msg)
+     for fname, payload in _attachments(msg):
+         if not fname.lower().endswith(".pdf"):
+             continue
+         if distributor == "US Foods":
+             d_events, d_errs = _usfoods_po_to_events(
+-                payload, distributor, msg_id, subject,
++                payload, distributor, msg_id, subject, received_at=received_at,
+             )
+             events.extend(d_events)
+             errors.extend(d_errs)
+         elif distributor == "Cheney Brothers":
+             d_events, d_errs = _cheney_po_to_events(
+-                payload, distributor, msg_id, subject,
++                payload, distributor, msg_id, subject, received_at=received_at,
+             )
+             events.extend(d_events)
+             errors.extend(d_errs)
+diff --git a/scripts/cowork_graph_scan.py b/scripts/cowork_graph_scan.py
+index 4a6a72c..99329d6 100644
+--- a/scripts/cowork_graph_scan.py
++++ b/scripts/cowork_graph_scan.py
+@@ -546,6 +546,12 @@ def run(argv: list[str] | None = None) -> int:
+     cw_pos_out: list[dict] = []     # Chefs Warehouse -> /api/chefs-warehouse/ingest-pos
+     freight_out: list[dict] = []    # Lineage Freight  -> /api/freight/ingest
+     error_strs: list[str] = []
++    # POs whose PDF parsed cleanly but yielded ZERO events -- i.e. every line
++    # was dropped because the ship-to DC or an item code isn't wired up yet.
++    # This is the failure mode that hid Houston (305202B2) for two days across
++    # five cron runs, and both Chicago DCs for months: the run still exited 0
++    # and read "OK" because the only trace was a line in `errors`.
++    blocked_pos: list[str] = []
+     msgs_parsed = 0
+ 
+     XLSX_CTYPE = ("application/vnd.openxmlformats-officedocument"
+@@ -612,18 +618,24 @@ def run(argv: list[str] | None = None) -> int:
+                             error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
+                 elif dist == "US Foods":
+                     events, errors = _usfoods_po_to_events(
+-                        pdf_bytes, dist, mid, subject)
++                        pdf_bytes, dist, mid, subject,
++                        received_at=received_iso)
+                     for e in events:
+                         events_out.append(asdict(e))
+                     for er in errors:
+                         error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
++                    if errors and not events:
++                        blocked_pos.append(f"{dist} | {subject} | {errors[0]}")
+                 elif dist == "Cheney Brothers":
+                     events, errors = _cheney_po_to_events(
+-                        pdf_bytes, dist, mid, subject)
++                        pdf_bytes, dist, mid, subject,
++                        received_at=received_iso)
+                     for e in events:
+                         events_out.append(asdict(e))
+                     for er in errors:
+                         error_strs.append(f"{mid[:12]}.. [{dist}]: {er}")
++                    if errors and not events:
++                        blocked_pos.append(f"{dist} | {subject} | {errors[0]}")
+                 elif dist == "Chefs Warehouse":
+                     record, errors = _chefs_warehouse_po_to_record(
+                         pdf_bytes, mid, subject)
+@@ -851,6 +863,22 @@ def run(argv: list[str] | None = None) -> int:
+         if cw_report:
+             _vlog(True, "CW report:")
+             _vlog(True, json.dumps(cw_report, indent=2))
++
++    # A PO PDF that parses but emits no events is a wiring gap, not a blip:
++    # the order is real, it is sitting in the inbox, and on_order will stay
++    # wrong until someone adds the DC or item code. Fail the run so it is
++    # visible outside the log tail. Everything successfully parsed has already
++    # been applied by this point, and the apply path is idempotent, so failing
++    # here loses nothing and the next run re-processes safely.
++    if blocked_pos:
++        print(
++            f"PO DROPPED: {len(blocked_pos)} purchase order(s) parsed but "
++            f"produced no events -- on_order is understated until wired up:",
++            file=sys.stderr,
++        )
++        for b in blocked_pos:
++            print(f"  - {b}", file=sys.stderr)
++        return 2
+     return 0
+ 
+ 
+diff --git a/sync_inventory.py b/sync_inventory.py
+index bf88039..e7fe3d0 100644
+--- a/sync_inventory.py
++++ b/sync_inventory.py
+@@ -176,6 +176,8 @@ def sync_all(clients: list[DistributorClient] | None = None,
+ # Email scanning
+ # ---------------------------------------------------------------------------
+ 
++from integrations.po_revision import is_newer as _po_doc_is_newer  # noqa: E402
++
+ # USF occasionally re-issues a PO with the literal revision token
+ # "REPRINT" (an entire copy of the latest state, not a numbered rev).
+ # In USF's workflow REPRINT is ALWAYS newer than any numbered revision
+@@ -212,6 +214,7 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:
+     Used to decide whether an incoming revision supersedes or duplicates."""
+     highest = 0
+     indices = []
++    best_rev, best_received = None, ""
+     for idx, entry in enumerate(usage):
+         if entry.get("po_number") != po_number:
+             continue
+@@ -220,11 +223,16 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:
+         if entry.get("reversal_of_revision"):
+             # Reversal audit rows aren't themselves "applied restock" — skip.
+             continue
++        if _po_doc_is_newer(entry.get("po_revision"),
++                            entry.get("source_received_at"),
++                            best_rev, best_received):
++            best_rev = entry.get("po_revision")
++            best_received = entry.get("source_received_at") or ""
+         rev_int = _po_rev_int(entry.get("po_revision"))
+         if rev_int > highest:
+             highest = rev_int
+         indices.append(idx)
+-    return highest, indices
++    return highest, indices, best_rev, best_received
+ 
+ 
+ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
+@@ -375,6 +383,8 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
+         "ordered_at": ordered_at_dt.isoformat(),
+         "po_number": evt.po_number,
+         "po_revision": new_rev_tag,
++        # Ordering signal for the next copy of this PO (see po_revision.py).
++        "source_received_at": getattr(evt, "source_received_at", "") or "",
+         "source": "Email Inbox",
+         "source_subject": (evt.source_subject or "")[:120],
+         "lead_days": lead_days if auto_eta else 0,
+@@ -416,8 +426,33 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
+     item["last_synced_from"] = "Email Inbox"
+ 
+ 
++def _newest_pending_doc(inv: dict, po_number: str):
++    """(revision, source_received_at) of the newest PENDING on_order row for a
++    PO, or (None, "") if there are none.
++
++    A PO that hasn't finished its lead time has no usage row yet, so
++    _highest_applied_rev can't see it. Without this, re-reading an OLDER copy
++    of the PO (every wide-lookback backfill does) appended a second pending row
++    instead of being skipped -- e.g. Greene's stale 305202B2 REPRINT landing on
++    top of Foley's correction.
++    """
++    best_rev, best_received = None, ""
++    seen = False
++    for item in inv.values():
++        for p in (item.get("on_order") or []):
++            if p.get("po_number") != po_number:
++                continue
++            rev = p.get("po_revision") or ""
++            rec = p.get("source_received_at") or ""
++            if not seen or _po_doc_is_newer(rev, rec, best_rev, best_received):
++                best_rev, best_received = rev, rec
++                seen = True
++    return (best_rev if seen else None), best_received
++
++
+ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
+-                           now: str, report: dict, dry_run: bool) -> None:
++                           now: str, report: dict, dry_run: bool,
++                           new_received: str = "") -> None:
+     """Drop pending on_order entries for a SUPERSEDED PO revision.
+ 
+     Same-revision entries are intentionally kept so that
+@@ -425,7 +460,6 @@ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
+     ordered_at across re-ingests of the same scan (which would
+     otherwise reset the date to "now"). Older revisions still get
+     nuked here; reversal audit lives in _reverse_po_entries."""
+-    new_rev_int = _po_rev_int(new_rev)
+     for key, item in inv.items():
+         pending = item.get("on_order") or []
+         if not pending:
+@@ -435,12 +469,13 @@ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
+         if not same_po:
+             continue
+         removed = [p for p in same_po
+-                   if _po_rev_int(p.get("po_revision") or "") < new_rev_int]
++                   if _po_doc_is_newer(new_rev, new_received,
++                                       p.get("po_revision") or "",
++                                       p.get("source_received_at") or "")]
+         if not removed:
+             continue
+-        kept = [p for p in pending
+-                if p.get("po_number") != po_number
+-                or _po_rev_int(p.get("po_revision") or "") >= new_rev_int]
++        removed_ids = {id(p) for p in removed}
++        kept = [p for p in pending if id(p) not in removed_ids]
+         removed_qty = round(sum(float(p.get("qty") or 0) for p in removed), 2)
+         report["changes"].append({
+             "name": item["name"],
+@@ -599,6 +634,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
+     if po_num:
+         entry["po_number"] = po_num
+         entry["po_revision"] = getattr(evt, "po_revision", "") or ""
++        entry["source_received_at"] = getattr(evt, "source_received_at", "") or ""
+     usage.append(entry)
+ 
+ 
+@@ -855,21 +891,44 @@ def _apply_events(events: list,
+         # All events in a group share the same revision; take it from the
+         # first one. Fall back to "" if the parser didn't set it.
+         new_rev = getattr(grp[0], "po_revision", "") or ""
++        new_received = getattr(grp[0], "source_received_at", "") or ""
+         new_rev_int = _po_rev_int(new_rev)
+-        existing_rev_int, active_idx = _highest_applied_rev(usage, po_num)
++        (existing_rev_int, active_idx,
++         active_rev, active_received) = _highest_applied_rev(usage, po_num)
++        # Ordering is by the source email's received time, guarded so a higher
++        # numeric revision still wins regardless of date. USF amends a PO
++        # without bumping the number (re-sending it "REVISED"/"REPRINT"), so
++        # the token alone can't decide. See integrations/po_revision.
++        incoming_is_newer = _po_doc_is_newer(
++            new_rev, new_received, active_rev, active_received)
++
++        # A pending-only PO has no usage row, so also compare against the
++        # newest pending on_order doc for this PO.
++        pend_rev, pend_received = _newest_pending_doc(inv, po_num)
++        if pend_rev is not None and not _po_doc_is_newer(
++                new_rev, new_received, pend_rev, pend_received):
++            report["po_revisions_skipped"].append(
++                f"PO {po_num} rev {new_rev or '(none)'} "
++                f"({new_received or 'no date'}): not newer than pending rev "
++                f"{pend_rev or '(none)'} ({pend_received or 'no date'}) - "
++                f"skipped {len(grp)} event(s)."
++            )
++            continue
+ 
+-        if active_idx and new_rev_int <= existing_rev_int:
++        if active_idx and not incoming_is_newer:
+             # Idempotent skip: we've already booked this PO at the same-or-
+             # higher revision. Guard is `active_idx`, not `existing_rev_int`,
+             # so POs that don't expose a revision (e.g. Cheney) — which parse
+             # to rev_int 0 — still skip correctly on replay.
+             report["po_revisions_skipped"].append(
+-                f"PO {po_num} rev {new_rev or '(none)'}: already applied at "
+-                f"rev {existing_rev_int} or higher - skipped {len(grp)} event(s)."
++                f"PO {po_num} rev {new_rev or '(none)'} "
++                f"({new_received or 'no date'}): not newer than applied rev "
++                f"{active_rev or '(none)'} ({active_received or 'no date'}) - "
++                f"skipped {len(grp)} event(s)."
+             )
+             continue
+ 
+-        if existing_rev_int and new_rev_int > existing_rev_int:
++        if active_idx and incoming_is_newer:
+             # Higher revision arriving for a PO we've already booked - reverse
+             # prior entries before posting the new ones.
+             _reverse_po_entries(po_num, new_rev, active_idx, inv, usage, now,
+@@ -882,7 +941,8 @@ def _apply_events(events: list,
+         # Always clear pending on_order rows tagged with this PO before
+         # posting new ones. Covers the case where the prior revision never
+         # finished its lead time (so nothing is in usage yet).
+-        _remove_on_order_by_po(po_num, new_rev, inv, now, report, dry_run)
++        _remove_on_order_by_po(po_num, new_rev, inv, now, report, dry_run,
++                               new_received=new_received)
+ 
+         for evt in grp:
+             _apply_email_event(evt, inv, usage, now, report, dry_run)
+diff --git a/test_on_order_dedup.py b/test_on_order_dedup.py
+index ab0d329..50c852a 100644
+--- a/test_on_order_dedup.py
++++ b/test_on_order_dedup.py
+@@ -421,7 +421,13 @@ def test_reprint_supersedes_numeric_revision():
+ def test_apply_path_supersedes_numeric_with_reprint():
+     """When events with rev='REPRINT' arrive AFTER events with rev='0000004'
+     in /api/email/ingest-events, the apply path must supersede the
+-    numeric revision (treat REPRINT as latest)."""
++    numeric revision.
++
++    US Foods amends a PO without bumping the number, re-sending it as
++    REVISED/REPRINT, so "later" is established by the source email's received
++    time -- not by the token (see integrations/po_revision). The REPRINT here
++    carries a later source_received_at, which is what every real ingest now
++    supplies."""
+     from datetime import datetime
+     from integrations.base import SyncItem
+     from integrations.email_scanner import EmailEvent
+@@ -433,7 +439,7 @@ def test_apply_path_supersedes_numeric_with_reprint():
+         target_variety = "Plain"
+         target = "plain bagel 4oz [usf - la mirada]"
+ 
+-        def make_evt(qty, rev):
++        def make_evt(qty, rev, received=""):
+             return EmailEvent(
+                 event_type="restock",
+                 item=SyncItem(quantity=qty, distributor="US Foods",
+@@ -441,16 +447,17 @@ def test_apply_path_supersedes_numeric_with_reprint():
+                               unit="cases"),
+                 source_message_id="m", source_subject="USF PO 5334574C",
+                 po_number="5334574C", po_revision=rev,
++                source_received_at=received,
+             )
+ 
+         # First wave: apply rev 0000004 with qty=80
+-        sync._apply_events([make_evt(80.0, "0000004")], dry_run=False)
++        sync._apply_events([make_evt(80.0, "0000004", "2026-08-01T12:00:00Z")], dry_run=False)
+         inv = it._load(it.INVENTORY_FILE)
+         assert inv[target]["on_order"][0]["qty"] == 80.0
+ 
+         # Second wave: apply REPRINT with qty=136 (USF re-issue at a
+         # corrected quantity). Must supersede.
+-        sync._apply_events([make_evt(136.0, "REPRINT")], dry_run=False)
++        sync._apply_events([make_evt(136.0, "REPRINT", "2026-08-02T12:00:00Z")], dry_run=False)
+         inv = it._load(it.INVENTORY_FILE)
+         pending = inv[target]["on_order"]
+         assert len(pending) == 1, f"expected exactly 1 pending after supersede; got {len(pending)}"
