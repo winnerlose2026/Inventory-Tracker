@@ -7,9 +7,17 @@ Runs equally well as a Render Cron Job or a scheduled Cowork routine.
 
 Feeds (agreed with Walt Wilcox / Cheney, 2026-07-06):
   * Daily on-hand inventory CSV  -> POSTed to the tracker (applied as on_hand)
-  * Daily EDI 810 invoices        -> parsed + summarized (downstream wiring is
-                                     deferred until a real 810 confirms field
-                                     semantics + money-decimal convention)
+  * Daily EDI 810 invoices       -> parsed + summarized (WHERE the 810 lands in
+                                    the tracker is still a modelling decision;
+                                    the field semantics are settled)
+
+2026-08-04 -- the first real CSV drop was an "OrderGuide" export, NOT the
+on-hand snapshot: catalog + case cost, with the on-hand column zero on every
+row (see integrations/cheney_order_guide.py). Order-guide files are therefore
+detected by shape and reported WITHOUT being POSTed to the on-hand endpoint --
+posting them would zero out every warehouse's real count. If Cheney later adds
+a genuine on-hand file to the same drop it flows through untouched, because the
+routing is by file shape, not by filename.
 
 CONFIG (all via env; the script no-ops quietly until SFTP is configured):
   CHENEY_SFTP_HOST        sftp hostname                    (required to run)
@@ -125,20 +133,54 @@ def main() -> int:
 
     print(f"Pulled {len(csv_files)} CSV + {len(edi_files)} EDI file(s) from {remote_dir}")
 
-    # --- CSV on-hand -> tracker ---
+    # --- CSVs: route by shape, never post an order guide to the on-hand path ---
+    from integrations.cheney_order_guide import (
+        parse_order_guide, looks_like_order_guide, summarize as og_summarize)
+
     dry = "1" if args.dry_run else "0"
+    guides = onhand = 0
     for lp in sorted(csv_files):
+        text = lp.read_text(encoding="utf-8", errors="replace")
+        if looks_like_order_guide(text):
+            guides += 1
+            rows, errors, meta = parse_order_guide(text, filename=lp.name)
+            s = og_summarize(rows, meta)
+            where = ", ".join(s["warehouses"]) or ", ".join(s["out_of_scope_dc"]) or "?"
+            print(f"  ORDER GUIDE {lp.name}: {s['rows']} row(s) for "
+                  f"{s['store']} ({where}); {s['priced_rows']} priced, "
+                  f"{len(s['hh_varieties'])} H&H variet(y/ies). "
+                  f"NOT applied to on-hand (no on-hand data in this file).")
+            for e in errors[:3]:
+                print(f"      ! {e}")
+            continue
+        onhand += 1
         url = f"{args.api_base}/api/ingest/cheney-inventory-csv?dry_run={dry}&filename={lp.name}"
         status, resp = _post(url, lp.read_bytes(), args.token, "text/csv")
         print(f"  CSV {lp.name}: POST -> HTTP {status}  {resp[:200]}")
 
-    # --- EDI 810 -> parse + summarize only (routing deferred) ---
+    # --- EDI 810 -> parse + summarize only (tracker routing still deferred) ---
     if edi_files:
-        from integrations.edi_810 import parse_810
+        from integrations.edi_810 import parse_810, summarize as edi_summarize
+        invoices: list[dict] = []
         for lp in sorted(edi_files):
             inv = parse_810(lp.read_text(encoding="utf-8", errors="replace"))
+            invoices.extend(inv)
             print(f"  810 {lp.name}: {len(inv)} invoice(s) parsed (not yet applied)")
+        s = edi_summarize(invoices)
+        print(f"  810 batch: {s['invoices']} invoice(s) ({s['credits']} credit), "
+              f"net ${s['net_total']:,.2f}, net {s['net_cases']:g} case(s)")
+        for label, key in (("did NOT reconcile", "unreconciled"),
+                           ("no case count", "lines_without_cases"),
+                           ("CTT mismatch", "line_count_mismatch"),
+                           ("ISS mismatch", "unit_count_mismatch")):
+            if s[key]:
+                print(f"      ! {label}: {', '.join(str(x) for x in s[key][:6])}")
 
+    if guides and not onhand:
+        print("\nWARNING: Cheney's drop contained ONLY order-guide files -- no "
+              "on-hand snapshot arrived, so no warehouse counts were updated. "
+              "This is the open item with Cheney (see "
+              "RUNBOOK_cheney_data_feeds.md).")
     if args.dry_run:
         print("\nDRY RUN -- CSV feed parsed but not applied. Re-run with --commit to apply.")
     return 0

@@ -1,59 +1,114 @@
 #!/usr/bin/env python3
-"""Parse a Cheney Brothers EDI 810 (invoice) file and summarize it.
+"""Parse Cheney Brothers EDI 810 (invoice) files and summarize them.
 
-Cheney (Walt Wilcox, 2026-07-06) will send daily EDI 810 invoices as our
-shipment-history feed. This reads an 810 file, parses it with
+Cheney (Walt Wilcox, 2026-07-06) sends daily EDI 810 invoices as our
+shipment-history feed. This reads one or more 810 files, parses them with
 integrations.edi_810, and prints a per-invoice summary (invoice #/date, PO #,
-ship-from DC, line items with Cheney item #, cases, unit price, extended
-cost). With --json it writes the parsed structure for inspection.
+ship-from DC, ship-to store, line items, money reconciliation) plus a batch
+roll-up with credits netted out.
 
-Ingest wiring (where this lands in the tracker -- usage/case-movement vs.
-restock vs. a spend ledger) is intentionally deferred until we have Cheney's
-first REAL 810 to confirm field semantics and the money-decimal convention
-(see the note in integrations/edi_810.py). Until then this is parse-and-review.
+Money + quantity semantics were CONFIRMED 2026-08-04 against Cheney's first
+real drop -- implied-decimal TDS, catch-weight LB lines, CR credit memos; see
+integrations/edi_810.py. Each invoice is checked against its own TDS total and
+any mismatch is called out, so a convention change on Cheney's side surfaces
+here instead of quietly corrupting numbers.
+
+What still isn't decided is WHERE the 810 lands in the tracker
+(usage/case-movement vs. restock vs. a spend ledger) -- that's a modelling
+call, so this stays parse-and-review.
 
     python scripts/ingest_cheney_810.py --edi /path/to/cheney_810.edi
-    python scripts/ingest_cheney_810.py --edi file.edi --json parsed_810.json
+    python scripts/ingest_cheney_810.py --edi dir_or_glob --json parsed_810.json
 """
 from __future__ import annotations
 
 import argparse
+import glob as globmod
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from integrations.edi_810 import parse_810  # noqa: E402
+from integrations.edi_810 import parse_810, summarize  # noqa: E402
+
+_EDI_SUFFIXES = (".edi", ".810", ".x12", ".txt")
 
 
 def _fmt_money(v):
     return f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
 
 
+def _resolve(spec: str) -> list[Path]:
+    """A file, a directory of 810s, or a glob -> sorted list of files."""
+    p = Path(spec)
+    if p.is_dir():
+        return sorted(f for f in p.iterdir()
+                      if f.is_file() and f.suffix.lower() in _EDI_SUFFIXES)
+    if p.exists():
+        return [p]
+    return sorted(Path(m) for m in globmod.glob(spec) if Path(m).is_file())
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--edi", required=True, help="Path to the EDI 810 file")
+    p.add_argument("--edi", required=True,
+                   help="EDI 810 file, a directory of them, or a glob")
     p.add_argument("--json", dest="json_out", default="",
                    help="Optional: write parsed invoices to this JSON path")
     args = p.parse_args()
 
-    path = Path(args.edi)
-    if not path.exists():
-        print(f"ERROR: EDI file not found: {path}", file=sys.stderr)
+    paths = _resolve(args.edi)
+    if not paths:
+        print(f"ERROR: no EDI file(s) matched: {args.edi}", file=sys.stderr)
         return 2
-    invoices = parse_810(path.read_text(encoding="utf-8", errors="replace"))
-    print(f"Parsed {len(invoices)} invoice(s) from {path.name}\n")
+
+    invoices: list[dict] = []
+    for path in paths:
+        invoices.extend(parse_810(path.read_text(encoding="utf-8", errors="replace")))
+    print(f"Parsed {len(invoices)} invoice(s) from {len(paths)} file(s)\n")
+
     for v in invoices:
-        print(f"Invoice {v['invoice_number'] or '—'}  date {v['invoice_date'] or '—'}  "
-              f"PO {v['po_number'] or '—'}  ship-from {v['ship_from'] or '—'}")
+        kind = "CREDIT MEMO" if v["is_credit"] else "invoice"
+        print(f"{kind} {v['invoice_number'] or '—'}  date {v['invoice_date'] or '—'}  "
+              f"PO {v['po_number'] or '—'}")
+        print(f"    {v['ship_from'] or '—'} (DC {v['ship_from_code'] or '?'})"
+              f"  ->  {v['ship_to'] or '—'} (acct {v['ship_to_account'] or '?'})")
         for l in v["lines"]:
-            print(f"    item {l['item_no'] or '—':>10}  {str(l['cases']) if l['cases'] is not None else '—':>6} "
-                  f"{l['uom'] or 'CA':<3} @ {_fmt_money(l['unit_price'])}  = {_fmt_money(l['extended'])}")
-        print(f"    total (TDS): {_fmt_money(v['total'])}\n")
+            cases = f"{l['cases']:g}" if l["cases"] is not None else "?"
+            note = ""
+            if l["uom"] not in ("CA", ""):
+                note = f"  [{l['qty']:g} {l['uom']} @ {l['case_weight'] or '?'}/cs]"
+                if l["case_weight_estimated"]:
+                    note += " (pack estimated)"
+            print(f"    item {l['item_no'] or '—':>10}  {cases:>7} cs "
+                  f"@ {_fmt_money(l['unit_price'])} = {_fmt_money(l['extended'])}"
+                  f"  {l['description'][:34]}{note}")
+        verdict = ("reconciles" if v["reconciles"]
+                   else f"MISMATCH off by {_fmt_money(v['variance'])}")
+        print(f"    subtotal {_fmt_money(v['subtotal'])}"
+              f"  tax {_fmt_money(v['tax'])}"
+              f"  charges {_fmt_money(v['charges'])}"
+              f"  ->  TDS {_fmt_money(v['total'])}  [{verdict}]")
+        print()
+
+    s = summarize(invoices)
+    print("Batch summary")
+    print(f"    invoices {s['invoices']} ({s['credits']} credit memo(s)), "
+          f"{s['lines']} line(s)")
+    print(f"    net total {_fmt_money(s['net_total'])}   net cases {s['net_cases']:g}")
+    for label, key in (("did NOT reconcile", "unreconciled"),
+                       ("no case count", "lines_without_cases"),
+                       ("CTT line-count mismatch", "line_count_mismatch"),
+                       ("ISS unit-count mismatch", "unit_count_mismatch")):
+        if s[key]:
+            print(f"    {label}: {', '.join(str(x) for x in s[key])}")
+    if not any(s[k] for k in ("unreconciled", "lines_without_cases",
+                              "line_count_mismatch", "unit_count_mismatch")):
+        print("    all invoices reconcile against their own TDS totals")
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(invoices, indent=2))
-        print(f"Wrote parsed JSON -> {args.json_out}")
+        print(f"\nWrote parsed JSON -> {args.json_out}")
     return 0
 
 

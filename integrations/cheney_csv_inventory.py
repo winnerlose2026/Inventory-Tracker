@@ -12,9 +12,21 @@ Feed the events to ``/api/email/ingest-events`` (source="cheney-sftp-csv").
 This replaces the fragile weekly OCR-from-embedded-image path with a
 structured daily feed.
 
-NOTE: validate the header names + date format against Cheney's real file once
-the feed is live; the fuzzy matcher below covers the likely variants but the
-first real drop should be spot-checked.
+2026-08-04 -- the first real CSV drop was NOT this file. Cheney sent a
+headerless daily "OrderGuide" export (catalog + case cost, on-hand column zero
+on every row); see ``cheney_order_guide``. Two guards below keep that file, and
+anything shaped like it, out of the on-hand path:
+
+  1. ``looks_like_order_guide`` -> rejected by name, with a pointer to the right
+     parser, instead of failing with an opaque "columns not found".
+  2. an on-hand column that is zero/blank on EVERY row is refused. A real
+     snapshot always has some stock somewhere; an all-zero column means the
+     column isn't populated, and applying it would overwrite every warehouse's
+     real count with 0. Pass ``allow_all_zero=True`` only for a deliberate
+     zero-out.
+
+The header names themselves are still not contract-fixed, so they stay
+fuzzily matched.
 """
 from __future__ import annotations
 
@@ -29,6 +41,7 @@ try:  # package import
         DEFAULT_CASE_SIZE,
     )
     from .cheney_po_parser import CHENEY_CASE_COST
+    from .cheney_order_guide import looks_like_order_guide
     from .parsers._common import opt_float, opt_int
 except ImportError:  # standalone (tests / CLI)
     from cheney_inventory_report import (  # type: ignore
@@ -36,6 +49,7 @@ except ImportError:  # standalone (tests / CLI)
         DEFAULT_CASE_SIZE,
     )
     from cheney_po_parser import CHENEY_CASE_COST  # type: ignore
+    from cheney_order_guide import looks_like_order_guide  # type: ignore
     from parsers._common import opt_float, opt_int  # type: ignore
 
 DISTRIBUTOR = "Cheney Brothers"
@@ -104,16 +118,30 @@ def _to_iso_date(v: str) -> str:
     return ""
 
 
-def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"):
+def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv",
+                        allow_all_zero: bool = False):
     """Parse a Cheney daily on-hand CSV into (events, errors).
 
     ``events`` are ``on_hand`` event dicts ready for /api/email/ingest-events.
     ``errors`` are human-readable strings for the unparsed/health surfaces.
+
+    Set ``allow_all_zero=True`` only to deliberately zero out counts; by
+    default a file whose on-hand column is zero on every row is refused (see
+    the module docstring).
     """
     events: list[dict] = []
     errors: list[str] = []
     if not (csv_text or "").strip():
         return events, ["cheney inventory csv: empty file"]
+
+    # Guard 1: Cheney's headerless order-guide export is not an on-hand file.
+    if looks_like_order_guide(csv_text):
+        return events, [
+            f"cheney inventory csv {filename}: this is Cheney's headerless "
+            f"OrderGuide export (catalog + case cost), not an on-hand "
+            f"snapshot -- refused. Parse it with "
+            f"integrations.cheney_order_guide.parse_order_guide instead."
+        ]
 
     reader = csv.reader(io.StringIO(csv_text))
     rows = [r for r in reader if any((c or "").strip() for c in r)]
@@ -135,6 +163,21 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
     def cell(row, role):
         j = roles.get(role)
         return (row[j].strip() if (j is not None and j < len(row)) else "")
+
+    # Guard 2: refuse a snapshot whose on-hand column is zero/blank on EVERY
+    # row. A real count has stock somewhere; an all-zero column means Cheney
+    # isn't populating it, and applying it would erase every warehouse's count.
+    data_rows = rows[1:]
+    if data_rows and not allow_all_zero:
+        seen_qty = [opt_float(cell(r, "qty")) for r in data_rows]
+        if not any(q for q in seen_qty if q):
+            return events, [
+                f"cheney inventory csv {filename}: the on-hand column "
+                f"({header[roles['qty']]!r}) is zero or blank on all "
+                f"{len(data_rows)} row(s) -- refused rather than zeroing out "
+                f"every warehouse's count. If this really is a full zero-out, "
+                f"re-run with allow_all_zero=True."
+            ]
 
     idx = 0
     for row in rows[1:]:
