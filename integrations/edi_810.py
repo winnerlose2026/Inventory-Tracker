@@ -366,11 +366,15 @@ def parse_810(text: str) -> list[dict]:
 
 
 def _signed(value, is_credit: bool):
-    """Apply credit direction to an amount. Uses magnitude, so a credit stays
-    negative whether the sender states its amounts positive (Cheney's
-    convention today) or already-negative."""
-    v = abs(value or 0.0)
-    return -v if is_credit else v
+    """Apply credit direction to an amount.
+
+    A credit is clamped negative, so it stays a reduction whether the sender
+    states its amounts positive (Cheney's convention today) or already-negative.
+    A non-credit amount is passed through UNCHANGED -- a negative line on an
+    invoice is a legitimate netted return and must keep its sign.
+    """
+    v = value or 0.0
+    return -abs(v) if is_credit else v
 
 
 def summarize(invoices: list[dict]) -> dict:

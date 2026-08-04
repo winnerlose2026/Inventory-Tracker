@@ -180,13 +180,63 @@ def test_units_per_case_from_pack_string():
 
 
 def test_untracked_dc_rows_are_skipped_with_a_reason():
-    """Statesville has on-hand but no tracker warehouse -- skip, don't guess."""
+    """Statesville has on-hand but no tracker warehouse -- skip, don't guess,
+    and don't claim the file had no on-hand data when it did."""
     csv_text = "10153018,H & H,12,11,001 60CT,30.00,20260803113325\n"
     fn = "OrderGuide-20260803-113325_0060415887.csv"
     events, errors = parse_inventory_csv(csv_text, filename=fn)
     assert events == []
-    assert any("not a tracked warehouse" in e for e in errors), errors
-    print("ok: on-hand rows for an untracked DC are skipped with a reason")
+    joined = " ".join(errors)
+    assert "does carry on-hand quantities" in joined, errors
+    assert "nothing to apply" in joined, errors
+    assert "no on-hand quantities at all" not in joined, errors
+    assert any("DC the tracker doesn't model" in e for e in errors), errors
+    print("ok: untracked-DC rows skipped with an accurate reason")
+
+
+def test_nonzero_untracked_rows_do_not_unlock_a_bagel_zero_out():
+    """The guard must measure the rows we would WRITE, not the whole catalog.
+    Cheney distributes ~220 third-party items alongside the ~12 H&H SKUs; a
+    case of Coke being in stock says nothing about the bagel rows."""
+    csv_text = (
+        "10064422,SCHREIBE,05,7,004 5LB,4.17,20260803113325\n"    # nonzero, untracked
+        "164011,KRAFT,05,3,004 5LB,2.80,20260803113325\n"         # nonzero, untracked
+        "10153018,H & H,05,0,001 60CT,30.00,20260803113325\n"     # tracked, ZERO
+        "10153048,H & H,05,0,001 60CT,30.00,20260803113325\n"
+        "10153019,H & H,05,0,001 60CT,30.00,20260803113325\n"
+    )
+    fn = "OrderGuide-20260803-113325_0060458212.csv"
+    rows, _errs, meta = parse_order_guide(csv_text, filename=fn)
+    # File-level view says "populated" -- and that view is NOT what gates us.
+    assert meta["on_hand_populated"] is True
+    events, errors = parse_inventory_csv(csv_text, filename=fn)
+    assert events == [], [e["item"] for e in events]
+    assert any("0 for all 3 tracked item(s)" in e for e in errors), errors
+    # One nonzero bagel row is enough to make it a real snapshot again.
+    fixed = csv_text.replace(
+        "10153018,H & H,05,0,", "10153018,H & H,05,6,")
+    events2, _ = parse_inventory_csv(fixed, filename=fn)
+    assert len(events2) == 3
+    assert {e["item"]["variety"]: e["item"]["quantity"] for e in events2} == {
+        "Plain": 6.0, "Everything": 0.0, "Poppy Seed": 0.0}
+    print("ok: nonzero untracked rows can't unlock a zero-out of tracked SKUs")
+
+
+def test_unmapped_catalog_rows_are_summarized_not_listed():
+    """A real order guide is ~236 rows, ~224 of them third-party. One error per
+    row would bury the health surface in ~1,800 lines per daily drop."""
+    rows = ["10153018,H & H,05,4,001 60CT,30.00,20260803113325"]
+    rows += [f"9{i:06d},BRAND{i},05,2,024 12OZ,10.00,20260803113325"
+             for i in range(40)]
+    fn = "OrderGuide-20260803-113325_0060458212.csv"
+    events, errors = parse_inventory_csv("\n".join(rows) + "\n", filename=fn)
+    assert len(events) == 1 and events[0]["item"]["variety"] == "Plain"
+    unmapped = [e for e in errors if "not H&H items we track" in e]
+    assert len(unmapped) == 1, errors
+    assert "40 catalog row(s)" in unmapped[0], unmapped
+    assert "+35 more" in unmapped[0], unmapped
+    assert len(errors) <= 2, errors
+    print("ok: unmapped catalog rows reported once, not one error per row")
 
 
 def test_split_units_column_does_not_steal_the_qty_role():

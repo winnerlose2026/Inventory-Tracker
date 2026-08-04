@@ -178,7 +178,39 @@ An adversarial review of the first cut found several real problems, fixed here:
   one reconciles with a confirmed case count on all 117 lines. Previously only
   2 were pinned, so the headline claim wasn't actually covered by CI.
 
-Test count 172 → 184.
+A second review pass caught two regressions the first round of fixes
+introduced, both of which were worse than what they replaced:
+
+- **The zero-out guard measured the wrong population.** `on_hand_populated` is
+  a whole-*file* check, but only the ~12 tracked H&H SKUs become events. Cheney
+  distributes ~220 third-party items alongside them, so a case of Coke being in
+  stock flipped the gate open while every bagel row sat at 0 — writing zeros
+  straight over real counts through the production endpoint. The gate now
+  measures the rows that would actually be **written**, not the catalog.
+- **`_signed` used `abs()`**, which clamped negative lines on *non-credit*
+  invoices. A returned line netted into a delivery invoice (routine X12) counted
+  as a delivery: 5 shipped − 1 returned reported as 6 cases, and it reconciled
+  clean so nothing flagged it. Credits are now clamped negative; everything else
+  passes through with its sign intact.
+
+Also from that pass:
+
+- `allow_all_zero=True` inverted on order-guide-shaped files — a *populated*
+  file plus the flag hit the refusal branch and threw away a good snapshot. The
+  flag now governs only the zero case, as documented.
+- The daily job (`sync_cheney_feeds.py`) never printed
+  `lines_with_estimated_pack`; that fix had landed only on the manual CLI, so
+  the up-to-8x case inflation was invisible on the path that actually runs.
+- The new on-hand path emitted one error per unmapped catalog row — ~1,800 per
+  daily drop, enough to bury every real problem. Unmapped rows are now counted
+  and reported once (measured: 1,798 → 11 errors across the 9 sample files).
+- Refusal messages no longer claim a file "carries no on-hand quantities" when
+  it does but none of the rows map to a tracked item at a tracked DC.
+- The qty-header exclusion is whole-word and scoped to the qty test, so `"lb"`
+  no longer matches "bulb" and the exclusion can't shadow the DC/item roles
+  tested after it.
+
+Test count 172 → 187.
 
 ## Still open (not code)
 

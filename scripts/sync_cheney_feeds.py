@@ -179,6 +179,8 @@ def main() -> int:
               f"net ${s['net_total']:,.2f}, net {s['net_cases']:g} case(s)")
         for label, key in (("did NOT reconcile", "unreconciled"),
                            ("no case count", "lines_without_cases"),
+                           ("pack size ASSUMED -- cases may be high",
+                            "lines_with_estimated_pack"),
                            ("CTT mismatch", "line_count_mismatch"),
                            ("ISS mismatch", "unit_count_mismatch")):
             if s[key]:

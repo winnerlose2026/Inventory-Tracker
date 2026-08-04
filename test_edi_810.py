@@ -240,6 +240,25 @@ def test_money_tolerates_commas_and_trailing_sign():
     print("ok: money parsing handles commas + trailing sign, rejects junk")
 
 
+def test_negative_line_on_an_invoice_keeps_its_sign():
+    """A returned line netted into a delivery invoice is routine X12. Clamping
+    the whole document to a magnitude would count the return as a delivery."""
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*INV8*20260730*PO8***DI*00",
+        "IT1*000010*5.000*CA*30.00**VN*10153018",
+        "IT1*000020*-1.000*CA*30.00**VN*10153018",
+        "TDS*12000",
+        "SE*6*1",
+    ]) + "~"
+    v = parse_810(doc)[0]
+    assert v["is_credit"] is False
+    s = summarize([v])
+    assert s["net_cases"] == 4.0, s["net_cases"]      # 5 shipped, 1 returned
+    assert s["net_total"] == 120.00
+    print("ok: a negative line on a non-credit invoice keeps its sign")
+
+
 def test_credit_direction_survives_a_negative_total():
     """If Cheney ever states credit amounts already-negative, a credit must
     still net negative rather than flipping to a charge."""

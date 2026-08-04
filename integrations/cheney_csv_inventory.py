@@ -61,6 +61,13 @@ def _norm_header(h: str) -> str:
     return re.sub(r"[^a-z0-9 ]", " ", (h or "").strip().lower())
 
 
+# Units a quantity column can be in that are NOT cases. Whole words, so "bulb"
+# doesn't read as "lb". _norm_header has already flattened punctuation to
+# spaces, so \b behaves.
+_NOT_CASES_RE = re.compile(
+    r"\b(split|splits|each|eaches|unit|units|weight|lb|lbs|pound|pounds|oz|ounce|ounces)\b")
+
+
 def _role_for_header(h: str) -> str:
     """Map one CSV header to a canonical role, or '' if none. Order matters:
     the most specific tests run first so e.g. 'case size' isn't grabbed as a
@@ -83,12 +90,13 @@ def _role_for_header(h: str) -> str:
     # on-hand quantity, in CASES. A feed that also reports splits/eaches/weight
     # on hand ("Split Units On Hand") must not win the qty role: it tends to
     # come first in the row, and binding to it both reads splits as cases and
-    # trips the all-zero guard on a perfectly good snapshot.
-    if any(k in s for k in ("split", "each", "unit", "weight", "lb", "pound")):
-        return ""
-    if ("on hand" in s or "onhand" in s or "on hnd" in s or "full case" in s
-            or s in ("cases", "qty", "quantity", "oh", "cs oh", "cases on hand", "on hand cases")):
-        return "qty"
+    # trips the all-zero guard on a perfectly good snapshot. Whole words only,
+    # and scoped to the qty test so it can't shadow the roles tested after it.
+    if not _NOT_CASES_RE.search(s):
+        if ("on hand" in s or "onhand" in s or "on hnd" in s or "full case" in s
+                or s in ("cases", "qty", "quantity", "oh", "cs oh",
+                         "cases on hand", "on hand cases")):
+            return "qty"
     # DC / facility / warehouse
     if s in ("dc", "dc name") or any(k in s for k in ("facility", "warehouse", "location", "branch", "site")):
         return "warehouse"
@@ -150,16 +158,37 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
     #     for every item at every warehouse.
     if looks_like_order_guide(csv_text):
         og_rows, og_errors, og_meta = parse_order_guide(csv_text, filename=filename)
-        if og_meta["on_hand_populated"] and not allow_all_zero:
-            events, conv_errors = to_on_hand_events(og_rows, filename=filename)
+        og_events, conv_errors = to_on_hand_events(og_rows, filename=filename)
+        # The test that matters is whether the rows we'd actually WRITE carry
+        # stock -- not whether anything in the 236-row catalog does. Cheney
+        # distributes ~220 third-party items alongside the ~12 H&H SKUs the
+        # tracker models; a nonzero count on a case of Coke says nothing about
+        # whether the bagel rows are populated, and gating on it would write 0
+        # over every real bagel count.
+        writable_nonzero = any((e["item"]["quantity"] or 0) > 0 for e in og_events)
+        if writable_nonzero or allow_all_zero:
             shape_errors = [e for e in og_errors if "NOT an" not in e]
-            return events, shape_errors + conv_errors
-        return events, [
-            f"cheney inventory csv {filename}: this is Cheney's headerless "
-            f"OrderGuide export (catalog + case cost) with no on-hand "
-            f"quantities -- refused, since applying it would zero out every "
-            f"warehouse's count. Parse it with "
-            f"integrations.cheney_order_guide.parse_order_guide instead."
+            return og_events, shape_errors + conv_errors
+        head = (f"cheney inventory csv {filename}: this is Cheney's headerless "
+                f"OrderGuide export (catalog + case cost)")
+        if og_events:
+            return [], [
+                f"{head}, and on-hand is 0 for all {len(og_events)} tracked "
+                f"item(s) in it -- refused, since applying it would zero out "
+                f"those counts. Parse it with "
+                f"integrations.cheney_order_guide.parse_order_guide, or re-run "
+                f"scripts/ingest_cheney_inventory_csv.py with --allow-all-zero "
+                f"for a deliberate zero-out."
+            ]
+        if og_meta["on_hand_populated"]:
+            return [], [
+                f"{head}. It does carry on-hand quantities, but none of those "
+                f"rows map to an H&H item at a tracked DC, so there is nothing "
+                f"to apply."
+            ] + conv_errors
+        return [], [
+            f"{head} with no on-hand quantities at all -- nothing to apply. "
+            f"Parse it with integrations.cheney_order_guide.parse_order_guide."
         ]
 
     reader = csv.reader(io.StringIO(csv_text))

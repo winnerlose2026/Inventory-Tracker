@@ -266,19 +266,22 @@ def to_on_hand_events(rows: list[dict], *, filename: str = "OrderGuide.csv"):
     """
     events: list[dict] = []
     errors: list[str] = []
+    # An order guide is a whole distributor catalog: ~95% of its rows are
+    # third-party items the tracker doesn't model. Listing each one would push
+    # ~1,800 errors per daily drop onto the health surface and bury the real
+    # problems, so unmapped rows are counted and reported once.
+    unmapped: list[str] = []
+    untracked_dc: list[str] = []
     idx = 0
     for r in rows:
         if r["on_hand"] is None:
             continue
         if not r["variety"]:
-            errors.append(f"cheney order guide: unmapped row "
-                          f"(item={r['item_no']!r}, brand={r['brand']!r})")
+            unmapped.append(r["item_no"])
             continue
         if not r["warehouse"]:
-            errors.append(
-                f"cheney order guide: DC {r['dc_name'] or r['dc_code']!r} is not a "
-                f"tracked warehouse -- skipped {r['variety']} "
-                f"(item={r['item_no']!r})")
+            untracked_dc.append(
+                f"{r['variety']} at {r['dc_name'] or r['dc_code']}")
             continue
         idx += 1
         item: dict = {
@@ -306,6 +309,19 @@ def to_on_hand_events(rows: list[dict], *, filename: str = "OrderGuide.csv"):
         if r["snapshot_date"]:
             ev["count_date"] = r["snapshot_date"]
         events.append(ev)
+
+    if unmapped:
+        shown = ", ".join(unmapped[:5])
+        more = f" (+{len(unmapped) - 5} more)" if len(unmapped) > 5 else ""
+        errors.append(
+            f"cheney order guide: {len(unmapped)} catalog row(s) are not H&H "
+            f"items we track -- skipped: {shown}{more}. Expected: an order "
+            f"guide lists Cheney's whole catalog for the account.")
+    if untracked_dc:
+        errors.append(
+            f"cheney order guide: {len(untracked_dc)} row(s) are at a DC the "
+            f"tracker doesn't model -- skipped: "
+            f"{', '.join(sorted(set(untracked_dc))[:5])}")
     return events, errors
 
 
