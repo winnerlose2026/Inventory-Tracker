@@ -173,9 +173,9 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
                 f"OrderGuide export (catalog + case cost)")
         if og_events:
             return [], [
-                f"{head}, and on-hand is 0 for all {len(og_events)} tracked "
-                f"item(s) in it -- refused, since applying it would zero out "
-                f"those counts. Parse it with "
+                f"{head}, and no tracked item in it has a positive on-hand "
+                f"figure ({len(og_events)} tracked item(s) checked) -- refused, "
+                f"since applying it would zero out those counts. Parse it with "
                 f"integrations.cheney_order_guide.parse_order_guide, or re-run "
                 f"scripts/ingest_cheney_inventory_csv.py with --allow-all-zero "
                 f"for a deliberate zero-out."

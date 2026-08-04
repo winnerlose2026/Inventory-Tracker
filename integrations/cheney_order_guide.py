@@ -310,6 +310,27 @@ def to_on_hand_events(rows: list[dict], *, filename: str = "OrderGuide.csv"):
             ev["count_date"] = r["snapshot_date"]
         events.append(ev)
 
+    # An item # can legitimately appear twice in one guide at two pack/splits
+    # (see the module docstring). Two events for one (variety, warehouse) both
+    # reach the apply path -- the ordering guard only rejects a STRICTLY older
+    # count, and rows from one file share a count date -- so the later row
+    # wins. If that row is the zero one, it erases the real count that made
+    # this file usable in the first place. Collapse to the highest quantity per
+    # SKU, mirroring what _apply_events already does for PO groups.
+    if events:
+        best: dict[tuple, dict] = {}
+        for ev in events:
+            key = (ev["item"]["variety"], ev["item"]["warehouse"])
+            prev = best.get(key)
+            if prev is None or (ev["item"]["quantity"] or 0) > (prev["item"]["quantity"] or 0):
+                best[key] = ev
+        if len(best) != len(events):
+            dropped = len(events) - len(best)
+            errors.append(
+                f"cheney order guide: {dropped} duplicate item row(s) collapsed "
+                f"-- kept the highest on-hand per variety/warehouse")
+        events = list(best.values())
+
     if unmapped:
         shown = ", ".join(unmapped[:5])
         more = f" (+{len(unmapped) - 5} more)" if len(unmapped) > 5 else ""

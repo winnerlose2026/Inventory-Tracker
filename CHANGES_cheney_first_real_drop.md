@@ -210,7 +210,16 @@ Also from that pass:
   no longer matches "bulb" and the exclusion can't shadow the DC/item roles
   tested after it.
 
-Test count 172 → 187.
+A third pass caught one more instance of the same failure mode: an item # can
+appear twice in one order guide at two pack/splits, and two events for one
+(variety, warehouse) both reach the apply path — the ordering guard only rejects
+a *strictly* older count, and rows from one file share a count date, so the
+later row wins. A duplicate zero row would therefore erase the real count that
+made the file usable. `to_on_hand_events` now collapses to the highest on-hand
+per variety/warehouse, mirroring what `_apply_events` already does for PO
+groups. Refusal wording no longer says "on-hand is 0" for a negative value.
+
+Test count 172 → 189.
 
 ## Still open (not code)
 

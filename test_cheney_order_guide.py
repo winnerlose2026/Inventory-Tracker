@@ -211,7 +211,8 @@ def test_nonzero_untracked_rows_do_not_unlock_a_bagel_zero_out():
     assert meta["on_hand_populated"] is True
     events, errors = parse_inventory_csv(csv_text, filename=fn)
     assert events == [], [e["item"] for e in events]
-    assert any("0 for all 3 tracked item(s)" in e for e in errors), errors
+    assert any("no tracked item in it has a positive on-hand" in e
+               for e in errors), errors
     # One nonzero bagel row is enough to make it a real snapshot again.
     fixed = csv_text.replace(
         "10153018,H & H,05,0,", "10153018,H & H,05,6,")
@@ -220,6 +221,41 @@ def test_nonzero_untracked_rows_do_not_unlock_a_bagel_zero_out():
     assert {e["item"]["variety"]: e["item"]["quantity"] for e in events2} == {
         "Plain": 6.0, "Everything": 0.0, "Poppy Seed": 0.0}
     print("ok: nonzero untracked rows can't unlock a zero-out of tracked SKUs")
+
+
+def test_duplicate_item_rows_collapse_to_the_highest_on_hand():
+    """Cheney lists some items twice at different pack/splits. Two events for
+    one (variety, warehouse) both reach the apply path and the later one wins --
+    so a duplicate zero row would erase the real count that made the file
+    usable. Keep the highest per SKU."""
+    csv_text = (
+        "10153018,H & H,05,6,001 60CT,30.00,20260803113325\n"
+        "10153018,H & H,05,0,001 60CT,30.00,20260803113325\n"
+        "10153048,H & H,05,2,001 60CT,30.00,20260803113325\n"
+    )
+    fn = "OrderGuide-20260803-113325_0060458212.csv"
+    events, errors = parse_inventory_csv(csv_text, filename=fn)
+    got = sorted((e["item"]["variety"], e["item"]["quantity"]) for e in events)
+    assert got == [("Everything", 2.0), ("Plain", 6.0)], got
+    assert any("duplicate item row(s) collapsed" in e for e in errors), errors
+    # Order within the file must not decide the outcome.
+    swapped = "\n".join(csv_text.strip().split("\n")[::-1]) + "\n"
+    events2, _ = parse_inventory_csv(swapped, filename=fn)
+    assert sorted((e["item"]["variety"], e["item"]["quantity"])
+                  for e in events2) == got
+    print("ok: duplicate item rows collapse to the highest on-hand per SKU")
+
+
+def test_negative_on_hand_does_not_unlock_the_file():
+    csv_text = "10153018,H & H,05,-3,001 60CT,30.00,20260803113325\n"
+    fn = "OrderGuide-20260803-113325_0060458212.csv"
+    events, errors = parse_inventory_csv(csv_text, filename=fn)
+    assert events == []
+    # The message must not claim the value is 0 when it's -3.
+    joined = " ".join(errors)
+    assert "no tracked item in it has a positive on-hand" in joined, errors
+    assert "is 0 for all" not in joined, errors
+    print("ok: negative on-hand keeps the file shut, with accurate wording")
 
 
 def test_unmapped_catalog_rows_are_summarized_not_listed():
