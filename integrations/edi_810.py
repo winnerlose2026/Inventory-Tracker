@@ -112,21 +112,21 @@ def _money(v: str):
     decimals apply, which for Cheney is 2 places ("167619" -> 1676.19). See the
     module docstring -- this is verified against the first real drop.
     """
-    s = (v or "").strip()
+    s = (v or "").strip().replace(",", "")
     if not s:
         return None
-    neg = s.startswith("-")
-    if neg:
-        s = s[1:]
+    # X12 permits a leading OR trailing sign.
+    neg = s.startswith("-") or s.endswith("-")
+    s = s.strip("-")
     if "." in s:
         val = _num(s)
         if val is None:
             return None
     else:
-        m = re.search(r"\d+", s)
+        m = re.fullmatch(r"\D*(\d+)\D*", s)
         if not m:
             return None
-        val = int(m.group(0)) / (10 ** _IMPLIED_PLACES)
+        val = int(m.group(1)) / (10 ** _IMPLIED_PLACES)
     return round(-val if neg else val, 2)
 
 
@@ -143,13 +143,24 @@ def _recompute_cases(line: dict) -> None:
 
     case weight = pack count (PO4) x unit weight (VU). Called after IT1 and
     again once PO4 arrives, since PO4 follows IT1 in the segment stream.
-    Leaves ``cases`` None when VU is missing -- better to surface an unknown
-    than to invent a case count.
+
+    Refuses to convert -- leaving ``cases`` None -- when VU is missing or when
+    PO4 states its pack in a different UOM than the line was invoiced in (a
+    320 OZ line against a "004 5LB" pack can't be divided safely). Better to
+    surface an unknown than to invent a case count; ``summarize()`` names every
+    such line.
+
+    With no PO4 at all, the pack count falls back to 1 and
+    ``case_weight_estimated`` is set. That fallback is only right for
+    single-unit packs; for a 4-unit pack it overstates cases 4x, which is why
+    ``summarize()`` reports estimated-pack lines separately instead of letting
+    them pass as clean. All 117 real sample lines carry a PO4.
     """
     qty, uom, vu = line["qty"], line["uom"], line["unit_weight"]
     if qty is None or not _is_weight_uom(uom):
         return
-    if not vu:
+    pack_uom = (line["pack_uom"] or "").upper()
+    if not vu or (pack_uom and pack_uom != uom):
         line["cases"] = None
         line["case_weight"] = None
         return
@@ -201,6 +212,7 @@ def _parse_it1(row):
         "description": "",               # PID
         "pack": "",                      # PO4 as "004 5LB"
         "pack_count": None,              # PO401: units per case
+        "pack_uom": "",                  # PO403: UOM the pack is stated in
         "case_weight": None,             # pack_count x unit_weight
         "case_weight_estimated": False,  # True when PO4 was missing
         "brand": ids.get("BL", ""),
@@ -303,13 +315,19 @@ def parse_810(text: str) -> list[dict]:
             # PO4*004*5*LB -> pack "004 5LB", 4 units per case. The pack COUNT
             # is what we trust; PO4's size is rounded to whole units, so the
             # precise per-unit weight stays with VU (see module docstring).
-            pack, size, puom = _seg_at(row, 1), _seg_at(row, 2), _seg_at(row, 3)
             line = cur["lines"][-1]
-            if pack or size:
-                line["pack"] = f"{pack} {size}{puom}".strip()
-            n = _num(pack)
-            if n:
-                line["pack_count"] = int(n)
+            # PO4 carries no line reference, so lines[-1] is the only anchor.
+            # Take only the FIRST PO4 of a line: a later one would silently
+            # overwrite a correct pack count.
+            if line["pack_count"] is None and not line["pack"]:
+                pack, size, puom = (_seg_at(row, 1), _seg_at(row, 2),
+                                    _seg_at(row, 3).upper())
+                if pack or size:
+                    line["pack"] = f"{pack} {size}{puom}".strip()
+                line["pack_uom"] = puom
+                n = _num(pack)
+                if n:
+                    line["pack_count"] = int(n)
                 _recompute_cases(line)
         elif tag == "CTP" and cur["lines"]:
             amt = _money(_seg_at(row, 7))
@@ -347,15 +365,26 @@ def parse_810(text: str) -> list[dict]:
     return invoices
 
 
+def _signed(value, is_credit: bool):
+    """Apply credit direction to an amount. Uses magnitude, so a credit stays
+    negative whether the sender states its amounts positive (Cheney's
+    convention today) or already-negative."""
+    v = abs(value or 0.0)
+    return -v if is_credit else v
+
+
 def summarize(invoices: list[dict]) -> dict:
     """Roll a batch of parsed invoices into one summary, credits subtracted.
 
     Returns totals plus the integrity signals a daily feed should be watched
-    on: which invoices failed to reconcile against their own TDS, and which
-    lines could not be converted to cases.
+    on: invoices that failed to reconcile against their own TDS, lines that
+    could not be converted to cases, and lines whose case count rests on an
+    assumed pack size. Note reconciliation is a MONEY check -- it says nothing
+    about whether the case counts are right, which is why the case-side
+    signals are reported separately.
     """
-    net = round(sum(i["sign"] * (i["total"] or 0.0) for i in invoices), 2)
-    cases = round(sum(i["sign"] * (l["cases"] or 0.0)
+    net = round(sum(_signed(i["total"], i["is_credit"]) for i in invoices), 2)
+    cases = round(sum(_signed(l["cases"], i["is_credit"])
                       for i in invoices for l in i["lines"]), 3)
     return {
         "invoices": len(invoices),
@@ -367,6 +396,13 @@ def summarize(invoices: list[dict]) -> dict:
         "lines_without_cases": [
             f"{i['invoice_number']}:{l['line_no']} ({l['item_no']} {l['qty']} {l['uom']})"
             for i in invoices for l in i["lines"] if l["cases"] is None
+        ],
+        # Weight lines with no PO4: cases assume a 1-unit pack and are too high
+        # by the real pack count. Never let these read as clean.
+        "lines_with_estimated_pack": [
+            f"{i['invoice_number']}:{l['line_no']} ({l['item_no']} {l['qty']} "
+            f"{l['uom']} -> {l['cases']} cs assuming 1/pack)"
+            for i in invoices for l in i["lines"] if l["case_weight_estimated"]
         ],
         "line_count_mismatch": [
             i["invoice_number"] for i in invoices

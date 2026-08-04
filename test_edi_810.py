@@ -204,6 +204,139 @@ def test_credit_memo_is_signed_negative():
     print("ok: credit memo (BIG07=CR) carries sign=-1 and nets negative")
 
 
+def test_all_seven_real_invoices_reconcile():
+    """The whole drop, not just the two invoices the other tests poke at.
+    This is the claim the money fix rests on, so CI pins it."""
+    files = sorted(FIX.glob("CheneyInvoices_*.EDI"))
+    assert len(files) == 7, [f.name for f in files]
+    invs = []
+    for f in files:
+        invs.extend(parse_810(f.read_text()))
+    assert len(invs) == 7
+    for v in invs:
+        assert v["reconciles"], (v["invoice_number"], v["variance"])
+        assert v["total"] is not None and v["total"] < 100_000, v["total"]
+        # Every line resolves to a case count, and none of them guessed a pack.
+        for l in v["lines"]:
+            assert l["cases"] is not None, (v["invoice_number"], l["line_no"])
+            assert l["case_weight_estimated"] is False
+    s = summarize(invs)
+    assert s == {**s, "invoices": 7, "credits": 2, "lines": 117,
+                 "net_total": 10869.66, "unreconciled": [],
+                 "lines_without_cases": [], "lines_with_estimated_pack": [],
+                 "line_count_mismatch": [], "unit_count_mismatch": []}
+    # DC coverage across the drop: 3 tracked FL DCs + Statesville NC.
+    assert sorted({v["ship_from"] for v in invs}) == [
+        "OCALA", "PUNTA GORDA", "RIVIERA", "STATESVILLE"]
+    print("ok: all 7 real invoices reconcile; 117 lines all have case counts")
+
+
+def test_money_tolerates_commas_and_trailing_sign():
+    assert _money("1,676.19") == 1676.19
+    assert _money("9449-") == -94.49          # X12 trailing sign
+    assert _money("$1,676.19") == 1676.19
+    assert _money("1E3") is None              # not a number we should guess at
+    assert _money("12x34") is None
+    print("ok: money parsing handles commas + trailing sign, rejects junk")
+
+
+def test_credit_direction_survives_a_negative_total():
+    """If Cheney ever states credit amounts already-negative, a credit must
+    still net negative rather than flipping to a charge."""
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*CR9*20260730*PO9***CR*00",
+        "IT1*000010*-1.000*CA*83.10**VN*10063604",
+        "TDS*-8310",
+        "SE*5*1",
+    ]) + "~"
+    v = parse_810(doc)[0]
+    assert v["is_credit"] is True and v["total"] == -83.10
+    s = summarize([v])
+    assert s["net_total"] == -83.10, s["net_total"]
+    assert s["net_cases"] == -1.0, s["net_cases"]
+    print("ok: credit stays negative even when the sender pre-signs amounts")
+
+
+def test_second_po4_does_not_overwrite_the_first():
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*INV4*20260730*PO4X***DI*00",
+        "IT1*000010*24.000*LB*3.52**VN*10024349*TP*Y*VU*1.5",
+        "PO4*008*2*LB",
+        "PO4*004*5*LB",
+        "TDS*8448",
+        "SE*7*1",
+    ]) + "~"
+    line = parse_810(doc)[0]["lines"][0]
+    assert line["pack_count"] == 8 and line["case_weight"] == 12.0
+    assert line["cases"] == 2.0, line["cases"]
+    print("ok: a stray second PO4 cannot overwrite a line's pack count")
+
+
+def test_pack_in_a_different_uom_is_not_divided():
+    """A 320 OZ line against a '004 5LB' pack can't be divided safely -- report
+    no case count rather than a 16x-wrong one."""
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*INV5*20260730*PO5***DI*00",
+        "IT1*000010*320.000*OZ*0.18**VN*99999*TP*Y*VU*5",
+        "PO4*004*5*LB",
+        "TDS*5760",
+        "SE*6*1",
+    ]) + "~"
+    inv = parse_810(doc)[0]
+    assert inv["lines"][0]["cases"] is None
+    assert summarize([inv])["lines_without_cases"] == ["INV5:000010 (99999 320.0 OZ)"]
+    print("ok: mismatched pack UOM yields no case count instead of a wrong one")
+
+
+def test_estimated_pack_is_reported_not_hidden():
+    """No PO4 -> the pack count is assumed 1, which for a real 4-unit pack is
+    4x high. It must never pass the roll-up as clean."""
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*INV6*20260730*PO6***DI*00",
+        "IT1*000010*20.000*LB*2.80**VN*164011*TP*Y*VU*5",
+        "TDS*5600",
+        "SE*5*1",
+    ]) + "~"
+    inv = parse_810(doc)[0]
+    line = inv["lines"][0]
+    assert line["case_weight_estimated"] is True and line["cases"] == 4.0
+    s = summarize([inv])
+    assert s["lines_without_cases"] == []      # it DID produce a number...
+    assert s["lines_with_estimated_pack"] == [   # ...but the number is flagged
+        "INV6:000010 (164011 20.0 LB -> 4.0 cs assuming 1/pack)"]
+    print("ok: assumed-pack lines are surfaced separately from clean ones")
+
+
+def test_blank_quantity_on_a_weight_line_does_not_crash_reporting():
+    """Regression: the daily 810 report formatted qty with :g unconditionally,
+    so one blank IT102 on a non-CA line killed the whole run."""
+    doc = "~".join([
+        "ST*810*1",
+        "BIG*20260731*INV7*20260730*PO7***DI*00",
+        "IT1*000010**LB*2.73**VN*164011*TP*Y*VU*5",
+        "PO4*004*5*LB",
+        "TDS*0",
+        "SE*6*1",
+    ]) + "~"
+    line = parse_810(doc)[0]["lines"][0]
+    assert line["qty"] is None and line["cases"] is None
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "blank.edi"
+        p.write_text(doc)
+        r = subprocess.run(
+            [sys.executable, "scripts/ingest_cheney_810.py", "--edi", str(p)],
+            capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-800:]
+    assert "Batch summary" in r.stdout, r.stdout[-500:]
+    print("ok: blank quantity on a weight line no longer crashes the report")
+
+
 def test_summarize_flags_integrity_problems():
     invs = parse_810(INVOICE.read_text()) + parse_810(CREDIT.read_text())
     s = summarize(invs)

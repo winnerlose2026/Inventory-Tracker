@@ -47,13 +47,28 @@ ACCOUNT_TO_STORE: dict[str, str] = {
 
 
 def normalize_dc_code(code: str) -> str:
-    """'05', '5', '3005', ' 3005 ' -> '3005'. Returns '' when unrecognizable."""
+    """Cheney DC code -> the 4-digit form used as the key here.
+
+    '05', '5', '003005', ' 3005 ', '3005' -> '3005'. Always returns either 4
+    digits or ''.
+
+    The CSV feed's DC column is the last two digits of the 3-digit DC number,
+    so a 1-2 digit code is expanded with the '30' prefix every current Cheney
+    DC shares. Anything that isn't 1-2 significant digits or a full 4-digit
+    code is refused rather than guessed at -- callers should surface an unknown
+    DC, not silently attach rows to the wrong warehouse.
+    """
     s = "".join(ch for ch in (code or "") if ch.isdigit())
     if not s:
         return ""
-    if len(s) >= 4:
-        return s[-4:]
-    return "30" + s.zfill(2)
+    trimmed = s.lstrip("0")
+    if not trimmed:            # all zeros
+        return ""
+    if len(trimmed) <= 2:
+        return "30" + trimmed.zfill(2)
+    if len(trimmed) == 4:
+        return trimmed
+    return ""
 
 
 def dc_name(code: str) -> str:

@@ -56,6 +56,11 @@ def main() -> int:
                    help="Parse + print only (default)")
     p.add_argument("--commit", dest="dry_run", action="store_false",
                    help="Actually POST the events to the tracker")
+    p.add_argument("--allow-all-zero", action="store_true",
+                   help="Accept a CSV whose on-hand column is zero on every "
+                        "row. Refused by default, because applying it zeroes "
+                        "out every warehouse's count -- pass this ONLY for a "
+                        "deliberate zero-out.")
     args = p.parse_args()
 
     path = Path(args.csv)
@@ -63,7 +68,8 @@ def main() -> int:
         print(f"ERROR: CSV not found: {path}", file=sys.stderr)
         return 2
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    events, errors = parse_inventory_csv(text, filename=path.name)
+    events, errors = parse_inventory_csv(text, filename=path.name,
+                                        allow_all_zero=args.allow_all_zero)
 
     print(f"Parsed {len(events)} on_hand event(s), {len(errors)} issue(s) from {path.name}")
     for e in errors:

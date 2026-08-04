@@ -130,6 +130,56 @@ ledger.
   prices some items at more than one pack/split. Rows are returned as-is;
   dedup is the caller's decision.
 
+## Hardening from the review pass
+
+An adversarial review of the first cut found several real problems, fixed here:
+
+- **The "on-hand arrives later" claim wasn't true.** The most likely form of the
+  fix Cheney owes us is the *same* headerless layout with the on-hand column
+  filled in — and shape-based routing sent it to the order-guide parser, which
+  emits nothing, while the log said "no on-hand data in this file". The decision
+  is now made on *content*, not shape: an order-guide-layout file whose on-hand
+  column is populated is converted to `on_hand` events
+  (`cheney_order_guide.to_on_hand_events`), and only an all-zero one is refused.
+  `case_size` comes from the pack string, so `001 60CT` yields 60 per case
+  rather than 1.
+- **Crash in the daily 810 report.** `ingest_cheney_810.py` formatted `qty` with
+  `:g` unconditionally, so a single blank `IT102` on a non-`CA` line raised
+  `TypeError` and killed the run before the batch summary printed. All
+  nullable fields are now formatted defensively.
+- **The no-PO4 fallback was silently wrong.** Assuming a 1-unit pack overstates
+  cases by the real pack count — the exact error this change set out to fix.
+  The estimate is kept (it beats nothing) but `summarize()` now reports
+  `lines_with_estimated_pack` separately, so it can't pass as clean. Reworded
+  the "all reconcile" line to say reconciliation is a *money* check that says
+  nothing about case counts.
+- **A good snapshot could be refused.** `_role_for_header` bound `qty` to the
+  first header containing "on hand", so a feed with `Split Units On Hand`
+  before `Cases On Hand` read splits as cases and then tripped the all-zero
+  guard. Split/each/unit/weight headers no longer claim the `qty` role.
+- **`allow_all_zero=True` was unreachable.** The refusal message told operators
+  to do something no caller supported. `ingest_cheney_inventory_csv.py` now has
+  `--allow-all-zero`, and the message points at it.
+- **`normalize_dc_code` could return 5 characters.** `"012"` became `"30012"`
+  instead of `"3012"`, silently turning Statesville into an unknown DC. It now
+  strips leading zeros and returns 4 digits or `''` — and refuses genuinely
+  ambiguous 3-digit input rather than guessing.
+- **Mismatched pack UOM.** A 320 `OZ` line divided by a `004 5LB` pack gave a
+  16x-wrong case count. Conversion now requires PO4's UOM to match the line's,
+  otherwise `cases` is None and the line is surfaced.
+- **A second PO4 could overwrite a correct pack count** (PO4 carries no line
+  reference, so `lines[-1]` is the only anchor). Only the first PO4 per line is
+  taken.
+- **Credit direction is now magnitude-based**, so a credit stays negative even
+  if Cheney starts stating credit amounts already-negative.
+- **`_money`** tolerates thousands separators and X12 trailing signs, and
+  rejects junk like `"1E3"` instead of reading it as `0.01`.
+- **Fixtures**: all 7 real invoices are now checked in, and a test asserts every
+  one reconciles with a confirmed case count on all 117 lines. Previously only
+  2 were pinned, so the headline claim wasn't actually covered by CI.
+
+Test count 172 → 184.
+
 ## Still open (not code)
 
 1. **The on-hand feed does not exist yet.** This is the blocker: the tracker

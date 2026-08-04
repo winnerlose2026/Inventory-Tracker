@@ -52,14 +52,18 @@ try:  # package import
         warehouse_from_dc_code, dc_name, is_known_dc, normalize_dc_code,
         store_from_account,
     )
-    from .cheney_inventory_report import _variety, _clean_code
+    from .cheney_inventory_report import (
+        _variety, _clean_code, _build_name, DEFAULT_CASE_SIZE)
+    from .cheney_po_parser import CHENEY_CASE_COST
     from .parsers._common import opt_float
 except ImportError:  # standalone (tests / CLI)
     from cheney_dcs import (  # type: ignore
         warehouse_from_dc_code, dc_name, is_known_dc, normalize_dc_code,
         store_from_account,
     )
-    from cheney_inventory_report import _variety, _clean_code  # type: ignore
+    from cheney_inventory_report import (  # type: ignore
+        _variety, _clean_code, _build_name, DEFAULT_CASE_SIZE)
+    from cheney_po_parser import CHENEY_CASE_COST  # type: ignore
     from parsers._common import opt_float  # type: ignore
 
 DISTRIBUTOR = "Cheney Brothers"
@@ -229,6 +233,82 @@ def parse_order_guide(csv_text: str, *, filename: str = "OrderGuide.csv"):
     return rows, errors, meta
 
 
+def _units_per_case(pack_count, pack_size: str):
+    """Units per case from the order guide's pack string.
+
+    "001 60CT" -> 60 (one 60-count pack), "024 12OZ" -> 24 (24 cans),
+    "004 5LB"  -> 4. A count size multiplies; a weight/volume size does not.
+    Returns None when the pack can't be read.
+    """
+    if not pack_count:
+        return None
+    m = re.match(r"^([\d.]+)\s*CT\b", (pack_size or "").upper())
+    if m:
+        try:
+            return int(pack_count * float(m.group(1)))
+        except ValueError:
+            return None
+    return int(pack_count)
+
+
+def to_on_hand_events(rows: list[dict], *, filename: str = "OrderGuide.csv"):
+    """Turn order-guide rows into ``on_hand`` events -- ONLY valid when the
+    file's on-hand column is actually populated.
+
+    Callers must check ``meta["on_hand_populated"]`` first; a file with an
+    all-zero on-hand column is a price list, and converting it would erase
+    every warehouse's real count. ``cheney_csv_inventory.parse_inventory_csv``
+    enforces that ordering, so route through it rather than calling this
+    directly.
+
+    Returns (events, errors) in the same shape as
+    ``cheney_csv_inventory.parse_inventory_csv``.
+    """
+    events: list[dict] = []
+    errors: list[str] = []
+    idx = 0
+    for r in rows:
+        if r["on_hand"] is None:
+            continue
+        if not r["variety"]:
+            errors.append(f"cheney order guide: unmapped row "
+                          f"(item={r['item_no']!r}, brand={r['brand']!r})")
+            continue
+        if not r["warehouse"]:
+            errors.append(
+                f"cheney order guide: DC {r['dc_name'] or r['dc_code']!r} is not a "
+                f"tracked warehouse -- skipped {r['variety']} "
+                f"(item={r['item_no']!r})")
+            continue
+        idx += 1
+        item: dict = {
+            "quantity": r["on_hand"],
+            "distributor": DISTRIBUTOR,
+            "name": _build_name(DISTRIBUTOR, r["variety"], r["warehouse"]),
+            "variety": r["variety"],
+            "warehouse": r["warehouse"],
+            "unit": "cs",
+            "case_size": _units_per_case(r["case_size"], r["pack_size"])
+                         or DEFAULT_CASE_SIZE,
+            "case_cost": (r["case_cost"] if r["case_cost"] is not None
+                          else CHENEY_CASE_COST),
+        }
+        if r["item_no"]:
+            item["distributor_sku"] = r["item_no"]
+        ev: dict = {
+            "event_type": "on_hand",
+            "item": item,
+            "source_message_id": f"cheney-order-guide:{filename}#{idx}",
+            "source_subject": f"Cheney daily order guide (with on-hand): {filename}",
+            "po_number": "",
+            "po_revision": "",
+        }
+        if r["snapshot_date"]:
+            ev["count_date"] = r["snapshot_date"]
+        events.append(ev)
+    return events, errors
+
+
 def summarize(rows: list[dict], meta: dict) -> dict:
     """Compact per-file summary for the daily feed report."""
     priced = [r for r in rows if r["case_cost"] is not None]
@@ -250,6 +330,7 @@ def summarize(rows: list[dict], meta: dict) -> dict:
 
 
 __all__ = [
-    "parse_order_guide", "looks_like_order_guide", "summarize",
-    "account_from_filename", "snapshot_from_filename", "DISTRIBUTOR",
+    "parse_order_guide", "looks_like_order_guide", "to_on_hand_events",
+    "summarize", "account_from_filename", "snapshot_from_filename",
+    "DISTRIBUTOR",
 ]

@@ -77,12 +77,17 @@ def main() -> int:
             cases = f"{l['cases']:g}" if l["cases"] is not None else "?"
             note = ""
             if l["uom"] not in ("CA", ""):
-                note = f"  [{l['qty']:g} {l['uom']} @ {l['case_weight'] or '?'}/cs]"
+                # Every field here can legitimately be None (blank IT102, no
+                # VU, no PO4), so format defensively -- this print must never
+                # be what kills the daily run.
+                qty = f"{l['qty']:g}" if l["qty"] is not None else "?"
+                cw = f"{l['case_weight']:g}" if l["case_weight"] is not None else "?"
+                note = f"  [{qty} {l['uom']} @ {cw}/cs]"
                 if l["case_weight_estimated"]:
-                    note += " (pack estimated)"
+                    note += " (pack ASSUMED 1/case -- cases may be high)"
             print(f"    item {l['item_no'] or '—':>10}  {cases:>7} cs "
                   f"@ {_fmt_money(l['unit_price'])} = {_fmt_money(l['extended'])}"
-                  f"  {l['description'][:34]}{note}")
+                  f"  {(l['description'] or '')[:34]}{note}")
         verdict = ("reconciles" if v["reconciles"]
                    else f"MISMATCH off by {_fmt_money(v['variance'])}")
         print(f"    subtotal {_fmt_money(v['subtotal'])}"
@@ -96,15 +101,19 @@ def main() -> int:
     print(f"    invoices {s['invoices']} ({s['credits']} credit memo(s)), "
           f"{s['lines']} line(s)")
     print(f"    net total {_fmt_money(s['net_total'])}   net cases {s['net_cases']:g}")
+    problems = ("unreconciled", "lines_without_cases",
+                "lines_with_estimated_pack", "line_count_mismatch",
+                "unit_count_mismatch")
     for label, key in (("did NOT reconcile", "unreconciled"),
                        ("no case count", "lines_without_cases"),
+                       ("pack size assumed", "lines_with_estimated_pack"),
                        ("CTT line-count mismatch", "line_count_mismatch"),
                        ("ISS unit-count mismatch", "unit_count_mismatch")):
         if s[key]:
-            print(f"    {label}: {', '.join(str(x) for x in s[key])}")
-    if not any(s[k] for k in ("unreconciled", "lines_without_cases",
-                              "line_count_mismatch", "unit_count_mismatch")):
-        print("    all invoices reconcile against their own TDS totals")
+            print(f"    ! {label}: {', '.join(str(x) for x in s[key])}")
+    if not any(s[k] for k in problems):
+        print("    all invoices reconcile against their own TDS totals, "
+              "and every line has a confirmed case count")
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(invoices, indent=2))

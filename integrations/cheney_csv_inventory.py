@@ -41,7 +41,8 @@ try:  # package import
         DEFAULT_CASE_SIZE,
     )
     from .cheney_po_parser import CHENEY_CASE_COST
-    from .cheney_order_guide import looks_like_order_guide
+    from .cheney_order_guide import (
+        looks_like_order_guide, parse_order_guide, to_on_hand_events)
     from .parsers._common import opt_float, opt_int
 except ImportError:  # standalone (tests / CLI)
     from cheney_inventory_report import (  # type: ignore
@@ -49,7 +50,8 @@ except ImportError:  # standalone (tests / CLI)
         DEFAULT_CASE_SIZE,
     )
     from cheney_po_parser import CHENEY_CASE_COST  # type: ignore
-    from cheney_order_guide import looks_like_order_guide  # type: ignore
+    from cheney_order_guide import (  # type: ignore
+        looks_like_order_guide, parse_order_guide, to_on_hand_events)
     from parsers._common import opt_float, opt_int  # type: ignore
 
 DISTRIBUTOR = "Cheney Brothers"
@@ -78,7 +80,12 @@ def _role_for_header(h: str) -> str:
     # case cost / price
     if "case cost" in s or "casecost" in s or "unit cost" in s or s in ("cost", "price", "extended cost") or "case price" in s:
         return "case_cost"
-    # on-hand quantity (cases)
+    # on-hand quantity, in CASES. A feed that also reports splits/eaches/weight
+    # on hand ("Split Units On Hand") must not win the qty role: it tends to
+    # come first in the row, and binding to it both reads splits as cases and
+    # trips the all-zero guard on a perfectly good snapshot.
+    if any(k in s for k in ("split", "each", "unit", "weight", "lb", "pound")):
+        return ""
     if ("on hand" in s or "onhand" in s or "on hnd" in s or "full case" in s
             or s in ("cases", "qty", "quantity", "oh", "cs oh", "cases on hand", "on hand cases")):
         return "qty"
@@ -134,12 +141,24 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
     if not (csv_text or "").strip():
         return events, ["cheney inventory csv: empty file"]
 
-    # Guard 1: Cheney's headerless order-guide export is not an on-hand file.
+    # Cheney's headerless order-guide export. Its column layout is known, so
+    # the deciding question is whether the on-hand column is actually
+    # populated:
+    #   * populated -> this IS the daily snapshot we've been waiting for;
+    #     convert it and carry on.
+    #   * all zero  -> a price list. Refuse: applying it would write 0 cases
+    #     for every item at every warehouse.
     if looks_like_order_guide(csv_text):
+        og_rows, og_errors, og_meta = parse_order_guide(csv_text, filename=filename)
+        if og_meta["on_hand_populated"] and not allow_all_zero:
+            events, conv_errors = to_on_hand_events(og_rows, filename=filename)
+            shape_errors = [e for e in og_errors if "NOT an" not in e]
+            return events, shape_errors + conv_errors
         return events, [
             f"cheney inventory csv {filename}: this is Cheney's headerless "
-            f"OrderGuide export (catalog + case cost), not an on-hand "
-            f"snapshot -- refused. Parse it with "
+            f"OrderGuide export (catalog + case cost) with no on-hand "
+            f"quantities -- refused, since applying it would zero out every "
+            f"warehouse's count. Parse it with "
             f"integrations.cheney_order_guide.parse_order_guide instead."
         ]
 
@@ -176,7 +195,8 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
                 f"({header[roles['qty']]!r}) is zero or blank on all "
                 f"{len(data_rows)} row(s) -- refused rather than zeroing out "
                 f"every warehouse's count. If this really is a full zero-out, "
-                f"re-run with allow_all_zero=True."
+                f"re-run scripts/ingest_cheney_inventory_csv.py with "
+                f"--allow-all-zero."
             ]
 
     idx = 0

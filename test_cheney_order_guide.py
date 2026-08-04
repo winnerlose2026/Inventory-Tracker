@@ -126,6 +126,98 @@ def test_all_zero_qty_column_refused_in_on_hand_csv():
     print("ok: all-zero on-hand column refused unless explicitly allowed")
 
 
+def test_same_layout_with_on_hand_populated_becomes_a_real_snapshot():
+    """The most likely shape of the fix Cheney owes us: same headerless
+    7-column export, on-hand column filled in. That MUST flow through to
+    on_hand events rather than being dismissed as a price list."""
+    csv_text = (
+        "10153018,H & H,05,14,001 60CT,30.00,20260803113325\n"
+        "10153048,H & H,05,9,001 60CT,30.00,20260803113325\n"
+        "10153046,H & H,05,0,001 60CT,30.00,20260803113325\n"
+    )
+    fn = "OrderGuide-20260803-113325_0060458212.csv"
+    rows, errors, meta = parse_order_guide(csv_text, filename=fn)
+    assert meta["on_hand_populated"] is True
+    assert meta["on_hand_nonzero_rows"] == 2
+    # No "this is a price list" complaint when there IS on-hand data.
+    assert not any("NOT an" in e for e in errors), errors
+
+    events, errs = parse_inventory_csv(csv_text, filename=fn)
+    assert len(events) == 3, (len(events), errs)
+    by_variety = {e["item"]["variety"]: e for e in events}
+    assert set(by_variety) == {"Plain", "Everything", "Cinnamon Raisin"}
+    plain = by_variety["Plain"]["item"]
+    assert plain["quantity"] == 14.0
+    assert plain["warehouse"] == "Ocala, FL"
+    assert plain["unit"] == "cs"
+    assert plain["case_size"] == 60          # "001 60CT" -> 60 per case, not 1
+    assert plain["case_cost"] == 30.00
+    assert plain["distributor_sku"] == "10153018"
+    assert by_variety["Plain"]["count_date"] == "2026-08-03"
+    # A genuine zero row still rides along -- it's a real count of zero here.
+    assert by_variety["Cinnamon Raisin"]["item"]["quantity"] == 0.0
+    print("ok: order-guide layout WITH on-hand converts to on_hand events")
+
+
+def test_units_per_case_from_pack_string():
+    """Count packs multiply; weight/volume packs don't."""
+    csv_text = (
+        "10153018,H & H,05,3,001 60CT,30.00,20260803113325\n"
+        "164011,KRAFT,05,2,004 5LB,2.80,20260803113325\n"
+        "102309,COKE,05,5,024 12OZ,49.27,20260803113325\n"
+    )
+    rows, _errors, meta = parse_order_guide(csv_text, filename="OrderGuide-20260803-113325_0060458212.csv")
+    assert meta["on_hand_populated"] is True
+    packs = {r["item_no"]: (r["case_size"], r["pack_size"]) for r in rows}
+    assert packs["10153018"] == (1, "60CT")
+    assert packs["164011"] == (4, "5LB")
+    assert packs["102309"] == (24, "12OZ")
+    # Only the H&H item resolves to a variety, so only it becomes an event.
+    events, _ = parse_inventory_csv(csv_text, filename="OrderGuide-20260803-113325_0060458212.csv")
+    assert len(events) == 1
+    assert events[0]["item"]["case_size"] == 60      # 1 x 60 CT
+    print("ok: 60CT pack -> case_size 60; weight/volume packs use pack count")
+
+
+def test_untracked_dc_rows_are_skipped_with_a_reason():
+    """Statesville has on-hand but no tracker warehouse -- skip, don't guess."""
+    csv_text = "10153018,H & H,12,11,001 60CT,30.00,20260803113325\n"
+    fn = "OrderGuide-20260803-113325_0060415887.csv"
+    events, errors = parse_inventory_csv(csv_text, filename=fn)
+    assert events == []
+    assert any("not a tracked warehouse" in e for e in errors), errors
+    print("ok: on-hand rows for an untracked DC are skipped with a reason")
+
+
+def test_split_units_column_does_not_steal_the_qty_role():
+    """A feed reporting splits AND cases on hand must bind qty to the CASES
+    column. Binding to 'Split Units On Hand' both misreads splits as cases and
+    trips the all-zero guard on a good snapshot."""
+    header = ("Item #,Description,DC,Split Units On Hand,Cases On Hand,"
+              "Case Size,Case Cost,Snapshot Timestamp\n")
+    body = ("10153018,BAGEL PLAIN PARBAKED,Ocala,0,14,60,30.00,2026-08-03\n"
+            "10153048,BAGEL EVERYTHING PARBAKED,Ocala,0,9,60,30.00,2026-08-03\n")
+    events, errors = parse_inventory_csv(header + body, filename="split.csv")
+    assert len(events) == 2, (len(events), errors)
+    qty = {e["item"]["variety"]: e["item"]["quantity"] for e in events}
+    assert qty == {"Plain": 14.0, "Everything": 9.0}, qty
+    print("ok: 'Cases On Hand' wins the qty role over 'Split Units On Hand'")
+
+
+def test_normalize_dc_code_refuses_ambiguous_input():
+    # Zero-padded short codes still resolve.
+    assert normalize_dc_code("005") == "3005"
+    assert normalize_dc_code("012") == "3012"
+    assert normalize_dc_code("003005") == "3005"
+    # Always 4 digits or empty -- never a 5-character code.
+    for bad in ("", "0", "00", "300", "30012", "abc", "-"):
+        out = normalize_dc_code(bad)
+        assert out == "" or len(out) == 4, (bad, out)
+    assert normalize_dc_code("300") == ""     # ambiguous, refused not guessed
+    assert warehouse_from_dc_code("300") == ""
+    print("ok: normalize_dc_code returns 4 digits or nothing")
+
+
 def test_looks_like_order_guide_does_not_false_positive():
     assert looks_like_order_guide(ALTAMONTE.read_text())
     assert looks_like_order_guide(CHAPEL_HILL.read_text())

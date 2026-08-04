@@ -142,17 +142,25 @@ def main() -> int:
     for lp in sorted(csv_files):
         text = lp.read_text(encoding="utf-8", errors="replace")
         if looks_like_order_guide(text):
-            guides += 1
             rows, errors, meta = parse_order_guide(text, filename=lp.name)
             s = og_summarize(rows, meta)
             where = ", ".join(s["warehouses"]) or ", ".join(s["out_of_scope_dc"]) or "?"
-            print(f"  ORDER GUIDE {lp.name}: {s['rows']} row(s) for "
-                  f"{s['store']} ({where}); {s['priced_rows']} priced, "
-                  f"{len(s['hh_varieties'])} H&H variet(y/ies). "
-                  f"NOT applied to on-hand (no on-hand data in this file).")
-            for e in errors[:3]:
-                print(f"      ! {e}")
-            continue
+            if not meta["on_hand_populated"]:
+                guides += 1
+                print(f"  ORDER GUIDE {lp.name}: {s['rows']} row(s) for "
+                      f"{s['store']} ({where}); {s['priced_rows']} priced, "
+                      f"{len(s['hh_varieties'])} H&H variet(y/ies). "
+                      f"NOT applied to on-hand (no on-hand data in this file).")
+                for e in errors[:3]:
+                    print(f"      ! {e}")
+                continue
+            # Same layout, but the on-hand column IS populated -- this is the
+            # snapshot we've been waiting on. POST it; the receiver routes it
+            # through cheney_csv_inventory, which converts it.
+            print(f"  ORDER GUIDE + ON-HAND {lp.name}: {s['rows']} row(s) for "
+                  f"{s['store']} ({where}); on-hand IS populated "
+                  f"({meta['on_hand_nonzero_rows']} non-zero row(s)) -- "
+                  f"applying as a snapshot.")
         onhand += 1
         url = f"{args.api_base}/api/ingest/cheney-inventory-csv?dry_run={dry}&filename={lp.name}"
         status, resp = _post(url, lp.read_bytes(), args.token, "text/csv")
