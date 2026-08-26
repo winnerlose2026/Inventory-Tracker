@@ -235,6 +235,21 @@ def _move_to_processed(ftp: ftplib.FTP_TLS, src_path: str,
 
 
 # ---------------------------------------------------------------------------
+# Public transport helpers
+# ---------------------------------------------------------------------------
+# scripts/sync_cheney_feeds.py pulls Cheney's own drop off this same cPanel
+# host (their real filenames -- OrderGuide-*.csv / CheneyInvoices_*.EDI --
+# don't match classify() below, so that bridge owns the parsing). It needs
+# the same FTPS client, including the shared-hosting TLS workaround in
+# _connect(), so the transport is exported here rather than duplicated.
+
+connect_ftps = _connect
+list_remote_files = _list_incoming
+download_bytes = _download_bytes
+move_to_processed = _move_to_processed
+
+
+# ---------------------------------------------------------------------------
 # File classification
 # ---------------------------------------------------------------------------
 
