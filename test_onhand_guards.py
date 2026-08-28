@@ -99,12 +99,20 @@ def test_every_mfg_code_is_refused_as_on_hand():
 
 
 def test_plausible_counts_near_the_code_range_still_apply():
-    """The guard is an exact-match tripwire, not a ceiling."""
+    """The guard is an exact-match tripwire, not a ceiling.
+
+    The sample values must not themselves be mfg codes -- 1154 used to sit in
+    the gap between 1153 and 1155 until Pumpernickel (the October LTO) claimed
+    it. Assert the gap instead of trusting a literal.
+    """
+    from integrations.hh_mfg_codes import HH_MFG_CODE_TO_VARIETY as codes
+    for probe in (1, 60, 417, 1149, 1190):
+        assert str(probe) not in codes, probe
     with TemporaryDirectory() as td:
         sys.path.insert(0, str(Path(__file__).parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
-        for qty in (1, 60, 417, 1149, 1154, 1190):
+        for qty in (1, 60, 417, 1149, 1190):
             sync._apply_events(
                 [_on_hand(qty, "Plain", "Ocala, FL",
                           source_id="cheney-xlsx:wk.xlsx#1")], dry_run=False)

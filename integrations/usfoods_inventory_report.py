@@ -92,6 +92,12 @@ REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     # Volunteer State area buyer copied on the same standing thread.
     "kimberly.cobb@usfoods.com": ("US Foods", "Alcoa, TN"),
     "christy.dunn@usfoods.com": ("US Foods", "Alcoa, TN"),
+    # NW Houston (DC B2, 13400 Hollister Rd). Charles Youngblood is the
+    # major account exec covering the Texas market; Tom Foley is the area
+    # buyer who actually cuts and re-cuts the POs. Either can send the
+    # weekly numbers, so both resolve to the same DC.
+    "charles.youngblood@usfoods.com": ("US Foods", "Houston, TX"),
+    "tom.foley@usfoods.com": ("US Foods", "Houston, TX"),
 }
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
@@ -101,6 +107,7 @@ USF_ITEM_NO_TO_MFG: dict[str, str] = {
     "1055010": "1184",  # Egg
     "1055061": "1171",  # Blueberry
     "1055064": "1159",  # Asiago
+    "1055066": "1154",  # Pumpernickel (October LTO)
     "1055074": "1189",  # Jalapeno Cheddar
     "1137644": "1157",  # Whole Wheat Everything
     "1198923": "1156",  # Whole Wheat

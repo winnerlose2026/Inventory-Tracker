@@ -183,10 +183,16 @@ class EmailEvent:
     # tracks the real lead time even for backlogged messages.
     po_order_date: str = ""
     # ISO datetime the SOURCE EMAIL was received. US Foods amends a PO without
-    # bumping the revision number (re-sending it as "REVISED"/"REPRINT"), so
-    # the revision token alone can't order two copies -- see
-    # integrations/po_revision.is_newer. Populated by every scan path.
+    # bumping the revision number (re-sending it as "REVISED"/"REPRINT"), and
+    # sometimes re-numbers DOWNWARD, so the revision token alone can't order
+    # two copies -- see integrations/po_revision.is_newer. Populated by every
+    # scan path.
     source_received_at: str = ""
+    # From: header of the source email. Ordering two copies of a PO is by
+    # received time, which makes a stale copy forwarded into JD@/info@ look
+    # like the newest document. po_revision.is_newer uses this to refuse to let
+    # an internally-forwarded copy supersede one the distributor sent.
+    source_sender: str = ""
     # ISO datetime (or YYYY-MM-DD) of when the count was actually taken at the
     # warehouse -- in practice the report email's sent date. Lets
     # _apply_email_event stamp last_count_at / last_usage_report_at with the
@@ -529,7 +535,7 @@ def _received_at_from_message(msg) -> str:
 
 
 def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                          received_at=""):
+                          received_at="", sender=""):
     """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
 
     Returns (events, errors). Errors are strings suitable for
@@ -579,13 +585,14 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
             po_revision=po.po_revision or "",
             po_order_date=_iso_from_usf_date(po.order_date),
             source_received_at=received_at or "",
+            source_sender=sender or "",
         ))
 
     return events, errors
 
 
 def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                         received_at=""):
+                         received_at="", sender=""):
     """Parse a Cheney Brothers PO PDF and convert each line to a restock
     EmailEvent.
 
@@ -638,6 +645,7 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
             po_revision="",
             po_order_date=_iso_from_cheney_date(po.order_date),
             source_received_at=received_at or "",
+            source_sender=sender or "",
         ))
 
     return events, errors
@@ -986,12 +994,14 @@ def parse_message_with_errors(msg):
         if distributor == "US Foods":
             d_events, d_errs = _usfoods_po_to_events(
                 payload, distributor, msg_id, subject, received_at=received_at,
+                sender=from_hdr,
             )
             events.extend(d_events)
             errors.extend(d_errs)
         elif distributor == "Cheney Brothers":
             d_events, d_errs = _cheney_po_to_events(
                 payload, distributor, msg_id, subject, received_at=received_at,
+                sender=from_hdr,
             )
             events.extend(d_events)
             errors.extend(d_errs)

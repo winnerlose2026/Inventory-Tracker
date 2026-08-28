@@ -4,7 +4,12 @@ Anchored on the real Houston incident (PO 305202B2) and on JD's description of
 US Foods' behaviour: they amend a PO without changing the PO number, labelling
 the re-send "REVISED" or "REPRINT".
 """
-from integrations.po_revision import is_newer, rev_int, is_numeric_rev, parse_dt
+from integrations.po_revision import (
+    is_newer, is_internal_sender, rev_int, is_numeric_rev, parse_dt,
+)
+
+VENDOR   = "Foley, Tom <tom.foley@usfoods.com>"
+INTERNAL = "JD Gross <JD@hhbagels.com>"
 
 GREENE = "2026-07-30T15:57:55Z"   # 305202B2 REPRINT   -> Plain 176 (stale)
 FOLEY  = "2026-07-30T19:05:38Z"   # 305202B2 0000003   -> Plain 168 (correct)
@@ -39,18 +44,57 @@ def test_later_reprint_supersedes_an_earlier_reprint():
                     "REPRINT", GREENE) is True
 
 
+# --- USF re-numbers DOWNWARD when a buyer re-cuts an order ------------------
+# 505876B2: rev 0000006 landed 18:03, Foley's CORRECTION landed 18:20 as rev
+# 0000003 with the pumpernickel added and the wrong SKU dropped. Under the old
+# "higher number always wins" rule the correction was rejected and Houston sat
+# at 104 cs against a 112 cs PO. The number is a tie-break now, not an override.
+
+def test_a_later_correction_wins_even_with_a_lower_number():
+    assert is_newer("0000003", "2026-08-25T18:20:11Z",
+                    "0000006", "2026-08-25T17:03:00Z",
+                    VENDOR, VENDOR) is True
+
+
+def test_an_earlier_higher_number_does_not_beat_a_later_correction():
+    assert is_newer("0000006", "2026-08-25T17:03:00Z",
+                    "0000003", "2026-08-25T18:20:11Z",
+                    VENDOR, VENDOR) is False
+
+
 # --- guard: a stale forward must not clobber a newer revision ---------------
+# The number can't carry this any more, so the SENDER does: a copy forwarded
+# from our own domain never outranks one the distributor sent.
 
-def test_stale_forward_of_an_older_number_cannot_win_on_date():
-    """JD forwards an old copy; it lands with a brand-new received time.
-    Both tokens are numeric, so the number wins and the forward is ignored."""
+def test_internal_forward_cannot_clobber_a_vendor_sent_revision():
+    """JD forwards an old copy into info@; it lands with a brand-new time."""
     assert is_newer("0000001", "2026-08-03T09:00:00Z",
-                    "0000003", FOLEY) is False
+                    "0000003", FOLEY, INTERNAL, VENDOR) is False
+    # Even a HIGHER number from an internal forward loses to the vendor copy.
+    assert is_newer("0000009", "2026-08-03T09:00:00Z",
+                    "0000003", FOLEY, INTERNAL, VENDOR) is False
 
 
-def test_higher_number_wins_even_when_it_arrives_earlier():
-    assert is_newer("0000005", "2026-07-01T00:00:00Z",
-                    "0000002", "2026-07-20T00:00:00Z") is True
+def test_vendor_copy_supersedes_an_earlier_internal_forward():
+    assert is_newer("0000003", FOLEY,
+                    "0000001", GREENE, VENDOR, INTERNAL) is True
+
+
+def test_internal_forward_still_applies_when_nothing_else_is_stored():
+    """Nothing to protect: an unknown/blank stored sender is not 'vendor'."""
+    assert is_newer("0000003", FOLEY, "0000001", GREENE, INTERNAL, "") is True
+
+
+def test_sender_classification():
+    assert is_internal_sender(INTERNAL) is True
+    assert is_internal_sender("jd@HHBAGELS.COM") is True
+    assert is_internal_sender(VENDOR) is False
+    assert is_internal_sender("") is False
+
+
+def test_senders_are_optional():
+    """Callers without sender data get pure date ordering."""
+    assert is_newer("0000001", "2026-08-03T09:00:00Z", "0000003", FOLEY) is True
 
 
 # --- idempotency ------------------------------------------------------------
@@ -76,13 +120,14 @@ def test_dated_incoming_supersedes_a_row_stored_before_the_date_field():
     number are a duplicate, though -- idempotency must hold."""
     assert is_newer("REPRINT", FOLEY, "REPRINT", "") is True
     assert is_newer("REPRINT", FOLEY, "0000004", "") is True
-    assert is_newer("0000003", FOLEY, "0000003", "") is False
+    # A dated document always supersedes an undated legacy row -- re-applying
+    # the same numbers is a harmless no-op, and it lets the row acquire a date.
+    assert is_newer("0000003", FOLEY, "0000003", "") is True
 
 
 def test_undated_non_numeric_incoming_never_beats_a_dated_stored_row():
-    """An undated REPRINT can't supersede a dated revision -- there's no
-    evidence it came later. (A higher NUMBER still wins undated: that's
-    rule 1, asserted by test_higher_number_wins_even_when_it_arrives_earlier.)"""
+    """An undated document can't supersede a dated one -- there's no evidence
+    it came later, whatever its revision number."""
     assert is_newer("REPRINT", "", "0000003", FOLEY) is False
     assert is_newer("", "", "0000003", FOLEY) is False
 

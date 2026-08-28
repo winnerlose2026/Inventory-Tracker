@@ -45,9 +45,11 @@ from inventory_tracker import add_item, load_inventory, save_inventory
 CASE_COST = {"Cheney Brothers": 26.50, "US Foods": 27.00}
 CASE_SIZE = 60
 
-# Variety -> (weekly usage cs/wk, on-hand cases, low-stock threshold cases).
-# Quantities and thresholds are whole cases. Weekly usage is a rate so it's
-# allowed to be fractional.
+# Variety -> (weekly usage cs/wk, on-hand cases, low-stock threshold cases
+# [, category]). Quantities and thresholds are whole cases. Weekly usage is a
+# rate so it's allowed to be fractional. The optional 5th element overrides the
+# "bagels" category -- used to mark limited-time offers, which the low-stock
+# panel should not nag about before the promo window opens.
 VARIETIES = [
     ("Plain",                   2.0, 2, 1),
     ("Everything",              1.7, 2, 1),
@@ -61,6 +63,13 @@ VARIETIES = [
     ("Onion",                   0.5, 1, 1),
     ("Asiago",                  0.3, 1, 1),
     ("Jalapeno Cheddar",        0.3, 1, 1),
+    # --- Limited-time offers -------------------------------------------------
+    # Pumpernickel is an OCTOBER-ONLY promo (APN 1055066 / H&H mfg 1154). Each
+    # DC cuts one PO for a fixed promo allocation rather than reordering to a
+    # par, so it seeds at 0 on hand with no threshold and no usage rate: the
+    # real numbers arrive from the POs and the weekly counts. Giving it a par
+    # would light up every warehouse as OUT for the five weeks before launch.
+    ("Pumpernickel",            0.0, 0, 0, "bagels-lto"),
 ]
 
 # Distributor -> [(warehouse label, short tag, stock multiplier)]
@@ -90,7 +99,9 @@ DISTRIBUTOR_TAG = {"Cheney Brothers": "CB", "US Foods": "USF"}
 
 def _build_bagels():
     bagels = []
-    for variety, weekly, base_qty, threshold in VARIETIES:
+    for entry in VARIETIES:
+        variety, weekly, base_qty, threshold = entry[:4]
+        category = entry[4] if len(entry) > 4 else "bagels"
         for distributor, warehouses in WAREHOUSES.items():
             case_cost = CASE_COST[distributor]
             tag = DISTRIBUTOR_TAG[distributor]
@@ -106,6 +117,7 @@ def _build_bagels():
                     "case_cost": case_cost,
                     "case_size": CASE_SIZE,
                     "weekly_usage": round(weekly * mult, 1),
+                    "category": category,
                 })
     return bagels
 
@@ -129,7 +141,7 @@ def seed(reset: bool = False):
             name=b["name"],
             quantity=b["quantity"],
             unit=b["unit"],
-            category="bagels",
+            category=b["category"],
             low_stock_threshold=b["threshold"],
             price=b["price"],
             distributor=b["distributor"],

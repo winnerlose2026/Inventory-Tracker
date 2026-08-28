@@ -305,13 +305,13 @@ def _po_rev_int(s) -> int:
         return _REPRINT_REV_SENTINEL
 
 
-def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:
-    """Return (highest_rev_int, indices_of_active_entries) for a PO in the usage log.
+def _highest_applied_rev(usage: list, po_number: str) -> tuple:
+    """Return (highest_rev_int, active_indices, rev, received_at, sender) for a PO.
     Active = tagged with this po_number and NOT yet marked superseded_by_revision.
     Used to decide whether an incoming revision supersedes or duplicates."""
     highest = 0
     indices = []
-    best_rev, best_received = None, ""
+    best_rev, best_received, best_sender = None, "", ""
     for idx, entry in enumerate(usage):
         if entry.get("po_number") != po_number:
             continue
@@ -322,14 +322,16 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple[int, list[int]]:
             continue
         if _po_doc_is_newer(entry.get("po_revision"),
                             entry.get("source_received_at"),
-                            best_rev, best_received):
+                            best_rev, best_received,
+                            entry.get("source_sender") or "", best_sender):
             best_rev = entry.get("po_revision")
             best_received = entry.get("source_received_at") or ""
+            best_sender = entry.get("source_sender") or ""
         rev_int = _po_rev_int(entry.get("po_revision"))
         if rev_int > highest:
             highest = rev_int
         indices.append(idx)
-    return highest, indices, best_rev, best_received
+    return highest, indices, best_rev, best_received, best_sender
 
 
 def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
@@ -480,8 +482,9 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
         "ordered_at": ordered_at_dt.isoformat(),
         "po_number": evt.po_number,
         "po_revision": new_rev_tag,
-        # Ordering signal for the next copy of this PO (see po_revision.py).
+        # Ordering signals for the next copy of this PO (see po_revision.py).
         "source_received_at": getattr(evt, "source_received_at", "") or "",
+        "source_sender": getattr(evt, "source_sender", "") or "",
         "source": "Email Inbox",
         "source_subject": (evt.source_subject or "")[:120],
         "lead_days": lead_days if auto_eta else 0,
@@ -524,8 +527,8 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
 
 
 def _newest_pending_doc(inv: dict, po_number: str):
-    """(revision, source_received_at) of the newest PENDING on_order row for a
-    PO, or (None, "") if there are none.
+    """(revision, source_received_at, source_sender) of the newest PENDING
+    on_order row for a PO, or (None, "", "") if there are none.
 
     A PO that hasn't finished its lead time has no usage row yet, so
     _highest_applied_rev can't see it. Without this, re-reading an OLDER copy
@@ -533,7 +536,7 @@ def _newest_pending_doc(inv: dict, po_number: str):
     instead of being skipped -- e.g. Greene's stale 305202B2 REPRINT landing on
     top of Foley's correction.
     """
-    best_rev, best_received = None, ""
+    best_rev, best_received, best_sender = None, "", ""
     seen = False
     for item in inv.values():
         for p in (item.get("on_order") or []):
@@ -541,15 +544,18 @@ def _newest_pending_doc(inv: dict, po_number: str):
                 continue
             rev = p.get("po_revision") or ""
             rec = p.get("source_received_at") or ""
-            if not seen or _po_doc_is_newer(rev, rec, best_rev, best_received):
-                best_rev, best_received = rev, rec
+            snd = p.get("source_sender") or ""
+            if not seen or _po_doc_is_newer(rev, rec, best_rev, best_received,
+                                            snd, best_sender):
+                best_rev, best_received, best_sender = rev, rec, snd
                 seen = True
-    return (best_rev if seen else None), best_received
+    return (best_rev if seen else None), best_received, best_sender
 
 
 def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
                            now: str, report: dict, dry_run: bool,
-                           new_received: str = "") -> None:
+                           new_received: str = "",
+                           new_sender: str = "") -> None:
     """Drop pending on_order entries for a SUPERSEDED PO revision.
 
     Same-revision entries are intentionally kept so that
@@ -568,7 +574,9 @@ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
         removed = [p for p in same_po
                    if _po_doc_is_newer(new_rev, new_received,
                                        p.get("po_revision") or "",
-                                       p.get("source_received_at") or "")]
+                                       p.get("source_received_at") or "",
+                                       new_sender,
+                                       p.get("source_sender") or "")]
         if not removed:
             continue
         removed_ids = {id(p) for p in removed}
@@ -783,6 +791,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         entry["po_number"] = po_num
         entry["po_revision"] = getattr(evt, "po_revision", "") or ""
         entry["source_received_at"] = getattr(evt, "source_received_at", "") or ""
+        entry["source_sender"] = getattr(evt, "source_sender", "") or ""
     usage.append(entry)
 
 
@@ -1025,18 +1034,24 @@ def _apply_events(events: list,
         # Once narrowed to a single document, max-qty dedup is safe: what
         # remains is the same PDF delivered to both JD@ and info@, or
         # re-attached on a reply, so the qtys agree.
-        newest_rev, newest_received, _seen_doc = None, "", False
+        newest_rev, newest_received, newest_sender = None, "", ""
+        _seen_doc = False
         for _evt in grp:
             _r = getattr(_evt, "po_revision", "") or ""
             _rc = getattr(_evt, "source_received_at", "") or ""
+            _sd = getattr(_evt, "source_sender", "") or ""
             if not _seen_doc or _po_doc_is_newer(_r, _rc, newest_rev,
-                                                newest_received):
-                newest_rev, newest_received, _seen_doc = _r, _rc, True
+                                                 newest_received,
+                                                 _sd, newest_sender):
+                newest_rev, newest_received, newest_sender = _r, _rc, _sd
+                _seen_doc = True
         _older = [
             _evt for _evt in grp
             if _po_doc_is_newer(newest_rev, newest_received,
                                 getattr(_evt, "po_revision", "") or "",
-                                getattr(_evt, "source_received_at", "") or "")
+                                getattr(_evt, "source_received_at", "") or "",
+                                newest_sender,
+                                getattr(_evt, "source_sender", "") or "")
         ]
         if _older:
             grp = [_evt for _evt in grp if _evt not in _older]
@@ -1071,21 +1086,26 @@ def _apply_events(events: list,
         # first one. Fall back to "" if the parser didn't set it.
         new_rev = getattr(grp[0], "po_revision", "") or ""
         new_received = getattr(grp[0], "source_received_at", "") or ""
+        new_sender = getattr(grp[0], "source_sender", "") or ""
         new_rev_int = _po_rev_int(new_rev)
-        (existing_rev_int, active_idx,
-         active_rev, active_received) = _highest_applied_rev(usage, po_num)
-        # Ordering is by the source email's received time, guarded so a higher
-        # numeric revision still wins regardless of date. USF amends a PO
-        # without bumping the number (re-sending it "REVISED"/"REPRINT"), so
-        # the token alone can't decide. See integrations/po_revision.
+        (existing_rev_int, active_idx, active_rev, active_received,
+         active_sender) = _highest_applied_rev(usage, po_num)
+        # Ordering is by the source email's received time. USF amends a PO
+        # without bumping the number (re-sending it "REVISED"/"REPRINT") and
+        # sometimes re-numbers DOWNWARD -- Foley's corrected 505876B2 came back
+        # as rev 0000003 on top of rev 0000006 -- so the token can't decide.
+        # The only guard is the sender: a copy forwarded from our own domain
+        # never outranks one the distributor sent. See integrations/po_revision.
         incoming_is_newer = _po_doc_is_newer(
-            new_rev, new_received, active_rev, active_received)
+            new_rev, new_received, active_rev, active_received,
+            new_sender, active_sender)
 
         # A pending-only PO has no usage row, so also compare against the
         # newest pending on_order doc for this PO.
-        pend_rev, pend_received = _newest_pending_doc(inv, po_num)
+        pend_rev, pend_received, pend_sender = _newest_pending_doc(inv, po_num)
         if pend_rev is not None and not _po_doc_is_newer(
-                new_rev, new_received, pend_rev, pend_received):
+                new_rev, new_received, pend_rev, pend_received,
+                new_sender, pend_sender):
             report["po_revisions_skipped"].append(
                 f"PO {po_num} rev {new_rev or '(none)'} "
                 f"({new_received or 'no date'}): not newer than pending rev "
@@ -1121,7 +1141,8 @@ def _apply_events(events: list,
         # posting new ones. Covers the case where the prior revision never
         # finished its lead time (so nothing is in usage yet).
         _remove_on_order_by_po(po_num, new_rev, inv, now, report, dry_run,
-                               new_received=new_received)
+                               new_received=new_received,
+                               new_sender=new_sender)
 
         for evt in grp:
             _apply_email_event(evt, inv, usage, now, report, dry_run)

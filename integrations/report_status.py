@@ -71,6 +71,14 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
         {"name": "Kim Cobb", "email": "kimberly.cobb@usfoods.com", "no_chase": True},
         {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com", "no_chase": True},
     ],
+    "Houston, TX": [
+        # NW Houston, DC B2. Youngblood is the covering account exec, Foley the
+        # area buyer at 13400 Hollister Rd who cuts the POs. Houston was live in
+        # inventory since 2026-08-03 but had no reps here, so it could never
+        # clear a week and sat permanently stale on the status page.
+        {"name": "Charles Youngblood", "email": "charles.youngblood@usfoods.com"},
+        {"name": "Tom Foley", "email": "tom.foley@usfoods.com"},
+    ],
     "Riviera Beach, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
     "Ocala, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
     "Punta Gorda, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
@@ -79,6 +87,7 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
 DISTRIBUTOR_OF = {
     "Manassas, VA": "US Foods", "Zebulon, NC": "US Foods", "La Mirada, CA": "US Foods",
     "Chicago, IL": "US Foods", "Alcoa, TN": "US Foods",
+    "Houston, TX": "US Foods",
     "Riviera Beach, FL": "Cheney Brothers", "Ocala, FL": "Cheney Brothers",
     "Punta Gorda, FL": "Cheney Brothers",
 }

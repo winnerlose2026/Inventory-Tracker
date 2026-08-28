@@ -9,11 +9,13 @@ code alongside their own catalog number:
 Both point to the same canonical H&H variety. This module is the single
 source of truth. Extend as new codes appear on POs.
 
-Coverage today (12 codes, 2026-05-13):
+Coverage today (13 codes, 2026-08-28):
     1150  Plain                   (USF POs)
     1151  Onion                   (USF POs - from "BAGEL, ONION 4.25 Z UNSL PARBK")
     1152  Poppy Seed              (USF + Cheney POs)
     1153  Sesame                  (USF POs)
+    1154  Pumpernickel            (USF POs - "BAGEL, PRNKL 4.06 Z UNSL HEAT")
+                                  October LTO; APN 1055066
     1155  Cinnamon Raisin         (Cheney POs)
     1156  Whole Wheat             (USF + Cheney POs - "BAGEL, WHL WHEAT 4.25 Z UNSL")
     1157  Whole Wheat Everything  (USF POs - "BAGEL, EVTHG WHL WHEAT 4.06 Z")
@@ -29,6 +31,10 @@ HH_MFG_CODE_TO_VARIETY: dict[str, str] = {
     "1151": "Onion",
     "1152": "Poppy Seed",
     "1153": "Sesame",
+    # October LTO. Every DC cut a pumpernickel PO for the promo, and every
+    # one of those lines was dropped on the floor until this code existed --
+    # `_usfoods_po_to_events` skips any line whose variety is unresolved.
+    "1154": "Pumpernickel",
     "1155": "Cinnamon Raisin",
     "1156": "Whole Wheat",
     "1157": "Whole Wheat Everything",
