@@ -661,6 +661,7 @@ def api_admin_production_renormalize_varieties():
     samples = []
     for r in records:
         any_changed = False
+        record_dropped_footer = False
         new_lines = []
         for L in r.get("lines") or []:
             raw_v = L.get("raw_variety") or L.get("variety") or ""
@@ -671,6 +672,7 @@ def api_admin_production_renormalize_varieties():
             if is_non_item_label(raw_v):
                 dropped_footer_lines += 1
                 dropped_footer_cases += float(L.get("cs_count") or 0)
+                record_dropped_footer = True
                 any_changed = True
                 if len(samples) < 30:
                     samples.append({"raw": raw_v, "old": old_can,
@@ -717,11 +719,14 @@ def api_admin_production_renormalize_varieties():
 
         if any_changed:
             r["lines"] = new_lines
-            # The header total is the sheet's own printed figure; only
-            # recompute it when it was derived from the lines to begin with.
-            recomputed = sum(float(x.get("cs_count") or 0) for x in new_lines)
-            if not r.get("total_cases") or dropped_footer_lines:
-                r["total_cases"] = int(recomputed)
+            # The header total is the sheet's OWN printed figure -- keep it,
+            # so a line the parser missed still shows up as a discrepancy
+            # rather than being silently papered over. Recompute only when
+            # there was no header total, or when THIS record shed a footer
+            # row (whose cases were inflating it).
+            if not r.get("total_cases") or record_dropped_footer:
+                r["total_cases"] = int(
+                    sum(float(x.get("cs_count") or 0) for x in new_lines))
             # Re-resolve the stored unmapped list against today's aliases so
             # the UI stops flagging labels that now map cleanly.
             r["unmapped_varieties"] = sorted({
