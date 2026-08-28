@@ -274,6 +274,9 @@ def sync_all(clients: list[DistributorClient] | None = None,
 # ---------------------------------------------------------------------------
 
 from integrations.po_revision import is_newer as _po_doc_is_newer  # noqa: E402
+from integrations.po_revision import (  # noqa: E402
+    is_internal_sender as _po_sender_is_internal,
+)
 
 # USF occasionally re-issues a PO with the literal revision token
 # "REPRINT" (an entire copy of the latest state, not a numbered rev).
@@ -552,10 +555,39 @@ def _newest_pending_doc(inv: dict, po_number: str):
     return (best_rev if seen else None), best_received, best_sender
 
 
+def _booked_skus_for_po(inv: dict, usage: list, po_number: str) -> set:
+    """(variety, warehouse) pairs already recorded for a PO, pending or applied.
+
+    Used to decide whether an "identical document" really is identical. It
+    isn't, if the parser has learned something since the first ingest.
+    """
+    out = set()
+    for key, item in inv.items():
+        for p in (item.get("on_order") or []):
+            if p.get("po_number") == po_number:
+                out.add(((item.get("name", "").split(" Bagel")[0]).strip().lower(),
+                         (item.get("warehouse") or "").strip().lower()))
+    for entry in usage:
+        if entry.get("po_number") != po_number:
+            continue
+        if entry.get("superseded_by_revision") or entry.get("reversal_of_revision"):
+            continue
+        name = str(entry.get("item_key") or "")
+        out.add(((name.split(" bagel")[0]).strip().lower(),
+                 (entry.get("warehouse") or "").strip().lower()))
+    return out
+
+
+def _skus_in_group(grp) -> set:
+    return {((e.item.variety or "").strip().lower(),
+             (e.item.warehouse or "").strip().lower()) for e in grp}
+
+
 def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
                            now: str, report: dict, dry_run: bool,
                            new_received: str = "",
-                           new_sender: str = "") -> None:
+                           new_sender: str = "",
+                           drop_same_rev: bool = False) -> None:
     """Drop pending on_order entries for a SUPERSEDED PO revision.
 
     Same-revision entries are intentionally kept so that
@@ -572,7 +604,8 @@ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
         if not same_po:
             continue
         removed = [p for p in same_po
-                   if _po_doc_is_newer(new_rev, new_received,
+                   if drop_same_rev
+                   or _po_doc_is_newer(new_rev, new_received,
                                        p.get("po_revision") or "",
                                        p.get("source_received_at") or "",
                                        new_sender,
@@ -1100,10 +1133,36 @@ def _apply_events(events: list,
             new_rev, new_received, active_rev, active_received,
             new_sender, active_sender)
 
+        # The "identical document" skips below assume same document => same
+        # result. That stops being true the moment the parser learns a code it
+        # used to skip: `_usfoods_po_to_events` drops any line whose variety is
+        # unresolved, so re-reading the SAME PDF with a wider hh_mfg_codes map
+        # legitimately yields MORE lines. That is how every DC's pumpernickel
+        # (mfg 1154) stayed invisible after the code was added -- each PO was
+        # waved through as a duplicate of the truncated version already booked.
+        # If the incoming parse carries a SKU we have nothing booked for,
+        # re-apply rather than skip; the qty-per-SKU replace makes it safe.
         # A pending-only PO has no usage row, so also compare against the
         # newest pending on_order doc for this PO.
         pend_rev, pend_received, pend_sender = _newest_pending_doc(inv, po_num)
-        if pend_rev is not None and not _po_doc_is_newer(
+
+        gained = _skus_in_group(grp) - _booked_skus_for_po(inv, usage, po_num)
+        # ...but NOT for a document the sender guard already outranks. A stale
+        # copy forwarded from our own domain "gains" every line the vendor's
+        # correction removed, which would let the forward undo the correction.
+        # An internal forward can never re-open a PO.
+        _stored_sender = pend_sender if pend_rev is not None else active_sender
+        if gained and _po_sender_is_internal(new_sender) and _stored_sender \
+                and not _po_sender_is_internal(_stored_sender):
+            gained = set()
+        if gained:
+            report.setdefault("reparse_gained_skus", []).append(
+                f"PO {po_num}: re-applied, parse now resolves "
+                f"{len(gained)} SKU(s) it previously dropped "
+                f"({', '.join(sorted(v for v, _w in gained))})."
+            )
+
+        if pend_rev is not None and not gained and not _po_doc_is_newer(
                 new_rev, new_received, pend_rev, pend_received,
                 new_sender, pend_sender):
             report["po_revisions_skipped"].append(
@@ -1114,7 +1173,7 @@ def _apply_events(events: list,
             )
             continue
 
-        if active_idx and not incoming_is_newer:
+        if active_idx and not incoming_is_newer and not gained:
             # Idempotent skip: we've already booked this PO at the same-or-
             # higher revision. Guard is `active_idx`, not `existing_rev_int`,
             # so POs that don't expose a revision (e.g. Cheney) — which parse
@@ -1142,7 +1201,8 @@ def _apply_events(events: list,
         # finished its lead time (so nothing is in usage yet).
         _remove_on_order_by_po(po_num, new_rev, inv, now, report, dry_run,
                                new_received=new_received,
-                               new_sender=new_sender)
+                               new_sender=new_sender,
+                               drop_same_rev=bool(gained))
 
         for evt in grp:
             _apply_email_event(evt, inv, usage, now, report, dry_run)
