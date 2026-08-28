@@ -2631,6 +2631,105 @@ function _poWarehouseLabel(g) {
     : escHtml(g.warehouse || '');
 }
 
+// Editable line quantities for an ARRIVED inventory PO. What was actually
+// received often differs from what the PO said (short ship, damage, an extra
+// pallet), and until now the only way to say so was to Reopen the whole PO.
+function _poItemsCellEditableHtml(g) {
+  const po = escAttr(g.po_number || '');
+  const lines = (g.lines || []).slice()
+    .sort((a, b) => (a.variety || '').localeCompare(b.variety || ''));
+  const rows = lines.map(L => {
+    const qty = (Number(L.qty) || 0).toFixed(0);
+    if (!L.item_key) {
+      // Pre-ledger rows have no key to address, so they stay read-only rather
+      // than offering an edit that would quietly do nothing.
+      return `<div style="font-size:11px;color:var(--muted)">${escHtml(L.variety)} ${qty}
+          <span title="This line predates per-line keys, so its quantity can't be edited here. Reopen the PO to change it." style="cursor:help">&#128274;</span></div>`;
+    }
+    return `<div style="display:flex;align-items:center;gap:5px;margin:2px 0">
+        <span style="font-size:11px;min-width:104px">${escHtml(L.variety)}</span>
+        <input type="number" min="0" step="1" class="arrived-qty-input"
+               data-po="${po}" data-key="${escAttr(L.item_key)}" value="${qty}"
+               style="width:64px;font-size:11px;padding:2px 4px" />
+        <span style="font-size:10px;color:var(--muted)">${escHtml(L.unit || 'cs')}</span>
+      </div>`;
+  }).join('');
+  return `<td style="font-size:12px">
+      ${rows}
+      <button class="btn btn-ghost btn-sm" style="margin-top:5px;font-size:11px;padding:2px 8px"
+              onclick="saveArrivedPoQtys('${po}')">Save received qty</button>
+    </td>`;
+}
+
+// POST one adjustment and report what actually moved. The response separates
+// on-hand movement from record-only corrections, because "I changed the number
+// and nothing moved" is correct behaviour when a count already superseded the
+// receipt -- and deeply confusing if we don't say so.
+async function _postArrivedAdjust(payload) {
+  let r;
+  try {
+    r = await api('/api/pos/arrived/adjust', 'POST', payload);
+  } catch (e) {
+    toast('Adjust failed: ' + String(e), 'error');
+    return null;
+  }
+  if (!r || !r.ok) {
+    if (r && r.freight_verified) {
+      toast('Ship date is freight-verified — confirm the override to change it', 'error');
+    } else {
+      toast('Adjust failed: ' + ((r && r.error) || 'unknown'), 'error');
+    }
+    await loadPendingPOs();
+    return null;
+  }
+  const moved = Number(r.onhand_delta_cs) || 0;
+  const recordOnly = (r.changes || []).filter(c => c.record_only).length;
+  let msg = `PO ${r.po_number} updated`;
+  if (moved) {
+    msg += ` — on-hand ${moved > 0 ? '+' : ''}${moved.toFixed(0)} cs`;
+  } else if (recordOnly) {
+    msg += ' — PO record corrected; on-hand left on the count';
+  } else {
+    msg += ' — no on-hand change';
+  }
+  toast(msg);
+  await loadPendingPOs();
+  loadDashboard();
+  return r;
+}
+
+async function onArrivedPoAdjust(po, field, value, shipVerified) {
+  if (!po || !value) return;
+  const payload = { po_number: po };
+  payload[field] = value;
+  if (field === 'ship_date' && shipVerified) {
+    const reason = prompt(
+      'This ship date is verified by a Lineage freight invoice.\n\n' +
+      'Why are you overriding it? (recorded on the PO)');
+    if (!reason || !reason.trim()) { await loadPendingPOs(); return; }
+    payload.override_freight = true;
+    payload.reason = reason.trim();
+  }
+  await _postArrivedAdjust(payload);
+}
+
+async function saveArrivedPoQtys(po) {
+  if (!po) return;
+  const inputs = Array.from(
+    document.querySelectorAll(`.arrived-qty-input[data-po="${CSS.escape(po)}"]`));
+  const lines = [];
+  for (const el of inputs) {
+    const qty = Number(el.value);
+    if (!Number.isFinite(qty) || qty < 0) {
+      toast('Quantities must be zero or more', 'error');
+      return;
+    }
+    lines.push({ item_key: el.dataset.key, qty });
+  }
+  if (!lines.length) { toast('Nothing to save', 'error'); return; }
+  await _postArrivedAdjust({ po_number: po, lines });
+}
+
 function togglePoRowEdit(po) {
   if (!po) return;
   if (editingPos.has(po)) editingPos.delete(po); else editingPos.add(po);
@@ -2657,38 +2756,57 @@ function _pendingRowHtml(g, now) {
   const shipVerified = g.ship_date_source === 'freight';
   const isArrived = state === 'arrived';
   const isCancelled = state === 'cancelled';
-  // Freight-verified ship dates are locked (the invoice is the final word).
-  // Cancelled rows are read-only. Pending rows -- and CW Arrived rows that
-  // aren't freight-verified -- get the editable date box (CW status is
-  // date-driven, so editing/clearing it un-arrives safely). Inventory Arrived
-  // rows show a read-only date and are edited via Reopen.
-  // Editability: freight-verified + cancelled are locked; inventory-arrived is
-  // changed via Reopen; CW-arrived (date-driven) stays editable. The date box
-  // appears only when this PO's row checkbox is ticked (opt-in per PO).
-  const editable = !shipVerified && !isCancelled
-    && (!terminal || (isArrived && source === 'chefs_warehouse'));
+  // Cancelled rows are read-only. Everything else is editable once its row
+  // checkbox is ticked (opt-in per PO), including Arrived.
+  //
+  // Inventory-side Arrived rows used to be locked here, with "use Reopen to
+  // change" as the only way out -- and Reopen un-rolls every line and blanks
+  // ship/ETA/ordered_at, so correcting one date meant re-keying the PO. They
+  // now edit in place via /api/pos/arrived/adjust, which moves on-hand only
+  // when the count-absorption state actually changes.
+  //
+  // A freight-verified ship date is still the invoice's word by default, but
+  // it is no longer a dead end: changing one prompts for a reason and is
+  // recorded as an override rather than silently refused.
+  const invArrived = isArrived && source !== 'chefs_warehouse';
+  const editable = !isCancelled;
   const editing = editingPos.has(g.po_number || '');
+  const poAttr = escAttr(g.po_number || '');
   let shipCell;
   if (editable && editing) {
-    shipCell = `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onclick="try{this.showPicker()}catch(e){}" onchange="onShipDateChange('${escAttr(g.po_number || '')}', this.value, '${escAttr(source)}')" />`;
+    const onChange = invArrived
+      ? `onArrivedPoAdjust('${poAttr}', 'ship_date', this.value, ${shipVerified ? 'true' : 'false'})`
+      : `onShipDateChange('${poAttr}', this.value, '${escAttr(source)}')`;
+    shipCell = `<input type="date" class="ship-date-input" value="${escAttr(shipISO)}" onclick="try{this.showPicker()}catch(e){}" onchange="${onChange}" />`
+      + (shipVerified ? _shipVerifiedMark() : '');
   } else {
-    const disp = shipISO
+    shipCell = shipISO
       ? (formatDate(shipISO) + (shipVerified ? _shipVerifiedMark() : ''))
       : '<span style="color:var(--muted)">&mdash;</span>';
-    const hint = (editing && !editable)
-      ? ' <span title="Freight-verified or already arrived; use Reopen to change" style="cursor:help">&#128274;</span>'
-      : '';
-    shipCell = disp + hint;
   }
+  // Arrival is the field that decides whether a delivery sits inside a count,
+  // so on an arrived inventory PO it is the most important thing to be able
+  // to correct -- that is what "it landed after we counted" means.
+  let arrivalCell = arrival;
+  if (invArrived && editing) {
+    const arrISO = (g.arrival_date || '').slice(0, 10);
+    arrivalCell = `<input type="date" class="ship-date-input" value="${escAttr(arrISO)}" title="The date the truck actually landed" onclick="try{this.showPicker()}catch(e){}" onchange="onArrivedPoAdjust('${poAttr}', 'arrival_date', this.value, false)" />`;
+  }
+  const itemsCell = (invArrived && editing)
+    ? _poItemsCellEditableHtml(g)
+    : _poItemsCellHtml(g);
+  const chkTitle = invArrived
+    ? 'Tick to edit this arrived PO (arrival date, ship date, received qty)'
+    : 'Tick to modify this PO ship date';
   return `<tr${rowStyle}>
-      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="Tick to modify this PO ship date" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${escAttr(g.po_number || '')}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span></td>
+      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="${chkTitle}" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${poAttr}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span></td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
-      ${_poItemsCellHtml(g)}
+      ${itemsCell}
       <td style="text-align:right;font-weight:600">${(Number(g.total_cs) || 0).toFixed(0)} <span style="color:var(--muted);font-size:11px">cs</span>${palletBadge}</td>
       <td style="white-space:nowrap">${formatDate(g.ordered_at)}</td>
       <td>${shipCell}</td>
-      <td style="white-space:nowrap">${arrival}</td>
+      <td style="white-space:nowrap">${arrivalCell}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
       <td>${_poTagHtml(state)}</td>
     </tr>`;

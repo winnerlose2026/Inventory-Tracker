@@ -296,6 +296,229 @@ def api_pending_reopen():
     })
 
 
+def _parse_iso_date(raw, field):
+    """Parse an ISO date/datetime, returning (iso_string, error_response)."""
+    try:
+        return datetime.fromisoformat(str(raw).strip()).isoformat(), None
+    except ValueError:
+        return None, (jsonify({
+            "ok": False,
+            "error": f"{field} must be ISO 8601 (YYYY-MM-DD or full datetime)",
+        }), 400)
+
+
+@pos_bp.route("/api/pos/arrived/adjust", methods=["POST"])
+def api_arrived_po_adjust():
+    """Adjust an ARRIVED inventory PO in place, without reopening it.
+
+    Every other PO write path edits ``item["on_order"]``. Once a PO rolls over
+    those rows are consumed and the PO survives only as on_order_rollover usage
+    rows, so ship-date / po-order-date / remove-po all silently no-op on it and
+    the only recourse was Reopen -- which un-rolls every line and blanks the
+    dates, forcing a full re-key to fix one field.
+
+    Body:
+      po_number        required.
+      arrival_date     ISO -- the date the truck ACTUALLY landed.
+      ship_date        ISO -- record only, never moves on-hand.
+      lines            [{item_key, qty}] -- quantities actually RECEIVED.
+      reason           free text, recorded on every row touched.
+      override_freight bool -- required to change a freight-verified ship date.
+
+    On-hand movement follows the count-absorption rule (the same one
+    _receipts_after_count and _rollover_still_in_onhand use), because a
+    receipt's cases are only a separate addend on on-hand while no count has
+    superseded them:
+
+      * Moving an arrival from before a count to AFTER it means the count never
+        saw those cases -> add them. This is the 2026-08-28 Chicago case: PO
+        2753463T carried ETA 08-23 but landed after the 08-24 08:53 count, and
+        the counted figures (3/6/41 cs) plainly excluded its 56 cs/SKU.
+      * Moving an arrival from after a count to BEFORE it means the count
+        already contains them -> subtract, or they are counted twice.
+      * Correcting a received quantity moves on-hand only while the receipt is
+        still live. Once a count has absorbed it the count IS the truth, so the
+        edit is recorded against the PO but on-hand is left alone.
+
+    Returns a per-line breakdown naming which changes moved on-hand and which
+    were record-only, so the operator is never guessing.
+    """
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    if not po_number:
+        return jsonify({"ok": False, "error": "po_number required"}), 400
+
+    reason = (body.get("reason") or "").strip()
+    override_freight = bool(body.get("override_freight"))
+    now_iso = datetime.now().isoformat()
+
+    arrival_iso = ship_iso = None
+    if body.get("arrival_date"):
+        arrival_iso, err = _parse_iso_date(body["arrival_date"], "arrival_date")
+        if err:
+            return err
+    if body.get("ship_date"):
+        ship_iso, err = _parse_iso_date(body["ship_date"], "ship_date")
+        if err:
+            return err
+
+    qty_by_key = {}
+    for L in (body.get("lines") or []):
+        k = (L.get("item_key") or "").strip().lower()
+        if not k:
+            return jsonify({"ok": False,
+                            "error": "every line needs an item_key"}), 400
+        try:
+            q = float(L.get("qty"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False,
+                            "error": f"qty for {k} must be a number"}), 400
+        if q < 0:
+            return jsonify({"ok": False,
+                            "error": f"qty for {k} cannot be negative"}), 400
+        qty_by_key[k] = q
+
+    if arrival_iso is None and ship_iso is None and not qty_by_key:
+        return jsonify({"ok": False,
+                        "error": "nothing to change - supply arrival_date, "
+                                 "ship_date or lines"}), 400
+
+    # The freight invoice is the trusted source for a ship date, so changing a
+    # verified one is deliberate and has to say why.
+    if ship_iso is not None:
+        key_norm = _norm_po_key(po_number)
+        if key_norm in (_freight_ship_date_index() or {}):
+            if not override_freight:
+                return jsonify({
+                    "ok": False, "freight_verified": True,
+                    "error": "This ship date is verified by a Lineage freight "
+                             "invoice. Re-send with override_freight and a "
+                             "reason to change it anyway.",
+                }), 409
+            if not reason:
+                return jsonify({
+                    "ok": False,
+                    "error": "override_freight requires a reason",
+                }), 400
+
+    inv = load_inventory()
+    usage = load_usage()
+    key_norm = _norm_po_key(po_number)
+    rows = [e for e in usage
+            if (e.get("source") or "") == "on_order_rollover"
+            and not e.get("reversed")
+            and _norm_po_key(e.get("po_number") or "") == key_norm]
+    if not rows:
+        return jsonify({"ok": False, "error": "No arrived lines found for this "
+                                              "PO - it may still be pending, "
+                                              "or already reopened"}), 404
+
+    unknown = sorted(qty_by_key) and [
+        k for k in qty_by_key
+        if not any((e.get("item_key") or "") == k for e in rows)
+    ]
+    if unknown:
+        return jsonify({"ok": False,
+                        "error": f"not lines on this PO: {', '.join(unknown)}"
+                                 " - adding new lines is a PO revision, not "
+                                 "an adjustment"}), 400
+
+    changes = []
+    audit_rows = []
+    onhand_delta_total = 0.0
+
+    for e in rows:
+        ik = e.get("item_key") or ""
+        item = inv.get(ik)
+        old_qty = abs(float(e.get("amount") or 0))
+        name = e.get("item_name") or (item.get("name") if item else ik) or ik
+        entry = {"item_key": ik, "name": name, "old_qty": old_qty,
+                 "new_qty": old_qty, "onhand_delta": 0.0, "record_only": False,
+                 "note": ""}
+        delta = 0.0
+
+        # 1) Arrival date. Evaluate absorption BEFORE and AFTER the move; only
+        #    a change in absorption state moves stock.
+        if arrival_iso is not None and item is not None:
+            was_live = _rollover_still_in_onhand(e, item)
+            e["arrival_date"] = arrival_iso
+            now_live = _rollover_still_in_onhand(e, item)
+            if now_live and not was_live:
+                delta += old_qty
+                entry["note"] = ("arrival moved after the "
+                                 f"{(item.get('last_count_at') or '')[:10]} "
+                                 "count, which never saw these cases")
+            elif was_live and not now_live:
+                delta -= old_qty
+                entry["note"] = ("arrival moved on/before the "
+                                 f"{(item.get('last_count_at') or '')[:10]} "
+                                 "count, which already contains these cases")
+        elif arrival_iso is not None:
+            e["arrival_date"] = arrival_iso
+
+        if ship_iso is not None:
+            e["ship_date"] = ship_iso
+            e["ship_date_source"] = "operator-override" if override_freight \
+                else "operator"
+
+        # 2) Received quantity, judged against the FINAL arrival date.
+        if ik in qty_by_key:
+            new_qty = qty_by_key[ik]
+            entry["new_qty"] = new_qty
+            e["amount"] = -new_qty
+            e["qty_adjusted_from"] = old_qty
+            if item is not None and new_qty != old_qty:
+                if _rollover_still_in_onhand(e, item):
+                    delta += (new_qty - old_qty)
+                else:
+                    entry["record_only"] = True
+                    entry["note"] = (entry["note"] + "; " if entry["note"] else "") + (
+                        "PO record corrected; on-hand left on the "
+                        f"{(item.get('last_count_at') or '')[:10]} count, which "
+                        "already measured what is physically there")
+
+        if reason:
+            e["adjust_reason"] = reason
+        e["adjusted_at"] = now_iso
+
+        if item is not None and delta:
+            item["quantity"] = round(float(item.get("quantity") or 0) + delta, 4)
+            item["updated"] = now_iso
+            onhand_delta_total += delta
+            audit_rows.append({
+                "item_key": ik,
+                "item_name": name,
+                # usage-log convention: negative amount == stock added
+                "amount": -delta,
+                "unit": e.get("unit") or (item.get("unit") if item else "cs"),
+                "note": (f"Adjusted arrived PO {po_number}: "
+                         f"{entry['note'] or 'received quantity corrected'}"
+                         + (f" ({reason})" if reason else "")),
+                "timestamp": now_iso,
+                "po_number": po_number,
+                "po_revision": e.get("po_revision") or "",
+                "source": "arrived-po-adjust",
+            })
+        entry["onhand_delta"] = round(delta, 4)
+        changes.append(entry)
+
+    if audit_rows:
+        usage.extend(audit_rows)
+    save_inventory(inv)
+    save_usage(usage)
+
+    return jsonify({
+        "ok": True,
+        "po_number": po_number,
+        "arrival_date": arrival_iso,
+        "ship_date": ship_iso,
+        "lines_touched": len(rows),
+        "onhand_delta_cs": round(onhand_delta_total, 4),
+        "freight_overridden": bool(ship_iso is not None and override_freight),
+        "changes": changes,
+    })
+
+
 @pos_bp.route("/api/pending/status-overrides")
 def api_pending_status_overrides():
     """Return the manual Pending-PO status overrides {normPOkey: status}."""
@@ -756,7 +979,8 @@ def build_po_ledger() -> list:
                 r["arrival_date"] = o["arrival_date"]
             qty = float(o.get("qty") or 0); r["total_cs"] += qty
             r["lines"].append({"variety": _ledger_variety(item.get("name") or key),
-                               "qty": qty, "unit": o.get("unit") or "cs"})
+                               "qty": qty, "unit": o.get("unit") or "cs",
+                               "item_key": key})
 
     # 2) arrived USF/Cheney -- usage rollover rows grouped by PO
     meta = {k: {"distributor": it.get("distributor") or "",
@@ -776,7 +1000,8 @@ def build_po_ledger() -> list:
                                 "total_cs": 0.0, "lines": []})
         qty = abs(float(e.get("amount") or 0)); g["total_cs"] += qty
         g["lines"].append({"variety": _ledger_variety(m.get("name") or ""),
-                           "qty": qty, "unit": e.get("unit") or "cs"})
+                           "qty": qty, "unit": e.get("unit") or "cs",
+                           "item_key": e.get("item_key") or ""})
         g["distributor"] = g["distributor"] or m.get("distributor") or ""
         g["warehouse"] = g["warehouse"] or m.get("warehouse") or ""
         ts = e.get("timestamp") or ""
