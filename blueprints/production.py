@@ -717,6 +717,19 @@ def api_admin_production_renormalize_varieties():
                 any_changed = True
             new_lines.append(L)
 
+        # Re-resolve the STORED unmapped list on every record, changed or
+        # not. It is a snapshot taken at ingest, so a record whose lines were
+        # already canonical kept flagging labels that a later alias had long
+        # since fixed -- 75 of the 85 flags on 2026-08-28 were stale, which
+        # buries the handful that are real.
+        fresh_unmapped = sorted({
+            (x.get("raw_variety") or "") for x in new_lines
+            if not _normalize_variety(x.get("raw_variety") or "")[1]
+        } - {""})
+        if fresh_unmapped != (r.get("unmapped_varieties") or []):
+            r["unmapped_varieties"] = fresh_unmapped
+            any_changed = True
+
         if any_changed:
             r["lines"] = new_lines
             # The header total is the sheet's OWN printed figure -- keep it,
@@ -727,12 +740,6 @@ def api_admin_production_renormalize_varieties():
             if not r.get("total_cases") or record_dropped_footer:
                 r["total_cases"] = int(
                     sum(float(x.get("cs_count") or 0) for x in new_lines))
-            # Re-resolve the stored unmapped list against today's aliases so
-            # the UI stops flagging labels that now map cleanly.
-            r["unmapped_varieties"] = sorted({
-                (x.get("raw_variety") or "") for x in new_lines
-                if not _normalize_variety(x.get("raw_variety") or "")[1]
-            } - {""})
             changed_records += 1
 
     if not dry_run:

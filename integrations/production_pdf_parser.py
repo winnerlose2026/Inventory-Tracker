@@ -189,9 +189,22 @@ _VARIETY_SHORTHAND: dict[str, str] = {
 #: "PARB-EVERYTHING 1158040226" (mfg 1158 + MMDDYY). Strip it before matching.
 _TRAILING_LOT_RE = re.compile(r"\s+\d{6,14}$")
 
+#: The par-baked prefix, however it was typed. These sheets are hand-keyed and
+#: the prefix alone has arrived as PARB-, PAARB-, PRB-, PAR-, PARABEKED and
+#: PARBAKED. Matching the family beats adding an alias per misspelling.
+_PARBAKE_PREFIX_RE = re.compile(r"^(?:PA{0,2}RA?B[A-Z]*|PRB[A-Z]*|PAR)[-.\s]+")
+
+#: Words that describe the product but not the variety.
+_STOPWORDS = frozenset({"CHEESE", "BAGEL", "BAGELS", "BGL", "BGLS",
+                        "CASE", "CASES", "CS", "EA"})
+
+#: Mini bagels are a different product size, so they never merge into the
+#: full-size variety totals -- they get their own "Mini <X>" bucket.
+_MINI_TOKENS = frozenset({"MINI", "MINIS"})
+
 #: "SLICED" is a form, not a variety -- H&H's 13 mfg codes have no sliced SKU,
 #: so "PLAIN SLICED" and "SLICED PLAIN" are both Plain. (JD, 2026-08-28.)
-_SLICED_RE = re.compile(r"\b(SLICED|SLCD|SLC)\b")
+_SLICED_RE = re.compile(r"\b(SLICED|SLCD|SLC|SL)\b")
 
 
 def is_non_item_label(raw: str) -> bool:
@@ -208,14 +221,14 @@ def is_non_item_label(raw: str) -> bool:
 def assorted_kind(raw: str) -> str:
     """'' | 'assorted' | 'mini' for a raw variety label."""
     key = _TRAILING_LOT_RE.sub("", (raw or "").strip().upper()).strip()
-    for pre in ("PARB-", "PARB ", "PARB.", "PARBAKED ", "PARBAKED-",
-                "PRBKD-", "PRBKD "):
-        if key.startswith(pre):
-            key = key[len(pre):].strip()
-            break
-    if key in _MINI_ASSORTED_LABELS:
-        return "mini"
-    if key in _ASSORTED_LABELS:
+    key = _PARBAKE_PREFIX_RE.sub("", key).strip()
+    toks = _tokens(key)
+    if toks & _MINI_TOKENS:
+        rest = toks - _MINI_TOKENS
+        if not rest or rest & {"ASST", "ASSORTED", "ASSORTMENT", "MIXED"}:
+            return "mini"
+        return ""          # "MINI EVERYTHING" is a mini of a known variety
+    if key in _ASSORTED_LABELS or toks in ({"ASST"}, {"ASSORTED"}):
         return "assorted"
     return ""
 
@@ -238,6 +251,22 @@ def _fuzzy_variety(key: str) -> str:
 #: Single-token alias keys eligible for fuzzy matching (see _fuzzy_variety).
 _FUZZY_CANDIDATES = [k for k in _VARIETY_ALIASES
                      if " " not in k and "-" not in k and len(k) >= 5]
+
+
+def _tokens(key: str) -> frozenset:
+    """Significant word tokens of a label, minus filler."""
+    parts = re.split(r"[\s\-_.]+", key)
+    return frozenset(t for t in parts if t and t not in _STOPWORDS)
+
+
+#: frozenset-of-tokens -> canonical, so "CHEDDAR JALAPENO" resolves the same
+#: as "JALAPENO CHEDDAR" and "ASIAGO CHEESE" the same as "ASIAGO", without an
+#: alias entry for every permutation.
+_TOKEN_INDEX: dict = {}
+for _k, _v in _VARIETY_ALIASES.items():
+    _TOKEN_INDEX.setdefault(_tokens(_PARBAKE_PREFIX_RE.sub("", _k)), _v)
+for _k, _v in _VARIETY_SHORTHAND.items():
+    _TOKEN_INDEX.setdefault(_tokens(_k), _v)
 
 
 def split_assorted(cs_count: int) -> list:
@@ -295,18 +324,22 @@ def _normalize_variety(raw: str) -> tuple[str, bool]:
         # is what a line carries until that runs.
         return ("Assorted", True)
 
-    # Strip Parb-* / Parbaked / PRBKD prefixes
-    stripped = key
-    for pre in ("PARB-", "PARB ", "PARB.", "PARBAKED ", "PARBAKED-",
-                "PRBKD-", "PRBKD "):
-        if stripped.startswith(pre):
-            stripped = stripped[len(pre):].strip()
-            break
-    if stripped != key:
-        if stripped in _VARIETY_ALIASES:
-            return (_VARIETY_ALIASES[stripped], True)
+    # Strip the par-baked prefix in whatever spelling it arrived in.
+    stripped = _PARBAKE_PREFIX_RE.sub("", key).strip()
+    if stripped != key and stripped in _VARIETY_ALIASES:
+        return (_VARIETY_ALIASES[stripped], True)
     if stripped in _VARIETY_SHORTHAND:
         return (_VARIETY_SHORTHAND[stripped], True)
+
+    # A mini of a known variety keeps its own bucket, so mini cases never
+    # inflate the full-size counts.
+    mini_toks = _tokens(stripped)
+    if mini_toks & _MINI_TOKENS:
+        base, base_ok = _normalize_variety(
+            " ".join(sorted(mini_toks - _MINI_TOKENS)))
+        if base_ok and base != "Assorted":
+            return (f"Mini {base}", True)
+        return ("Mini Assorted", True)
 
     # "SLICED" is a form, not a variety -- drop the token and re-match.
     if _SLICED_RE.search(stripped):
@@ -318,9 +351,22 @@ def _normalize_variety(raw: str) -> tuple[str, bool]:
         if assorted_kind(unsliced) == "assorted":
             return ("Assorted", True)
 
+    # Word order and filler words shouldn't matter: "CHEDDAR JALAPENO" and
+    # "ASIAGO CHEESE" are the same products as their canonical spellings.
+    hit = _TOKEN_INDEX.get(_tokens(stripped))
+    if hit:
+        return (hit, True)
+
     fuzzy = _fuzzy_variety(stripped)
     if fuzzy:
         return (fuzzy, True)
+    # Single stray token that fuzzy-matches (e.g. "PAARB-EVERYTHING" once the
+    # prefix family has been stripped down to a lone misspelling).
+    toks = [t for t in _tokens(stripped) if len(t) >= 5]
+    if len(toks) == 1:
+        fuzzy = _fuzzy_variety(toks[0])
+        if fuzzy:
+            return (fuzzy, True)
     return ("In-House Inventory", False)
 
 # Warehouse normalization. The production sheet uses an UPPERCASE

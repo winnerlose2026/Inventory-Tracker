@@ -152,3 +152,58 @@ def test_a_real_sheet_leaves_nothing_unmapped():
             "PARB-EVERTYTHING", "PARB-WW-ET 1157020626"]
     unmapped = [r for r in raws if not recognized(r)]
     assert unmapped == [], unmapped
+
+
+# --- hand-keyed prefix / word-order / mini variants ------------------------
+# Everything below was still landing in the catch-all after the first pass.
+# Adding an alias per misspelling doesn't scale, so these are handled by the
+# par-baked prefix family, a token-set index and a MINI rule.
+
+def test_parbake_prefix_family():
+    for raw in ("PARB-EVERYTHING", "PAARB-EVERYTHING", "PARABEKED EVERYTHING",
+                "PARBAKED EVERYTHING", "PRB-EVERYTHING", "PAR-EVERYTHING"):
+        assert canon(raw) == "Everything", raw
+    assert canon("PAR-PUMPERNICKEL") == "Pumpernickel"
+    assert canon("PRB-CINN RAISIN") == "Cinnamon Raisin"
+
+
+def test_word_order_and_filler_words_do_not_matter():
+    assert canon("PARB- CHEDDAR JALAPENO") == "Jalapeno Cheddar"
+    assert canon("ASIAGO CHEESE") == "Asiago"
+    assert canon("PLAIN BAGEL") == "Plain"
+
+
+def test_sl_is_a_sliced_abbreviation():
+    assert canon("EVERYTHING SL") == "Everything"
+
+
+def test_mini_of_a_known_variety_keeps_its_own_bucket():
+    """A mini case is not a full-size case, so it must never merge into the
+    full-size variety total."""
+    assert canon("MINI EVERYTHING") == "Mini Everything"
+    assert canon("MINI PLAIN") == "Mini Plain"
+    assert canon("ASST MINIS") == "Mini Assorted"
+    assert canon("MINI ASST") == "Mini Assorted"
+
+
+def test_mini_is_never_split_like_a_full_size_assorted():
+    assert assorted_kind("MINI EVERYTHING") == ""
+    assert assorted_kind("ASST MINIS") == "mini"
+
+
+def test_prefix_family_cannot_swallow_a_real_variety():
+    for raw in ("PLAIN", "POPPY SEED", "PUMPERNICKEL", "PARB-PLAIN"):
+        assert recognized(raw), raw
+    assert canon("PLAIN") == "Plain"
+    assert canon("PUMPERNICKEL") == "Pumpernickel"
+
+
+def test_every_label_seen_in_production_now_resolves():
+    """The full residual set from the live data after the first renormalize."""
+    raws = ["PAARB-EVERYTHING", "PRB-CINN RAISIN", "PARABEKED EVERYTHING",
+            "ASST MINIS", "MINI EVERYTHING", "PARB- CHEDDAR JALAPENO",
+            "ASIAGO CHEESE", "PAR-PUMPERNICKEL", "EVERYTHING SL",
+            "PARB-WHOLEWHEAT", "PARB-WW-ET", "PARB-WWET", "PARB-WW",
+            "CINNAMON RAISIN", "PARB- EVERYTHING", "PARB- PLAIN",
+            "PARB-EVERYTTHING", "WW-ET", "PARB- ONION"]
+    assert [r for r in raws if not recognized(r)] == []
