@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 
 from core.cache import _AGG_CACHE, _data_sig
-from core.errors import _safe_err
+from core.errors import _log_exc, _safe_err
 from inventory_tracker import load_inventory, load_usage
 
 production_bp = Blueprint("production", __name__)
@@ -296,6 +296,57 @@ def api_production_ingest():
     return jsonify({"ok": True, "status": "ingested", "record": record})
 
 
+def _graph_page(url: str, token: str, *, attempts: int = 3, timeout: int = 45):
+    """GET one Graph page, retrying transient failures.
+
+    Why this exists: the production scan used to do a single bare urlopen and,
+    on ANY exception, append "page N: parse error" and `break` out of that
+    mailbox entirely. A momentary 429 or 503 on JD@ -- the only mailbox the
+    production sheets arrive in -- therefore skipped the whole inbox for that
+    run, reported a message that named the wrong layer (nothing had been
+    parsed yet), and logged nothing at all server-side. That combination is
+    why a ten-week ingestion gap was invisible.
+
+    Retries 429/5xx/timeouts with backoff, honouring Retry-After. Raises
+    RuntimeError with a CLASSIFIED, exception-text-free message on give-up;
+    the caller logs the real exception to stderr.
+    """
+    import time as _time
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+    last = ""
+    for attempt in range(1, attempts + 1):
+        req = _ureq.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Accept", "application/json")
+        req.add_header("ConsistencyLevel", "eventual")
+        try:
+            with _ureq.urlopen(req, timeout=timeout) as resp:
+                return _json_loads(resp.read().decode("utf-8"))
+        except _uerr.HTTPError as exc:
+            last = f"HTTP {exc.code}"
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            wait = 0.0
+            if retryable:
+                try:
+                    wait = float(exc.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+        except Exception as exc:  # noqa: BLE001  (timeout, DNS, decode)
+            last = type(exc).__name__
+            retryable = True
+            wait = 0.0
+        if not retryable or attempt == attempts:
+            raise RuntimeError(last)
+        _time.sleep(wait or min(2 ** attempt, 8))
+    raise RuntimeError(last or "unknown")
+
+
+def _json_loads(txt):
+    import json as _json
+    return _json.loads(txt)
+
+
 @production_bp.route("/api/production/scan", methods=["POST"])
 def api_production_scan():
     """Wide-lookback scan of mailbox(es) for Daily Production sheet emails.
@@ -364,6 +415,14 @@ def api_production_scan():
     qualifying_count = 0
     ingested = 0
     parse_errors = []
+    # Kept apart from parse_errors on purpose. A fetch failure means messages
+    # went UNREAD; a parse failure means a sheet was read and couldn't be
+    # understood. Lumping them together is what let "page 1: parse error"
+    # masquerade as a parsing problem for ten weeks.
+    fetch_errors = []
+    # Production emails whose attachments held no PDF. This used to be a bare
+    # `continue`, so a sheet sent as .xlsx only vanished with no trace.
+    skipped_no_pdf = []
     brief_records = []
     existing = load_production()
     seen_msg_ids = {r.get("source_message_id") for r in existing if r.get("source_message_id")}
@@ -387,14 +446,17 @@ def api_production_scan():
         while next_url and pages < 40 and per_mailbox < max_messages:
             pages += 1
             try:
-                req = urllib.request.Request(next_url, method="GET")
-                req.add_header("Authorization", f"Bearer {token}")
-                req.add_header("Accept", "application/json")
-                req.add_header("ConsistencyLevel", "eventual")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    page = _json.loads(resp.read().decode("utf-8"))
+                page = _graph_page(next_url, token)
             except Exception as exc:  # noqa: BLE001
-                parse_errors.append(f"{upn} page {pages}: parse error")
+                # Say which mailbox stopped, at which page, and why -- and
+                # make clear the REST of that inbox went unread, because a
+                # silent partial scan reads as "nothing new".
+                _log_exc(exc, f"production scan {upn} page {pages}")
+                fetch_errors.append(
+                    f"{upn}: aborted at page {pages} after retries "
+                    f"({_safe_err(exc, 'graph fetch')}) - the rest of this "
+                    f"mailbox was NOT scanned on this run."
+                )
                 break
             for m in page.get("value", []):
                 scanned += 1
@@ -420,12 +482,21 @@ def api_production_scan():
                     araw, _ = client._graph_get(att_url, token)
                     apage = _json.loads(araw.decode("utf-8"))
                 except Exception as exc:  # noqa: BLE001
-                    parse_errors.append(f"{subject[:60]!r}: list-att failed")
+                    _log_exc(exc, f"production scan list-att {subject[:60]!r}")
+                    fetch_errors.append(
+                        f"{subject[:60]!r}: could not list attachments "
+                        f"({_safe_err(exc, 'graph fetch')})")
                     continue
                 pdf_atts = [a for a in apage.get("value", [])
                             if (a.get("name") or "").lower().endswith(".pdf")
                             or (a.get("contentType") or "").lower() == "application/pdf"]
                 if not pdf_atts:
+                    names = [a.get("name") or "?" for a in apage.get("value", [])]
+                    skipped_no_pdf.append({
+                        "subject": subject[:90],
+                        "received_at": m.get("receivedDateTime") or "",
+                        "attachments": names[:6],
+                    })
                     continue
                 # Fetch + parse the first PDF attachment
                 a = pdf_atts[0]
@@ -436,7 +507,10 @@ def api_production_scan():
                     apayload = _json.loads(fraw.decode("utf-8"))
                     pdf_bytes = base64.b64decode(apayload.get("contentBytes") or "")
                 except Exception as exc:  # noqa: BLE001
-                    parse_errors.append(f"{subject[:60]!r}: fetch-att failed")
+                    _log_exc(exc, f"production scan fetch-att {subject[:60]!r}")
+                    fetch_errors.append(
+                        f"{subject[:60]!r}: could not download the PDF "
+                        f"({_safe_err(exc, 'graph fetch')})")
                     continue
                 sheet = parse_production_pdf(pdf_bytes, subject=subject)
                 if sheet.error and not sheet.lines:
@@ -475,7 +549,8 @@ def api_production_scan():
                     "po_number":          sheet.po_number,
                     "lines": [
                         {"variety": L.variety, "raw_variety": L.raw_variety,
-                         "cs_count": L.cs_count, "lot_number": L.lot_number}
+                         "cs_count": L.cs_count, "lot_number": L.lot_number,
+                         "derived_from": getattr(L, "derived_from", "")}
                         for L in sheet.lines
                     ],
                     "total_cases":        sheet.total_cases,
@@ -551,6 +626,9 @@ def api_production_scan():
         "messages_qualifying": qualifying_count,
         "ingested": ingested,
         "parse_errors": parse_errors,
+        "fetch_errors": fetch_errors,
+        "skipped_no_pdf": skipped_no_pdf,
+        "complete": not fetch_errors,
         "records": brief_records,
     })
 
@@ -569,21 +647,62 @@ def api_admin_production_renormalize_varieties():
     Body: { dry_run: bool }
     """
     from inventory_tracker import load_production, save_production
-    from integrations.production_pdf_parser import _normalize_variety
+    from integrations.production_pdf_parser import (
+        _normalize_variety, is_non_item_label, split_assorted,
+    )
     body = request.json or {}
     dry_run = bool(body.get("dry_run", False))
     records = load_production()
     changed_lines = 0
     changed_records = 0
+    dropped_footer_lines = 0
+    dropped_footer_cases = 0.0
+    expanded_assorted = 0
     samples = []
     for r in records:
         any_changed = False
+        new_lines = []
         for L in r.get("lines") or []:
             raw_v = L.get("raw_variety") or L.get("variety") or ""
             old_can = L.get("variety") or ""
+
+            # A "TOTAL" footer row is a rollup of the sheet, not an item.
+            # Stored as a line it double-counts the whole sheet.
+            if is_non_item_label(raw_v):
+                dropped_footer_lines += 1
+                dropped_footer_cases += float(L.get("cs_count") or 0)
+                any_changed = True
+                if len(samples) < 30:
+                    samples.append({"raw": raw_v, "old": old_can,
+                                    "new": "(dropped - footer row)",
+                                    "cs": L.get("cs_count"),
+                                    "po": r.get("po_number") or ""})
+                continue
+
             new_can, _recognized = _normalize_variety(raw_v)
+
+            # Assorted expands into ASSORTED_SPLIT. Already-derived lines are
+            # left alone so re-running stays idempotent.
+            if new_can == "Assorted" and not L.get("derived_from"):
+                cs = int(float(L.get("cs_count") or 0))
+                for v, part in split_assorted(cs):
+                    if not part:
+                        continue
+                    new_lines.append({**L, "variety": v, "cs_count": part,
+                                      "raw_variety": raw_v,
+                                      "derived_from": raw_v.strip().upper()})
+                expanded_assorted += 1
+                changed_lines += 1
+                any_changed = True
+                if len(samples) < 30:
+                    samples.append({"raw": raw_v, "old": old_can,
+                                    "new": f"split {cs} cs across "
+                                           f"{len(split_assorted(cs))} varieties",
+                                    "po": r.get("po_number") or ""})
+                continue
+
             if new_can != old_can:
-                if len(samples) < 25:
+                if len(samples) < 30:
                     samples.append({
                         "raw": raw_v,
                         "old": old_can,
@@ -594,8 +713,23 @@ def api_admin_production_renormalize_varieties():
                 L["variety"] = new_can
                 changed_lines += 1
                 any_changed = True
+            new_lines.append(L)
+
         if any_changed:
+            r["lines"] = new_lines
+            # The header total is the sheet's own printed figure; only
+            # recompute it when it was derived from the lines to begin with.
+            recomputed = sum(float(x.get("cs_count") or 0) for x in new_lines)
+            if not r.get("total_cases") or dropped_footer_lines:
+                r["total_cases"] = int(recomputed)
+            # Re-resolve the stored unmapped list against today's aliases so
+            # the UI stops flagging labels that now map cleanly.
+            r["unmapped_varieties"] = sorted({
+                (x.get("raw_variety") or "") for x in new_lines
+                if not _normalize_variety(x.get("raw_variety") or "")[1]
+            } - {""})
             changed_records += 1
+
     if not dry_run:
         save_production(records)
     return jsonify({
@@ -604,6 +738,9 @@ def api_admin_production_renormalize_varieties():
         "records_scanned": len(records),
         "records_changed": changed_records,
         "lines_changed": changed_lines,
+        "assorted_lines_expanded": expanded_assorted,
+        "footer_lines_dropped": dropped_footer_lines,
+        "footer_cases_removed": round(dropped_footer_cases, 2),
         "samples": samples,
     })
 

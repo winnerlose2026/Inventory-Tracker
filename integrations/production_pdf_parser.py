@@ -118,7 +118,50 @@ _VARIETY_ALIASES: dict[str, str] = {
     "PARB-JC":                   "Jalapeno Cheddar",
     "PARB-JLP":                  "Jalapeno Cheddar",
     "PARB-AS":                   "Asiago",
+    # Pumpernickel — H&H mfg 1154, the October LTO. Every DC cut a promo PO
+    # for it; the production sheets were bucketing it into the catch-all.
+    "PUMPERNICKEL":              "Pumpernickel",
+    "PARB-PUMPERNICKEL":         "Pumpernickel",
+    "PRNKL":                     "Pumpernickel",
+    "PUMP":                      "Pumpernickel",
+    # Cinnamon Raisin — 1155 is the only cinnamon SKU H&H makes, so a bare
+    # "CINNAMON" on a sheet can only mean Cinnamon Raisin.
+    "CINN RAISIN":               "Cinnamon Raisin",
+    "CINNAMON":                  "Cinnamon Raisin",
+    "CINN":                      "Cinnamon Raisin",
+    "CIN RAISIN":                "Cinnamon Raisin",
+    "RAISIN":                    "Cinnamon Raisin",
+    # Punctuation variants of the two-word names.
+    "JALAPENO-CHEDDAR":          "Jalapeno Cheddar",
+    "JALAPENO CHEDDER":          "Jalapeno Cheddar",
+    "POPPYSEED":                 "Poppy Seed",
+    "WHOLE-WHEAT":               "Whole Wheat",
 }
+
+#: Assorted cases hold a mix the sheet never itemises. JD's call (2026-08-28):
+#: an H&H assorted case is an even split of these four.
+ASSORTED_SPLIT: tuple[str, ...] = (
+    "Plain", "Sesame", "Everything", "Cinnamon Raisin",
+)
+
+#: Labels that mean "assorted case" and get the split above.
+_ASSORTED_LABELS = frozenset({
+    "ASSORTED", "ASST", "ASSORTED SLICED", "ASST SLICED", "SLICED ASSORTED",
+    "ASSORTMENT", "MIXED", "VARIETY",
+})
+
+#: Mini assorted stays its OWN bucket -- a mini case is not a full-size case,
+#: so folding it into the four full-size varieties would overstate them.
+_MINI_ASSORTED_LABELS = frozenset({
+    "MINI ASST", "MINI ASSORTED", "ASST MINI", "MINI",
+})
+
+#: Footer / rollup rows that are not line items. "TOTAL" alone accounted for
+#: 1,112 phantom cases before this existed.
+_NON_ITEM_LABELS = frozenset({
+    "TOTAL", "TOTALS", "GRAND TOTAL", "SUBTOTAL", "SUB TOTAL", "SUM",
+    "TOTAL CASES", "TOTAL CS", "ALL", "OTHER",
+})
 
 # Map of compact abbreviations applied AFTER stripping a "PARB-" prefix.
 # Lets us treat the bare form and the parbaked form the same way without
@@ -142,6 +185,82 @@ _VARIETY_SHORTHAND: dict[str, str] = {
 }
 
 
+#: A lot code sometimes lands in the same text run as the variety, e.g.
+#: "PARB-EVERYTHING 1158040226" (mfg 1158 + MMDDYY). Strip it before matching.
+_TRAILING_LOT_RE = re.compile(r"\s+\d{6,14}$")
+
+#: "SLICED" is a form, not a variety -- H&H's 13 mfg codes have no sliced SKU,
+#: so "PLAIN SLICED" and "SLICED PLAIN" are both Plain. (JD, 2026-08-28.)
+_SLICED_RE = re.compile(r"\b(SLICED|SLCD|SLC)\b")
+
+
+def is_non_item_label(raw: str) -> bool:
+    """Is this a footer / rollup row rather than a production line?
+
+    The sheet's "TOTAL" row parses as "<n> CS TOTAL" exactly like a real line,
+    so it was being stored as a line item and double-counting the whole sheet
+    -- 1,112 phantom cases across three sheets before this check existed.
+    """
+    key = _TRAILING_LOT_RE.sub("", (raw or "").strip().upper()).strip()
+    return key in _NON_ITEM_LABELS
+
+
+def assorted_kind(raw: str) -> str:
+    """'' | 'assorted' | 'mini' for a raw variety label."""
+    key = _TRAILING_LOT_RE.sub("", (raw or "").strip().upper()).strip()
+    for pre in ("PARB-", "PARB ", "PARB.", "PARBAKED ", "PARBAKED-",
+                "PRBKD-", "PRBKD "):
+        if key.startswith(pre):
+            key = key[len(pre):].strip()
+            break
+    if key in _MINI_ASSORTED_LABELS:
+        return "mini"
+    if key in _ASSORTED_LABELS:
+        return "assorted"
+    return ""
+
+
+def _fuzzy_variety(key: str) -> str:
+    """Last-resort close match against the known labels.
+
+    The sheets are hand-keyed and Everything alone arrived as EVRYTHING,
+    EVEYRTHING, EVRERYTHING and EVERTYTHING. The cutoff is deliberately high
+    and only single-token labels are considered, so ASSORTED can never drift
+    into ASIAGO.
+    """
+    import difflib
+    if len(key) < 5 or " " in key:
+        return ""
+    hits = difflib.get_close_matches(key, _FUZZY_CANDIDATES, n=1, cutoff=0.86)
+    return _VARIETY_ALIASES[hits[0]] if hits else ""
+
+
+#: Single-token alias keys eligible for fuzzy matching (see _fuzzy_variety).
+_FUZZY_CANDIDATES = [k for k in _VARIETY_ALIASES
+                     if " " not in k and "-" not in k and len(k) >= 5]
+
+
+def split_assorted(cs_count: int) -> list:
+    """Split an assorted case count evenly across ASSORTED_SPLIT.
+
+    A sheet says "24 CS ASSORTED" and never itemises the mix, so the split is
+    H&H's known case makeup (JD, 2026-08-28) rather than anything the sheet
+    reported. Integer cases with the remainder handed to the earliest
+    varieties, so the parts always sum EXACTLY to the original -- a rounded
+    split that loses a case would quietly corrupt the sheet total.
+
+    Returns [(variety, cs), ...].
+    """
+    n = len(ASSORTED_SPLIT)
+    total = int(cs_count or 0)
+    base, rem = divmod(abs(total), n)
+    sign = -1 if total < 0 else 1
+    out = []
+    for i, v in enumerate(ASSORTED_SPLIT):
+        out.append((v, sign * (base + (1 if i < rem else 0))))
+    return out
+
+
 def _normalize_variety(raw: str) -> tuple[str, bool]:
     """Resolve a raw variety string from a production sheet to a
     canonical variety name.
@@ -162,8 +281,20 @@ def _normalize_variety(raw: str) -> tuple[str, bool]:
     if not raw:
         return ("In-House Inventory", False)
     key = raw.strip().upper()
+    # A lot code glued onto the variety ("PARB-EVERYTHING 1158040226") is not
+    # part of the name.
+    key = _TRAILING_LOT_RE.sub("", key).strip()
     if key in _VARIETY_ALIASES:
         return (_VARIETY_ALIASES[key], True)
+
+    kind = assorted_kind(key)
+    if kind == "mini":
+        return ("Mini Assorted", True)
+    if kind == "assorted":
+        # Expanded into ASSORTED_SPLIT by expand_assorted_lines(); this label
+        # is what a line carries until that runs.
+        return ("Assorted", True)
+
     # Strip Parb-* / Parbaked / PRBKD prefixes
     stripped = key
     for pre in ("PARB-", "PARB ", "PARB.", "PARBAKED ", "PARBAKED-",
@@ -176,6 +307,20 @@ def _normalize_variety(raw: str) -> tuple[str, bool]:
             return (_VARIETY_ALIASES[stripped], True)
     if stripped in _VARIETY_SHORTHAND:
         return (_VARIETY_SHORTHAND[stripped], True)
+
+    # "SLICED" is a form, not a variety -- drop the token and re-match.
+    if _SLICED_RE.search(stripped):
+        unsliced = _SLICED_RE.sub("", stripped).replace("  ", " ").strip(" -")
+        if unsliced in _VARIETY_ALIASES:
+            return (_VARIETY_ALIASES[unsliced], True)
+        if unsliced in _VARIETY_SHORTHAND:
+            return (_VARIETY_SHORTHAND[unsliced], True)
+        if assorted_kind(unsliced) == "assorted":
+            return ("Assorted", True)
+
+    fuzzy = _fuzzy_variety(stripped)
+    if fuzzy:
+        return (fuzzy, True)
     return ("In-House Inventory", False)
 
 # Warehouse normalization. The production sheet uses an UPPERCASE
@@ -234,6 +379,11 @@ class ProductionLine:
     raw_variety: str      # exactly as it appeared on the sheet
     cs_count: int
     lot_number: str = ""
+    #: Set when this line was DERIVED rather than read off the sheet -- today
+    #: only by the assorted split, which turns one "24 CS ASSORTED" row into
+    #: four. Keeps the estimate visible and reversible: raw_variety still holds
+    #: the original label, so re-splitting on a different mix is a re-run.
+    derived_from: str = ""
 
 
 @dataclass
@@ -394,9 +544,21 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     for match in _LINE_RE.finditer(text):
         cs = int(match.group(1))
         raw_v = match.group(2).strip()
+        # A "TOTAL" footer row matches the line regex exactly like a real
+        # item. Storing it double-counts the sheet.
+        if is_non_item_label(raw_v):
+            continue
         canonical, recognized = _normalize_variety(raw_v)
         if not recognized:
             seen_unknown.add(raw_v)
+        if canonical == "Assorted":
+            for v, part in split_assorted(cs):
+                if part:
+                    sheet.lines.append(ProductionLine(
+                        variety=v, raw_variety=raw_v, cs_count=part,
+                        derived_from=raw_v.strip().upper(),
+                    ))
+            continue
         sheet.lines.append(ProductionLine(
             variety=canonical, raw_variety=raw_v, cs_count=cs,
         ))

@@ -66,8 +66,8 @@ def _self_base_url() -> str:
     return f"http://127.0.0.1:{os.environ.get('PORT', '10000')}"
 
 
-def _post(path: str, timeout: int = 120) -> None:
-    """POST an empty JSON body to one of our own endpoints, authenticated with
+def _post(path: str, timeout: int = 120, payload: dict | None = None) -> None:
+    """POST a JSON body to one of our own endpoints, authenticated with
     the same INVENTORY_API_TOKEN the crons used. Never raises — a failure is
     logged and the next scheduled run tries again."""
     token = (os.environ.get("INVENTORY_API_TOKEN") or "").strip()
@@ -75,9 +75,11 @@ def _post(path: str, timeout: int = 120) -> None:
         log.warning("skipping %s - INVENTORY_API_TOKEN not set", path)
         return
     url = f"{_self_base_url()}{path}"
+    import json as _json
+    body = _json.dumps(payload or {}).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=b"{}",
+        data=body,
         method="POST",
         headers={"Content-Type": "application/json", "X-Inventory-Token": token},
     )
@@ -102,6 +104,23 @@ def _run_forecast_decrement() -> None:
 
 def _run_graph_renew() -> None:
     _post("/api/graph/subscriptions/renew")
+
+
+def _run_production_scan() -> None:
+    """Ingest Daily Production sheets from the mailbox.
+
+    Nothing scheduled this before, so /api/production/scan only ran when
+    someone remembered to call it by hand -- the last time was 2026-06-22 and
+    the tab silently sat ten weeks behind.
+
+    The 14-day lookback is deliberate overlap, not thoroughness for its own
+    sake: ingestion is idempotent on source_message_id, so a run that fails
+    or a day the service is down heals itself on the next run instead of
+    leaving a permanent hole. The timeout is generous because each sheet
+    costs a Graph attachment fetch plus a pypdf parse.
+    """
+    _post("/api/production/scan", timeout=600,
+          payload={"lookback_days": 14, "max_messages": 200})
 
 
 def start_scheduler() -> BackgroundScheduler | None:
@@ -134,11 +153,21 @@ def start_scheduler() -> BackgroundScheduler | None:
         coalesce=True,
         misfire_grace_time=3600,
     )
+    # Daily Production sheet ingest — 23:30 UTC (7:30pm ET), after the
+    # production day's sheets have been sent.
+    sched.add_job(
+        _run_production_scan,
+        CronTrigger(hour=23, minute=30, timezone=UTC),
+        id="production-scan-daily",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     sched.start()
     _scheduler = sched
     log.info(
         "in-process scheduler started: forecast-decrement 05:05 UTC, "
-        "graph-renew 09:00 UTC (base=%s)",
+        "graph-renew 09:00 UTC, production-scan 23:30 UTC (base=%s)",
         _self_base_url(),
     )
     return sched
