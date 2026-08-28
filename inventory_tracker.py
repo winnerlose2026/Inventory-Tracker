@@ -603,6 +603,9 @@ def save_status_overrides(data: dict):
 # _append_rollover_usage pass (which mutates the usage list). Not thread-safe
 # — we rely on the single-process Flask dev/gunicorn model.
 _PENDING_ROLLOVER_AUDIT: list = []
+#: Rollover entries dropped WITHOUT touching on-hand because a later
+#: physical count already absorbed the delivery. Audit only.
+_PENDING_ROLLOVER_ABSORBED: list = []
 
 
 # A PO date parsed off a PDF can come out with a nonsense year (PO 8513015G
@@ -656,8 +659,9 @@ def _rollover_on_order(inv: dict) -> bool:
     INSTEAD of eta as the trigger. Promotion is idempotent: once an
     entry has been added to quantity and the entry removed from
     on_order it cannot be added again."""
-    global _PENDING_ROLLOVER_AUDIT
+    global _PENDING_ROLLOVER_AUDIT, _PENDING_ROLLOVER_ABSORBED
     _PENDING_ROLLOVER_AUDIT = []
+    _PENDING_ROLLOVER_ABSORBED = []
     now = datetime.now()
     changed = False
     for key, item in inv.items():
@@ -679,6 +683,33 @@ def _rollover_on_order(inv: dict) -> bool:
             if qty <= 0:
                 changed = True
                 continue
+
+            # A delivery dated on or before this SKU's last physical count is
+            # already inside that counted figure -- promoting it would add
+            # cases the counter has already walked past and tallied. Drop it
+            # out of on_order without touching quantity.
+            #
+            # This is the receiving-side mirror of
+            # sync_inventory._receipts_after_count(). It matters when a PO is
+            # re-booked with a back-dated ETA: the 2026-08-28 Alcoa re-apply
+            # of PO 2055126H posted an ETA of 08-14 that promoted instantly,
+            # on top of a count taken 08-24 that already contained it.
+            count_date = (item.get("last_count_at") or "")[:10]
+            if count_date and trigger.date().isoformat() <= count_date:
+                _PENDING_ROLLOVER_ABSORBED.append({
+                    "item_key": key,
+                    "item_name": item.get("name", key),
+                    "unit": item.get("unit", ""),
+                    "qty": qty,
+                    "po_number": entry.get("po_number", ""),
+                    "po_revision": entry.get("po_revision", ""),
+                    "eta": trigger.isoformat(),
+                    "count_date": count_date,
+                    "timestamp": now.isoformat(),
+                })
+                changed = True
+                continue
+
             item["quantity"] = float(item.get("quantity", 0)) + qty
             item["updated"] = now.isoformat()
             _PENDING_ROLLOVER_AUDIT.append({
@@ -865,6 +896,27 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "source": "on_order_rollover",
         })
     _PENDING_ROLLOVER_AUDIT.clear()
+
+    # Absorbed arrivals get a zero-amount audit row under their own source so
+    # the PO's disappearance from on_order is traceable, while never counting
+    # as a receipt (_receipts_after_count filters on "on_order_rollover").
+    for absorbed in _PENDING_ROLLOVER_ABSORBED:
+        usage.append({
+            "item_key": absorbed["item_key"],
+            "item_name": absorbed["item_name"],
+            "amount": 0,
+            "unit": absorbed["unit"],
+            "note": (f"PO {absorbed['po_number']} arrival "
+                     f"(ETA {absorbed['eta'][:10]}) absorbed by the "
+                     f"{absorbed['count_date']} count - "
+                     f"{absorbed['qty']:g} cs already on hand, not re-added"),
+            "timestamp": absorbed["timestamp"],
+            "po_number": absorbed["po_number"],
+            "po_revision": absorbed["po_revision"],
+            "arrival_date": absorbed["eta"],
+            "source": "on_order_absorbed",
+        })
+    _PENDING_ROLLOVER_ABSORBED.clear()
 
 
 # ---------------------------------------------------------------------------

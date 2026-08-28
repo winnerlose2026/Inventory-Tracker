@@ -349,6 +349,43 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
         entry = usage[idx]
         key = entry.get("item_key", "")
         item = inv.get(key)
+
+        # A receipt the warehouse has since COUNTED is already inside the
+        # counted figure, so reversing it subtracts cases that are physically
+        # on the shelf. This is the mirror of _receipts_after_count(): that
+        # guard stops a count erasing a delivery that landed AFTER it; this
+        # one stops a later PO re-apply clawing back a delivery an earlier
+        # count already absorbed.
+        #
+        # 2026-08-28: PO 2055126H (Alcoa) had rolled into on-hand twice --
+        # ETA 08-03 and a duplicate ETA 08-04 -- and Kim's 08-24 count then
+        # set on-hand to physical truth, absorbing both. A re-scan that
+        # afternoon resolved pumpernickel as a "gained" SKU, which bypassed
+        # the idempotent skip; the supersede path reversed BOTH arrivals
+        # (-224 cs) and re-applied one (+112 cs), driving six of Alcoa's
+        # twelve SKUs negative and the rest to OUT.
+        #
+        # Compared on ARRIVAL date, not the row's posting timestamp, for the
+        # same reason _receipts_after_count is: a wide-lookback backfill
+        # posts long-past arrivals "now". Same-day counts as absorbed.
+        if item is not None:
+            _count_date = (item.get("last_count_at") or "")[:10]
+            _arrival = _rollover_arrival(entry)
+            if _count_date and _arrival and _arrival <= _count_date:
+                report.setdefault("reversals_absorbed", []).append(
+                    f"PO {po_number} rev {new_rev_tag}: kept "
+                    f"{abs(float(entry.get('amount') or 0)):g} cs of "
+                    f"{item.get('name', key)} - it arrived {_arrival}, on or "
+                    f"before the {_count_date} count that already absorbed it."
+                )
+                if not dry_run:
+                    # Still retire the row so a later scan can't reverse it
+                    # either; just never touch on-hand for it.
+                    entry["superseded_by_revision"] = new_rev_tag
+                    entry["superseded_at"] = now
+                    entry["reversal_skipped_absorbed_by_count"] = _count_date
+                continue
+
         if item is None:
             # SKU got removed since the original restock — nothing to undo
             # on-hand for, but still mark the log entry superseded.
