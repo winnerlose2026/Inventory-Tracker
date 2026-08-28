@@ -216,3 +216,62 @@ def test_an_audit_row_is_written_for_every_move(monkeypatch):
     assert len(audit) == 2
     assert audit[0]["amount"] == -56.0          # negative == stock added
     assert "JD confirmed receipt" in audit[0]["note"]
+
+
+# --- superseded rollover rows are retired for every reader ----------------
+# A rollover row can be retired two ways: `reversed` (reopen / usage reversal)
+# and `superseded_by_revision` (a newer PO revision). Only the first was ever
+# checked, so a revised PO counted its old AND new arrival everywhere --
+# 2753463T rendered 6 lines / 336 cs for a 3-line, 168 cs PO, and reopen would
+# have subtracted its cases twice.
+
+from core.util import rollover_row_live
+
+
+def _superseded(row):
+    row = dict(row)
+    row["superseded_by_revision"] = "0000006"
+    return row
+
+
+def test_live_predicate_retires_both_markers():
+    live = _usage()[0]
+    assert rollover_row_live(live) is True
+    assert rollover_row_live(_superseded(live)) is False
+    assert rollover_row_live(dict(live, reversed=True)) is False
+    assert rollover_row_live(dict(live, source="email")) is False
+
+
+def test_adjust_ignores_superseded_rows(monkeypatch):
+    """The old 08-23 arrival and its 08-28 replacement both sit in the log;
+    only the replacement may be adjusted, or the change lands twice."""
+    u = _usage()
+    u = [_superseded(u[0]), _superseded(u[1])] + _usage()
+    out, _, inv, _ = _run(monkeypatch, {"po_number": PO,
+                                        "arrival_date": "2026-08-25"}, usage=u)
+    assert out["lines_touched"] == 2          # not 4
+    assert inv[KEY]["quantity"] == 56.0       # +56 once, not +112
+
+
+def test_ledger_counts_a_revised_po_once(monkeypatch):
+    import inventory_tracker as it
+    u = [_superseded(r) for r in _usage()] + _usage()
+    monkeypatch.setattr(it, "load_inventory", lambda: _inv())
+    monkeypatch.setattr(it, "load_usage", lambda: u)
+    monkeypatch.setattr(it, "load_chefs_warehouse_pos", lambda: [])
+    monkeypatch.setattr(it, "load_canceled_pos", lambda: {})
+    monkeypatch.setattr(it, "load_status_overrides", lambda: {})
+    monkeypatch.setattr(pos, "_freight_ship_date_index", lambda: {})
+    rec = [r for r in pos.build_po_ledger() if r["po_number"] == PO][0]
+    assert len(rec["lines"]) == 2
+    assert rec["total_cs"] == 112.0
+
+
+def test_receipts_after_count_ignores_superseded(monkeypatch):
+    """The replacement row is the receipt; the superseded one was already
+    un-rolled, so counting it would re-add cases that aren't there."""
+    import sync_inventory as sync
+    live = {"source": "on_order_rollover", "item_key": KEY, "amount": -56.0,
+            "arrival_date": "2026-08-26T00:00:00"}
+    assert sync._receipts_after_count([live], KEY, "2026-08-24") == 56.0
+    assert sync._receipts_after_count([_superseded(live)], KEY, "2026-08-24") == 0.0

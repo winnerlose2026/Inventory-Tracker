@@ -10,7 +10,7 @@ from flask import Blueprint, jsonify, request
 # ship dates. freight imports only core/, so no cycle.
 from blueprints.freight import _freight_ship_date_index
 from core.errors import _safe_err
-from core.util import _norm_po_key
+from core.util import _norm_po_key, rollover_row_live
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -231,9 +231,9 @@ def api_pending_reopen():
     removed_cs = 0.0
     new_rows = []
     for e in usage:
-        if (e.get("source") or "") != "on_order_rollover":
-            continue
-        if e.get("reversed"):
+        # Superseded rows were already un-rolled by the revision that replaced
+        # them; un-rolling them again would subtract the cases twice.
+        if not rollover_row_live(e):
             continue
         if _norm_po_key(e.get("po_number") or "") != key_norm:
             continue
@@ -405,8 +405,7 @@ def api_arrived_po_adjust():
     usage = load_usage()
     key_norm = _norm_po_key(po_number)
     rows = [e for e in usage
-            if (e.get("source") or "") == "on_order_rollover"
-            and not e.get("reversed")
+            if rollover_row_live(e)
             and _norm_po_key(e.get("po_number") or "") == key_norm]
     if not rows:
         return jsonify({"ok": False, "error": "No arrived lines found for this "
@@ -785,9 +784,7 @@ def api_arrived_pos():
 
     groups: dict = {}
     for e in (load_usage() or []):
-        if (e.get("source") or "") != "on_order_rollover":
-            continue
-        if e.get("reversed"):
+        if not rollover_row_live(e):
             continue
         po = (e.get("po_number") or "").strip()
         if not po:
@@ -872,7 +869,7 @@ def _present_po_numbers() -> set:
             if po:
                 present.add(po)
     for e in (load_usage() or []):
-        if (e.get("source") or "") == "on_order_rollover" and not e.get("reversed"):
+        if rollover_row_live(e):
             po = str(e.get("po_number") or "").strip()
             if po:
                 present.add(po)
@@ -988,7 +985,10 @@ def build_po_ledger() -> list:
                 "name": it.get("name") or k} for k, it in inv.items()}
     arr: dict = {}
     for e in (load_usage() or []):
-        if (e.get("source") or "") != "on_order_rollover" or e.get("reversed"):
+        # Skips superseded arrivals too, or a revised PO renders its old and
+        # new lines side by side -- 2753463T showed 6 lines / 336 cs for a
+        # 3-line, 168 cs PO.
+        if not rollover_row_live(e):
             continue
         po = (e.get("po_number") or "").strip()
         if not po:

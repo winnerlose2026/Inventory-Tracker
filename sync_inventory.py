@@ -20,6 +20,7 @@ import sys
 from datetime import datetime, timedelta
 from typing import Iterable
 
+from core.util import rollover_row_live
 from integrations import (
     CheneyBrothersClient, USFoodsClient,
     DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
@@ -112,7 +113,11 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
         return 0.0
     total = 0.0
     for e in usage:
-        if (e.get("source") or "") != "on_order_rollover" or e.get("reversed"):
+        # A superseded arrival is not a live addend: _reverse_po_entries either
+        # took its cases back out of on-hand, or left them inside a count that
+        # already absorbed them. Re-adding it here would double the receipt --
+        # the replacement row is the one that counts.
+        if not rollover_row_live(e):
             continue
         if (e.get("item_key") or "") != item_key:
             continue

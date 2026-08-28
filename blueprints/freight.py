@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, make_response, request
 
 from core.cache import _AGG_CACHE, _data_sig
+from core.util import rollover_row_live
 from core.errors import _log_exc, _safe_err
 from core.http import _TRUSTED_OUTBOUND_HOSTS
 from core.util import _norm_po_key
@@ -622,7 +623,7 @@ def api_freight_lead_times():
 
     meta = {k: (it.get("warehouse") or "") for k, it in inv.items()}
     for ev in usage:
-        if (ev.get("source") or "") != "on_order_rollover" or ev.get("reversed"):
+        if not rollover_row_live(ev):
             continue
         po = (ev.get("po_number") or "").strip()
         if not po:
