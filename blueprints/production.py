@@ -663,7 +663,44 @@ def api_admin_production_renormalize_varieties():
         any_changed = False
         record_dropped_footer = False
         new_lines = []
+
+        # DERIVED lines (today: the assorted split) are re-derived as a GROUP
+        # from their shared original, never re-resolved individually.
+        #
+        # Re-resolving them individually is precisely the bug this replaced:
+        # raw_variety on every one of them is still "ASSORTED", so the
+        # "canonical changed" branch happily rewrote all four back to
+        # Assorted and destroyed the split -- 96 lines on 2026-08-28.
+        # Re-splitting the group's own total instead is idempotent AND
+        # self-healing: it reproduces the same split whether the lines are
+        # intact or collapsed.
+        derived_groups: dict = {}
         for L in r.get("lines") or []:
+            src = L.get("derived_from")
+            if src:
+                derived_groups.setdefault(src, []).append(L)
+        for src, group in derived_groups.items():
+            total = int(sum(float(x.get("cs_count") or 0) for x in group))
+            rebuilt = [
+                {**group[0], "variety": v, "cs_count": part,
+                 "raw_variety": group[0].get("raw_variety") or src,
+                 "derived_from": src}
+                for v, part in split_assorted(total) if part
+            ]
+            before = [(x.get("variety"), x.get("cs_count")) for x in group]
+            after = [(x.get("variety"), x.get("cs_count")) for x in rebuilt]
+            if before != after:
+                changed_lines += len(rebuilt)
+                any_changed = True
+                if len(samples) < 30:
+                    samples.append({"raw": src, "old": before[:2],
+                                    "new": f"re-split {total} cs",
+                                    "po": r.get("po_number") or ""})
+            new_lines.extend(rebuilt)
+
+        for L in r.get("lines") or []:
+            if L.get("derived_from"):
+                continue          # handled as a group above
             raw_v = L.get("raw_variety") or L.get("variety") or ""
             old_can = L.get("variety") or ""
 
@@ -685,7 +722,7 @@ def api_admin_production_renormalize_varieties():
 
             # Assorted expands into ASSORTED_SPLIT. Already-derived lines are
             # left alone so re-running stays idempotent.
-            if new_can == "Assorted" and not L.get("derived_from"):
+            if new_can == "Assorted":
                 cs = int(float(L.get("cs_count") or 0))
                 for v, part in split_assorted(cs):
                     if not part:
