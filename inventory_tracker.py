@@ -4,6 +4,7 @@
 import copy
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,10 +28,26 @@ USAGE_FILE = DATA_DIR / "usage.json"
 _FILE_CACHE: dict = {}
 
 
+class DataFileCorrupt(RuntimeError):
+    """A data file exists on disk but will not parse.
+
+    Raised instead of quietly returning the empty default. On 2026-09-17 a
+    torn inventory.json read back here as {}, and the next save wrote that {}
+    over the file -- a recoverable read error became real data loss. A file
+    that exists but cannot be parsed is now always an error, never an empty
+    inventory.
+    """
+
+
+def _backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
 def _read_json(path: Path, default):
     try:
         st = path.stat()
     except OSError:
+        # Genuinely absent -- a first run. The default is correct here.
         return copy.deepcopy(default)
     sig = (st.st_mtime_ns, st.st_size)
     key = str(path)
@@ -40,8 +57,28 @@ def _read_json(path: Path, default):
     try:
         with open(path) as f:
             data = json.load(f)
-    except Exception:
-        return copy.deepcopy(default)
+    except Exception as exc:
+        # The file EXISTS but will not parse. Prefer the rolling backup
+        # _write_json keeps; only then decide whether this is loss or not.
+        bak = _backup_path(path)
+        try:
+            with open(bak) as bf:
+                recovered = json.load(bf)
+        except Exception:
+            recovered = None
+        if recovered:
+            print("[data] %s unreadable (%s); recovered from %s"
+                  % (path.name, type(exc).__name__, bak.name), file=sys.stderr)
+            return copy.deepcopy(recovered)
+        if st.st_size == 0:
+            # A zero-byte file is not evidence of loss: it is what a
+            # create-then-append caller leaves behind before its first write,
+            # and no backup contradicts it. Treat it as absent.
+            return copy.deepcopy(default)
+        raise DataFileCorrupt(
+            "%s exists (%d bytes) but is not valid JSON (%s), and %s holds "
+            "nothing usable" % (path, st.st_size, type(exc).__name__, bak.name)
+        ) from exc
     _FILE_CACHE[key] = (sig, data)
     return copy.deepcopy(data)
 
@@ -51,11 +88,40 @@ def _load(path: Path) -> "dict | list":
 
 
 def _write_json(path: Path, data):
-    """Write JSON and refresh the cache entry, so any reader in this process
-    sees the new data immediately regardless of filesystem mtime granularity."""
+    """Write JSON atomically and refresh the cache entry, so any reader in this
+    process sees the new data immediately regardless of filesystem mtime
+    granularity.
+
+    The payload goes to a temp file in the same directory and is moved into
+    place with os.replace(), which is atomic: a concurrent reader sees either
+    the whole old file or the whole new one, never a half-written one. The
+    previous contents are kept beside it as <name>.bak so a bad write is one
+    step from recovery.
+
+    This used to be a plain open(path, "w") -- truncate, then write. With
+    gunicorn running 2 workers x 4 threads, two scans landing at the same
+    second both did a full read-modify-write of inventory.json; on 2026-09-17
+    they interleaved and left the file unparseable, which then read back as {}
+    and was saved over. Atomicity removes the torn-file half of that.
+    """
     DATA_DIR.mkdir(exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    tmp = path.with_name("%s.tmp.%d" % (path.name, os.getpid()))
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.exists():
+            try:
+                shutil.copyfile(path, _backup_path(path))
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     try:
         st = path.stat()
         _FILE_CACHE[str(path)] = ((st.st_mtime_ns, st.st_size), copy.deepcopy(data))
@@ -105,7 +171,28 @@ def load_inventory() -> dict:
     return reconcile_inventory()
 
 
-def save_inventory(inv: dict):
+def save_inventory(inv: dict, *, allow_empty: bool = False):
+    """Persist inventory, refusing to replace a populated file with an empty
+    one unless the caller explicitly opts in (seeding, a deliberate reset).
+
+    save_inventory() is where every scan and every ingest ends, so it is what
+    amplified the 2026-09-17 read failure into data loss: once a corrupt read
+    had handed the caller {}, the next scan wrote {} back and the SKUs were
+    gone. An empty inventory is now something a caller has to ask for.
+    """
+    if not inv and not allow_empty:
+        try:
+            existing = _read_json(INVENTORY_FILE, {})
+        except DataFileCorrupt:
+            raise ValueError(
+                "refusing to write an empty inventory while inventory.json is "
+                "unreadable -- recover the file first"
+            ) from None
+        if existing:
+            raise ValueError(
+                "refusing to overwrite %d SKUs with an empty inventory; pass "
+                "allow_empty=True for a deliberate reset" % len(existing)
+            )
     _save(INVENTORY_FILE, inv)
 
 

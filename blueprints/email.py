@@ -1,6 +1,7 @@
 """Email blueprint — the MS365 mailbox scan, outbound send (Graph/SMTP), and
 the ingest-events endpoint. Extracted from app.py (refactor — see
 REFACTOR_PLAN.md). Shared helpers come from core/."""
+import contextlib
 import os
 from datetime import datetime, timedelta
 
@@ -12,8 +13,64 @@ from core.http import _TRUSTED_OUTBOUND_HOSTS
 email_bp = Blueprint("email", __name__)
 
 
+@contextlib.contextmanager
+def _ingest_lock():
+    """Let only one inventory-writing ingest run at a time, across processes.
+
+    gunicorn runs 2 workers x 4 threads, and every scan / ingest is a long
+    read-modify-write of data/inventory.json. On 2026-09-17 two scans arrived
+    in the same second, landed on different workers, and interleaved their
+    writes; the file was left unparseable and the next save blanked it.
+
+    Yields True when the lock was taken and False when another ingest already
+    holds it -- callers answer 409 rather than queueing, because a scan that
+    waits behind a 3-minute scan just dies on the worker timeout instead.
+    """
+    lock_path = os.path.join("data", ".ingest.lock")
+    try:
+        os.makedirs("data", exist_ok=True)
+    except OSError:
+        pass
+    try:
+        import fcntl
+    except ImportError:  # Windows / desktop GUI runs -- single process anyway
+        yield True
+        return
+    fh = open(lock_path, "w")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+def _busy_response(what):
+    return jsonify({
+        "ok": False,
+        "status": "busy",
+        "error": "another ingest is already running; retry shortly",
+        "endpoint": what,
+        "reports": [],
+    }), 409
+
+
 @email_bp.route("/api/email/scan", methods=["POST"])
 def api_email_scan():
+    with _ingest_lock() as got:
+        if not got:
+            return _busy_response("/api/email/scan")
+        return _api_email_scan_locked()
+
+
+def _api_email_scan_locked():
     # The whole route runs inside one try block so that ANY failure (import,
     # JSON parse, scan_email itself) becomes a structured 200 with status:
     # "error" + a traceback excerpt -- never a generic Flask 500. That's a
@@ -177,6 +234,22 @@ def api_scan_health():
         health = load_scan_health()
         fresh = warehouse_freshness()
         stale = [r for r in fresh if r.get("stale")]
+        # An empty inventory makes every downstream signal read "fine": no
+        # SKUs means no warehouses, which means zero stale warehouses. That
+        # false all-clear is what let the 2026-09-17 wipe sit unnoticed for
+        # hours. Count the SKUs and say so plainly.
+        from inventory_tracker import DataFileCorrupt, load_inventory
+        inventory_error = None
+        try:
+            sku_count = len(load_inventory())
+        except DataFileCorrupt as exc:
+            sku_count, inventory_error = -1, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "scan health inventory count")
+            sku_count, inventory_error = -1, "inventory unreadable"
+        if sku_count == 0:
+            inventory_error = ("inventory is EMPTY -- 0 SKUs on file; "
+                               "warehouse freshness below is meaningless")
         scan_age_hours = None
         last_ts = health.get("ts") if health else None
         if last_ts:
@@ -187,7 +260,10 @@ def api_scan_health():
             except ValueError:
                 pass
         return jsonify({
-            "ok": True,
+            "ok": inventory_error is None,
+            "inventory_sku_count": sku_count,
+            "inventory_empty": sku_count == 0,
+            "inventory_error": inventory_error,
             "last_scan": health or None,
             "last_scan_age_hours": scan_age_hours,
             "stale_count_days": STALE_COUNT_DAYS,
@@ -450,6 +526,13 @@ def api_cheney_stock_images():
 
 @email_bp.route("/api/email/ingest-events", methods=["POST"])
 def api_email_ingest_events():
+    with _ingest_lock() as got:
+        if not got:
+            return _busy_response("/api/email/ingest-events")
+        return _api_email_ingest_events_locked()
+
+
+def _api_email_ingest_events_locked():
     """Accept externally-parsed EmailEvents and apply them through the same
     PO revision-replace pipeline as /api/email/scan.
 

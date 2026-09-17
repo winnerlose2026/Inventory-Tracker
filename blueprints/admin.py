@@ -174,6 +174,78 @@ def api_seed():
     return jsonify({"ok": True, **summary})
 
 
+# Fields /api/inventory adds on the way out (see blueprints/inventory.py
+# _enrich_on_order). A snapshot taken from that endpoint carries them, and
+# they must not be written back into the stored item.
+_DERIVED_FIELDS = ("on_order_qty", "on_order_next_eta",
+                   "on_order_next_arrival", "on_order_next_is_actual")
+
+
+@admin_bp.route("/api/admin/restore-inventory", methods=["POST"])
+def api_admin_restore_inventory():
+    """Restore inventory from a snapshot taken off /api/inventory.
+
+    Exists because on 2026-09-17 inventory.json was blanked and there was no
+    way back in short of re-seeding and losing every count. Accepts the list
+    that /api/inventory returns, strips the derived fields, and rebuilds the
+    stored dict keyed on lowercased name.
+
+    Body:
+      items      list of item dicts (required, non-empty)
+      dry_run    bool -- report what would change, write nothing
+      mode       "replace"     overwrite the whole file (default)
+                 "fill-missing" only add SKUs not currently present, leaving
+                                existing ones untouched
+    """
+    body = request.json or {}
+    items = body.get("items")
+    dry_run = bool(body.get("dry_run", False))
+    mode = (body.get("mode") or "replace").strip()
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False,
+                        "error": "items must be a non-empty list"}), 400
+    if mode not in ("replace", "fill-missing"):
+        return jsonify({"ok": False, "error": "unknown mode %r" % mode}), 400
+
+    incoming = {}
+    for raw in items:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            return jsonify({"ok": False,
+                            "error": "every item needs a name"}), 400
+        item = {k: v for k, v in raw.items() if k not in _DERIVED_FIELDS}
+        incoming[str(raw["name"]).lower()] = item
+
+    try:
+        current = load_inventory()
+    except Exception:  # noqa: BLE001 -- unreadable is exactly when this runs
+        current = {}
+
+    added = sorted(set(incoming) - set(current))
+    kept = sorted(set(incoming) & set(current))
+    dropped = sorted(set(current) - set(incoming))
+    if mode == "fill-missing":
+        result = dict(current)
+        for k in added:
+            result[k] = incoming[k]
+        dropped = []
+    else:
+        result = incoming
+
+    summary = {
+        "ok": True, "dry_run": dry_run, "mode": mode,
+        "before_sku_count": len(current), "after_sku_count": len(result),
+        "added": len(added), "overwritten": len(kept) if mode == "replace" else 0,
+        "dropped": len(dropped), "dropped_keys": dropped[:20],
+        "on_order_rows": sum(len(v.get("on_order") or [])
+                             for v in result.values()),
+        "total_quantity": round(sum(float(v.get("quantity") or 0)
+                                    for v in result.values()), 2),
+    }
+    if not dry_run:
+        save_inventory(result)
+    return jsonify(summary)
+
+
 @admin_bp.route("/api/migrate-units", methods=["POST"])
 def api_migrate_units():
     from inventory_tracker import migrate_units_to_case

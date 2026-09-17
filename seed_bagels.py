@@ -128,7 +128,7 @@ BAGELS = _build_bagels()
 def seed(reset: bool = False):
     if reset:
         print("  Resetting inventory...")
-        save_inventory({})
+        save_inventory({}, allow_empty=True)
 
     existing = load_inventory()
     added = 0
