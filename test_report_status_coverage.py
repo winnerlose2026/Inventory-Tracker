@@ -42,3 +42,10 @@ def test_every_rep_has_a_usable_address():
             assert "@" in rep["email"], (warehouse, rep)
             assert rep["email"] == rep["email"].lower(), (warehouse, rep)
             assert rep["name"].strip(), (warehouse, rep)
+
+
+def test_houston_chases_tom_foley_only():
+    """JD, 2026-09-30: correspond with Tom Foley only on Houston."""
+    reps = WAREHOUSE_REPS["Houston, TX"]
+    chase = [r["email"] for r in reps if not r.get("no_chase")]
+    assert chase == ["tom.foley@usfoods.com"]

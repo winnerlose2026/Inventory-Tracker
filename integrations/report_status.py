@@ -72,12 +72,16 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
         {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com", "no_chase": True},
     ],
     "Houston, TX": [
-        # NW Houston, DC B2. Youngblood is the covering account exec, Foley the
-        # area buyer at 13400 Hollister Rd who cuts the POs. Houston was live in
-        # inventory since 2026-08-03 but had no reps here, so it could never
-        # clear a week and sat permanently stale on the status page.
-        {"name": "Charles Youngblood", "email": "charles.youngblood@usfoods.com"},
+        # NW Houston, DC B2. Foley is the area buyer at 13400 Hollister Rd who
+        # cuts the POs and holds the DC on-hand -- he is the ONLY Houston rep we
+        # chase. JD took Youngblood (major account exec) off Houston
+        # correspondence on 2026-09-30 ("just correspond with Tom Foley for
+        # now"); he stays listed no_chase only so a report he forwards still
+        # clears the warehouse. Houston was live in inventory since 2026-08-03
+        # but had no reps here until 325a84fd, so it sat permanently stale.
         {"name": "Tom Foley", "email": "tom.foley@usfoods.com"},
+        {"name": "Charles Youngblood", "email": "charles.youngblood@usfoods.com",
+         "no_chase": True},
     ],
     "Riviera Beach, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
     "Ocala, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],

@@ -95,7 +95,9 @@ REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     # NW Houston (DC B2, 13400 Hollister Rd). Charles Youngblood is the
     # major account exec covering the Texas market; Tom Foley is the area
     # buyer who actually cuts and re-cuts the POs. Either can send the
-    # weekly numbers, so both resolve to the same DC.
+    # weekly numbers, so both resolve to the same DC. (Since 2026-09-30 JD
+    # corresponds with Foley only; Youngblood stays mapped so anything he
+    # forwards still lands on Houston instead of erroring as unknown.)
     "charles.youngblood@usfoods.com": ("US Foods", "Houston, TX"),
     "tom.foley@usfoods.com": ("US Foods", "Houston, TX"),
 }
