@@ -195,7 +195,8 @@ RVB_USAGE = [("10153048", 55), ("10153018", 55), ("10153041", 33),
 
 def _usage_grid(rows, total, date_line=("Drill Down Reporting : Date Range >= "
                                         "09/28/2026 AND <= 10/03/2026"),
-                misread=None, print_mfg=None):
+                misread=None, print_mfg=None,
+                sum_label="Sum of All Products Activity"):
     """Patch the detector + recognizer with a synthetic usage-grid screenshot.
     ``misread`` maps item# -> the string the recognizer returns for that row."""
     _restore()
@@ -205,7 +206,7 @@ def _usage_grid(rows, total, date_line=("Drill Down Reporting : Date Range >= "
             (440, 60, 520, 70, 65.0, "Dist Item #", 0.9),
             (550, 60, 680, 70, 65.0, "Mfq.Product Code", 0.9),
             (700, 60, 780, 70, 65.0, "Full Cases", 0.9),
-            (0, 82, 200, 92, 87.0, "Sum of All Products Activity", 0.9),
+            (0, 82, 200, 92, 87.0, sum_label, 0.9),
             (700, 82, 730, 92, 87.0, str(total), 0.9)]
     by_y = {}
     for i, (item, _v) in enumerate(rows):
@@ -280,6 +281,18 @@ def test_usage_without_date_range_blocks():
     _usage_grid(RVB_USAGE, 295, date_line="Drill Down Reporting")
     ev, warn, _n = C.usage_events_from_image(b"png", "Riviera Beach, FL", "2026-10-03")
     assert ev == [] and any("Date Range" in w for w in warn), warn
+
+
+def test_usage_grid_read_when_ocr_drops_spaces():
+    """rapidocr 1.4 (what the desktop VM installs) returns the header lines with
+    the spaces squeezed out; the Date Range and total must still be found."""
+    _usage_grid(RVB_USAGE, 295,
+                date_line="DrillDownReporting:DateRange>=09/28/2026AND<=10/03/2026",
+                sum_label="SumofAllProductsActivity")
+    ev, warn, notes = C.usage_events_from_image(b"png", "Riviera Beach, FL", "")
+    assert warn == [], warn
+    assert len(ev) == 13 and all(e["count_date"] == "2026-10-03" for e in ev)
+    assert C._reject_as_stock_table(["SumofAllProductsActivity"]), "marker"
 
 
 if __name__ == "__main__":

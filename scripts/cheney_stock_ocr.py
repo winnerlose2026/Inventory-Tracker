@@ -153,12 +153,20 @@ def _ocr_rows(png_bytes: bytes) -> "list[dict]":
     return _ocr_page(png_bytes)[0]
 
 
+def _flat(text) -> str:
+    """Lower-cased with all whitespace removed (OCR spacing is unreliable)."""
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
 def _reject_as_stock_table(texts) -> str:
     """Return why this image must not yield on_hand, or "" when it looks like a
     genuine on-hand stock table."""
     blob = " ".join(str(t or "") for t in texts).lower()
+    # rapidocr 1.4 drops inter-word spaces ("DrillDownReporting:DateRange..",
+    # "SumofAllProductsActivity"), so match the markers space-insensitively.
+    flat = _flat(blob)
     for m in _CASE_MOVEMENT_MARKERS:
-        if m in blob:
+        if m in blob or _flat(m) in flat:
             return f"case-movement (usage) grid marker {m!r}"
     if not any(m in blob for m in _STOCK_MARKERS):
         return ("no on-hand stock-table header found "
@@ -251,9 +259,11 @@ def usage_events_from_image(png_bytes, warehouse, count_date, *,
     except Exception as exc:  # noqa: BLE001 -- unreadable image
         return [], [f"{warehouse}: usage grid image unreadable "
                     f"({type(exc).__name__}: {exc})"], []
-    texts = [t[5] for t in toks]
-
-    span, lo, hi, note = _span_days([[t] for t in texts])
+    # Rebuild the Date Range line from its two dates: rapidocr 1.4 returns it
+    # as "DrillDownReporting:DateRange>=09/28/2026AND<=10/03/2026".
+    rng = [f"Date Range >= {' AND <= '.join(_DATE_RE.findall(t[5]))}"
+           for t in toks if "daterange" in _flat(t[5])]
+    span, lo, hi, note = _span_days([[r] for r in rng])
     if note:
         warnings.append(f"{warehouse}: usage grid has no readable Date Range "
                         f"-- can't convert Full Cases to a weekly rate")
@@ -304,6 +314,13 @@ def usage_events_from_image(png_bytes, warehouse, count_date, *,
                             f"{printed[0]} but crosswalk says {mfg}")
             continue
         reads, scores = [], []
+        x_val = max(t[2] for t in codes) if codes else x_mfg
+        for t in toks:
+            if (abs(t[4] - a[4]) < half_h and t[0] > x_val
+                    and re.fullmatch(r"\d{1,4}", t[5])):
+                reads.append(int(t[5]))
+                scores.append(t[6])
+                break
         for hh in heights:
             for sc in _REC_SCALES:
                 txt, score = _read_strip(im, x_mfg, a[4], hh, sc)
@@ -339,7 +356,7 @@ def usage_events_from_image(png_bytes, warehouse, count_date, *,
 
     # Cross-check against the grid's printed total. Candidates: whatever the
     # detector saw on that row plus recognizer reads of the cases strip.
-    tot = next((t for t in toks if "sum of all" in t[5].lower()), None)
+    tot = next((t for t in toks if "sumofall" in _flat(t[5])), None)
     if tot is None:
         warnings.append(f"{warehouse}: 'Sum of All Products Activity' total not "
                         f"found -- can't verify the rows")
