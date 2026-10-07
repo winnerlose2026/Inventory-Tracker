@@ -166,6 +166,207 @@ def _reject_as_stock_table(texts) -> str:
     return ""
 
 
+# --- Usage (case-movement) grid --------------------------------------------
+# Ross's weekly workbook carries the week's case movement ONLY as a pasted
+# picture ("Drill Down Reporting : Date Range >= .. AND <= .." / Products | Pack
+# | Dist Item # | Mfq.Product Code | Full Cases). Nothing else feeds FL weekly
+# usage, so it froze at the last cell-based export (2026-06-27). This reads it
+# into usage_rate events -- weekly_usage only, NEVER on_hand (see the 2026-08-03
+# incident above).
+#
+# Reading strategy, from what RapidOCR actually does on these screenshots:
+#   * the detector reliably finds item #s, mfg codes and the header, but it
+#     MISSES lone 1-2 digit "Full Cases" values (Punta Gorda: 0 of 13 found);
+#   * the recognizer alone misreads a lone digit ("8" -> "：", "9" -> "。").
+# So each row is cropped from the Mfq.Product Code column to the right edge and
+# recognized as ONE string, e.g. "1158 8" or "11588". The 4-digit mfg code for
+# that row is already known exactly (item # -> CHENEY_ITEM_NO_TO_MFG), so it is
+# stripped as a prefix and the remainder is the value. A read whose prefix
+# doesn't match is discarded rather than guessed at.
+#
+# Commit gate: the rows must add up to the grid's own "Sum of All Products
+# Activity" total. A dropped or misread digit almost never preserves the sum.
+_REC_SCALES = (2, 3)
+# The recognizer is sensitive to the exact crop height (RVB Blueberry read
+# "11719" at +/-10 px and "1171" -- value dropped -- at +/-10.56 px), so each
+# row is read at several heights and scales and the agreeing reads vote.
+_REC_HEIGHTS = (0.42, 0.48, 0.54)   # x row pitch, half-height of the crop
+
+
+def _det_tokens(png_bytes: bytes):
+    """Detector pass: (image, [(x0, y0, x1, y1, cy, text, score)])."""
+    import numpy as np
+    from PIL import Image
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    res, _ = _engine()(np.array(im))
+    toks = []
+    for box, text, score in (res or []):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        toks.append((min(xs), min(ys), max(xs), max(ys), sum(ys) / 4.0,
+                     str(text).strip(), float(score)))
+    return im, toks
+
+
+def _recognize(img) -> "tuple[str, float]":
+    """Recognizer-only read of one cropped strip, NFKC-normalised (the model
+    sometimes answers in full-width digits)."""
+    import unicodedata
+    import numpy as np
+    arr = np.array(img.convert("RGB"))
+    eng = _engine()
+    rec = getattr(eng, "text_recognizer", None)
+    if rec is not None:
+        out, _ = rec([arr])
+        text, score = (out[0][0], out[0][1]) if out else ("", 0.0)
+    else:  # pragma: no cover - other rapidocr builds
+        out, _ = eng(arr, use_det=False, use_cls=False, use_rec=True)
+        text, score = (out[0][0], out[0][1]) if out else ("", 0.0)
+    return unicodedata.normalize("NFKC", str(text)), float(score)
+
+
+def _read_strip(im, x0, cy, half_h, scale):
+    from PIL import Image, ImageOps
+    box = (max(0, int(x0)), max(0, int(cy - half_h)),
+           im.width, min(im.height, int(cy + half_h)))
+    c = im.crop(box).convert("L")
+    c = c.resize((max(1, c.width * scale), max(1, c.height * scale)), Image.LANCZOS)
+    c = ImageOps.expand(c, border=6 * scale, fill=255)
+    return _recognize(c)
+
+
+def usage_events_from_image(png_bytes, warehouse, count_date, *,
+                            source="cheney-usage-image"):
+    """OCR Ross's pasted case-movement grid into usage_rate events.
+
+    weekly_usage = Full Cases x 7 / span_days, span from the grid's own Date
+    Range (the rule used for every Cheney usage export since 2026-06-09).
+    count_date on each event = the range end (-> last_usage_report_at); the
+    caller's ``count_date`` (filename-derived) is only a fallback.
+    Returns (events, warnings, notes); any warning blocks the facility."""
+    from integrations.cheney_inventory_report import _span_days, _DATE_RE
+    events, warnings, notes = [], [], []
+    try:
+        im, toks = _det_tokens(png_bytes)
+    except Exception as exc:  # noqa: BLE001 -- unreadable image
+        return [], [f"{warehouse}: usage grid image unreadable "
+                    f"({type(exc).__name__}: {exc})"], []
+    texts = [t[5] for t in toks]
+
+    span, lo, hi, note = _span_days([[t] for t in texts])
+    if note:
+        warnings.append(f"{warehouse}: usage grid has no readable Date Range "
+                        f"-- can't convert Full Cases to a weekly rate")
+        return [], warnings, notes
+    mo, dy, yr = (int(x) for x in hi.split("/"))
+    end_iso = f"{yr:04d}-{mo:02d}-{dy:02d}"
+    if count_date and count_date[:10] != end_iso:
+        notes.append(f"{warehouse}: grid Date Range ends {end_iso}; filename "
+                     f"says {count_date[:10]} -- using the grid's")
+
+    anchors = sorted((t for t in toks if _ITEM_RE.search(t[5])), key=lambda t: t[4])
+    if len(anchors) < 10:
+        warnings.append(f"{warehouse}: only {len(anchors)} item rows found in "
+                        f"the usage grid (expected ~13) -- image likely under-read")
+    if not anchors:
+        return [], warnings, notes
+    gaps = sorted(b[4] - a[4] for a, b in zip(anchors, anchors[1:]))
+    pitch = gaps[len(gaps) // 2] if gaps else 22.0
+    half_h = max(8.0, pitch * 0.48)
+    heights = [max(7.0, pitch * f) for f in _REC_HEIGHTS]
+
+    # Left edge of the Mfq.Product Code column: its header, else the leftmost
+    # detected 4-digit mfg code token.
+    hdr = [t for t in toks if t[5].lower().startswith(("mfq", "mfg"))]
+    codes = [t for t in toks if t[5] in HH_MFG_CODE_TO_VARIETY]
+    if hdr:
+        x_mfg = min(t[0] for t in hdr)
+    elif codes:
+        x_mfg = min(t[0] for t in codes)
+    else:
+        warnings.append(f"{warehouse}: Mfq.Product Code column not found in usage grid")
+        return [], warnings, notes
+    x_mfg -= 6
+
+    total_rows = 0
+    for a in anchors:
+        item = _ITEM_RE.search(a[5]).group(1)
+        mfg = CHENEY_ITEM_NO_TO_MFG.get(item, "")
+        variety = HH_MFG_CODE_TO_VARIETY.get(mfg, "")
+        if not variety:
+            warnings.append(f"{warehouse}: usage row item#{item} is not in the "
+                            f"Cheney crosswalk")
+            continue
+        # The mfg code PRINTED on this row must agree with the crosswalk.
+        printed = [t[5] for t in codes if abs(t[4] - a[4]) < half_h]
+        if printed and mfg not in printed:
+            warnings.append(f"{warehouse}: item#{item} row shows mfg "
+                            f"{printed[0]} but crosswalk says {mfg}")
+            continue
+        reads, scores = [], []
+        for hh in heights:
+            for sc in _REC_SCALES:
+                txt, score = _read_strip(im, x_mfg, a[4], hh, sc)
+                m = re.fullmatch(re.escape(mfg) + r"(\d{1,4})",
+                                 re.sub(r"\s+", "", txt))
+                if m:
+                    reads.append(int(m.group(1)))
+                    scores.append(score)
+        if not reads:
+            warnings.append(f"{warehouse}: could not read Full Cases for "
+                            f"{variety} (item#{item})")
+            continue
+        val = max(set(reads), key=lambda v: (reads.count(v), -reads.index(v)))
+        if reads.count(val) * 2 <= len(reads):
+            warnings.append(f"{warehouse}: {variety} Full Cases reads disagree "
+                            f"{reads} -- no majority")
+            continue
+        if len(set(reads)) > 1:
+            notes.append(f"{warehouse}: {variety} read as {reads}; using {val}")
+        total_rows += val
+        events.append({
+            "event_type": "usage_rate",
+            "item": {"quantity": 0.0, "distributor": DISTRIBUTOR,
+                     "variety": variety, "warehouse": warehouse, "unit": "cs",
+                     "weekly_usage": round(val * 7.0 / span, 2),
+                     "distributor_sku": item},
+            "source_message_id": f"{source}:{warehouse}",
+            "source_subject": f"Cheney case movement (OCR image) {lo}-{hi}: {warehouse}",
+            "count_date": end_iso,
+            "_cases": val,
+            "_min_score": min(scores),
+        })
+
+    # Cross-check against the grid's printed total. Candidates: whatever the
+    # detector saw on that row plus recognizer reads of the cases strip.
+    tot = next((t for t in toks if "sum of all" in t[5].lower()), None)
+    if tot is None:
+        warnings.append(f"{warehouse}: 'Sum of All Products Activity' total not "
+                        f"found -- can't verify the rows")
+    else:
+        cands = {int(t[5]) for t in toks
+                 if abs(t[4] - tot[4]) < half_h and re.fullmatch(r"\d{1,5}", t[5])}
+        x_cases = max(t[2] for t in codes) + 4 if codes else x_mfg
+        for sc in (2, 3, 4):
+            txt, _s = _read_strip(im, x_cases, tot[4], half_h, sc)
+            d = re.sub(r"\s+", "", txt)
+            if re.fullmatch(r"\d{1,5}", d):
+                cands.add(int(d))
+        if total_rows not in cands:
+            warnings.append(f"{warehouse}: usage rows sum to {total_rows} but the "
+                            f"grid's total reads {sorted(cands) or '?'} -- a row "
+                            f"was misread; refusing")
+        else:
+            notes.append(f"{warehouse}: rows sum to the grid total ({total_rows} cs, "
+                         f"{lo}-{hi}, {span} days)")
+
+    v = [e["item"]["variety"] for e in events]
+    dups = {x for x in v if v.count(x) > 1}
+    if dups:
+        warnings.append(f"{warehouse}: duplicate varieties in usage grid: {sorted(dups)}")
+    return events, warnings, notes
+
+
 def events_from_image(png_bytes, warehouse, count_date, *, source="cheney-stock-image"):
     """OCR ONE embedded stock image into on_hand event dicts for a warehouse.
     Reusable by both the .xlsx path (extract_facility) and the scheduled task
@@ -180,6 +381,17 @@ def events_from_image(png_bytes, warehouse, count_date, *, source="cheney-stock-
     # on_hand from a usage grid overwrites real stock with a week of movement,
     # so refuse it outright and say why.
     reason = _reject_as_stock_table(all_texts)
+    if reason.startswith("case-movement"):
+        # It IS the usage grid -> read it as weekly usage (usage_rate only).
+        u_events, u_warn, u_notes = usage_events_from_image(
+            png_bytes, warehouse, count_date,
+            source=source.replace("stock", "usage"))
+        msg = (f"{warehouse}: embedded image is the usage grid, not an on-hand "
+               f"stock table ({reason}) -- no on_hand emitted; on-hand comes "
+               f"from the worksheet cells via "
+               f"cheney_inventory_report.parse_report_xlsx")
+        (u_warn if u_warn else u_notes).insert(0, msg)
+        return u_events, u_warn, u_notes
     if reason:
         warnings.append(
             f"{warehouse}: embedded image is not an on-hand stock table "
@@ -250,10 +462,22 @@ def extract_facility(xlsx_bytes: bytes, filename: str):
     return warehouse, count_date, events, warnings, notes
 
 
+def fmt_event_row(e) -> str:
+    """One verification-table line for an on_hand or usage_rate event."""
+    it = e["item"]
+    if e.get("event_type") == "usage_rate":
+        body = (f"usage {int(e.get('_cases', 0)):>4} cs -> "
+                f"{it.get('weekly_usage', 0):>6.2f}/wk")
+    else:
+        body = f"on_hand {int(it['quantity']):>5}"
+    return (f"   {it['variety']:24} {body}  sku={it.get('distributor_sku', '')}  "
+            f"score={e.get('_min_score', 0):.2f}")
+
+
 def _post(base, token, events, dry_run):
     payload = {"dry_run": dry_run, "source": "cheney-stock-ocr",
                "messages_seen": 1, "messages_parsed": 1,
-               "events": [{k: v for k, v in e.items() if k != "_min_score"} for e in events]}
+               "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in events]}
     req = urllib.request.Request(base.rstrip("/") + "/api/email/ingest-events",
                                  data=json.dumps(payload).encode(), method="POST",
                                  headers={"Content-Type": "application/json",
@@ -286,8 +510,7 @@ def main(argv=None):
         all_warn += warn
         print(f"\n=== {wh or f}  (count_date={cd or '?'}, {len(events)} rows) ===")
         for e in sorted(events, key=lambda z: z["item"]["variety"]):
-            print(f"   {e['item']['variety']:24} {int(e['item']['quantity']):>5}  "
-                  f"sku={e['item'].get('distributor_sku','')}  score={e['_min_score']:.2f}")
+            print(fmt_event_row(e))
         low = [e for e in events if e["_min_score"] < a.min_score]
         for n in notes:
             print("   note:", n)

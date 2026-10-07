@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Zero-touch weekly Cheney on-hand ingest.
+"""Zero-touch weekly Cheney image ingest (weekly usage, and on-hand if ever
+pasted as a picture).
 
-Pulls Michael Ross's embedded on-hand STOCK images from the app's
+Ross's current workbooks put on-hand in worksheet CELLS (read by the app's own
+mailbox scan) and paste the week's case-movement grid as a PICTURE. That
+picture is OCR'd into usage_rate events (weekly_usage only, gated on the rows
+summing to the grid's own total); a genuine stock-table picture would still
+yield on_hand.
+
+Pulls Michael Ross's embedded images from the app's
 /api/email/cheney-stock-images endpoint (server-side Microsoft Graph, so no raw
 email attachments are needed client-side), OCRs them with RapidOCR via
 cheney_stock_ocr.events_from_image (item#-authoritative mapping), and POSTs the
@@ -85,8 +92,7 @@ def main(argv=None):
         low = [e for e in events if e.get("_min_score", 1.0) < a.min_score]
         print(f"\n=== {wh}  (count_date={cd or '?'}, {len(events)} rows) ===")
         for e in sorted(events, key=lambda z: z["item"]["variety"]):
-            print(f"   {e['item']['variety']:24} {int(e['item']['quantity']):>5}  "
-                  f"sku={e['item'].get('distributor_sku','')}  score={e.get('_min_score',0):.2f}")
+            print(ocr.fmt_event_row(e))
         for n in notes:
             print("   note:", n)
         for w in warnings:

@@ -438,14 +438,20 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
                 "po_revision": "",
             })
 
-    # Stamp the report's true "as of" date (its period end -- e.g. the "week
-    # ending 6/27" of a Usage&Stock export) onto every event, so the apply path
-    # records last_count_at / last_usage_report_at as when the count was
-    # actually taken rather than the scan/email time. Left unset when no date is
-    # discoverable, so the caller's email-date fallback still applies.
+    # The two grids are dated differently:
+    #   - usage_rate: the case-movement period end (the "<= 10/03/2026" of its
+    #     Date Range, else the filename) -> last_usage_report_at.
+    #   - on_hand: NOT the period end. The Stock column is a live snapshot Ross
+    #     pulls minutes before he sends (the 10/5/2026 workbooks were created
+    #     12:35-12:48 ET and mailed at 12:51), so stamping it with Saturday's
+    #     usage-period end both mis-dated the count (shown as "Counted Oct 2")
+    #     and let _receipts_after_count re-add a Sun/Mon delivery the snapshot
+    #     already includes. Left unset so the caller stamps the email's sent
+    #     time (email_scanner / cowork_graph_scan both do).
     if as_of_iso:
         for e in events:
-            e["count_date"] = as_of_iso
+            if e["event_type"] == "usage_rate":
+                e["count_date"] = as_of_iso
 
     if not events and not errors:
         seen = ("; ".join(headers_seen)) or "no non-empty rows"

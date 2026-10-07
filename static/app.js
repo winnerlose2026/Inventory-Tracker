@@ -380,7 +380,11 @@ function renderWarehouseFreshness(iso) {
   if (!iso) {
     return '<span class="wh-fresh wh-fresh-red" title="No inventory count received yet">\u2717 No count</span>';
   }
-  const then = new Date(iso);
+  // A bare "YYYY-MM-DD" is a calendar day, not an instant: new Date() reads it
+  // as UTC midnight, which renders as the PREVIOUS day in US time zones (a
+  // 2026-10-03 count showed "Counted Oct 2"). Build it as local midnight.
+  const dOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso).trim());
+  const then = dOnly ? new Date(+dOnly[1], +dOnly[2] - 1, +dOnly[3]) : new Date(iso);
   const days = Math.floor((Date.now() - then.getTime()) / 86400000);
   const ok = days <= 8;
   const dateStr = then.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });

@@ -124,8 +124,10 @@ def test_parse_case_movement_usage():
 def test_combined_usage_and_stock_workbook():
     """Ross's current 'Usage&Stock' export: the usage (case-movement) grid AND
     the on-hand stock grid live in ONE workbook on separate sheets. BOTH must
-    parse, and every event must carry the report's END date (6/27) as
-    count_date -- not the range start (6/22) or the email/scan time."""
+    parse. Usage carries the report's END date (6/27) as count_date -- not the
+    range start (6/22). On-hand carries NO count_date: the Stock column is a
+    live snapshot pulled when Ross sends, so the caller stamps the email's sent
+    time (a Mon 10/5 send of a 9/28-10/3 workbook was shown as "Counted Oct 2")."""
     usage = [
         ["Report Creation Date : 6/28/2026"],
         ["Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"],
@@ -153,7 +155,11 @@ def test_combined_usage_and_stock_workbook():
     assert oh == {"Everything": 184, "Plain": 181}, (oh, err)
     ur = {e["item"]["variety"] for e in ev if e["event_type"] == "usage_rate"}
     assert ur == {"Everything", "Plain"}, (ur, err)
-    assert all(e.get("count_date") == "2026-06-27" for e in ev), (
+    assert all(e.get("count_date") == "2026-06-27"
+               for e in ev if e["event_type"] == "usage_rate"), (
+        [e.get("count_date") for e in ev])
+    assert not any(e.get("count_date")
+                   for e in ev if e["event_type"] == "on_hand"), (
         [e.get("count_date") for e in ev])
     assert all(it["warehouse"] == "Riviera Beach, FL"
                for it in (e["item"] for e in ev))
@@ -162,8 +168,8 @@ def test_combined_usage_and_stock_workbook():
 
 def test_combined_usage_and_stock_one_sheet():
     """Ross's 'Usage&Stock' export with the usage grid and the on-hand grid
-    STACKED on a single sheet. Both must parse (usage_rate + on_hand) and every
-    event must carry the report end date (6/27)."""
+    STACKED on a single sheet. Both must parse (usage_rate + on_hand); usage is
+    dated to the report end (6/27), on-hand is left for the email's sent time."""
     rows = [
         ["Report Creation Date : 6/28/2026"],
         ["Drill Down Reporting : Date Range >= 06/22/2026 AND <= 06/27/2026"],
@@ -183,23 +189,32 @@ def test_combined_usage_and_stock_one_sheet():
     ur = {e["item"]["variety"] for e in ev if e["event_type"] == "usage_rate"}
     assert oh == {"Everything": 184, "Plain": 181}, (oh, err)
     assert ur == {"Everything", "Plain"}, (ur, err)
-    assert all(e.get("count_date") == "2026-06-27" for e in ev), (
+    assert all(e.get("count_date") == "2026-06-27"
+               for e in ev if e["event_type"] == "usage_rate"), (
+        [e.get("count_date") for e in ev])
+    assert not any(e.get("count_date")
+                   for e in ev if e["event_type"] == "on_hand"), (
         [e.get("count_date") for e in ev])
     print("OK test_combined_usage_and_stock_one_sheet")
 
 
-def test_count_date_from_filename_when_no_range():
-    """A stock-only sheet has no Date Range line -> fall back to the filename
-    date (here 6-8-2026)."""
+def test_stock_count_date_left_for_email_sent_time():
+    """A stock-only sheet must NOT take the filename's (usage-period) date: the
+    10/5/2026 workbooks were named ...Sept28-October32026 but their Stock column
+    was pulled Mon 10/5. Leaving count_date unset lets email_scanner /
+    cowork_graph_scan stamp the email's sent time."""
     rows = [
         ["Item #", "Description", "Brand", "Pack", "Size", "UOM", "Stock"],
         ["10153018", "BAGEL PLAIN PARBAKED", "H & H", 1, "60CT", "cs", 100],
+        ["10153020", "BAGEL PUMPERNICKEL PARBAKED", "H & H", 1, "60CT", "cs", 128],
     ]
-    ev, err = parse_report_xlsx(_wb(rows), "HHBagRVB6-8-2026.xlsx")
-    assert ev, err
-    assert all(e.get("count_date") == "2026-06-08" for e in ev), (
+    ev, err = parse_report_xlsx(
+        _wb(rows), "HHBagelsRivieraBeachUsage-StockSept28-October32026.xlsx")
+    assert {e["item"]["variety"]: e["item"]["quantity"] for e in ev} == {
+        "Plain": 100, "Pumpernickel": 128}, (ev, err)
+    assert not any(e.get("count_date") for e in ev), (
         [e.get("count_date") for e in ev], err)
-    print("OK test_count_date_from_filename_when_no_range")
+    print("OK test_stock_count_date_left_for_email_sent_time")
 
 
 def test_extract_stock_image():
@@ -247,7 +262,7 @@ if __name__ == "__main__":
     test_parse_case_movement_usage()
     test_combined_usage_and_stock_workbook()
     test_combined_usage_and_stock_one_sheet()
-    test_count_date_from_filename_when_no_range()
+    test_stock_count_date_left_for_email_sent_time()
     test_extract_stock_image()
     test_extract_stock_image_none_when_no_image()
     print("ALL CHENEY PARSER TESTS PASSED")

@@ -53,6 +53,8 @@ HH_MFG_CODE_TO_VARIETY: dict[str, str] = {
 CHENEY_ITEM_NO_TO_MFG: dict[str, str] = {
     "10153018": "1150",  # Plain
     "10153034": "1151",  # Onion
+    "10153020": "1154",  # Pumpernickel (Oct 2026 LTO; Dist Item # / Mfq code
+                         # side by side in Ross's 9/28-10/3 usage grid)
     "10153019": "1152",  # Poppy Seed
     "10153041": "1153",  # Sesame
     "10153046": "1155",  # Cinnamon Raisin

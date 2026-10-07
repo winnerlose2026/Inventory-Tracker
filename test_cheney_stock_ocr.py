@@ -27,7 +27,8 @@ STOCK_TEXTS = ["Item #", "Description", "Brand", "Pack", "Size", "UOM", "Stock"]
 # _patch() rebinds module globals, so keep the originals to restore in tests
 # that exercise the real token reconstruction (otherwise a stub leaks across).
 _REAL = {n: getattr(C, n) for n in ("_cell_rows", "_extract_pngs",
-                                    "_ocr_page", "_ocr_rows", "_engine")}
+                                    "_ocr_page", "_ocr_rows", "_engine",
+                                    "_det_tokens", "_read_strip")}
 
 
 def _restore():
@@ -181,6 +182,104 @@ def test_ocr_rows_prefers_stock_over_mfg_code_column():
     assert rows[0]["stock"] == 1, rows            # not 1184
     assert rows[0]["item"] == "10153047"
     assert "1184" in texts
+
+
+# --- Usage grid -> usage_rate (2026-10-07) ---------------------------------
+# Ross's 9/28-10/3 Riviera Beach grid, exactly as pasted (Full Cases column).
+RVB_USAGE = [("10153048", 55), ("10153018", 55), ("10153041", 33),
+             ("10153020", 27), ("10153043", 22), ("10153046", 20),
+             ("10153047", 16), ("10153045", 15), ("10153034", 13),
+             ("10153049", 12), ("10153019", 10), ("10153044", 9),
+             ("10153042", 8)]
+
+
+def _usage_grid(rows, total, date_line=("Drill Down Reporting : Date Range >= "
+                                        "09/28/2026 AND <= 10/03/2026"),
+                misread=None, print_mfg=None):
+    """Patch the detector + recognizer with a synthetic usage-grid screenshot.
+    ``misread`` maps item# -> the string the recognizer returns for that row."""
+    _restore()
+    toks = [(0, 0, 400, 10, 5.0, date_line, 0.9),
+            (0, 30, 400, 40, 35.0, "DSRGroup =MICHAEL ROSS-8564, DC =01 RIVIERA", 0.9),
+            (0, 60, 60, 70, 65.0, "Products", 0.9),
+            (440, 60, 520, 70, 65.0, "Dist Item #", 0.9),
+            (550, 60, 680, 70, 65.0, "Mfq.Product Code", 0.9),
+            (700, 60, 780, 70, 65.0, "Full Cases", 0.9),
+            (0, 82, 200, 92, 87.0, "Sum of All Products Activity", 0.9),
+            (700, 82, 730, 92, 87.0, str(total), 0.9)]
+    by_y = {}
+    for i, (item, _v) in enumerate(rows):
+        y = 110.0 + 22 * i
+        mfg = (print_mfg or {}).get(item, CHENEY_ITEM_NO_TO_MFG[item])
+        toks += [(0, y - 7, 250, y + 7, y, "BAGEL X PARBAKED", 0.9),
+                 (440, y - 7, 520, y + 7, y, item, 0.9),
+                 (560, y - 7, 600, y + 7, y, mfg, 0.9)]
+        by_y[y] = item
+    vals = dict(rows)
+
+    def fake_read(im, x0, cy, half_h, scale):
+        if abs(cy - 87.0) < 1:
+            return str(total), 0.9
+        item = by_y[min(by_y, key=lambda y: abs(y - cy))]
+        if misread and item in misread:
+            return misread[item], 0.7
+        return f"{CHENEY_ITEM_NO_TO_MFG[item]} {vals[item]}", 0.7
+    C._det_tokens = lambda png: (None, toks)
+    C._read_strip = fake_read
+
+
+def test_usage_grid_yields_usage_rate_only():
+    """The pasted usage grid becomes weekly usage (Full Cases x 7 / 6-day
+    range), dated to the range end -- and NEVER on_hand (2026-08-03)."""
+    _usage_grid(RVB_USAGE, 295)
+    ev, warn, notes = C.usage_events_from_image(b"png", "Riviera Beach, FL", "2026-10-03")
+    assert warn == [], warn
+    assert {e["event_type"] for e in ev} == {"usage_rate"}, ev
+    assert all(e["item"]["quantity"] == 0.0 for e in ev)
+    wu = {e["item"]["variety"]: e["item"]["weekly_usage"] for e in ev}
+    assert len(wu) == 13 and wu["Everything"] == round(55 * 7 / 6, 2), wu
+    assert wu["Pumpernickel"] == round(27 * 7 / 6, 2), wu   # new crosswalk row
+    assert all(e["count_date"] == "2026-10-03" for e in ev)
+    assert any("grid total (295" in n for n in notes), notes
+
+
+def test_events_from_image_routes_usage_grid_to_usage():
+    """events_from_image (what the weekly endpoint task calls) must hand a
+    usage-grid picture to the usage reader, not just block it."""
+    _usage_grid(RVB_USAGE, 295)
+    C._ocr_page = lambda png: ([{"desc": "", "item": "10153048", "stock": 55,
+                                 "min_score": 1.0}],
+                               ["Full Cases", "Mfq.Product Code", "295"])
+    ev, warn, notes = C.events_from_image(b"png", "Riviera Beach, FL", "2026-10-03")
+    assert warn == [], warn
+    assert ev and all(e["event_type"] == "usage_rate" for e in ev), ev
+    assert any("not an on-hand stock table" in n for n in notes), notes
+
+
+def test_usage_sum_mismatch_blocks():
+    """A digit the recognizer drops ("55" -> "5") breaks the printed total."""
+    _usage_grid(RVB_USAGE, 295, misread={"10153018": "1150 5"})
+    ev, warn, _n = C.usage_events_from_image(b"png", "Riviera Beach, FL", "")
+    assert any("sum to 245" in w and "295" in w for w in warn), warn
+
+
+def test_usage_read_without_the_row_mfg_prefix_is_discarded():
+    """'1171' (value dropped) or a neighbour row's code must not become a value."""
+    _usage_grid(RVB_USAGE, 295, misread={"10153044": "1171"})
+    _ev, warn, _n = C.usage_events_from_image(b"png", "Riviera Beach, FL", "")
+    assert any("could not read Full Cases for Blueberry" in w for w in warn), warn
+
+
+def test_usage_printed_mfg_disagreeing_with_crosswalk_blocks():
+    _usage_grid(RVB_USAGE, 295, print_mfg={"10153044": "1184"})
+    _ev, warn, _n = C.usage_events_from_image(b"png", "Riviera Beach, FL", "")
+    assert any("item#10153044" in w and "crosswalk says 1171" in w for w in warn), warn
+
+
+def test_usage_without_date_range_blocks():
+    _usage_grid(RVB_USAGE, 295, date_line="Drill Down Reporting")
+    ev, warn, _n = C.usage_events_from_image(b"png", "Riviera Beach, FL", "2026-10-03")
+    assert ev == [] and any("Date Range" in w for w in warn), warn
 
 
 if __name__ == "__main__":
