@@ -230,16 +230,18 @@ def _usage_grid(rows, total, date_line=("Drill Down Reporting : Date Range >= "
 
 
 def test_usage_grid_yields_usage_rate_only():
-    """The pasted usage grid becomes weekly usage (Full Cases x 7 / 6-day
-    range), dated to the range end -- and NEVER on_hand (2026-08-03)."""
+    """The pasted usage grid becomes weekly usage -- the Full Cases figures
+    exactly as printed for this Mon-Sat week (no 7/6 scaling; JD 2026-10-07)
+    -- dated to the range end, and NEVER on_hand (2026-08-03)."""
     _usage_grid(RVB_USAGE, 295)
     ev, warn, notes = C.usage_events_from_image(b"png", "Riviera Beach, FL", "2026-10-03")
     assert warn == [], warn
     assert {e["event_type"] for e in ev} == {"usage_rate"}, ev
     assert all(e["item"]["quantity"] == 0.0 for e in ev)
     wu = {e["item"]["variety"]: e["item"]["weekly_usage"] for e in ev}
-    assert len(wu) == 13 and wu["Everything"] == round(55 * 7 / 6, 2), wu
-    assert wu["Pumpernickel"] == round(27 * 7 / 6, 2), wu   # new crosswalk row
+    assert wu == {C.HH_MFG_CODE_TO_VARIETY[C.CHENEY_ITEM_NO_TO_MFG[i]]: float(v)
+                  for i, v in RVB_USAGE}, wu   # incl. Pumpernickel (new crosswalk row)
+    assert wu["Everything"] == 55.0 and wu["Blueberry"] == 9.0, wu
     assert all(e["count_date"] == "2026-10-03" for e in ev)
     assert any("grid total (295" in n for n in notes), notes
 

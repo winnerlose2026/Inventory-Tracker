@@ -261,6 +261,19 @@ def _report_as_of(rows_by_sheet: list, filename: str) -> str:
     return best.isoformat() if best else ""
 
 
+def weekly_from_period(cases: float, span_days: int) -> float:
+    """Cases moved over a report period -> cases per week.
+
+    A report covering a week or less (Ross's weekly grid runs Mon-Sat, 6 days)
+    IS the week's usage: its Full Cases figure is used as-is. JD, 2026-10-07:
+    the site must show the numbers in the image -- scaling 55 cs by 7/6 to
+    64.17 overstated every FL variety by ~17%. Only longer (monthly) ranges are
+    converted, total x 7 / span_days (the rule JD confirmed 2026-06-09)."""
+    if span_days <= 7:
+        return round(float(cases), 2)
+    return round(float(cases) * 7.0 / span_days, 2)
+
+
 def _find_cm_header(rows: list):
     """Locate a case-movement header: a 'Full Cases' column plus a
     'Dist Item #' or 'Mfq.Product Code' column. Returns
@@ -283,8 +296,9 @@ def _parse_case_movement(rows: list, warehouse: str, filename: str,
                          distributor: str) -> "tuple[list[dict], list[str]]":
     """Parse a Cheney case-movement (usage) sheet into usage_rate events.
 
-    'Full Cases' totals the report's date range (currently a month); it is
-    converted to a weekly average (total * 7 / span_days). These events carry
+    'Full Cases' totals the report's date range; see weekly_from_period (a
+    weekly grid is used as-is, a monthly one becomes total * 7 / span_days).
+    These events carry
     weekly_usage ONLY -- the apply path refreshes the usage reference without
     touching cases on hand or writing a movement ledger entry. Returns
     ([], []) when the sheet isn't a case-movement export, so the caller falls
@@ -313,7 +327,7 @@ def _parse_case_movement(rows: list, warehouse: str, filename: str,
                 errors.append(f"{warehouse}: unmapped case-movement row "
                               f"(mfg={mfg!r}, item={sku!r})")
             continue
-        weekly = round(cases * 7.0 / span, 2)
+        weekly = weekly_from_period(cases, span)
         events.append({
             "event_type": "usage_rate",
             "item": {

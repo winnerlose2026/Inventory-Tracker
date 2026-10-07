@@ -253,6 +253,26 @@ def test_extract_stock_image_none_when_no_image():
     print("OK test_extract_stock_image_none_when_no_image")
 
 
+def test_weekly_case_movement_is_used_as_printed():
+    """A Mon-Sat weekly grid's Full Cases IS the weekly usage (JD 2026-10-07:
+    the site showed 64.17 for an image that said 55). Monthly still converts."""
+    from integrations.cheney_inventory_report import weekly_from_period
+    assert weekly_from_period(55, 6) == 55.0
+    assert weekly_from_period(9, 7) == 9.0
+    assert weekly_from_period(250, 31) == round(250 * 7 / 31, 2)
+    rows = [
+        ["Drill Down Reporting : Date Range >= 09/28/2026 AND <= 10/03/2026"],
+        ["Products", "Pack", "Dist Item #", "Mfq.Product Code", "Full Cases"],
+        ["Sum of All Products Activity", "", "", "", 64],
+        ["BAGEL EVERYTHING PARBAKED", "1:60 CT", "10153048", "1158", 55],
+        ["BAGEL BLUEBERRY PARBAKED", "1:60 CT", "10153044", "1171", 9],
+    ]
+    ev, err = parse_report_xlsx(_wb(rows), "HHBagelsRivieraBeachUsage-StockSept28-October32026.xlsx")
+    wk = {e["item"]["variety"]: e["item"]["weekly_usage"] for e in ev}
+    assert wk == {"Everything": 55.0, "Blueberry": 9.0}, (wk, err)
+    print("OK test_weekly_case_movement_is_used_as_printed")
+
+
 if __name__ == "__main__":
     test_warehouse_from_filename()
     test_parse_mfg_format()
@@ -263,6 +283,7 @@ if __name__ == "__main__":
     test_combined_usage_and_stock_workbook()
     test_combined_usage_and_stock_one_sheet()
     test_stock_count_date_left_for_email_sent_time()
+    test_weekly_case_movement_is_used_as_printed()
     test_extract_stock_image()
     test_extract_stock_image_none_when_no_image()
     print("ALL CHENEY PARSER TESTS PASSED")

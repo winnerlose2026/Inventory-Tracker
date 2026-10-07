@@ -247,12 +247,14 @@ def usage_events_from_image(png_bytes, warehouse, count_date, *,
                             source="cheney-usage-image"):
     """OCR Ross's pasted case-movement grid into usage_rate events.
 
-    weekly_usage = Full Cases x 7 / span_days, span from the grid's own Date
-    Range (the rule used for every Cheney usage export since 2026-06-09).
+    weekly_usage = weekly_from_period(Full Cases, span_days): the Full Cases
+    figure as printed for a weekly (<= 7 day) grid, x 7 / span_days only for a
+    longer range. Span comes from the grid's own Date Range.
     count_date on each event = the range end (-> last_usage_report_at); the
     caller's ``count_date`` (filename-derived) is only a fallback.
     Returns (events, warnings, notes); any warning blocks the facility."""
-    from integrations.cheney_inventory_report import _span_days, _DATE_RE
+    from integrations.cheney_inventory_report import (
+        _span_days, _DATE_RE, weekly_from_period)
     events, warnings, notes = [], [], []
     try:
         im, toks = _det_tokens(png_bytes)
@@ -345,13 +347,15 @@ def usage_events_from_image(png_bytes, warehouse, count_date, *,
             "event_type": "usage_rate",
             "item": {"quantity": 0.0, "distributor": DISTRIBUTOR,
                      "variety": variety, "warehouse": warehouse, "unit": "cs",
-                     "weekly_usage": round(val * 7.0 / span, 2),
+                     "weekly_usage": weekly_from_period(val, span),
                      "distributor_sku": item},
             "source_message_id": f"{source}:{warehouse}",
             "source_subject": f"Cheney case movement (OCR image) {lo}-{hi}: {warehouse}",
             "count_date": end_iso,
             "_cases": val,
-            "_min_score": min(scores),
+            # confidence of the reads that WON the vote (an outvoted
+            # dropped-digit read shouldn't drag the row under --min-score)
+            "_min_score": min(sc for r, sc in zip(reads, scores) if r == val),
         })
 
     # Cross-check against the grid's printed total. Candidates: whatever the
