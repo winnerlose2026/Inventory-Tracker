@@ -490,26 +490,42 @@ def _run_server_mode(args) -> int:
 
     # 2) Lineage freight invoices (actual ship dates). Server-side too, so
     #    the ship-date stamping onto pending POs runs in the same process.
-    try:
-        fstatus, fbody = _post_json(
-            f"{app_url}/api/freight/scan", token,
-            {"dry_run": bool(args.dry_run),
-             "lookback_days": int(args.freight_lookback_days),
-             "max_messages": 500},
-            timeout=600)
-    except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: /api/freight/scan: {_redact(str(exc), [token])}",
-              file=sys.stderr)
-        return 1
+    #    One retry after 60 s: a Graph 5xx inside the route comes back as
+    #    200 {"ok": false, "error": "internal error (graph)"} and failed the
+    #    10/8 18:00 run. An invoice is re-read for 14 days, so a slot that
+    #    still fails loses nothing -- but it still exits 1 so Render alerts.
+    fstatus, fbody = 0, None
+    for attempt in (1, 2):
+        try:
+            fstatus, fbody = _post_json(
+                f"{app_url}/api/freight/scan", token,
+                {"dry_run": bool(args.dry_run),
+                 "lookback_days": int(args.freight_lookback_days),
+                 "max_messages": 500},
+                timeout=600)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: /api/freight/scan attempt {attempt}: "
+                  f"{_redact(str(exc), [token])}", file=sys.stderr)
+            fstatus, fbody = 0, None
+        if fstatus == 200 and isinstance(fbody, dict) and fbody.get("ok"):
+            break
+        if attempt == 1:
+            text = fbody if isinstance(fbody, str) else json.dumps(fbody)[:200]
+            print(f"freight scan failed (HTTP {fstatus}: "
+                  f"{_redact(str(text)[:200], [token])}); retrying in 60s",
+                  file=sys.stderr)
+            time.sleep(60)
     if fstatus != 200 or not isinstance(fbody, dict) or not fbody.get("ok"):
         text = fbody if isinstance(fbody, str) else json.dumps(fbody)[:400]
         print(f"ERROR: /api/freight/scan HTTP {fstatus}: "
               f"{_redact(str(text)[:400], [token])}", file=sys.stderr)
         return 1
     frep = fbody.get("report") or {}
-    print("freight-scan: added={a} updated={u} errors={e}".format(
-        a=frep.get("added"), u=frep.get("updated"),
-        e=len(frep.get("errors") or [])))
+    print("freight-scan: seen={s} parsed={p} added={a} updated={u} "
+          "notes={e}".format(
+              s=frep.get("messages_seen"), p=frep.get("invoices_parsed"),
+              a=frep.get("invoices_added"), u=frep.get("invoices_updated"),
+              e=frep.get("error_count", len(frep.get("errors") or []))))
     return rc
 
 

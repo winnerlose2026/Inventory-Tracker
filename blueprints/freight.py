@@ -290,13 +290,33 @@ def api_freight_scan():
             payload = _json.loads(resp.read().decode("utf-8"))
         return payload["access_token"]
 
+    import time as _time
+
     def _graph_get(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
         if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
             raise ValueError("refusing outbound request to untrusted host")
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return _json.loads(resp.read().decode("utf-8"))
+        # Graph answers 429 / 5xx under load (a 504 Gateway Timeout failed the
+        # 10/8 18:00 cron run). Three tries, honouring Retry-After up to 20 s,
+        # keeps a transient blip from costing a whole 6-hour slot while
+        # staying well inside gunicorn's 180 s budget.
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return _json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                    raise
+                try:
+                    wait = float(exc.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+                _time.sleep(min(max(wait, 3.0 * (attempt + 1)), 20.0))
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 2:
+                    raise
+                _time.sleep(3.0 * (attempt + 1))
 
     def _graph_get_bytes(token, path):
         url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
@@ -337,14 +357,12 @@ def api_freight_scan():
                                 "error": f"bad until_date {until_date!r}"}), 200
             since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
             until_iso = until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            flt = ("hasAttachments eq true "
-                   f"and receivedDateTime ge {since_iso} "
+            flt = (f"receivedDateTime ge {since_iso} "
                    f"and receivedDateTime lt {until_iso}")
         else:
             since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            flt = ("hasAttachments eq true "
-                   f"and receivedDateTime ge {since_iso}")
+            flt = f"receivedDateTime ge {since_iso}"
         LINEAGE_DOMAINS = ("tms.blujaysolutions.net", "blujaysolutions.net",
                            "tms.e2open.com", "e2open.com",
                            "lineagelogistics.com", "onelineage.com")
@@ -358,9 +376,15 @@ def api_freight_scan():
             # invoices may have been auto-filed via Outlook rules or
             # manually moved. Use AllItems via the standard "messages"
             # endpoint (no /mailFolders/Inbox prefix).
+            # Filter on receivedDateTime ONLY (+ matching $orderby) and test
+            # hasAttachments here: `hasAttachments eq true` in $filter makes
+            # Graph scan every folder of the mailbox and it 504s on JD@
+            # (10/8). receivedDateTime is indexed -- the same query shape
+            # the mail scan and the old cron's Lineage sweep always used.
             list_url = (f"{GRAPH_BASE}/users/{user}/messages"
-                        f"?$top=100&$filter={urllib.parse.quote(flt)}"
-                        f"&$select=id,subject,from")
+                        f"?$top=250&$filter={urllib.parse.quote(flt)}"
+                        f"&$orderby={urllib.parse.quote('receivedDateTime desc')}"
+                        f"&$select=id,subject,from,hasAttachments")
             fetched = 0
             while list_url and fetched < max_messages:
                 page = _graph_get(token, list_url)
@@ -371,6 +395,8 @@ def api_freight_scan():
                     seen += 1
                     if fetched >= max_messages:
                         break
+                    if not m.get("hasAttachments"):
+                        continue
                     # Post-filter by sender domain or subject keyword
                     sender = (((m.get("from") or {}).get("emailAddress") or {})
                               .get("address") or "").lower()

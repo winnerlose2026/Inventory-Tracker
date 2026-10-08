@@ -67,11 +67,14 @@ _EMAIL_OK = {"dry_run": False, "reports": [{
     "status": "ok", "messages_seen": 12, "messages_parsed": 5, "updated": 3,
     "unchanged": 40, "po_revisions_skipped": ["x"], "errors": [],
     "chefs_warehouse": {"added": 1, "updated": 0}}]}
-_FREIGHT_OK = {"ok": True, "report": {"added": 0, "updated": 2, "errors": []}}
+_FREIGHT_OK = {"ok": True, "report": {
+    "messages_seen": 2098, "invoices_parsed": 12, "invoices_added": 0,
+    "invoices_updated": 2, "errors": [], "error_count": 0}}
 
 
-def _fake_server(calls, email_responses):
+def _fake_server(calls, email_responses, freight_responses=None):
     email_responses = list(email_responses)
+    freight_responses = list(freight_responses or [])
 
     def urlopen(req, timeout=None):
         url = req.full_url
@@ -86,6 +89,8 @@ def _fake_server(calls, email_responses):
                     url, status, "busy", {}, io.BytesIO(json.dumps(body).encode()))
             return _Resp(status, body)
         if url.endswith("/api/freight/scan"):
+            if freight_responses:
+                return _Resp(200, freight_responses.pop(0))
             return _Resp(200, _FREIGHT_OK)
         raise AssertionError(f"unexpected POST {url}")
     return urlopen
@@ -124,7 +129,7 @@ def test_cron_command_asks_the_server_to_scan(monkeypatch, capsys):
     assert calls[1][1]["lookback_days"] == 14
     out = capsys.readouterr()
     assert "email-scan: status=ok" in out.out
-    assert "freight-scan:" in out.out
+    assert "freight-scan: seen=2098 parsed=12 added=0 updated=2" in out.out
     assert "tok-xyz" not in out.out + out.err
 
 
@@ -142,6 +147,36 @@ def test_server_mode_waits_out_a_concurrent_scan(monkeypatch):
     assert [c[0].rsplit("/", 1)[-1] for c in calls] == ["scan", "scan", "scan", "scan"]
     assert calls[-1][0].endswith("/api/freight/scan")
     assert slept == [90, 90]
+
+
+def test_freight_graph_blip_is_retried_once(monkeypatch):
+    """10/8 18:00: Graph 504'd inside /api/freight/scan, which answers
+    200 {"ok": false}; the run exited 1 and Render emailed an alert."""
+    _cron_env(monkeypatch)
+    cgs = _script()
+    import time
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    calls = []
+    graph_504 = {"ok": False, "error": "internal error (graph)", "errors": []}
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_server(
+        calls, [(200, _EMAIL_OK)], [graph_504, _FREIGHT_OK]))
+    assert cgs.run(CRON_ARGS) == 0
+    assert [c[0].rsplit("/api/", 1)[-1] for c in calls] == [
+        "email/scan", "freight/scan", "freight/scan"]
+    assert slept == [60]
+
+
+def test_freight_failing_twice_still_alerts(monkeypatch):
+    _cron_env(monkeypatch)
+    cgs = _script()
+    import time
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    calls = []
+    graph_504 = {"ok": False, "error": "internal error (graph)", "errors": []}
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_server(
+        calls, [(200, _EMAIL_OK)], [graph_504, graph_504]))
+    assert cgs.run(CRON_ARGS) == 1
 
 
 def test_server_mode_reports_a_failed_scan(monkeypatch):
