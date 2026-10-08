@@ -2,6 +2,7 @@
 restock, the usage log + reversal, and the warehouses / distributors
 reference views. Extracted from app.py (refactor — see REFACTOR_PLAN.md)."""
 from flask import Blueprint, jsonify, request
+from core.util import with_data_lock
 
 from inventory_tracker import (
     add_item, load_inventory, load_inventory_audit, load_usage, record_usage,
@@ -138,6 +139,7 @@ def api_inventory():
 
 
 @inventory_bp.route("/api/inventory", methods=["POST"])
+@with_data_lock
 def api_add():
     d = request.json
     add_item(
@@ -157,6 +159,7 @@ def api_add():
 
 
 @inventory_bp.route("/api/inventory/<path:name>", methods=["PUT"])
+@with_data_lock
 def api_update(name):
     d = request.json
     update_item(
@@ -176,12 +179,14 @@ def api_update(name):
 
 
 @inventory_bp.route("/api/inventory/<path:name>", methods=["DELETE"])
+@with_data_lock
 def api_remove(name):
     remove_item(name)
     return jsonify({"ok": True})
 
 
 @inventory_bp.route("/api/use", methods=["POST"])
+@with_data_lock
 def api_use():
     d = request.json
     record_usage(d["name"], float(d["amount"]), d.get("note", ""))
@@ -189,6 +194,7 @@ def api_use():
 
 
 @inventory_bp.route("/api/restock", methods=["POST"])
+@with_data_lock
 def api_restock():
     d = request.json
     restock(d["name"], float(d["amount"]), d.get("note", ""))
@@ -208,6 +214,7 @@ def api_usage():
 
 
 @inventory_bp.route("/api/usage/reverse", methods=["POST"])
+@with_data_lock
 def api_usage_reverse():
     """Undo a single usage/restock entry by its timestamp."""
     d = request.json or {}

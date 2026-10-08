@@ -7,7 +7,7 @@ import integrations.planning_config as pc
 
 def test_defaults_shape():
     c = pc.load_planning_config()
-    assert len(c["warehouses"]) == 8
+    assert len(c["warehouses"]) == 9      # 6 USF (incl. Houston, added 2026-10-08) + 3 Cheney
     assert len(c["varieties"]) == 12
     assert c["top4"] == ["Plain", "Everything", "Sesame", "Cinnamon Raisin"]
     assert c["freezer_pallet_cap"] == 110

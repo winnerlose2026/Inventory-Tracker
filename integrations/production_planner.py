@@ -163,6 +163,14 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
         if (po.get("status") or "") == "arrived":
             continue   # already in on-hand
         wh = po.get("warehouse") or ""
+        # Only POs for a warehouse we hold stock for count toward its cover.
+        # Chefs Warehouse's Chicago DC is ALSO labelled "Chicago, IL", so a
+        # shipped CW Chicago PO was credited to US Foods Chicago and hid its
+        # buffer flag; CW is tracked PO-only (no on-hand), so it never belongs
+        # here.
+        if dist_of.get(wh) and (po.get("distributor") or "") \
+                and (po.get("distributor") or "") != dist_of.get(wh):
+            continue
         for L in (po.get("lines") or []):
             shipped_incoming[(wh, L.get("variety") or "")] = \
                 shipped_incoming.get((wh, L.get("variety") or ""), 0.0) + float(L.get("qty") or 0)

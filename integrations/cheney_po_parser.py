@@ -49,9 +49,9 @@ from typing import Optional
 import pypdf
 
 try:
-    from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY
+    from .hh_mfg_codes import HH_MFG_CODE_TO_VARIETY, CHENEY_ITEM_NO_TO_MFG
 except ImportError:  # standalone / test use
-    from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY  # type: ignore
+    from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY, CHENEY_ITEM_NO_TO_MFG  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +116,7 @@ class CheneyPO:
     warehouse: str = ""            # canonical "<City>, <ST>"
     lines: list = field(default_factory=list)
     unmapped_items: list = field(default_factory=list)  # mfg codes not in HH_MFG_CODE_TO_VARIETY
+    warnings: list = field(default_factory=list)        # resolved, but worth a look
 
     @property
     def total_cases(self) -> float:
@@ -174,6 +175,34 @@ _LINE_HEAD_RE = re.compile(
 # Mfg# line follows the head line (may have trailing GTIN#).
 _MFG_RE = re.compile(r"Mfg#\s+(?P<mfg>\S+)(?:\s+GTIN#:\s*(?P<gtin>\S*))?")
 
+# Last-resort variety resolution from Cheney's description column. Longest
+# match first so "WHOLE WHEAT EVERYTHING" is not read as "WHOLE WHEAT", and
+# "CHEDDAR JALAPENO" (Cheney's word order) as plain Cheddar.
+_DESC_TO_VARIETY = (
+    ("WHOLE WHEAT EVERYTHING", "Whole Wheat Everything"),
+    ("CINNAMON RAISIN", "Cinnamon Raisin"),
+    ("CHEDDAR JALAPENO", "Jalapeno Cheddar"),
+    ("JALAPENO CHEDDAR", "Jalapeno Cheddar"),
+    ("WHOLE WHEAT", "Whole Wheat"),
+    ("PUMPERNICKEL", "Pumpernickel"),
+    ("EVERYTHING", "Everything"),
+    ("BLUEBERRY", "Blueberry"),
+    ("ASIAGO", "Asiago"),
+    ("SESAME", "Sesame"),
+    ("POPPY", "Poppy Seed"),
+    ("ONION", "Onion"),
+    ("PLAIN", "Plain"),
+    ("EGG", "Egg"),
+)
+
+
+def _variety_from_description(desc: str) -> str:
+    d = " ".join((desc or "").upper().split())
+    for needle, variety in _DESC_TO_VARIETY:
+        if needle in d:
+            return variety
+    return ""
+
 
 def parse_po_text(text: str) -> CheneyPO:
     po = CheneyPO()
@@ -202,11 +231,27 @@ def parse_po_text(text: str) -> CheneyPO:
             continue
         mfg_code, gtin = "", ""
         for j in range(idx + 1, min(idx + 4, len(lines))):
+            if _LINE_HEAD_RE.match(lines[j]):
+                # Next item already -- this one's Mfg# line is missing (lost
+                # to a page break). Without this stop the look-ahead borrowed
+                # the NEXT item's code, so Plain 104 + Poppy 8 both read as
+                # Poppy and were then summed into "Poppy 112".
+                break
             mm = _MFG_RE.search(lines[j])
             if mm:
                 mfg_code = (mm.group("mfg") or "").strip()
                 gtin     = (mm.group("gtin") or "").strip()
                 break
+        xwalk = CHENEY_ITEM_NO_TO_MFG.get(head.group("cheney"), "")
+        if mfg_code and xwalk and mfg_code != xwalk \
+                and xwalk in HH_MFG_CODE_TO_VARIETY:
+            po.warnings.append(
+                f"line {head.group('pos')} {head.group('desc').strip()!r}: "
+                f"Mfg# read as {mfg_code} but Cheney item "
+                f"{head.group('cheney')} is {xwalk} "
+                f"({HH_MFG_CODE_TO_VARIETY[xwalk]}); using the item number."
+            )
+            mfg_code = xwalk
 
         line = CheneyPOLine(
             position     = head.group("pos"),
@@ -223,8 +268,24 @@ def parse_po_text(text: str) -> CheneyPO:
             net_cost     = CHENEY_CASE_COST,
         )
         line.variety = HH_MFG_CODE_TO_VARIETY.get(mfg_code, "")
-        if not line.variety and mfg_code:
-            po.unmapped_items.append(mfg_code)
+        if not line.variety:
+            # The "Mfg#" line is printed UNDER the item, and when the item is
+            # the last on a page pypdf loses it to the page break (Ocala
+            # 054511758943: Onion; 054511767347: Egg; Punta Gorda
+            # 064511757163: Whole Wheat -- each PO booked 8 cs short).
+            # Cheney's own catalog number is on the head line, so resolve
+            # through that crosswalk, then the description as a last resort.
+            fallback = CHENEY_ITEM_NO_TO_MFG.get(head.group("cheney"), "")
+            if fallback and fallback in HH_MFG_CODE_TO_VARIETY:
+                line.mfg_code = line.mfg_code or fallback
+                line.variety = HH_MFG_CODE_TO_VARIETY[fallback]
+            else:
+                line.variety = _variety_from_description(line.description)
+        if not line.variety:
+            # Record it either way: an item with no Mfg#, an unknown catalog
+            # number AND an unrecognised description used to vanish silently.
+            po.unmapped_items.append(
+                mfg_code or f"{head.group('cheney')}:{line.description}")
         po.lines.append(line)
 
     return po

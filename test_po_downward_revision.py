@@ -26,8 +26,16 @@ from tempfile import TemporaryDirectory
 PO = "505876B2"
 VENDOR = "Foley, Tom <tom.foley@usfoods.com>"
 INTERNAL = "JD Gross <JD@hhbagels.com>"
-STALE_AT = "2026-08-25T17:03:00Z"
-FIXED_AT = "2026-08-25T18:20:11Z"
+# The incident dates are kept in the docstring; the fixtures are anchored to
+# "yesterday" because a PO dated more than PO_LEAD_DAYS ago rolls straight
+# into on-hand on the next load_inventory(), which silently turned these
+# tests red 30 days after they were written (first seen 2026-10-08).
+from datetime import datetime, timedelta, timezone
+_DAY = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+_DAY_AFTER = (datetime.now(timezone.utc)).date().isoformat()
+STALE_AT = f"{_DAY}T17:03:00Z"
+FIXED_AT = f"{_DAY}T18:20:11Z"
+ORDER_DATE = _DAY
 
 STALE = {"Plain": 32.0, "Poppy Seed": 16.0,
          "Whole Wheat Everything": 32.0, "Jalapeno Cheddar": 24.0}
@@ -67,7 +75,7 @@ def _doc(lines, rev, received, sender=VENDOR):
             source_subject=f"US Foods PO Request - {PO} {rev}",
             po_number=PO,
             po_revision=rev,
-            po_order_date="2026-08-25",
+            po_order_date=ORDER_DATE,
             source_received_at=received,
             source_sender=sender,
         )
@@ -148,7 +156,7 @@ def test_internal_forward_of_the_stale_copy_cannot_undo_the_correction():
         sync._apply_events(_doc(FIXED, "0000003", FIXED_AT), dry_run=False)
         # Someone forwards the old PDF into info@ the next morning.
         report = sync._apply_events(
-            _doc(STALE, "0000006", "2026-08-26T09:00:00Z", sender=INTERNAL),
+            _doc(STALE, "0000006", f"{_DAY_AFTER}T09:00:00Z", sender=INTERNAL),
             dry_run=False)
 
         assert report.get("po_revisions_skipped")

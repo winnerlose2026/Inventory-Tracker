@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request
 from blueprints.freight import _freight_ship_date_index
 from core.errors import _safe_err
 from core.util import _norm_po_key, rollover_row_live
+from core.util import with_data_lock
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -60,6 +61,7 @@ def _cw_po_summary(record: dict) -> dict:
 
 
 @pos_bp.route("/api/on-order/ship-date", methods=["POST"])
+@with_data_lock
 def api_on_order_ship_date():
     """Set (or clear) a ship_date on all pending on_order entries for a PO.
 
@@ -109,7 +111,7 @@ def api_on_order_ship_date():
         arrival_iso = ""
     else:
         try:
-            ship_dt = datetime.fromisoformat(str(ship_raw).strip())
+            ship_dt = _naive_dt(str(ship_raw).strip())
         except ValueError:
             return jsonify({
                 "ok": False,
@@ -119,8 +121,7 @@ def api_on_order_ship_date():
         arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
         if arrival_raw is not None and str(arrival_raw).strip():
             try:
-                arrival_iso = datetime.fromisoformat(
-                    str(arrival_raw).strip()).isoformat()
+                arrival_iso = _naive_dt(str(arrival_raw).strip()).isoformat()
             except ValueError:
                 return jsonify({
                     "ok": False,
@@ -181,6 +182,7 @@ def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
 
 
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
+@with_data_lock
 def api_pending_reopen():
     """Reopen an Arrived PO back into the active pipeline.
 
@@ -259,10 +261,14 @@ def api_pending_reopen():
             "po_number":    e.get("po_number") or po_number,
             "po_revision":  e.get("po_revision") or "",
             "unit":         e.get("unit") or item.get("unit") or "cs",
-            "ordered_at":   "",
+            "ordered_at":   e.get("ordered_at") or "",
             "eta":          "",
             "ship_date":    "",
             "arrival_date": "",
+            # Keep the document identity so the next re-scan of the same
+            # email is recognised as a replay, not a newer revision.
+            "source_received_at": e.get("source_received_at") or "",
+            "source_sender":      e.get("source_sender") or "",
         })
         # Audit row (positive = reverses the original -qty restock). When a
         # count already superseded the rollover nothing moves, so the row
@@ -296,10 +302,26 @@ def api_pending_reopen():
     })
 
 
+def _naive_dt(raw: str) -> datetime:
+    """datetime.fromisoformat that returns NAIVE LOCAL time.
+
+    A tz-aware value ("2026-10-20T00:00:00Z", what JS toISOString() and
+    datetime.now(timezone.utc) produce) stored on an on_order entry made
+    `trigger > now` raise TypeError inside every load_inventory() -- every
+    endpoint 500'd until the JSON was hand-edited."""
+    raw = (raw or "").strip()
+    if raw.endswith("Z") or raw.endswith("z"):
+        raw = raw[:-1] + "+00:00"          # Python < 3.11 rejects a bare Z
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 def _parse_iso_date(raw, field):
     """Parse an ISO date/datetime, returning (iso_string, error_response)."""
     try:
-        return datetime.fromisoformat(str(raw).strip()).isoformat(), None
+        return _naive_dt(str(raw).strip()).isoformat(), None
     except ValueError:
         return None, (jsonify({
             "ok": False,
@@ -308,6 +330,7 @@ def _parse_iso_date(raw, field):
 
 
 @pos_bp.route("/api/pos/arrived/adjust", methods=["POST"])
+@with_data_lock
 def api_arrived_po_adjust():
     """Adjust an ARRIVED inventory PO in place, without reopening it.
 
@@ -526,6 +549,7 @@ def api_pending_status_overrides():
 
 
 @pos_bp.route("/api/pending/set-status", methods=["POST"])
+@with_data_lock
 def api_pending_set_status():
     """Set or clear a manual status override for a PO.
 
@@ -625,6 +649,7 @@ def api_chefs_warehouse_pos():
 
 
 @pos_bp.route("/api/chefs-warehouse/ingest-pos", methods=["POST"])
+@with_data_lock
 def api_chefs_warehouse_ingest_pos():
     """Accept externally-parsed CW PO records and apply them.
 
@@ -664,6 +689,7 @@ def api_chefs_warehouse_ingest_pos():
 
 
 @pos_bp.route("/api/chefs-warehouse/ship-date", methods=["POST"])
+@with_data_lock
 def api_chefs_warehouse_ship_date():
     """Set / clear ship_date (and the derived arrival_date) on a CW PO.
 
@@ -681,13 +707,23 @@ def api_chefs_warehouse_ship_date():
     if not po_number:
         return jsonify({"ok": False, "error": "po_number required"}), 400
 
+    arrival_raw = (body.get("arrival_date") or "").strip()
     if ship_iso:
         try:
-            ship_dt = datetime.fromisoformat(ship_iso)
+            ship_dt = _naive_dt(ship_iso)
         except ValueError:
             return jsonify({"ok": False,
                             "error": "ship_date must be YYYY-MM-DD"}), 400
+        ship_iso = ship_dt.isoformat()
         arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+        if arrival_raw:
+            # A CW truck that lands on day 5 or day 9 could not be recorded;
+            # status flipped at ship+7 regardless. Mirror /api/on-order/ship-date.
+            try:
+                arrival_iso = _naive_dt(arrival_raw).isoformat()
+            except ValueError:
+                return jsonify({"ok": False,
+                                "error": "arrival_date must be YYYY-MM-DD"}), 400
     else:
         ship_iso = ""
         arrival_iso = ""
@@ -714,6 +750,7 @@ def api_chefs_warehouse_ship_date():
 
 
 @pos_bp.route("/api/chefs-warehouse/cancel", methods=["POST"])
+@with_data_lock
 def api_chefs_warehouse_cancel():
     """Mark a CW PO canceled. Removes it from the default Pending POs
     list and adds the PO# to the shared canceled-POs ignore list so a
@@ -738,7 +775,10 @@ def api_chefs_warehouse_cancel():
         r["canceled_at"]     = datetime.now().isoformat(timespec="seconds")
         r["canceled_reason"] = reason
         found = True
-    save_chefs_warehouse_pos(records)
+    if found:
+        # Never write the file back when nothing changed: a torn read that
+        # came up empty would otherwise be saved over the real list.
+        save_chefs_warehouse_pos(records)
 
     canceled = load_canceled_pos()
     canceled[po_number] = {
@@ -810,15 +850,25 @@ def api_arrived_pos():
         name = m.get("name") or e.get("item_name") or ""
         variety = name.split(" Bagel")[0] if " Bagel" in name else name
         g["lines"].append({
-            "variety": variety,
-            "name":    name,
-            "qty":     qty,
-            "unit":    e.get("unit") or "cs",
+            "variety":  variety,
+            "name":     name,
+            "qty":      qty,
+            "unit":     e.get("unit") or "cs",
+            "item_key": e.get("item_key") or "",
         })
-        # arrival_date = the latest rollover timestamp across the PO's lines.
+        # arrival_date = the date the PO was treated as delivered (the
+        # rollover trigger), which is what the count-absorption rule and
+        # /api/pos/arrived/adjust evaluate. The rollover row's timestamp is
+        # when the pass happened to run (lazily, on a read) -- keep it as
+        # rolled_at.
+        trig = (e.get("arrival_date") or "").strip()
         ts = e.get("timestamp") or ""
-        if ts > (g["arrival_date"] or ""):
+        if trig and trig > (g["arrival_date"] or ""):
+            g["arrival_date"] = trig
+        elif not trig and ts > (g["arrival_date"] or ""):
             g["arrival_date"] = ts
+        if ts > (g.get("rolled_at") or ""):
+            g["rolled_at"] = ts
         # First non-empty distributor / warehouse wins (lines may map to
         # SKUs that lost their metadata; keep the first useful one).
         if not g["distributor"] and m.get("distributor"):
@@ -929,8 +979,8 @@ def _date_le(iso_s: str, now) -> bool:
     if not iso_s:
         return False
     try:
-        return datetime.fromisoformat(iso_s) <= now
-    except ValueError:
+        return _naive_dt(iso_s) <= now
+    except (ValueError, TypeError):
         return False
 
 
@@ -997,6 +1047,7 @@ def build_po_ledger() -> list:
         g = arr.setdefault(po, {"distributor": "", "warehouse": "",
                                 "ordered_at": e.get("ordered_at") or "",
                                 "arrival_date": "", "ship_date": "", "eta": "",
+                                "rolled_at": "",
                                 "total_cs": 0.0, "lines": []})
         qty = abs(float(e.get("amount") or 0)); g["total_cs"] += qty
         g["lines"].append({"variety": _ledger_variety(m.get("name") or ""),
@@ -1005,8 +1056,17 @@ def build_po_ledger() -> list:
         g["distributor"] = g["distributor"] or m.get("distributor") or ""
         g["warehouse"] = g["warehouse"] or m.get("warehouse") or ""
         ts = e.get("timestamp") or ""
-        if ts > g["arrival_date"]:
+        trig = (e.get("arrival_date") or "").strip()
+        # arrival_date = the rollover TRIGGER (the date the PO was treated as
+        # delivered), the same date the count-absorption rule and
+        # /api/pos/arrived/adjust evaluate; the row timestamp is only when a
+        # read happened to run the rollover pass.
+        if trig and trig > g["arrival_date"]:
+            g["arrival_date"] = trig
+        elif not trig and ts > g["arrival_date"]:
             g["arrival_date"] = ts
+        if ts > (g.get("rolled_at") or ""):
+            g["rolled_at"] = ts
         # The rollover row carries the ship date the PO was booked with, and the
         # trigger date it arrived on. Without these the Pending POs tab renders
         # an arrived PO with an arrival date but a blank Ship column, even though
@@ -1014,7 +1074,7 @@ def build_po_ledger() -> list:
         if not g["ship_date"] and e.get("ship_date"):
             g["ship_date"] = e["ship_date"]
         if not g["eta"]:
-            g["eta"] = (e.get("arrival_date") or "").strip()
+            g["eta"] = trig
     for po, g in arr.items():
         r = _rec(po); r["sources"].add("usage_rollover"); r["_arrived"] = True
         r["distributor"] = r["distributor"] or g["distributor"]
@@ -1024,8 +1084,16 @@ def build_po_ledger() -> list:
         r["eta"] = r["eta"] or g["eta"]
         if g["ship_date"] and not r["ship_date"]:
             r["ship_date"] = g["ship_date"]; r["ship_date_source"] = "operator"
+        r["rolled_at"] = g.get("rolled_at") or ""
         if not r["_pending"]:   # use the arrived snapshot only if not still pending
             r["total_cs"] = g["total_cs"]; r["lines"] = g["lines"]
+        else:
+            # Part of the PO rolled over, part is still pending (a revision
+            # added a SKU after arrival, or a per-SKU ship date). Show BOTH
+            # halves, and let the pending half decide the status below.
+            r["partial"] = True
+            r["total_cs"] += g["total_cs"]
+            r["lines"] = list(r["lines"]) + [dict(l, arrived=True) for l in g["lines"]]
 
     # 3) Chefs Warehouse store
     for cw in load_chefs_warehouse_pos():
@@ -1055,11 +1123,14 @@ def build_po_ledger() -> list:
         sd = freight_idx.get(_norm_po_key(po))
         if sd:
             r["ship_date"] = sd; r["ship_date_source"] = "freight"; r["sources"].add("freight")
-        ov = overrides.get(po)
+        ov = overrides.get(_norm_po_key(po)) or overrides.get(po)
         if r["_canceled"] or po in canceled or ov in ("cancelled", "canceled"):
             status = "canceled"
         elif ov:
             status = ov
+        elif r["_pending"] and r["_arrived"]:
+            # Partially rolled: the pending lines are still on order.
+            status = "in_transit" if r.get("ship_date") else "pending"
         elif r["_arrived"] or _date_le(r.get("arrival_date"), now):
             status = "arrived"
         elif r.get("ship_date"):

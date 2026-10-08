@@ -2456,10 +2456,12 @@ function _isPoArrived(g, now) {
   return !isNaN(d.getTime()) && d <= (now || new Date());
 }
 
-function _poState(g, now) {
+function _poState(g, now, trustServer) {
   now = now || new Date();
   if (g.status === 'canceled' || g.canceled) return 'cancelled';
-  if (_isPoArrived(g, now)) return 'arrived';
+  // With the ledger as the source, a PO is arrived only when the server says
+  // so (its rollover is what credits on-hand); a past date alone is not.
+  if (trustServer ? (g.status === 'arrived') : _isPoArrived(g, now)) return 'arrived';
   const ordered = _poDate(g.ordered_at);
   if (ordered) {
     const cutoff = new Date(ordered);
@@ -2526,15 +2528,24 @@ function _groupsFromLedger(records) {
       arrival_date: r.arrival_date || '', total_cs: Number(r.total_cs) || 0,
       status: r.status || '', transfer_group: r.transfer_group || null,
       lines: (r.lines || []).map(L => ({ variety: L.variety || '', qty: Number(L.qty) || 0,
-                                         unit: L.unit || 'cs', name: L.name || L.variety || '' })),
+                                         unit: L.unit || 'cs', name: L.name || L.variety || '',
+                                         // Needed by the arrived-PO received-qty editor; without
+                                         // it every line rendered read-only ("Nothing to save").
+                                         item_key: L.item_key || '',
+                                         arrived: !!L.arrived })),
+      partial: !!r.partial,
+      rolled_at: r.rolled_at || '',
       _source: src,
     };
-    // Match the legacy freight behavior: a freight-verified ship date on a
-    // not-yet-arrived PO implies arrival = ship + 7.
-    if (g.ship_date_source === 'freight' && src !== 'arrived' && g.status !== 'arrived')
-      g.arrival_date = _addDaysISO(g.ship_date, 7);
+    // The server is the authority on arrived vs pending: on-hand is only
+    // credited when IT rolls the PO over. Freight ship dates are now stamped
+    // onto the pending rows server-side (arrival = ship + 7), so the ledger's
+    // status already reflects them; inferring an arrival here made the tab
+    // hide a PO as "arrived" while the Inventory tab still carried it On
+    // Order and the edit path then found nothing to edit.
     g._stateOverride = r.override || '';
-    g._state = g._stateOverride || _poState(g, now);
+    g._state = g._stateOverride || (g.status === 'arrived' ? 'arrived'
+                                    : _poState(g, now, /*trustServer*/ true));
     return g;
   });
 }
@@ -4064,7 +4075,9 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function escAttr(s) {
-  return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+  // '&' first: inside an onclick="..." attribute an entity like &#39; decodes
+  // before the JS is parsed, which would end the quoted string early.
+  return String(s).replace(/&/g,'&amp;').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
 }
 
 // -------------------------------------------------------------------------

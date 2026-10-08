@@ -311,7 +311,11 @@ def _parse_case_movement(rows: list, warehouse: str, filename: str,
     events: list[dict] = []
     errors: list[str] = []
     if note:
-        errors.append(f"{warehouse}: {note}")
+        # No period => no rate. Scaling by a guessed 30-day span would book a
+        # weekly grid at 7/30 of the true usage, which then drives the daily
+        # burn. The OCR path refuses in the same situation.
+        errors.append(f"{warehouse}: {note} -- usage_rate NOT emitted")
+        return events, errors
     for r in rows[hi + 1:]:
         mfg = _clean_code(r[col_mfg]) if (col_mfg is not None and col_mfg < len(r)) else ""
         sku = _clean_code(r[col_item]) if (col_item is not None and col_item < len(r)) else ""

@@ -38,3 +38,22 @@ def rollover_row_live(e: dict) -> bool:
     if (e.get("source") or "") != "on_order_rollover":
         return False
     return not e.get("reversed") and not e.get("superseded_by_revision")
+
+
+def with_data_lock(fn):
+    """Run a Flask view (or any function) inside inventory_tracker.data_lock().
+
+    Every endpoint that loads, edits and saves inventory.json / usage.json is
+    a read-modify-write across gunicorn's 2 workers x 4 threads; os.replace()
+    keeps the file whole but two overlapping cycles still lose one of them.
+    The lock is per-thread re-entrant, so the load_inventory() inside the view
+    taking it again is fine.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def _inner(*args, **kwargs):
+        from inventory_tracker import data_lock
+        with data_lock():
+            return fn(*args, **kwargs)
+    return _inner

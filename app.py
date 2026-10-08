@@ -183,9 +183,14 @@ _LOGIN_MAX_FAILS = 8           # lock after this many failures within the window
 
 
 def _client_ip() -> str:
+    # The LAST entry is the one Render's edge appended; the first is whatever
+    # the client chose to send, so keying the lockout on it let a caller
+    # rotate the header and never lock.
     fwd = request.headers.get("X-Forwarded-For", "")
     if fwd:
-        return fwd.split(",")[0].strip()
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.remote_addr or "?"
 
 
@@ -240,7 +245,8 @@ def login():
         # configuration — fail closed.
         if allowed and expected_pass \
                 and username.lower() in allowed \
-                and secrets.compare_digest(password, expected_pass):
+                and secrets.compare_digest(password.encode("utf-8"),
+                                           expected_pass.encode("utf-8")):
             _LOGIN_FAILS.pop(ip, None)
             session.permanent = True
             # Preserve the casing the user typed so the header chip reads

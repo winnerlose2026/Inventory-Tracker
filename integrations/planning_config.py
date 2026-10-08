@@ -26,6 +26,7 @@ _WAREHOUSES = [
     {"distributor": "US Foods", "warehouse": "La Mirada, CA", "region": "West", "transit_days": 7, "transfer_group": None},
     {"distributor": "US Foods", "warehouse": "Chicago, IL", "region": "Midwest", "transit_days": 7, "transfer_group": None},
     {"distributor": "US Foods", "warehouse": "Alcoa, TN", "region": "Southeast", "transit_days": 7, "transfer_group": None},
+    {"distributor": "US Foods", "warehouse": "Houston, TX", "region": "South", "transit_days": 7, "transfer_group": None},
     {"distributor": "Cheney Brothers", "warehouse": "Riviera Beach, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},
     {"distributor": "Cheney Brothers", "warehouse": "Ocala, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},
     {"distributor": "Cheney Brothers", "warehouse": "Punta Gorda, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},

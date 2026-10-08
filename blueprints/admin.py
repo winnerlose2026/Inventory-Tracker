@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 
 from core.errors import _safe_err
+from core.util import with_data_lock
 from inventory_tracker import load_inventory, save_inventory
 
 admin_bp = Blueprint("admin", __name__)
@@ -44,32 +45,43 @@ def api_admin_po_order_date():
         order_dt = None
     else:
         try:
-            order_dt = datetime.fromisoformat(str(order_raw).strip())
+            _raw = str(order_raw).strip()
+            if _raw.endswith(("Z", "z")):
+                _raw = _raw[:-1] + "+00:00"
+            order_dt = datetime.fromisoformat(_raw)
         except ValueError:
             return jsonify({
                 "ok": False,
                 "error": "order_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
             }), 400
+        if order_dt.tzinfo is not None:
+            # A tz-aware value stored here broke every later load_inventory().
+            order_dt = order_dt.astimezone().replace(tzinfo=None)
         order_iso = order_dt.isoformat()
 
-    inv = load_inventory()
-    updated = 0
-    touched_items: list[str] = []
-    for key, item in inv.items():
-        pending = item.get("on_order") or []
-        for entry in pending:
-            if (entry.get("po_number") or "") != po_number:
-                continue
-            entry["ordered_at"] = order_iso
-            if recompute_eta and order_dt is not None:
-                lead = int(entry.get("lead_days") or 0)
-                if lead > 0:
-                    entry["eta"] = (order_dt + timedelta(days=lead)).isoformat()
-            updated += 1
-            name = item.get("name") or key
-            if name not in touched_items:
-                touched_items.append(name)
-    save_inventory(inv)
+    from inventory_tracker import data_lock
+    with data_lock():
+        inv = load_inventory()
+        updated = 0
+        touched_items: list[str] = []
+        for key, item in inv.items():
+            pending = item.get("on_order") or []
+            for entry in pending:
+                if (entry.get("po_number") or "") != po_number:
+                    continue
+                entry["ordered_at"] = order_iso
+                # Mark the provenance so the legacy subject-date rebase that
+                # runs on every read leaves this entry alone.
+                entry["ordered_at_source"] = "operator"
+                if recompute_eta and order_dt is not None:
+                    lead = int(entry.get("lead_days") or 0)
+                    if lead > 0:
+                        entry["eta"] = (order_dt + timedelta(days=lead)).isoformat()
+                updated += 1
+                name = item.get("name") or key
+                if name not in touched_items:
+                    touched_items.append(name)
+        save_inventory(inv)
     return jsonify({
         "ok": True,
         "po_number": po_number,
@@ -80,6 +92,7 @@ def api_admin_po_order_date():
 
 
 @admin_bp.route("/api/admin/remove-po", methods=["POST"])
+@with_data_lock
 def api_admin_remove_po():
     """Drop all pending on_order entries matching a po_number.
 
@@ -128,6 +141,7 @@ def api_admin_remove_po():
 
 
 @admin_bp.route("/api/admin/uncancel-po", methods=["POST"])
+@with_data_lock
 def api_admin_uncancel_po():
     """Remove a po_number from the canceled-POs ignore list.
 
@@ -182,6 +196,7 @@ _DERIVED_FIELDS = ("on_order_qty", "on_order_next_eta",
 
 
 @admin_bp.route("/api/admin/restore-inventory", methods=["POST"])
+@with_data_lock
 def api_admin_restore_inventory():
     """Restore inventory from a snapshot taken off /api/inventory.
 

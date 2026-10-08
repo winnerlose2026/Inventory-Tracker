@@ -20,7 +20,7 @@ import sys
 from datetime import datetime, timedelta
 from typing import Iterable
 
-from core.util import rollover_row_live
+from core.util import rollover_row_live, _norm_po_key
 from integrations import (
     CheneyBrothersClient, USFoodsClient,
     DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
@@ -123,6 +123,42 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
             continue
         if _rollover_arrival(e) > cd:
             total += abs(float(e.get("amount") or 0))
+    return total
+
+
+# Ledger sources that represent a real movement of cases AFTER a count and
+# must therefore survive a re-read of that count. Rollover receipts are
+# handled separately by _receipts_after_count (matched on arrival date).
+_POST_COUNT_MOVEMENT_SOURCES = ("forecast-daily", "manual-use", "manual-restock",
+                                "manual-correction")
+
+
+def _movement_after_count(usage: list, item_key: str, count_date: str) -> float:
+    """Net cases consumed for this SKU by movements dated AFTER ``count_date``
+    (positive = consumed; a manual restock counts negative).
+
+    A reported count is the truth at its count date. The daily forecast burn
+    and any manual Use/Restock entered after that date are movements the count
+    could not have seen, so a later re-read of the same report must not reset
+    them. Before this, every 6-hourly scan re-applied the week's count as
+    ``count + receipts`` and wiped the burns since: Zebulon Onion showed
+    +0.45 forecast-daily at 05:05 and -0.45 "Email on-hand sync" at 10:12,
+    three days running -- on-hand never moved between weekly counts.
+    """
+    cd = (count_date or "")[:10]
+    if not cd or not item_key:
+        return 0.0
+    total = 0.0
+    for e in usage:
+        if (e.get("item_key") or "") != item_key:
+            continue
+        if e.get("reversed"):
+            continue
+        if e.get("source") not in _POST_COUNT_MOVEMENT_SOURCES:
+            continue
+        eff = (e.get("forecast_date") or e.get("timestamp") or "")[:10]
+        if eff > cd:
+            total += float(e.get("amount") or 0)
     return total
 
 
@@ -279,6 +315,7 @@ def sync_all(clients: list[DistributorClient] | None = None,
 # ---------------------------------------------------------------------------
 
 from integrations.po_revision import is_newer as _po_doc_is_newer  # noqa: E402
+from integrations.po_revision import parse_dt as _po_parse_dt  # noqa: E402
 from integrations.po_revision import (  # noqa: E402
     is_internal_sender as _po_sender_is_internal,
 )
@@ -313,6 +350,12 @@ def _po_rev_int(s) -> int:
         return _REPRINT_REV_SENTINEL
 
 
+# Usage rows tagged with a po_number that are NOT a booked receipt. (An
+# `on_order_absorbed` row IS still the record that the PO was processed, so a
+# re-read of its email is recognised as a replay; it just carries 0 cs.)
+_NOT_APPLIED_RESTOCK_SOURCES = ("arrived-po-adjust", "reversal")
+
+
 def _highest_applied_rev(usage: list, po_number: str) -> tuple:
     """Return (highest_rev_int, active_indices, rev, received_at, sender) for a PO.
     Active = tagged with this po_number and NOT yet marked superseded_by_revision.
@@ -327,6 +370,16 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple:
             continue
         if entry.get("reversal_of_revision"):
             # Reversal audit rows aren't themselves "applied restock" — skip.
+            continue
+        if entry.get("reversed"):
+            # Un-rolled by Reopen (or a true-up): its cases are already out of
+            # on-hand. Reversing it AGAIN on the next revision drove a SKU to
+            # -92 cs.
+            continue
+        if entry.get("source") in _NOT_APPLIED_RESTOCK_SOURCES:
+            # Audit rows that carry a po_number but are not a receipt: the
+            # arrived-PO adjust delta (the rollover row itself was edited in
+            # place) and reopen/undo reversals.
             continue
         if _po_doc_is_newer(entry.get("po_revision"),
                             entry.get("source_received_at"),
@@ -518,7 +571,21 @@ def _apply_po_on_order(evt, item: dict, key: str, now: str,
 
     # ETA stays blank for non-auto-ETA distributors; the rollover skips
     # entries with no resolvable arrival date.
-    eta_iso = (ordered_at_dt + timedelta(days=lead_days)).isoformat() if auto_eta else ""
+    #
+    # The lead-time clock starts at the LATER of the PO's order date and the
+    # day its email reached us. USF re-cuts a PO under its original order
+    # date: Houston 393072B2 was dated 08/10 but re-issued 09/28 (rev 0000005,
+    # 1,120 cs). ordered_at + 30 was already three weeks in the past, so the
+    # PO rolled straight into on-hand at ingest, the next count absorbed it,
+    # and it vanished from the Pending tab. A backlogged scan of a genuinely
+    # old email is unaffected: its received date is old too.
+    eta_anchor_dt = ordered_at_dt
+    received_dt = _po_parse_dt(getattr(evt, "source_received_at", "") or "")
+    if received_dt is not None:
+        received_local = datetime.combine(received_dt.date(), datetime.min.time())
+        if received_local.date() > ordered_at_dt.date():
+            eta_anchor_dt = received_local
+    eta_iso = (eta_anchor_dt + timedelta(days=lead_days)).isoformat() if auto_eta else ""
 
     entry = {
         "qty": amount,
@@ -614,10 +681,46 @@ def _booked_skus_for_po(inv: dict, usage: list, po_number: str) -> set:
             continue
         if entry.get("superseded_by_revision") or entry.get("reversal_of_revision"):
             continue
+        if entry.get("reversed") or entry.get("source") in _NOT_APPLIED_RESTOCK_SOURCES:
+            continue
         name = str(entry.get("item_key") or "")
+        # Rollover / absorbed rows written before 2026-10-08 carry no
+        # `warehouse`, and a direct restock row may not either. An empty
+        # warehouse here never matched the incoming (variety, warehouse), so
+        # every arrived PO "gained" all of its SKUs on each re-scan of its
+        # email and was reversed + re-booked every 6 hours (Houston 393072B2,
+        # La Mirada 6073804C). Resolve it from the SKU record instead.
+        wh = (entry.get("warehouse") or "").strip()
+        if not wh:
+            wh = (inv.get(name, {}) or {}).get("warehouse") or ""
         out.add(((name.split(" bagel")[0]).strip().lower(),
-                 (entry.get("warehouse") or "").strip().lower()))
+                 wh.strip().lower()))
     return out
+
+
+def _legacy_same_document(grp, usage: list, active_idx: list, inv: dict) -> bool:
+    """True when every booked line equals the incoming line for that SKU.
+
+    The incoming copy may carry EXTRA SKUs (a line the parser could not
+    resolve when the PO was first booked -- Punta Gorda 064511757163's
+    page-break Whole Wheat line); that is still the same document, and the
+    extra lines are handled as a gain below."""
+    want = {}
+    for e in grp:
+        k = ((e.item.variety or "").strip().lower(),
+             (e.item.warehouse or "").strip().lower())
+        want[k] = want.get(k, 0.0) + float(e.item.quantity or 0)
+    have = {}
+    for i in active_idx:
+        row = usage[i]
+        name = str(row.get("item_key") or "")
+        wh = (row.get("warehouse") or "").strip() or \
+            (inv.get(name, {}) or {}).get("warehouse") or ""
+        k = ((name.split(" bagel")[0]).strip().lower(), wh.strip().lower())
+        have[k] = have.get(k, 0.0) + abs(float(row.get("amount") or 0))
+    if not have or not set(have) <= set(want):
+        return False
+    return all(abs(want[k] - have[k]) < 1e-6 for k in have)
 
 
 def _skus_in_group(grp) -> set:
@@ -781,15 +884,48 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # happen to match.
         new_wu = evt.item.weekly_usage
         old_wu = item.get("weekly_usage")
-        # The count is authoritative only up to its own count_date. Add back any
-        # PO receipt that arrived AFTER it, so re-reading an older report can't
-        # erase a delivery. Derived from immutable inputs (reported count +
-        # recorded receipts), so re-applying the same report is idempotent.
-        _receipts = _receipts_after_count(usage, key, _evt_cd)
-        _target_qty = amount + _receipts
-        qty_changed = abs(_target_qty - old_qty) >= 1e-9
         wu_changed = (new_wu is not None
                       and abs(float(new_wu) - float(old_wu or 0)) >= 1e-9)
+        # The very same count document, read again (the 6-hourly scan re-reads
+        # everything in its lookback window): same date, same trust rank, same
+        # email, same figure. Nothing about on-hand can change -- only a
+        # weekly-usage refresh may still land. Decided BEFORE the arithmetic
+        # below so a replay can never drift the quantity.
+        _cur_qty_at_count = item.get("last_count_qty")
+        _is_replay = (
+            _evt_cd and _evt_cd == _cur_cd
+            and (_cur_rank is None or _evt_rank == int(_cur_rank))
+            and (not _evt_rcv or not _cur_rcv or _evt_rcv == _cur_rcv)
+            and _cur_qty_at_count is not None
+            and abs(float(_cur_qty_at_count) - amount) < 1e-9
+        )
+        if _is_replay:
+            if wu_changed and not dry_run:
+                item["weekly_usage"] = round(float(new_wu), 2)
+                item["updated"] = now
+                report["changes"].append({
+                    "name": item["name"],
+                    "warehouse": item.get("warehouse", ""),
+                    "event_type": "weekly_usage",
+                    "old_quantity": old_qty, "new_quantity": old_qty,
+                    "delta": 0,
+                    "old_weekly_usage": old_wu,
+                    "new_weekly_usage": round(float(new_wu), 2),
+                })
+                report["updated"] += 1
+            else:
+                report["unchanged"] += 1
+            return
+        # The count is authoritative only up to its own count_date. Add back any
+        # PO receipt that arrived AFTER it, so re-reading an older report can't
+        # erase a delivery, and take off the forecast burn / manual movements
+        # dated after it, so they are not reset either. Derived from the
+        # reported count plus recorded ledger rows, so re-applying the same
+        # report lands on the same number.
+        _receipts = _receipts_after_count(usage, key, _evt_cd)
+        _moved = _movement_after_count(usage, key, _evt_cd)
+        _target_qty = amount + _receipts - _moved
+        qty_changed = abs(_target_qty - old_qty) >= 1e-9
         # Record that a fresh count was received for this warehouse today,
         # even when the numbers match last week's. Drives the per-warehouse
         # freshness indicator on the Inventory page.
@@ -802,6 +938,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
             # a weaker source can be rejected rather than silently winning.
             item["last_count_rank"] = _evt_rank
             item["last_count_received_at"] = _evt_rcv
+            item["last_count_qty"] = amount
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return
@@ -814,6 +951,8 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
                 f"{item['name']}: reported {amount:g} cs as of {_evt_cd}, "
                 f"+{_receipts:g} cs arrived after that date -> {new_qty:g} cs"
             )
+        if abs(_moved) >= 1e-9:
+            note += f" -{_moved:g} cs used since {_evt_cd}"
     elif evt.event_type == "restock":
         new_qty = old_qty + amount
         delta_usage = -round(amount, 2)  # negative = restock in the log
@@ -1082,6 +1221,25 @@ def _apply_events(events: list,
     report["po_revisions_skipped"] = []
     report["po_revisions_superseded"] = []
 
+    # A PO an operator retired with /api/admin/remove-po must stay retired
+    # however its email reaches us. The filter lived only on
+    # /api/email/ingest-events; the server-side scan ("Scan now", the 6-hour
+    # cron) and the Cheney CSV ingest call this function directly and
+    # re-booked every canceled PO within hours ("gained" every SKU, since
+    # nothing was booked).
+    try:
+        from inventory_tracker import load_canceled_pos
+        _canceled = {_norm_po_key(k) for k in (load_canceled_pos() or {})}
+    except Exception:  # noqa: BLE001 -- a missing side table is not an error
+        _canceled = set()
+    if _canceled:
+        for _po in [p for p in po_groups if _norm_po_key(p) in _canceled]:
+            report.setdefault("canceled_skipped", []).append(
+                f"PO {_po}: on the canceled list - skipped "
+                f"{len(po_groups[_po])} event(s)."
+            )
+            del po_groups[_po]
+
     for po_num, grp in po_groups.items():
         # Collapse duplicate lines that arrived in the same scan. The
         # scanner pulls from multiple mailboxes (JD@ and info@), and the
@@ -1109,6 +1267,15 @@ def _apply_events(events: list,
         # Once narrowed to a single document, max-qty dedup is safe: what
         # remains is the same PDF delivered to both JD@ and info@, or
         # re-attached on a reply, so the qtys agree.
+        #
+        # This relies on the PO parsers emitting ONE event per SKU per
+        # document. A Cheney PO can list the same variety on two lines
+        # (Ocala 054511767347: Poppy 8 + 8, Everything 48 + 24, ... 224 cs),
+        # and at this point two 8 cs Poppy events are indistinguishable from
+        # the same line read twice -- so `_cheney_po_to_events` /
+        # `_usfoods_po_to_events` sum split lines first, where the line
+        # position still tells them apart. Max-per-SKU here booked that PO
+        # at 152 cs before that.
         newest_rev, newest_received, newest_sender = None, "", ""
         _seen_doc = False
         for _evt in grp:
@@ -1175,6 +1342,30 @@ def _apply_events(events: list,
             new_rev, new_received, active_rev, active_received,
             new_sender, active_sender)
 
+        # Legacy bridge. Rollover rows written before 2026-10-08 carry no
+        # source_received_at, and "a dated document supersedes an undated
+        # row" would reverse every recently-arrived PO the moment its email
+        # is re-read (Chicago 5903413Y: -672 cs, re-booked pending for three
+        # weeks under the received-date ETA floor). For an undated booking,
+        # the same revision token with the SAME lines and quantities is the
+        # same document: treat it as a replay and stamp the identity onto
+        # the rows so the next read is an ordinary one.
+        if active_idx and not active_received and incoming_is_newer \
+                and (new_rev or "") == (active_rev or "") \
+                and _legacy_same_document(grp, usage, active_idx, inv):
+            incoming_is_newer = False
+            if not dry_run:
+                for _i in active_idx:
+                    _row = usage[_i]
+                    _row.setdefault("source_received_at", new_received)
+                    _row.setdefault("source_sender", new_sender)
+                    if not _row.get("warehouse"):
+                        _row["warehouse"] = (inv.get(_row.get("item_key") or "", {}) or {}).get("warehouse", "")
+            report.setdefault("legacy_identity_stamped", []).append(
+                f"PO {po_num}: {len(active_idx)} booked row(s) predate the "
+                f"document-identity fields; content matches the incoming copy, "
+                f"treated as a replay and stamped {new_received or '(undated)'}.")
+
         # The "identical document" skips below assume same document => same
         # result. That stops being true the moment the parser learns a code it
         # used to skip: `_usfoods_po_to_events` drops any line whose variety is
@@ -1228,6 +1419,64 @@ def _apply_events(events: list,
             )
             continue
 
+        _absorbed_before = len(report.get("reversals_absorbed") or [])
+
+        # A parser gain on a PO that has ALREADY ARRIVED (rollover rows live,
+        # nothing pending, incoming copy not newer): book ONLY the gained
+        # lines. Re-booking the whole document used to put every line back
+        # on order next to its live rollover rows -- a second delivery on the
+        # next rollover. The gained line was on the same truck as its
+        # siblings, so it inherits their arrival date; when a count has
+        # already absorbed that arrival it is recorded as absorbed, not added.
+        if active_idx and not incoming_is_newer and gained:
+            _arrival = max((_rollover_arrival(usage[_i]) for _i in active_idx
+                            if usage[_i].get("source") == "on_order_rollover"),
+                           default="")
+            _gained_events = [e for e in grp
+                              if ((e.item.variety or "").strip().lower(),
+                                  (e.item.warehouse or "").strip().lower()) in gained]
+            for evt in _gained_events:
+                key = _find_local_key(inv, evt.item)
+                item = inv.get(key) if key else None
+                if item is None:
+                    report["unmatched"].append(
+                        evt.item.name or f"{evt.item.variety}@{evt.item.warehouse}")
+                    continue
+                count_date = (item.get("last_count_at") or "")[:10]
+                qty = float(evt.item.quantity or 0)
+                if _arrival and count_date and _arrival <= count_date:
+                    report.setdefault("gained_absorbed", []).append(
+                        f"PO {po_num}: {item['name']} {qty:g} cs resolved late; "
+                        f"the PO arrived {_arrival}, inside the {count_date} "
+                        f"count -- recorded, not added to on-hand.")
+                    if not dry_run:
+                        usage.append({
+                            "item_key": key, "item_name": item["name"], "amount": 0,
+                            "unit": item.get("unit", "cs"),
+                            "note": (f"PO {po_num} line resolved after arrival "
+                                     f"({_arrival}); already inside the {count_date} "
+                                     f"count - {qty:g} cs not re-added"),
+                            "timestamp": now, "po_number": po_num,
+                            "po_revision": new_rev, "arrival_date": _arrival,
+                            "source": "on_order_absorbed",
+                            "source_received_at": new_received,
+                            "source_sender": new_sender,
+                            "warehouse": item.get("warehouse", ""),
+                            "variety": (item.get("name", "") or "").split(" Bagel")[0],
+                        })
+                else:
+                    _apply_email_event(evt, inv, usage, now, report, dry_run)
+                    if _arrival and not dry_run:
+                        for _p in (item.get("on_order") or []):
+                            if _p.get("po_number") == po_num and not _p.get("arrival_date"):
+                                _p["arrival_date"] = f"{_arrival}T00:00:00"
+                                _p["eta"] = f"{_arrival}T00:00:00"
+                                _p["arrival_source"] = "sibling-lines"
+                    report.setdefault("gained_booked", []).append(
+                        f"PO {po_num}: {item['name']} {qty:g} cs resolved late; "
+                        f"booked with the PO's arrival {_arrival or '(unknown)'}.")
+            continue
+
         if active_idx and incoming_is_newer:
             # Higher revision arriving for a PO we've already booked - reverse
             # prior entries before posting the new ones.
@@ -1237,6 +1486,23 @@ def _apply_events(events: list,
                 f"PO {po_num}: rev {existing_rev_int} superseded by rev "
                 f"{new_rev_int} ({len(active_idx)} line(s) reversed)."
             )
+
+        # Operator-entered ship / arrival dates live on the pending rows that
+        # are about to be dropped. A gained-SKU re-apply drops the SAME-rev
+        # rows too (so nothing is left for _apply_po_on_order to copy from),
+        # and every pending PO lost its dates the moment a new mfg code was
+        # added. Snapshot them per SKU and put them back on the re-booked
+        # rows below.
+        _carry_dates: dict = {}
+        for _key, _item in inv.items():
+            for _p in (_item.get("on_order") or []):
+                if _p.get("po_number") != po_num:
+                    continue
+                if _p.get("ship_date") or _p.get("arrival_date"):
+                    _carry_dates[_key] = {
+                        k: _p.get(k) for k in
+                        ("ship_date", "arrival_date", "eta", "arrival_source")
+                        if _p.get(k)}
 
         # Always clear pending on_order rows tagged with this PO before
         # posting new ones. Covers the case where the prior revision never
@@ -1248,6 +1514,34 @@ def _apply_events(events: list,
 
         for evt in grp:
             _apply_email_event(evt, inv, usage, now, report, dry_run)
+
+        _absorbed_now = len(report.get("reversals_absorbed") or []) - _absorbed_before
+        if not dry_run:
+            for _key, _item in inv.items():
+                for _p in (_item.get("on_order") or []):
+                    if _p.get("po_number") != po_num:
+                        continue
+                    if _key in _carry_dates and not _p.get("ship_date"):
+                        _p.update(_carry_dates[_key])
+                    if _absorbed_now:
+                        # The previous booking of this PO was delivered and a
+                        # physical count already absorbed it. Re-booking the
+                        # same cases as pending means they land in on-hand
+                        # a second time when this entry rolls over -- unless
+                        # the vendor really did re-issue it as a new shipment
+                        # (Houston 393072B2: the first copy never shipped).
+                        # The system cannot tell those apart; flag it so an
+                        # operator confirms before it rolls.
+                        _p["rebooked_after_count"] = (
+                            _item.get("last_count_at") or "")[:10]
+        if _absorbed_now:
+            report.setdefault("warnings", []).append(
+                f"PO {po_num}: re-booked as pending although a count on "
+                f"{(next((i.get('last_count_at') for i in inv.values() for p in (i.get('on_order') or []) if p.get('po_number') == po_num), '') or '')[:10]} "
+                f"already absorbed its earlier delivery ({_absorbed_now} line(s)). "
+                f"If this is NOT a new shipment, remove it with /api/admin/remove-po "
+                f"before it rolls into on-hand."
+            )
 
     # Apply non-PO events (on_hand, usage_rate, body usage) oldest-count
     # first, so when several reports for the same warehouse land in one scan

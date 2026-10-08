@@ -27,6 +27,18 @@ jobs:
       - name: Syntax gate (byte-compile all sources)
         run: python -m compileall -q .
 
+      - name: Set up Node (for node --check on the front-end JS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: File-integrity gate (NUL bytes, JS/HTML/JSON parse)
+        # Same validator the push flow runs; checks every tracked source
+        # file so a Dropbox-padded template or a truncated app.js can never
+        # pass CI the way the 2026-06..10 NUL-padded index.html did.
+        run: |
+          python scripts/safe_push.py --skip-size-check $(git ls-files '*.py' '*.html' '*.js' '*.json' '*.yaml' '*.yml' | grep -v '^tests/fixtures/')
+
       - name: Run tests
         # Whole suite, deliberately NOT a hand-maintained file list. The old
         # allow-list silently excluded every test file added after it was

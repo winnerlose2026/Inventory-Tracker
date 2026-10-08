@@ -494,9 +494,26 @@ def run(argv: list[str] | None = None) -> int:
     # ---- discover qualifying messages
     qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
     mailbox_diag: list[str] = []  # one line per mailbox, always logged
+    # --lineage-lookback-hours was parsed and never used: render.yaml passes
+    # 2160 believing a 90-day Lineage sweep runs, but every invoice older
+    # than --lookback-hours was skipped (and never back-filled). List the
+    # deeper window separately and keep only Lineage senders from it.
+    lineage_hours = int(getattr(args, "lineage_lookback_hours", 0) or 0)
+    lineage_since = (datetime.now(timezone.utc) - timedelta(hours=lineage_hours)
+                     if lineage_hours > lookback_hours else None)
     for mb in mailboxes:
         try:
             msgs = _list_recent_messages(token, mb, since, verbose=args.verbose)
+            if lineage_since is not None:
+                seen_mids = {m.get("id") for m in msgs}
+                extra = _list_recent_messages(token, mb, lineage_since,
+                                              verbose=args.verbose)
+                for m in extra:
+                    if m.get("id") in seen_mids:
+                        continue
+                    s_addr = ((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""
+                    if _classify(s_addr, m.get("subject") or "") == "Lineage Freight":
+                        msgs.append(m)
         except Exception as exc:
             msg = _redact(str(exc), secrets_to_redact)
             # ALWAYS surface mailbox-list failures (not just under --verbose).
@@ -619,7 +636,7 @@ def run(argv: list[str] | None = None) -> int:
                 elif dist == "US Foods":
                     events, errors = _usfoods_po_to_events(
                         pdf_bytes, dist, mid, subject,
-                        received_at=received_iso)
+                        received_at=received_iso, sender=sender)
                     for e in events:
                         events_out.append(asdict(e))
                     for er in errors:
@@ -629,7 +646,7 @@ def run(argv: list[str] | None = None) -> int:
                 elif dist == "Cheney Brothers":
                     events, errors = _cheney_po_to_events(
                         pdf_bytes, dist, mid, subject,
-                        received_at=received_iso)
+                        received_at=received_iso, sender=sender)
                     for e in events:
                         events_out.append(asdict(e))
                     for er in errors:

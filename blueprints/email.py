@@ -154,6 +154,19 @@ def _api_email_scan_locked():
             dry_run=dry_run,
             source=client.source(),
         )
+        # Chefs Warehouse POs ride alongside the events on the ScanResult but
+        # land in their own store. sync_inventory.scan_email applied them;
+        # this route -- the one the 6-hour cron and "Scan now" actually use --
+        # did not, so a CW PO only ever arrived through the cowork fallback.
+        cw_pos = list(getattr(scan, "cw_pos", None) or [])
+        if cw_pos:
+            try:
+                from sync_inventory import _apply_cw_pos
+                report["chefs_warehouse"] = _apply_cw_pos(
+                    cw_pos, dry_run=dry_run, source=client.source())
+            except Exception as exc:  # noqa: BLE001
+                report.setdefault("errors", []).append(
+                    f"chefs-warehouse apply failed: {_safe_err(exc)}")
         # Persist a scan-health heartbeat + capture recognized-but-unparsed
         # distributor mail (real runs only) so a missed warehouse or parser
         # gap is observable on /api/scan/health (roadmap #2/#5/#6).
@@ -614,10 +627,12 @@ def _api_email_ingest_events_locked():
     canceled = load_canceled_pos()
     canceled_skipped = 0
     if canceled:
+        from core.util import _norm_po_key
+        _canceled_keys = {_norm_po_key(k) for k in canceled}
         kept_events = []
         for ev in raw_events:
             po = str((ev or {}).get("po_number") or "").strip()
-            if po and po in canceled:
+            if po and _norm_po_key(po) in _canceled_keys:
                 canceled_skipped += 1
                 continue
             kept_events.append(ev)
@@ -663,6 +678,7 @@ def _api_email_ingest_events_locked():
                 source_received_at=str(e.get("source_received_at") or ""),
                 source_sender=str(e.get("source_sender") or ""),
                 count_date=str(e.get("count_date") or ""),
+                parser_source=str(e.get("parser_source") or ""),
             ))
         except (TypeError, ValueError, KeyError) as exc:
             build_errors.append(f"events[{idx}]: error")
@@ -759,10 +775,14 @@ def api_ingest_cheney_inventory_csv():
         ))
 
     try:
-        report = _apply_events(
-            events=built, messages_seen=1, messages_parsed=1 if built else 0,
-            errors=list(errors), dry_run=dry_run, source="cheney-sftp-csv",
-        )
+        with _ingest_lock() as got:
+            if not got:
+                return jsonify({"ok": False,
+                                "error": "another ingest is running"}), 409
+            report = _apply_events(
+                events=built, messages_seen=1, messages_parsed=1 if built else 0,
+                errors=list(errors), dry_run=dry_run, source="cheney-sftp-csv",
+            )
     except Exception as exc:  # noqa: BLE001
         return jsonify({"dry_run": dry_run, "reports": [{
             "distributor": "Cheney Brothers", "source": "cheney-sftp-csv",

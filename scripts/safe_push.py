@@ -43,8 +43,16 @@ Checks per file
                  inline JS parses with `node --check`,
                  CSS brace balance inside <style>,
                  presence of </body></html>
+*.js           - `node --check`
+*.json         - json.load
+*.yaml / *.yml - yaml.safe_load (when PyYAML is installed)
+all text files - NO NUL BYTES. Dropbox's other corruption mode pads a file
+                 with \x00 (templates/index.html carried 1,668 trailing NULs
+                 on origin/main from 2026-06-10 to 2026-10-08 and served them
+                 to every browser; every earlier check passed).
 all files      - line-count drop vs origin/main flagged when >5%
                  (Dropbox truncations usually take 1-50%+ off the tail)
+New (untracked) files are validated too, not only files modified vs origin/main.
 """
 from __future__ import annotations
 
@@ -64,6 +72,55 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
 def py_compile_check(path: Path) -> list[str]:
     code, _, err = _run([sys.executable, "-m", "py_compile", str(path)])
     return [] if code == 0 else [f"py_compile failed: {err.strip()[:400]}"]
+
+
+_TEXT_SUFFIXES = (".py", ".html", ".htm", ".js", ".css", ".json", ".yaml",
+                  ".yml", ".md", ".txt", ".cfg", ".ini", ".toml", ".csv",
+                  ".liquid", ".cmd", ".ps1", ".sh")
+
+
+def nul_check(path: Path) -> list[str]:
+    """A text file must not contain NUL bytes (Dropbox NUL padding)."""
+    if not path.name.lower().endswith(_TEXT_SUFFIXES):
+        return []
+    data = path.read_bytes()
+    n = data.count(b"\x00")
+    if not n:
+        return []
+    first = data.find(b"\x00")
+    where = "trailing" if data[first:].strip(b"\x00") == b"" else "embedded"
+    return [f"{n} NUL byte(s) ({where}, first at offset {first}) -- Dropbox "
+            "padding; strip them (python: data[:data.find(b'\\x00')]) and "
+            "re-run"]
+
+
+def js_check(path: Path) -> list[str]:
+    code, _, err = _run(["node", "--check", str(path)])
+    if code == 0:
+        return []
+    first_err = err.strip().splitlines()[:5]
+    return ["node --check failed:\n        " + "\n        ".join(first_err)]
+
+
+def json_check(path: Path) -> list[str]:
+    import json
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+        return []
+    except Exception as exc:  # noqa: BLE001
+        return [f"not valid JSON: {exc}"]
+
+
+def yaml_check(path: Path) -> list[str]:
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return []
+    try:
+        yaml.safe_load(path.read_text(encoding="utf-8"))
+        return []
+    except Exception as exc:  # noqa: BLE001
+        return [f"not valid YAML: {exc}"]
 
 
 def html_check(path: Path) -> list[str]:
@@ -163,6 +220,12 @@ def main() -> int:
         default="origin/main",
         help="Git ref to compare line counts against (default: origin/main).",
     )
+    p.add_argument(
+        "--skip-size-check",
+        action="store_true",
+        help="Skip the >5%% line-count-drop check (CI on a branch that "
+             "legitimately deletes code).",
+    )
     args = p.parse_args()
 
     files = args.files
@@ -171,6 +234,10 @@ def main() -> int:
         _run(["git", "fetch", "--quiet", "origin", "main"])
         code, out, _ = _run(["git", "diff", "--name-only", args.ref])
         files = [f for f in out.splitlines() if f.strip()]
+        # Brand-new files never showed up here, so a new module or test went
+        # out unchecked.
+        _, out2, _ = _run(["git", "ls-files", "--others", "--exclude-standard"])
+        files += [f for f in out2.splitlines() if f.strip() and f not in files]
 
     if not files:
         print("safe_push: nothing to check — no diff vs", args.ref)
@@ -184,11 +251,19 @@ def main() -> int:
             all_errors[f] = ["does not exist on disk"]
             continue
         errs: list[str] = []
-        errs.extend(size_drop_check(path, f))
+        errs.extend(nul_check(path))
+        if not args.skip_size_check:
+            errs.extend(size_drop_check(path, f))
         if f.endswith(".py"):
             errs.extend(py_compile_check(path))
         elif f.endswith((".html", ".htm")):
             errs.extend(html_check(path))
+        elif f.endswith(".js"):
+            errs.extend(js_check(path))
+        elif f.endswith(".json"):
+            errs.extend(json_check(path))
+        elif f.endswith((".yaml", ".yml")):
+            errs.extend(yaml_check(path))
         if errs:
             all_errors[f] = errs
         else:

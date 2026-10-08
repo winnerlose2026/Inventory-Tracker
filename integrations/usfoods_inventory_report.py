@@ -74,7 +74,9 @@ except ImportError:  # standalone / test use
 # each US Foods DC rep starts sending the weekly body report.
 REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
     "maria.hernandez@usfoods.com": ("US Foods", "Zebulon, NC"),
+    "kathleen.thompson@usfoods.com": ("US Foods", "Zebulon, NC"),
     "jasmin.gomez@usfoods.com": ("US Foods", "Manassas, VA"),
+    "thomas.paxson@usfoods.com": ("US Foods", "Manassas, VA"),
     # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
     # from the team alias rather than a named coordinator.
     "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),

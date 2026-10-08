@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Inventory Tracker with Usage History"""
 
+import contextlib
 import copy
 import json
 import os
 import shutil
 import sys
+import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -53,7 +56,7 @@ def _read_json(path: Path, default):
     key = str(path)
     cached = _FILE_CACHE.get(key)
     if cached is not None and cached[0] == sig:
-        return copy.deepcopy(cached[1])
+        return _copy_out(cached[1])
     try:
         with open(path) as f:
             data = json.load(f)
@@ -80,6 +83,22 @@ def _read_json(path: Path, default):
             "nothing usable" % (path, st.st_size, type(exc).__name__, bak.name)
         ) from exc
     _FILE_CACHE[key] = (sig, data)
+    return _copy_out(data)
+
+
+def _copy_out(data):
+    """Copy a cached document for a caller.
+
+    The usage ledger is a flat list of scalar-valued dicts, ~20k rows and
+    growing ~100/day; copy.deepcopy of it costs 120-350 ms on every read and
+    was paid by every ledger / arrived-POs / distributors request. A per-row
+    dict copy gives callers the same freedom to mutate rows without touching
+    the cache at ~1/20th the cost. Anything else keeps the deep copy."""
+    if isinstance(data, list) and data and all(
+            isinstance(r, dict) and all(
+                not isinstance(v, (dict, list)) for v in r.values())
+            for r in data):
+        return [dict(r) for r in data]
     return copy.deepcopy(data)
 
 
@@ -105,9 +124,16 @@ def _write_json(path: Path, data):
     and was saved over. Atomicity removes the torn-file half of that.
     """
     DATA_DIR.mkdir(exist_ok=True)
-    tmp = path.with_name("%s.tmp.%d" % (path.name, os.getpid()))
+    # One temp file PER CALL. The name used to be <file>.tmp.<pid>, which the
+    # 4 threads of a gunicorn worker share: two concurrent load_inventory()
+    # calls on a rollover day both opened the same temp file, one os.replace
+    # won and the other raised FileNotFoundError (a 500), and the two writers
+    # could interleave into one inode -- the torn write this path exists to
+    # prevent.
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".tmp.")
+    tmp = Path(tmp_name)
     try:
-        with open(tmp, "w") as f:
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
@@ -133,6 +159,63 @@ def _save(path: Path, data):
     _write_json(path, data)
 
 
+_LOCK_STATE = threading.local()
+
+
+@contextlib.contextmanager
+def data_lock(blocking: bool = True):
+    """Serialise read-modify-write cycles on the data files across gunicorn
+    workers and threads. Re-entrant per thread, so an endpoint that takes it
+    and then calls load_inventory() (which takes it again) does not deadlock.
+
+    os.replace() already keeps each file whole, but it does nothing for LOST
+    updates: the rollover pass inside load_inventory() runs on every GET, and
+    two threads promoting the same PO at once left one of them with a promoted
+    quantity and no ledger row (the receipt then vanished from Arrived and the
+    next count erased it). Writers that load, change and save should run
+    inside this.
+
+    Yields True when held. With blocking=False yields False instead of waiting
+    (for the long scans, which answer 409 rather than queue)."""
+    depth = getattr(_LOCK_STATE, "depth", 0)
+    if depth:
+        _LOCK_STATE.depth = depth + 1
+        try:
+            yield True
+        finally:
+            _LOCK_STATE.depth -= 1
+        return
+    try:
+        import fcntl
+    except ImportError:          # Windows desktop GUI -- single process
+        _LOCK_STATE.depth = 1
+        try:
+            yield True
+        finally:
+            _LOCK_STATE.depth = 0
+        return
+    DATA_DIR.mkdir(exist_ok=True)
+    fh = open(DATA_DIR / ".data.lock", "w")
+    try:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(fh, flags)
+        except OSError:
+            yield False
+            return
+        _LOCK_STATE.depth = 1
+        try:
+            yield True
+        finally:
+            _LOCK_STATE.depth = 0
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        fh.close()
+
+
 def reconcile_inventory() -> dict:
     """Run the on_order normalization + rollover passes and persist any change.
     Idempotent. load_inventory() calls this on every read (the dedup/rollover
@@ -148,18 +231,19 @@ def reconcile_inventory() -> dict:
       4. Rollover entries whose eta is in the past into the SKU's quantity.
          Must run AFTER rebase.
     """
-    inv = _load(INVENTORY_FILE)
-    rebased = _rebase_ordered_at_from_subject(inv)
-    rev_collapsed = _collapse_revision_dupes(inv)
-    deduped = _dedup_on_order(inv)
-    rolled = _rollover_on_order(inv)
-    if rebased or rev_collapsed or deduped or rolled:
-        usage = _load(USAGE_FILE) if rolled else None
-        if rolled:
-            _append_rollover_usage(inv, usage)
-        _save(INVENTORY_FILE, inv)
-        if rolled:
-            _save(USAGE_FILE, usage)
+    with data_lock():
+        inv = _load(INVENTORY_FILE)
+        rebased = _rebase_ordered_at_from_subject(inv)
+        rev_collapsed = _collapse_revision_dupes(inv)
+        deduped = _dedup_on_order(inv)
+        rolled = _rollover_on_order(inv)
+        if rebased or rev_collapsed or deduped or rolled:
+            usage = _load(USAGE_FILE) if rolled else None
+            if rolled:
+                _append_rollover_usage(inv, usage)
+            _save(INVENTORY_FILE, inv)
+            if rolled:
+                _save(USAGE_FILE, usage)
     return inv
 
 
@@ -497,19 +581,14 @@ def load_chefs_warehouse_pos() -> list:
         ingested_at,
         canceled (optional bool), canceled_at, canceled_reason
     """
-    if CHEFS_WAREHOUSE_POS_FILE.exists():
-        with open(CHEFS_WAREHOUSE_POS_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
+    # Through _read_json so a torn file raises DataFileCorrupt (or recovers
+    # from .bak) instead of reading as [] and being saved back empty -- the
+    # 2026-09-17 failure mode, which these side tables still had.
+    return _read_json(CHEFS_WAREHOUSE_POS_FILE, [])
 
 
 def save_chefs_warehouse_pos(records: list) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(CHEFS_WAREHOUSE_POS_FILE, "w") as f:
-        json.dump(records, f, indent=2)
+    _write_json(CHEFS_WAREHOUSE_POS_FILE, records)
 
 
 # Lineage freight invoices — one record per outbound shipment from H&H
@@ -629,19 +708,11 @@ def save_bakery_sales(entries: list):
 
 def load_canceled_pos() -> dict:
     """Return {po_number: {canceled_at, reason, note}}."""
-    if CANCELED_POS_FILE.exists():
-        with open(CANCELED_POS_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return {}
-    return {}
+    return _read_json(CANCELED_POS_FILE, {})
 
 
 def save_canceled_pos(data: dict):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(CANCELED_POS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _write_json(CANCELED_POS_FILE, data)
 
 
 def is_po_canceled(po_number: str) -> bool:
@@ -660,19 +731,11 @@ def load_status_overrides() -> dict:
     the date-computed status and any freight inference. Does not touch
     inventory quantity.
     """
-    if STATUS_OVERRIDES_FILE.exists():
-        with open(STATUS_OVERRIDES_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return {}
-    return {}
+    return _read_json(STATUS_OVERRIDES_FILE, {})
 
 
 def save_status_overrides(data: dict):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(STATUS_OVERRIDES_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    _write_json(STATUS_OVERRIDES_FILE, data)
 
 
 
@@ -685,14 +748,23 @@ def save_status_overrides(data: dict):
 # consistent. This runs on every load_inventory() so readers always see
 # current state without needing a separate scheduler.
 
-# Staged arrivals that have been promoted get stashed here between the
-# _rollover_on_order pass (which mutates the inventory dict) and the
-# _append_rollover_usage pass (which mutates the usage list). Not thread-safe
-# — we rely on the single-process Flask dev/gunicorn model.
-_PENDING_ROLLOVER_AUDIT: list = []
-#: Rollover entries dropped WITHOUT touching on-hand because a later
-#: physical count already absorbed the delivery. Audit only.
-_PENDING_ROLLOVER_ABSORBED: list = []
+# Staged arrivals that have been promoted are handed from the
+# _rollover_on_order pass (which mutates the inventory dict) to the
+# _append_rollover_usage pass (which mutates the usage list) through a
+# THREAD-LOCAL. They were module globals, reset at the start of every pass;
+# with 4 threads per gunicorn worker two concurrent load_inventory() calls on
+# a rollover day could reset each other's list, and the receipt was promoted
+# into quantity with no ledger row -- invisible to _receipts_after_count,
+# Reopen and the Arrived tab, so the next count erased it.
+_ROLLOVER_STAGE = threading.local()
+
+
+def _rollover_stage() -> dict:
+    st = getattr(_ROLLOVER_STAGE, "stage", None)
+    if st is None:
+        st = {"audit": [], "absorbed": []}
+        _ROLLOVER_STAGE.stage = st
+    return st
 
 
 # A PO date parsed off a PDF can come out with a nonsense year (PO 8513015G
@@ -710,13 +782,47 @@ def _parse_sane_dt(raw: str) -> "datetime | None":
     raw = (raw or "").strip()
     if not raw:
         return None
+    if raw.endswith("Z") or raw.endswith("z"):
+        raw = raw[:-1] + "+00:00"          # Python < 3.11 rejects a bare Z
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError:
         return None
+    if dt.tzinfo is not None:
+        # One "...Z" / "+00:00" arrival_date persisted by an API caller made
+        # `trigger > now` raise TypeError inside every load_inventory() --
+        # every endpoint 500'd until the JSON was hand-edited. Compare in
+        # naive local time like everything else here.
+        dt = dt.astimezone().replace(tzinfo=None)
     if not (_MIN_SANE_YEAR <= dt.year <= _MAX_SANE_YEAR):
         return None
     return dt
+
+
+def naive_local_iso(raw: str) -> str:
+    """Normalise an ISO date/datetime (possibly tz-aware) to the naive local
+    ISO form the data files use. Returns '' when unparseable."""
+    dt = _parse_sane_dt(raw)
+    return dt.isoformat() if dt else ""
+
+
+def _po_doc_identity(entry: dict, item: dict) -> dict:
+    """Fields a rollover / absorbed usage row must inherit from its on_order
+    entry so the PO's DOCUMENT identity survives arrival.
+
+    sync_inventory._highest_applied_rev orders a re-scanned PO copy against
+    the stored rows by `source_received_at` + `source_sender`, and
+    _booked_skus_for_po matches on `warehouse`. Rows written without these
+    (every rollover row before 2026-10-08) looked undated and warehouse-less,
+    so the same email re-read on the next 6-hour scan always counted as a
+    newer document that "gained" every SKU -- reverse, re-book, roll over,
+    repeat (Houston 393072B2: 276 reversal rows in two weeks)."""
+    return {
+        "source_received_at": entry.get("source_received_at", "") or "",
+        "source_sender": entry.get("source_sender", "") or "",
+        "warehouse": item.get("warehouse", "") or "",
+        "variety": (item.get("name", "") or "").split(" Bagel")[0].strip(),
+    }
 
 
 def _rollover_trigger(entry: dict) -> "datetime | None":
@@ -746,9 +852,11 @@ def _rollover_on_order(inv: dict) -> bool:
     INSTEAD of eta as the trigger. Promotion is idempotent: once an
     entry has been added to quantity and the entry removed from
     on_order it cannot be added again."""
-    global _PENDING_ROLLOVER_AUDIT, _PENDING_ROLLOVER_ABSORBED
-    _PENDING_ROLLOVER_AUDIT = []
-    _PENDING_ROLLOVER_ABSORBED = []
+    stage = _rollover_stage()
+    stage["audit"] = []
+    stage["absorbed"] = []
+    _PENDING_ROLLOVER_AUDIT = stage["audit"]
+    _PENDING_ROLLOVER_ABSORBED = stage["absorbed"]
     now = datetime.now()
     changed = False
     for key, item in inv.items():
@@ -793,6 +901,7 @@ def _rollover_on_order(inv: dict) -> bool:
                     "eta": trigger.isoformat(),
                     "count_date": count_date,
                     "timestamp": now.isoformat(),
+                    **_po_doc_identity(entry, item),
                 })
                 changed = True
                 continue
@@ -810,6 +919,7 @@ def _rollover_on_order(inv: dict) -> bool:
                 "ship_date": entry.get("ship_date", ""),
                 "eta": trigger.isoformat(),
                 "timestamp": now.isoformat(),
+                **_po_doc_identity(entry, item),
             })
             changed = True
         item["on_order"] = kept
@@ -846,6 +956,14 @@ def _rebase_ordered_at_from_subject(inv: dict) -> bool:
     changed = False
     for key, item in inv.items():
         for entry in (item.get("on_order") or []):
+            # Entries with a known provenance are not legacy: the parser
+            # supplied the PO date (lead_days is stamped alongside it) or an
+            # operator set it via /api/admin/po-order-date. Rewriting those on
+            # every read silently undid both -- including the received-date
+            # ETA floor, since a re-cut USF PO carries its ORIGINAL date in
+            # the subject too.
+            if entry.get("ordered_at_source") or entry.get("lead_days"):
+                continue
             subj = entry.get("source_subject") or ""
             m = _USF_DATE_RE.search(subj)
             if not m:
@@ -861,7 +979,11 @@ def _rebase_ordered_at_from_subject(inv: dict) -> bool:
             if entry.get("ordered_at") == new_ordered_at:
                 continue
             entry["ordered_at"] = new_ordered_at
-            entry["eta"] = (dt + timedelta(days=lead)).isoformat()
+            anchor = dt
+            rcv = _parse_sane_dt(entry.get("source_received_at") or "")
+            if rcv is not None and rcv.date() > dt.date():
+                anchor = datetime.combine(rcv.date(), datetime.min.time())
+            entry["eta"] = (anchor + timedelta(days=lead)).isoformat()
             changed = True
     return changed
 
@@ -966,6 +1088,9 @@ def _dedup_on_order(inv: dict) -> bool:
 
 def _append_rollover_usage(inv: dict, usage: list) -> None:
     """Append a usage-log entry for each promoted on_order entry."""
+    stage = _rollover_stage()
+    _PENDING_ROLLOVER_AUDIT = stage["audit"]
+    _PENDING_ROLLOVER_ABSORBED = stage["absorbed"]
     for audit in _PENDING_ROLLOVER_AUDIT:
         usage.append({
             "item_key": audit["item_key"],
@@ -981,6 +1106,10 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "ship_date": audit.get("ship_date", ""),
             "arrival_date": audit.get("eta", ""),
             "source": "on_order_rollover",
+            "source_received_at": audit.get("source_received_at", ""),
+            "source_sender": audit.get("source_sender", ""),
+            "warehouse": audit.get("warehouse", ""),
+            "variety": audit.get("variety", ""),
         })
     _PENDING_ROLLOVER_AUDIT.clear()
 
@@ -1002,6 +1131,10 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "po_revision": absorbed["po_revision"],
             "arrival_date": absorbed["eta"],
             "source": "on_order_absorbed",
+            "source_received_at": absorbed.get("source_received_at", ""),
+            "source_sender": absorbed.get("source_sender", ""),
+            "warehouse": absorbed.get("warehouse", ""),
+            "variety": absorbed.get("variety", ""),
         })
     _PENDING_ROLLOVER_ABSORBED.clear()
 
@@ -1105,7 +1238,14 @@ def update_item(name: str, quantity: Optional[float] = None,
         print(f"  Item '{name}' not found.")
         return
     item = inv[key]
+    qty_delta_row = None
     if quantity is not None:
+        old_qty = float(item.get("quantity") or 0)
+        if abs(float(quantity) - old_qty) >= 1e-9:
+            # A hand edit of on-hand used to leave no trace in the ledger, so
+            # nothing could tell a later re-read of the week's count report
+            # that the figure had been corrected after it -- the count won.
+            qty_delta_row = (old_qty - float(quantity))   # positive = consumed
         item["quantity"] = quantity
     if unit is not None:
         item["unit"] = unit
@@ -1127,6 +1267,13 @@ def update_item(name: str, quantity: Optional[float] = None,
         item["weekly_usage"] = weekly_usage
     item["updated"] = datetime.now().isoformat()
     save_inventory(inv)
+    if qty_delta_row is not None:
+        _record_usage(key, item.get("name", key), round(qty_delta_row, 4),
+                      item.get("unit", "cs"),
+                      f"Manual on-hand correction -> {float(quantity):g}",
+                      warehouse=item.get("warehouse", ""),
+                      variety=_variety_from_name(item.get("name", "")),
+                      source="manual-correction")
     print(f"  Updated '{name}'.")
 
 
@@ -1142,7 +1289,8 @@ def restock(name: str, amount: float, note: str = ""):
     _record_usage(key, inv[key]["name"], -amount, inv[key]["unit"],
                   note or f"Restocked +{amount}",
                   warehouse=inv[key].get("warehouse", ""),
-                  variety=_variety_from_name(inv[key].get("name", "")))
+                  variety=_variety_from_name(inv[key].get("name", "")),
+                  source="manual-restock")
     print(f"  Restocked '{name}' by {amount} {inv[key]['unit']}. "
           f"New total: {inv[key]['quantity']}")
 
@@ -1163,12 +1311,13 @@ def record_usage(name: str, amount: float, note: str = ""):
     save_inventory(inv)
     _record_usage(key, item["name"], amount, item["unit"], note,
                   warehouse=item.get("warehouse", ""),
-                  variety=_variety_from_name(item.get("name", "")))
+                  variety=_variety_from_name(item.get("name", "")),
+                  source="manual-use")
     print(f"  Used {amount} {item['unit']} of '{name}'. "
           f"Remaining: {item['quantity']}")
-    if item["quantity"] <= item["low_stock_threshold"]:
+    if item["quantity"] <= float(item.get("low_stock_threshold") or 0):
         print(f"  *** LOW STOCK ALERT: '{name}' is at or below threshold "
-              f"({item['low_stock_threshold']} {item['unit']}) ***")
+              f"({item.get('low_stock_threshold', 0)} {item['unit']}) ***")
 
 
 def _variety_from_name(name: str) -> str:
@@ -1185,7 +1334,8 @@ def _variety_from_name(name: str) -> str:
 
 def _record_usage(key: str, display_name: str, amount: float,
                   unit: str, note: str,
-                  warehouse: str = "", variety: str = ""):
+                  warehouse: str = "", variety: str = "",
+                  source: str = ""):
     """Append one entry to the usage ledger.
 
     ``warehouse`` and ``variety`` are stamped onto each new entry (when the
@@ -1207,6 +1357,10 @@ def _record_usage(key: str, display_name: str, amount: float,
         entry["warehouse"] = warehouse
     if variety:
         entry["variety"] = variety
+    if source:
+        # Lets sync_inventory._movement_after_count keep a manual Use /
+        # Restock when the week's count report is re-read.
+        entry["source"] = source
     usage.append(entry)
     save_usage(usage)
 

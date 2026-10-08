@@ -470,6 +470,15 @@ def handle_notification(payload: dict) -> dict:
     if not isinstance(notifications, list):
         return {"ok": False, "error": "value field is not a list"}
 
+    # Reject the batch before doing any outbound work: the webhook is an open
+    # endpoint, and an unauthenticated POST used to cost a token round trip
+    # to login.microsoftonline.com plus a stack trace in the logs.
+    import hmac as _hmac
+    if not any(_hmac.compare_digest(str(n.get("clientState") or ""),
+                                    str(expected_client_state or ""))
+               for n in notifications if isinstance(n, dict)):
+        return {"ok": False, "error": "no notification carried a valid clientState"}
+
     client = EmailInboxClient()
     try:
         token = client._ms365_token()

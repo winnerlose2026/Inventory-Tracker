@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request, send_file
 
 from core.errors import _safe_err
+from core.util import with_data_lock
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -1007,6 +1008,7 @@ def api_report_bakery_sales():
 
 
 @reporting_bp.route("/api/forecast/decrement-daily", methods=["POST"])
+@with_data_lock
 def api_forecast_decrement_daily():
     """Apply one day's worth of forecast usage to every SKU.
 
@@ -1123,6 +1125,7 @@ def api_forecast_decrement_daily():
 
 
 @reporting_bp.route("/api/forecast/backfill-historical", methods=["POST"])
+@with_data_lock
 def api_forecast_backfill_historical():
     """One-shot opening reconciliation between lot production and on-hand.
 
@@ -1268,6 +1271,7 @@ def api_forecast_backfill_historical():
 
 
 @reporting_bp.route("/api/forecast/true-up", methods=["POST"])
+@with_data_lock
 def api_forecast_true_up():
     """Reconcile against a vendor on-hand snapshot.
 
@@ -1464,11 +1468,19 @@ def api_report():
     consumed: dict = {}
     restocked: dict = {}
     for e in usage:
-        key = e["item_key"]
-        if e["amount"] < 0:
-            restocked[key] = restocked.get(key, 0) + abs(e["amount"])
+        key = e.get("item_key")
+        if not key:
+            continue
+        # Undone rows and audit rows are not consumption: a reversed forecast
+        # burn plus its vendor-truth replacement counted twice, and a reopen
+        # reversal counted as a use.
+        if e.get("reversed") or e.get("source") in ("reversal", "on_order_absorbed"):
+            continue
+        amt = float(e.get("amount") or 0)
+        if amt < 0:
+            restocked[key] = restocked.get(key, 0) + abs(amt)
         else:
-            consumed[key] = consumed.get(key, 0) + e["amount"]
+            consumed[key] = consumed.get(key, 0) + amt
 
     top_consumed = sorted(
         [{"key": k, "name": inv.get(k, {}).get("name", k),

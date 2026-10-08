@@ -27,7 +27,10 @@ def _has_valid_api_token() -> bool:
     if not expected:
         return False
     got = (request.headers.get("X-Inventory-Token") or "").strip()
-    return bool(got) and secrets.compare_digest(got, expected)
+    # bytes: compare_digest raises TypeError on non-ASCII str (a 500 from the
+    # auth gate instead of a 401).
+    return bool(got) and secrets.compare_digest(got.encode("utf-8"),
+                                                expected.encode("utf-8"))
 
 
 def _is_authenticated() -> bool:

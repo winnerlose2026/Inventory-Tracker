@@ -76,6 +76,7 @@ Configuration
 
 from __future__ import annotations
 
+import copy
 import email
 import imaplib
 import json
@@ -557,14 +558,26 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
             f"{sorted(set(po.unmapped_items))} — add them to "
             "usfoods_po_parser.USF_ITEM_TO_VARIETY"
         )
-    if po.ship_to_city and not po.warehouse:
+    if po.lines and not po.po_number:
+        # Without a PO number the lines would be applied as a plain restock:
+        # straight onto on-hand, no on_order row, no revision dedup, and
+        # re-added on every re-scan of the email.
         errors.append(
-            f"usfoods PO {po.po_number or '?'}: unknown ship-to DC "
-            f"{po.ship_to_city!r} — add it to "
-            "usfoods_po_parser.USF_DC_CITY_TO_WAREHOUSE"
+            f"usfoods PO ({subject!r}): {len(po.lines)} line(s) but no PO "
+            "number found in the PDF -- skipped. Check _PO_HEADER_RE against "
+            "this layout."
+        )
+        return events, errors
+    if po.lines and not po.warehouse:
+        errors.append(
+            f"usfoods PO {po.po_number or '?'}: ship-to DC "
+            f"{po.ship_to_city or '<not found>'!r} did not resolve -- "
+            f"{len(po.lines)} line(s) skipped. Add it to "
+            "usfoods_po_parser.USF_DC_CITY_TO_WAREHOUSE or check the "
+            "ship-to block regex."
         )
 
-    for line in po.lines:
+    for line in _sum_split_lines(po.lines):
         if not line.variety or not po.warehouse:
             continue
         events.append(EmailEvent(
@@ -589,6 +602,35 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
         ))
 
     return events, errors
+
+
+def _sum_split_lines(lines):
+    """Collapse a PO document to ONE line per resolved variety.
+
+    Cheney sometimes lists the same bagel on two lines of one PO (Ocala
+    054511767347, 2026-09-28: Poppy 8 + 8, Everything 48 + 24, Cinnamon
+    Raisin 8 + 24 ... 16 lines, 9 varieties, 224 cs). Downstream dedup in
+    sync_inventory._apply_events keeps the MAX quantity per SKU, because by
+    then two 8 cs Poppy events look exactly like the same line read from
+    both mailboxes -- so that PO booked 152 cs. Here the line position still
+    tells a split line from a duplicate, so sum first. Unresolved lines
+    (no variety) are passed through untouched so the caller's error path
+    still sees them.
+    """
+    merged = {}
+    order = []
+    out = []
+    for line in lines:
+        v = getattr(line, "variety", "") or ""
+        if not v:
+            out.append(line)
+            continue
+        if v in merged:
+            merged[v].quantity = float(merged[v].quantity or 0) + float(line.quantity or 0)
+            continue
+        merged[v] = copy.copy(line)
+        order.append(v)
+    return out + [merged[v] for v in order]
 
 
 def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
@@ -617,14 +659,25 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
             f"{sorted(set(po.unmapped_items))} — add them to "
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
         )
-    if po.ship_to_city and not po.warehouse:
+    for w in getattr(po, "warnings", None) or []:
+        errors.append(f"cheney PO {po.po_number or '?'}: warning: {w}")
+    if po.lines and not po.po_number:
         errors.append(
-            f"cheney PO {po.po_number or '?'}: unknown ship-to DC "
-            f"{po.ship_to_city!r} — add it to "
-            "cheney_po_parser.CHENEY_DC_CITY_TO_WAREHOUSE"
+            f"cheney PO ({subject!r}): {len(po.lines)} line(s) but no PO "
+            "number found in the PDF -- skipped. Check _PO_NUMBER_RE against "
+            "this layout."
+        )
+        return events, errors
+    if po.lines and not po.warehouse:
+        errors.append(
+            f"cheney PO {po.po_number or '?'}: ship-to DC "
+            f"{po.ship_to_city or '<not found>'!r} did not resolve -- "
+            f"{len(po.lines)} line(s) skipped. Add it to "
+            "cheney_po_parser.CHENEY_DC_CITY_TO_WAREHOUSE or check the "
+            "ship-to block regex."
         )
 
-    for line in po.lines:
+    for line in _sum_split_lines(po.lines):
         if not line.variety or not po.warehouse:
             continue
         events.append(EmailEvent(
@@ -930,7 +983,17 @@ def _msg_date_iso(msg) -> str:
         dt = parsedate_to_datetime(raw)
     except (TypeError, ValueError):
         return ""
-    return dt.isoformat() if dt is not None else ""
+    if dt is None:
+        return ""
+    # count_date is compared as a STRING against other count dates
+    # (sync_inventory on_hand branch). A sender's local offset
+    # ("...T12:51:00-04:00") sorts before the same instant in UTC
+    # ("...T16:51:00Z"), so normalise to the same form as
+    # _received_at_from_message.
+    from datetime import timezone as _tz
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    return dt.astimezone(_tz.utc).isoformat().replace("+00:00", "Z")
 
 
 def _decode_subject(raw) -> str:
@@ -1129,6 +1192,22 @@ def parse_message_with_errors(msg):
     # date only when the subject has none. This keeps a late-sent report dated
     # to its count day, not its delivery day.
     _count_iso = _count_date_from_subject(subject) or sent_iso
+    # Reps post new weeks on a standing thread, so a subject date can be a
+    # week (or a month) older than the table in the body. Honour the subject
+    # date only when the email was sent within a few days of it; otherwise
+    # the send date is the count date (JD's rule for undated subjects).
+    if _count_iso and sent_iso and _count_iso != sent_iso:
+        try:
+            _gap = (datetime.fromisoformat(sent_iso[:10])
+                    - datetime.fromisoformat(_count_iso[:10])).days
+        except ValueError:
+            _gap = 0
+        if _gap > 5 or _gap < -1:
+            errors.append(
+                f"count date {_count_iso[:10]} from the subject is {_gap} day(s) "
+                f"from the send date {sent_iso[:10]}; using the send date."
+            )
+            _count_iso = sent_iso
     if _count_iso:
         for _e in events:
             if _e.event_type in ("on_hand", "usage_rate") and not _e.count_date:

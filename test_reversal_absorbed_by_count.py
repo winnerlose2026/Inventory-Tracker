@@ -141,7 +141,7 @@ def test_backdated_arrival_inside_the_count_is_not_promoted():
     assert it._rollover_on_order(inv) is True
     assert inv[KEY]["quantity"] == 17.07          # not promoted
     assert inv[KEY]["on_order"] == []             # but cleared out of pending
-    assert it._PENDING_ROLLOVER_ABSORBED[0]["qty"] == 8
+    assert it._rollover_stage()["absorbed"][0]["qty"] == 8
 
 
 def test_absorbed_promotion_logs_a_zero_amount_audit_row():
@@ -162,7 +162,7 @@ def test_arrival_after_the_count_still_promotes():
                      on_order=[_pending(8, eta)])}
     assert it._rollover_on_order(inv) is True
     assert inv[KEY]["quantity"] == 25.07
-    assert not it._PENDING_ROLLOVER_ABSORBED
+    assert not it._rollover_stage()["absorbed"]
 
 
 def test_uncounted_sku_still_promotes():
@@ -178,4 +178,4 @@ def test_future_eta_still_stays_pending():
     it._rollover_on_order(inv)
     assert inv[KEY]["quantity"] == 17.07
     assert len(inv[KEY]["on_order"]) == 1
-    assert not it._PENDING_ROLLOVER_ABSORBED
+    assert not it._rollover_stage()["absorbed"]

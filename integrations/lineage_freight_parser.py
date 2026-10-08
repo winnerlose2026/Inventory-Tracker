@@ -70,6 +70,10 @@ _DC_PATTERNS: list[tuple[str, str, str]] = [
     ("USF ZEBULON",                  "Zebulon, NC",       "US Foods"),
     ("US FOODS - ALCOA",             "Alcoa, TN",         "US Foods"),
     ("USF ALCOA",                    "Alcoa, TN",         "US Foods"),
+    ("US FOODS - HOUSTON",           "Houston, TX",       "US Foods"),
+    ("US FOODS HOUSTON",             "Houston, TX",       "US Foods"),
+    ("USF HOUSTON",                  "Houston, TX",       "US Foods"),
+    ("NW HOUSTON",                   "Houston, TX",       "US Foods"),
     # Generic "US FOODS" / "US FOOD SERVICE" — fall back to state-from-zip
     # below; we set the distributor here but leave dest_dc empty so the
     # post-processing block can fill it in.
@@ -135,6 +139,7 @@ _ZIP_TO_DC: dict[str, tuple[str, str]] = {
     "60106": ("Chicago, IL",       "US Foods"),
     "60515": ("Chicago, IL",       "US Foods"),
     "37701": ("Alcoa, TN",         "US Foods"),
+    "77086": ("Houston, TX",       "US Foods"),
     "33404": ("Riviera Beach, FL", "Cheney Brothers"),
     "34474": ("Ocala, FL",         "Cheney Brothers"),
     "34475": ("Ocala, FL",         "Cheney Brothers"),

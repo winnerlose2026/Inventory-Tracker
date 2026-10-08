@@ -23,7 +23,12 @@ PO = "054511747707"
 WH = "Ocala, FL"
 DIST = "Cheney Brothers"
 SENDER = "donotreply@cheneybrothers.com"
-AT = "2026-08-21T16:01:54Z"
+# Anchored to "yesterday": a PO dated more than PO_LEAD_DAYS ago rolls into
+# on-hand on the next load_inventory(), which turned this file red 30 days
+# after it was written (first seen 2026-10-08).
+from datetime import datetime, timedelta, timezone
+_DAY = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+AT = f"{_DAY}T16:01:54Z"
 
 TRUNCATED = {"Plain": 48.0, "Everything": 40.0, "Sesame": 24.0}
 FULL = dict(TRUNCATED, Pumpernickel=16.0)
@@ -55,7 +60,7 @@ def _doc(lines):
             item=SyncItem(quantity=qty, distributor=DIST, variety=v,
                           warehouse=WH, unit="cases"),
             source_message_id=PO, source_subject=PO,
-            po_number=PO, po_revision="", po_order_date="2026-08-21",
+            po_number=PO, po_revision="", po_order_date=_DAY,
             source_received_at=AT, source_sender=SENDER,
         )
         for v, qty in lines.items()

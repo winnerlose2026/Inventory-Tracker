@@ -176,6 +176,13 @@ def api_freight_ingest():
                 "traceback": "",
             }), 500
 
+    ship_dates = {}
+    if not dry_run and (added or updated):
+        try:
+            ship_dates = apply_freight_ship_dates()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"apply ship dates: {_safe_err(exc)}")
+
     return jsonify({
         "ok": True,
         "dry_run": dry_run,
@@ -186,6 +193,7 @@ def api_freight_ingest():
             "skipped": skipped,
             "total_after": len(by_inv),
             "errors": errors,
+            "ship_dates_stamped": ship_dates.get("stamped", 0),
         },
     })
 
@@ -501,6 +509,10 @@ def api_freight_scan():
                         key=lambda x: (x.get("ship_date") or "",
                                        x.get("invoice_number") or ""))
         save_freight_invoices(merged)
+        try:
+            apply_freight_ship_dates()
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "freight apply ship dates")
 
     # Trim domain_seen to top 25 for log readability
     top_domains = dict(sorted(domain_seen.items(), key=lambda x: -x[1])[:25])
@@ -530,6 +542,70 @@ def api_freight_scan():
             },
         },
     })
+
+
+def apply_freight_ship_dates(dry_run: bool = False) -> dict:
+    """Stamp freight-verified ship dates onto pending on_order rows.
+
+    A Lineage invoice is the strongest evidence we have that a PO left
+    Woodside. Until now it was DISPLAY-ONLY: the ledger showed the ship date,
+    the UI then treated ship+7 as arrived, but the server kept the PO pending
+    until ordered_at + 30 and on-hand was not credited -- so the Pending tab,
+    the ledger status and the Inventory tab disagreed for up to three weeks,
+    and the operator's edits went to an endpoint that found nothing to edit.
+
+    Same contract as an operator entering the ship date on the row:
+    arrival = ship + 7 (the rollover trigger), unless an arrival is already
+    set. Idempotent; rows that already carry a ship_date are left alone.
+    """
+    from inventory_tracker import load_inventory, save_inventory, data_lock
+    idx = _freight_ship_date_index()
+    stamped: list[dict] = []
+    if not idx:
+        return {"stamped": 0, "rows": stamped}
+    with data_lock():
+        inv = load_inventory()
+        changed = False
+        for key, item in inv.items():
+            for entry in (item.get("on_order") or []):
+                if (entry.get("ship_date") or "").strip():
+                    continue
+                po = (entry.get("po_number") or "").strip()
+                sd = idx.get(_norm_po_key(po)) if po else None
+                if not sd:
+                    continue
+                try:
+                    ship_dt = datetime.fromisoformat(sd[:10])
+                except ValueError:
+                    continue
+                arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+                stamped.append({"item_key": key, "po_number": po,
+                                "ship_date": ship_dt.isoformat(),
+                                "arrival_date": arrival_iso})
+                if dry_run:
+                    continue
+                entry["ship_date"] = ship_dt.isoformat()
+                entry["ship_date_source"] = "freight"
+                if not (entry.get("arrival_date") or "").strip():
+                    entry["arrival_date"] = arrival_iso
+                    entry["eta"] = arrival_iso
+                    entry["arrival_source"] = "freight"
+                changed = True
+        if changed and not dry_run:
+            save_inventory(inv)
+    return {"stamped": len(stamped), "rows": stamped}
+
+
+@freight_bp.route("/api/freight/apply-ship-dates", methods=["POST"])
+def api_freight_apply_ship_dates():
+    """Backfill freight ship dates onto pending POs (idempotent). Runs
+    automatically after every freight ingest; this is the manual trigger."""
+    body = request.json or {}
+    try:
+        return jsonify({"ok": True, **apply_freight_ship_dates(
+            dry_run=bool(body.get("dry_run", False)))})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 500
 
 
 def _freight_ship_date_index() -> dict:
