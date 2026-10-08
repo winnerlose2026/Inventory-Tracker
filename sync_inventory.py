@@ -723,6 +723,81 @@ def _legacy_same_document(grp, usage: list, active_idx: list, inv: dict) -> bool
     return all(abs(want[k] - have[k]) < 1e-6 for k in have)
 
 
+_ABSORBED_QTY_RE = re.compile(r"(\d+(?:\.\d+)?) cs (?:already on hand|not re-added)")
+
+
+def _row_qty(row: dict) -> float:
+    """Cases a booked usage row stands for. An on_order_absorbed row carries
+    amount 0 (it never moved on-hand) but still represents its PO line."""
+    amt = abs(float(row.get("amount") or 0))
+    if amt or row.get("source") != "on_order_absorbed":
+        return amt
+    if row.get("absorbed_qty") is not None:
+        return abs(float(row.get("absorbed_qty") or 0))
+    m = _ABSORBED_QTY_RE.search(row.get("note") or "")
+    return float(m.group(1)) if m else 0.0
+
+
+def _group_content(grp) -> dict:
+    out: dict = {}
+    for e in grp:
+        k = ((e.item.variety or "").strip().lower(),
+             (e.item.warehouse or "").strip().lower())
+        out[k] = out.get(k, 0.0) + float(e.item.quantity or 0)
+    return out
+
+
+def _booked_content_for_po(inv: dict, usage: list, po_number: str) -> dict:
+    """{(variety, warehouse): cases} currently booked for a PO -- pending
+    on_order rows plus live applied rows (same predicate as
+    _highest_applied_rev)."""
+    out: dict = {}
+    for key, item in inv.items():
+        for p in (item.get("on_order") or []):
+            if p.get("po_number") != po_number:
+                continue
+            k = (((item.get("name") or "").split(" Bagel")[0]).strip().lower(),
+                 (item.get("warehouse") or "").strip().lower())
+            out[k] = out.get(k, 0.0) + float(p.get("qty") or 0)
+    for row in usage:
+        if row.get("po_number") != po_number:
+            continue
+        if (row.get("superseded_by_revision") or row.get("reversal_of_revision")
+                or row.get("reversed")
+                or row.get("source") in _NOT_APPLIED_RESTOCK_SOURCES):
+            continue
+        name = str(row.get("item_key") or "")
+        wh = (row.get("warehouse") or "").strip() or \
+            (inv.get(name, {}) or {}).get("warehouse") or ""
+        k = ((name.split(" bagel")[0]).strip().lower(), wh.strip().lower())
+        out[k] = out.get(k, 0.0) + _row_qty(row)
+    return out
+
+
+# Two stamps of ONE email: Graph receivedDateTime trails the MIME Date header
+# by seconds to minutes (longer when a relay queues). A genuine re-issue with
+# the same content is a new email, hours to weeks later.
+_SAME_DOC_WINDOW = timedelta(hours=2)
+
+
+def _same_send_window(a: str, b: str) -> bool:
+    """True when both stamps carry a time of day and are within
+    _SAME_DOC_WINDOW of each other. A bare date or an unparseable stamp is
+    never "the same send" -- the caller falls back to normal ordering."""
+    if not a or not b or "T" not in str(a) or "T" not in str(b):
+        return False
+    da, db = _po_parse_dt(a), _po_parse_dt(b)
+    if da is None or db is None:
+        return False
+    return abs(da - db) <= _SAME_DOC_WINDOW
+
+
+def _same_content(a: dict, b: dict) -> bool:
+    if set(a) != set(b):
+        return False
+    return all(abs(a[k] - b[k]) < 1e-6 for k in a)
+
+
 def _skus_in_group(grp) -> set:
     return {((e.item.variety or "").strip().lower(),
              (e.item.warehouse or "").strip().lower()) for e in grp}
@@ -1419,6 +1494,32 @@ def _apply_events(events: list,
             )
             continue
 
+        # The copy reads as NEWER than the booking (otherwise it was skipped
+        # just above) -- but if it has the same lines and quantities as what
+        # is already booked (pending or arrived), it is the same document,
+        # whatever its timestamp says.
+        # Two copies of one email carry different stamps depending on who
+        # read them -- the MIME Date header vs Graph receivedDateTime, JD@
+        # vs info@ -- and before 2026-10-08 two ingest paths stamped them
+        # differently. Ordering by stamp then read the other path's booking
+        # as an older document and reversed + re-booked it: operator ship
+        # dates lost, an arrived PO sent back to pending.
+        # Bounded to stamps within _SAME_DOC_WINDOW of each other: USF re-cuts
+        # an unshipped PO under the same number and content WEEKS later
+        # (Houston 393072B2, 08/10 -> 09/28), and that re-issue must still
+        # re-open an "arrived" booking.
+        _booked_received = pend_received if pend_rev is not None else active_received
+        if not gained and (pend_rev is not None or active_idx) \
+                and _same_send_window(new_received, _booked_received):
+            _booked = _booked_content_for_po(inv, usage, po_num)
+            if _booked and _same_content(_group_content(grp), _booked):
+                report.setdefault("po_identical_skipped", []).append(
+                    f"PO {po_num} rev {new_rev or '(none)'} "
+                    f"({new_received or 'no date'}): same lines and "
+                    f"quantities as the booked copy - skipped {len(grp)} "
+                    f"event(s).")
+                continue
+
         _absorbed_before = len(report.get("reversals_absorbed") or [])
 
         # A parser gain on a PO that has ALREADY ARRIVED (rollover rows live,
@@ -1459,6 +1560,7 @@ def _apply_events(events: list,
                             "timestamp": now, "po_number": po_num,
                             "po_revision": new_rev, "arrival_date": _arrival,
                             "source": "on_order_absorbed",
+                            "absorbed_qty": qty,
                             "source_received_at": new_received,
                             "source_sender": new_sender,
                             "warehouse": item.get("warehouse", ""),

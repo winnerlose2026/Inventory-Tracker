@@ -78,32 +78,29 @@ services:
     # saving (a fixed UTC cron drifts an hour against local time twice a
     # year, which is fine for an order-ingestion scan).
     #
-    # The cowork_graph_scan.py script talks to Microsoft Graph directly using
-    # the same MS365_* client-credentials that the web service uses, fetches
-    # PO PDFs from the JD@ and info@ mailboxes, parses them out-of-process,
-    # and POSTs the parsed records to the web service:
-    #   - US Foods + Cheney Brothers events -> /api/email/ingest-events
-    #     (apply through the inventory on_order pipeline)
-    #   - Chefs Warehouse records           -> /api/chefs-warehouse/ingest-pos
-    #     (apply to the parallel data/chefs_warehouse_pos.json store; CW
-    #     POs surface on the Pending POs tab but never touch the Inventory
-    #     tab by design).
-    # PO-revision idempotency in sync_inventory means re-scanning the same
-    # message (or a stale revision) cannot double-count the on_order column;
-    # the per-cron-container .cowork_seen_ids.txt is a nice-to-have
-    # message-level shortcut but is not required for safety.
+    # ONE LIVE INGEST PATH (2026-10-08). The startCommand below is what the
+    # dashboard runs (this cron is not blueprint-managed; keep the two in
+    # sync by hand). cowork_graph_scan.py defaults to --mode server: it does
+    # NO parsing, it POSTs /api/email/scan (POs, weekly count/usage reports,
+    # Chefs Warehouse) and then /api/freight/scan (Lineage ship dates) on the
+    # web service, so every ingest -- this cron, the laptop Cowork task,
+    # "Scan now" -- runs the same deployed parsers under the same ingest lock
+    # and stamps documents the same way (MIME Date header). A 409 from a scan
+    # already in progress is retried (4 x 90 s).
     #
-    # This scan stays a SEPARATE cron on purpose: it does heavy outbound Graph
-    # fetches and pypdf parsing (plus a 90-day Lineage sweep) that we don't
-    # want running inside the web dyno. cowork_graph_scan.py imports
-    # integrations.email_scanner (which pulls in pypdf), so the cron service
-    # needs the full requirements.txt installed in its build.
+    # The --lookback-hours / --lineage-lookback-hours flags only apply to
+    # --mode local (SCAN_MODE=local): the old Graph-direct parse that POSTs
+    # /api/email/ingest-events, kept for when the web service itself cannot
+    # reach Graph. Local mode stamps Graph sentDateTime (= the Date header).
+    # Before 10/8 local mode was the live cron path and stamped
+    # receivedDateTime, so the two paths re-ordered each other's PO copies.
+    #
+    # Server mode needs only APP_URL + INVENTORY_API_TOKEN; the MS365_* vars
+    # are used by local mode alone.
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    # USF/Cheney/CW POs: 24h is plenty since the inbox refresh is fast and
-    # the apply path is idempotent. Lineage Freight invoices are rarer
-    # and arrive weeks after ship date, so we sweep a 90-day window for
-    # those. The seen-state dedup keeps re-scans cheap.
+    # Server mode: /api/email/scan lookback 14 d x 200 msgs/mailbox, freight
+    # 14 d (see --server-lookback-days / --freight-lookback-days).
     startCommand: python scripts/cowork_graph_scan.py --lookback-hours 24 --lineage-lookback-hours 2160
     envVars:
       - key: APP_URL

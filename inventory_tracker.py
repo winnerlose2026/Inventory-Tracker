@@ -1131,6 +1131,9 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "po_revision": absorbed["po_revision"],
             "arrival_date": absorbed["eta"],
             "source": "on_order_absorbed",
+            # amount stays 0 (on-hand never moved); the PO line's size is
+            # kept so a re-read of the PO can still be compared line for line.
+            "absorbed_qty": absorbed.get("qty", 0),
             "source_received_at": absorbed.get("source_received_at", ""),
             "source_sender": absorbed.get("source_sender", ""),
             "warehouse": absorbed.get("warehouse", ""),

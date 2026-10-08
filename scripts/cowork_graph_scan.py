@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
-"""Cowork-direct mailbox scan via Microsoft Graph.
+"""Mailbox scan entry point for the Render cron -- and a manual fallback.
 
-STATUS (2026-06): SECONDARY / FALLBACK PATH. The canonical, always-on
-ingest is the Render web service POST /api/email/scan (run every 6h by
-the bagel-inventory-6h-scan cron via scripts/trigger_email_scan.py) --
-that runs the DEPLOYED code and is what keeps the site fresh. This
-script is kept in parity (same parsers, count_date stamping, body-only
-handling) as a manual / offline fallback. If you change ingest logic,
-change /api/email/scan first, then mirror it here.
+ONE LIVE INGEST PATH (2026-10-08)
+---------------------------------
+The Render cron `bagel-inventory-6h-scan` runs THIS script (its dashboard
+startCommand is `python scripts/cowork_graph_scan.py --lookback-hours 24
+--lineage-lookback-hours 2160`; render.yaml is documentation only). Until
+2026-10-08 that meant it parsed mail locally and POSTed /api/email/ingest-events
+at 00/06/12/18 UTC, while the Cowork `inventory-mailbox-scan` task on JD's
+laptop POSTed /api/email/scan at ~04/10/16/22 UTC. Two parsers, two
+ingest paths, and two different timestamps for the same email: this script
+stamped Graph `receivedDateTime` (different in JD@ and info@, and seconds to
+minutes after sending) while the server stamps the MIME Date header. PO copies
+are ordered by that stamp, so each path could read the other's booking as an
+older document and reverse + re-book it.
+
+Now the default `--mode server` does no parsing at all: it asks the web
+service to scan (POST /api/email/scan, then /api/freight/scan for Lineage).
+Every ingest -- this cron, the laptop task, "Scan now" in the UI -- runs the
+same deployed code under the same ingest lock.
+
+`--mode local` (or SCAN_MODE=local) keeps the old Graph-direct parse for when
+the web service itself cannot reach Graph. It now stamps documents with
+`sentDateTime`, which IS the MIME Date header the server uses, and is the same
+in both mailboxes.
 
 Replaces the Outlook-MCP path used by the `inventory-mailbox-scan-4h` Cowork
 scheduled task. The Outlook MCP that ships with Claude Cowork does not surface
@@ -231,7 +247,7 @@ def _list_recent_messages(token: str, mailbox: str, since_dt: datetime,
     since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     qs = urllib.parse.urlencode({
         "$select": ("id,subject,from,toRecipients,receivedDateTime,"
-                    "hasAttachments,internetMessageId"),
+                    "sentDateTime,hasAttachments,internetMessageId"),
         "$filter": f"receivedDateTime ge {since_iso}",
         "$top": "100",
     })
@@ -384,6 +400,119 @@ def _cheney_inventory_report_to_events(xlsx_bytes, filename, mid, subject):
     return events, errors
 
 
+def _post_json(url: str, token: str, payload: dict, *, timeout: int) -> tuple:
+    """POST JSON, return (status, parsed body or text). Never raises on HTTP
+    errors -- the caller decides."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "X-Inventory-Token": token,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        status = exc.code
+    try:
+        return status, json.loads(text)
+    except ValueError:
+        return status, text
+
+
+def _run_server_mode(args) -> int:
+    """Have the web service run the scan. See the module docstring."""
+    import time
+    app_url = (args.app_url or "").rstrip("/")
+    token = args.api_token or ""
+    if not app_url or not token:
+        print("ERROR: server mode needs APP_URL and INVENTORY_API_TOKEN",
+              file=sys.stderr)
+        return 2
+    if args.lookback_hours != 24 or args.lineage_lookback_hours:
+        _vlog(True, f"server mode: --lookback-hours {args.lookback_hours} / "
+                    f"--lineage-lookback-hours {args.lineage_lookback_hours} "
+                    f"are local-mode flags; using --server-lookback-days "
+                    f"{args.server_lookback_days} and --freight-lookback-days "
+                    f"{args.freight_lookback_days}")
+
+    # 1) Mail: POs, weekly reports, Chefs Warehouse. The route holds a
+    #    NON-blocking ingest lock and answers 409 when another scan is
+    #    running (the laptop task, a "Scan now" click). Wait and retry
+    #    rather than skip a whole 6-hour slot.
+    payload = {"dry_run": bool(args.dry_run),
+               "lookback_days": int(args.server_lookback_days),
+               "max_messages": int(args.server_max_messages)}
+    status, body = 0, None
+    for attempt in range(1, 5):
+        try:
+            status, body = _post_json(f"{app_url}/api/email/scan", token,
+                                      payload, timeout=600)
+        except Exception as exc:  # noqa: BLE001 -- network / timeout
+            print(f"ERROR: /api/email/scan attempt {attempt}: "
+                  f"{_redact(str(exc), [token])}", file=sys.stderr)
+            status, body = 0, None
+        if status == 409 and attempt < 4:
+            print(f"email scan busy (409), retrying in 90s "
+                  f"(attempt {attempt}/4)", file=sys.stderr)
+            time.sleep(90)
+            continue
+        break
+    rc = 0
+    if status != 200 or not isinstance(body, dict):
+        text = body if isinstance(body, str) else json.dumps(body)[:400]
+        print(f"ERROR: /api/email/scan HTTP {status}: "
+              f"{_redact(str(text)[:400], [token])}", file=sys.stderr)
+        rc = 1
+    else:
+        rep = (body.get("reports") or [{}])[0]
+        cw = rep.get("chefs_warehouse") or {}
+        print("email-scan: status={s} seen={seen} parsed={p} updated={u} "
+              "unchanged={uc} skipped_revs={sk} superseded={sup} "
+              "gained={g} canceled_skipped={cs} cw_added={cwa} "
+              "cw_updated={cwu} errors={e}".format(
+                  s=rep.get("status"), seen=rep.get("messages_seen"),
+                  p=rep.get("messages_parsed"), u=rep.get("updated"),
+                  uc=rep.get("unchanged"),
+                  sk=len(rep.get("po_revisions_skipped") or []),
+                  sup=len(rep.get("po_revisions_superseded") or []),
+                  g=len(rep.get("reparse_gained_skus") or []),
+                  cs=len(rep.get("canceled_skipped") or []),
+                  cwa=cw.get("added", 0), cwu=cw.get("updated", 0),
+                  e=len(rep.get("errors") or [])))
+        for k in ("warnings", "po_revisions_superseded", "reparse_gained_skus",
+                  "gained_booked", "gained_absorbed", "po_identical_skipped"):
+            for line in (rep.get(k) or [])[:10]:
+                print(f"  {k}: {line}")
+        if rep.get("status") not in (None, "ok"):
+            rc = 1
+
+    # 2) Lineage freight invoices (actual ship dates). Server-side too, so
+    #    the ship-date stamping onto pending POs runs in the same process.
+    try:
+        fstatus, fbody = _post_json(
+            f"{app_url}/api/freight/scan", token,
+            {"dry_run": bool(args.dry_run),
+             "lookback_days": int(args.freight_lookback_days),
+             "max_messages": 500},
+            timeout=600)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: /api/freight/scan: {_redact(str(exc), [token])}",
+              file=sys.stderr)
+        return 1
+    if fstatus != 200 or not isinstance(fbody, dict) or not fbody.get("ok"):
+        text = fbody if isinstance(fbody, str) else json.dumps(fbody)[:400]
+        print(f"ERROR: /api/freight/scan HTTP {fstatus}: "
+              f"{_redact(str(text)[:400], [token])}", file=sys.stderr)
+        return 1
+    frep = fbody.get("report") or {}
+    print("freight-scan: added={a} updated={u} errors={e}".format(
+        a=frep.get("added"), u=frep.get("updated"),
+        e=len(frep.get("errors") or [])))
+    return rc
+
+
 def run(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -417,7 +546,29 @@ def run(argv: list[str] | None = None) -> int:
                         "MS365_TENANT_ID=, MS365_CLIENT_ID=, MS365_CLIENT_SECRET= "
                         "lines; values override unset env vars.")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--mode", choices=("server", "local"),
+                   default=(os.environ.get("SCAN_MODE", "").strip().lower()
+                            or "server"),
+                   help="server (default): ask the web service to scan "
+                        "(POST /api/email/scan + /api/freight/scan) -- the one "
+                        "live ingest path. local: parse mail here via Graph "
+                        "and POST /api/email/ingest-events (fallback only). "
+                        "Env SCAN_MODE overrides the default.")
+    p.add_argument("--server-lookback-days", type=int, default=14,
+                   help="server mode: /api/email/scan lookback (default 14, "
+                        "same as scripts/trigger_email_scan.py; body-pasted "
+                        "weekly reports need the wide window).")
+    p.add_argument("--server-max-messages", type=int, default=200,
+                   help="server mode: per-mailbox message budget (default 200).")
+    p.add_argument("--freight-lookback-days", type=int, default=14,
+                   help="server mode: /api/freight/scan lookback by RECEIVED "
+                        "date (default 14). A Lineage invoice arrives once; a "
+                        "14-day window re-read 4x a day catches it with two "
+                        "weeks of retries. A deep backfill is a manual call.")
     args = p.parse_args(argv)
+
+    if args.mode == "server":
+        return _run_server_mode(args)
 
     secrets_to_redact: list[str] = []
 
@@ -551,7 +702,13 @@ def run(argv: list[str] | None = None) -> int:
                 "subject": subject,
                 "sender": sender,
                 "distributor": dist,
-                "received": m.get("receivedDateTime") or "",
+                # Document identity = when it was SENT (the MIME Date header,
+                # which is what /api/email/scan stamps). receivedDateTime is
+                # per-mailbox (JD@ and info@ differ) and lags by seconds to
+                # minutes, so the two paths disagreed about which copy of a
+                # PO was newer.
+                "received": (m.get("sentDateTime")
+                             or m.get("receivedDateTime") or ""),
             })
 
     if not qualifying:
