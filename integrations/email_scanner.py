@@ -440,12 +440,34 @@ def _html_body(msg: Message) -> str:
     return ""
 
 
+def _decode_filename(raw) -> str:
+    """Attachment filename as plain text.
+
+    get_filename() handles RFC 2231 (``filename*=``) but NOT an RFC 2047
+    encoded-word in a plain ``filename=`` -- which is what Outlook sends when
+    the name has a non-ASCII character. Manassas's 10/12/2026 report arrived as
+    ``=?iso-8859-1?Q?Customer_Metric_Source=A0_(1).xlsx?=`` (a non-breaking
+    space in the name), so every ``.endswith(".xlsx")`` check failed and the
+    report was dropped without an error or an unparsed-queue entry.
+    """
+    if not raw:
+        return ""
+    raw = str(raw)
+    if "=?" in raw:
+        try:
+            from email.header import decode_header, make_header
+            raw = str(make_header(decode_header(raw)))
+        except Exception:  # noqa: BLE001 -- keep the raw name
+            pass
+    return raw.replace("\r", "").replace("\n", "").strip()
+
+
 def _attachments(msg: Message):
     for part in msg.walk() if msg.is_multipart() else [msg]:
         disp = (part.get("Content-Disposition") or "").lower()
         if "attachment" not in disp and not part.get_filename():
             continue
-        fname = part.get_filename() or ""
+        fname = _decode_filename(part.get_filename())
         payload = part.get_payload(decode=True) or b""
         yield fname, payload
 

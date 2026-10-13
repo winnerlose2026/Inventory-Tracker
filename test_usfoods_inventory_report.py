@@ -515,6 +515,75 @@ def test_manassas_mdc_customercontact_sender_maps():
     print("ok: usfcustomercontact alias maps to Manassas")
 
 
+# --- 2026-10-12 Manassas "Customer Metric Source" + encoded filename ---------
+def _customer_metric_xlsx_bytes():
+    """Jasmin's 10/12/2026 layout: Customer Name (#) | Product Description |
+    APN # | Pack Size | Mfg Code | Cases | Cases on Hand  (trailing space)."""
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Customer Metric Source"
+    ws.append(["Customer Name (#)", "Product Description", "APN #", "Pack Size",
+               "Mfg Code", "Cases", "Cases on Hand "])
+    for apn, desc, mfg, used, oh in [
+            ("7309056", "BAGEL, EVTHG 4 Z UNSL PARBK", "1158", 13, 34),
+            ("7095637", "BAGEL, PLN 4.25 Z UNSL PARBK", "1150", 13, 13),
+            ("1055074", "BAGEL, JLP CHEDR CHS WHEAT Z &", "1189", 1, 15)]:
+        ws.append(["HH BAGELS (91634139)", desc, apn, "10/6/4.25 OZ", mfg, used, oh])
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _mime_raw_filename(xlsx_bytes, raw_filename):
+    """A message whose attachment filename header is sent VERBATIM (Outlook
+    puts an RFC 2047 encoded-word inside filename="..." for non-ASCII names)."""
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    m = MIMEMultipart()
+    m["Subject"] = "HH Bagel Report"
+    m["From"] = '"Gomez, Jasmin" <Jasmin.Gomez@usfoods.com>'
+    m["To"] = "JD@hhbagels.com"
+    m["Date"] = "Mon, 12 Oct 2026 14:12:42 +0000"
+    m["Message-ID"] = "<test-encoded-name@usfoods.com>"
+    m.attach(MIMEText("Hello,\n\nPlease see attached. Ty"))
+    part = MIMEApplication(
+        xlsx_bytes, "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    part["Content-Disposition"] = f'attachment; filename="{raw_filename}"'
+    m.attach(part)
+    return email.message_from_bytes(m.as_bytes())
+
+
+def test_xlsx_customer_metric_source_parser():
+    rep = R.parse_report_xlsx(_customer_metric_xlsx_bytes(),
+                              distributor="US Foods", warehouse="Manassas, VA")
+    assert rep is not None and rep.unmapped_codes == [], rep
+    bv = {L.variety: L for L in rep.lines}
+    assert bv["Everything"].cases_on_hand == 34 and bv["Everything"].weekly_usage == 13
+    assert bv["Jalapeno Cheddar"].cases_on_hand == 15
+    assert bv["Jalapeno Cheddar"].weekly_usage == 1
+
+
+def test_rfc2047_encoded_attachment_name_is_still_ingested():
+    """The real 10/12 header: a non-breaking space made Outlook encode the
+    name, and the scanner silently skipped the report."""
+    from integrations.email_scanner import _attachments, _carries_report_payload
+    raw = "=?iso-8859-1?Q?Customer_Metric_Source=A0_(1).xlsx?="
+    msg = _mime_raw_filename(_customer_metric_xlsx_bytes(), raw)
+    names = [n for n, _p in _attachments(msg)]
+    assert names == ["Customer Metric Source\xa0 (1).xlsx"], names
+    assert _carries_report_payload(msg, "HH Bagel Report")
+    events, errors, _cw = parse_message_with_errors(msg)
+    assert errors == [], errors
+    got = {e.item.variety: (e.item.quantity, e.item.weekly_usage) for e in events}
+    assert got == {"Everything": (34, 13), "Plain": (13, 13),
+                   "Jalapeno Cheddar": (15, 1)}, got
+    assert {e.item.warehouse for e in events} == {"Manassas, VA"}
+    assert {e.count_date[:10] for e in events} == {"2026-10-12"}
+
+
 if __name__ == "__main__":
     test_sender_resolves_to_zebulon()
     test_parse_html_nearest_week_and_varieties()
