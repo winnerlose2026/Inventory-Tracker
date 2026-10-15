@@ -332,6 +332,48 @@ def test_prune_unparsed_clears_non_report_backlog_and_own_count():
     assert [e["id"] for e in kept] == ["live"], kept
 
 
+def test_prune_unparsed_heals_entry_counted_from_its_own_send_time():
+    """Tom Foley's Houston replies are screenshots, ingested by hand and dated
+    to the email's SEND time (JD's rule). Graph's receivedDateTime trails that
+    by seconds, so the strict count >= received check kept the very message
+    that supplied the count queued as an open miss (10/13: sent 14:26:49,
+    received 14:27:10)."""
+    import inventory_tracker as it
+
+    now = datetime(2026, 10, 15, 15, 0, tzinfo=timezone.utc)
+    entries = [
+        # legacy entry (receive time only), counted from its own send time
+        {"id": "own-legacy", "sender": "tom.foley@usfoods.com",
+         "subject": "RE: Weekly Bagel Inventory & Usage Report",
+         "received": "2026-10-13T14:27:10Z"},
+        # new-style entry carrying the Date header
+        {"id": "own-sent", "sender": "tom.foley@usfoods.com",
+         "subject": "RE: Weekly Bagel Inventory & Usage Report",
+         "received": "2026-10-13T14:27:10Z", "sent": "2026-10-13T14:26:49Z"},
+        # a later Houston reply nobody has read yet -> still open
+        {"id": "later", "sender": "tom.foley@usfoods.com",
+         "subject": "RE: Weekly Bagel Inventory & Usage Report",
+         "received": "2026-10-13T15:10:00Z", "sent": "2026-10-13T15:09:40Z"},
+        # Alcoa entry an hour after its last count -> slack must not reach it
+        {"id": "alcoa", "sender": "Kimberly.Cobb@usfoods.com",
+         "subject": "Report", "received": "2026-10-13T15:00:00Z"},
+    ]
+    freshness = [
+        {"warehouse": "Houston, TX", "last_count_at": "2026-10-13T14:26:49Z"},
+        {"warehouse": "Alcoa, TN", "last_count_at": "2026-10-13T14:00:00Z"},
+    ]
+
+    orig_load, orig_write = it.load_unparsed_reports, it._write_json
+    try:
+        it.load_unparsed_reports = lambda: list(entries)
+        it._write_json = lambda path, data: None
+        kept = it.prune_unparsed_reports(now=now, freshness=freshness)
+    finally:
+        it.load_unparsed_reports, it._write_json = orig_load, orig_write
+
+    assert [e["id"] for e in kept] == ["later", "alcoa"], kept
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

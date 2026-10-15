@@ -1499,6 +1499,10 @@ class EmailInboxClient:
                             "sender": _snd,
                             "subject": m.get("subject") or "",
                             "received": m.get("receivedDateTime") or "",
+                            # Date header, normalised like a count_date: a
+                            # manual ingest of this message is stamped with it,
+                            # which is what lets the entry self-heal.
+                            "sent": _msg_date_iso(msg),
                         })
             list_url = page.get("@odata.nextLink")
 

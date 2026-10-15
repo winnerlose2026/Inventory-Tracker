@@ -318,6 +318,13 @@ STALE_COUNT_DAYS = 7
 # only buries the entries that still matter.
 UNPARSED_MAX_AGE_DAYS = 21
 
+# A count stamped from a message's own send time (the Date header -- JD's rule
+# when a report carries no date) lands a few seconds BEFORE that message's
+# Graph receivedDateTime (Tom Foley 10/13: sent 14:26:49, received 14:27:10).
+# Queue entries recorded before the scanner kept the send time only have the
+# receive time, so allow this much transit lag when judging them self-healed.
+UNPARSED_SELF_HEAL_SLACK = timedelta(minutes=5)
+
 
 def load_scan_health() -> dict:
     """Last real email-scan summary (heartbeat). {} if never recorded."""
@@ -451,7 +458,13 @@ def prune_unparsed_reports(now: Optional[datetime] = None,
         _dist, wh = _unparsed_sender_warehouse(sender)
         if wh and received:
             c_dt = _parse_iso_utc(latest_count.get(wh) or "")
-            if c_dt is not None and recv_dt is not None and c_dt >= recv_dt:
+            # Compare against when the message was SENT: that is the instant a
+            # count taken from this very message is stamped with. Older entries
+            # carry only the receive time, which trails the send by transit lag.
+            sent_dt = _parse_iso_utc(e.get("sent") or "")
+            heal_at = sent_dt if sent_dt is not None else (
+                recv_dt - UNPARSED_SELF_HEAL_SLACK if recv_dt is not None else None)
+            if c_dt is not None and heal_at is not None and c_dt >= heal_at:
                 continue  # self-healed: counted at/after this message
         kept.append(e)
     if len(kept) != len(entries):
