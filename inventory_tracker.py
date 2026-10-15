@@ -765,6 +765,21 @@ def save_po_delivery(data: dict):
     _write_json(PO_DELIVERY_FILE, data)
 
 
+PO_DELIVERY_THREADS_FILE = DATA_DIR / "po_delivery_threads.json"
+
+
+def load_po_delivery_threads() -> dict:
+    """What the last /api/pos/delivery/sync-threads read from the mailbox:
+    {synced_at, messages: {internetMessageId: {from, sent, text, ...}},
+    threads: {conversationId: {reply_to_graph_id, last_sent, po_numbers, ...}}}.
+    The events route checks evidence against it; send-followups replies off it."""
+    return _read_json(PO_DELIVERY_THREADS_FILE, {})
+
+
+def save_po_delivery_threads(data: dict):
+    _write_json(PO_DELIVERY_THREADS_FILE, data)
+
+
 def _delivery_gate(entry: dict, tracking: dict):
     """How Lineage tracking changes one pending entry's rollover.
 

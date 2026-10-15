@@ -10,7 +10,9 @@ will arrive at 1000AM/18th for pickup and delivery is set for 0800AM/20th",
 ... re-requested for 7/10", "Yes, this shows delivered 10/07".
 
 This module is the deterministic half (the free text is read by the Lineage
-follow-up scheduled task, which posts structured events here):
+follow-up scheduled task, which posts structured events here; since 10/15 the
+task runs in the cloud with a limited DELIVERY_API_TOKEN and the SERVER writes
+and sends the follow-up emails, so no laptop is involved):
 
   * a per-PO tracking record (data/po_delivery.json) with a small state
     machine -- requested -> scheduled (appointment, may be re-scheduled) ->
@@ -19,7 +21,9 @@ follow-up scheduled task, which posts structured events here):
   * the plausibility rules an event must pass before it can move a date;
   * when a follow-up is due (no appointment yet / appointment passed with no
     delivery confirmation);
-  * parsing the PO blocks out of H&H's own request email.
+  * parsing the PO blocks out of H&H's own request email;
+  * checking an event's quote against the message the mailbox really holds,
+    and composing the follow-up (fixed recipients and wording).
 
 ARRIVAL IS CONFIRMATION-DRIVEN (JD, 2026-10-15): while a PO is tracked here
 and not yet confirmed delivered, the inventory rollover HOLDS it in Pending
@@ -54,6 +58,28 @@ REPEAT_ASK_AFTER = timedelta(hours=16)       # at most ~once per run pair
 APPT_PAST_LIMIT = timedelta(days=45)
 APPT_FUTURE_LIMIT = timedelta(days=90)
 DELIVERED_FUTURE_SLACK = timedelta(hours=2)
+
+# Follow-ups the server sends itself (POST /api/pos/delivery/send-followups).
+# Recipients are fixed here -- JD chose them 2026-10-15 -- so the caller (the
+# cloud scheduled task, holding only the limited DELIVERY_API_TOKEN) can
+# trigger a follow-up but never choose who gets it or what it says.
+FOLLOWUP_FROM = "jd@hhbagels.com"
+FOLLOWUP_TO = ("bmorris@onelineage.com", "LTransSolutionsEast@onelineage.com",
+               "rwilt@onelineage.com", "dyarnold@onelineage.com")
+FOLLOWUP_CC = ("Isaiah@hhbagels.com", "Gabo@hhbagels.com")
+THREAD_QUIET_FOR = timedelta(hours=4)    # someone wrote on the thread just now: wait
+SYNC_FRESH_FOR = timedelta(minutes=45)   # follow-ups only off a just-read mailbox
+MAX_FOLLOWUP_EMAILS = 10                 # per call
+ASK_TEXT = {
+    "schedule": ("could you send the pickup date and the delivery appointment "
+                 "(date and time)? If it has already delivered, please confirm "
+                 "the delivery date and time."),
+    "confirm_delivery": ("can you confirm it delivered at its {appt} appointment? "
+                         "If it delivered at a different time or hasn't delivered "
+                         "yet, please send the actual or updated date and time."),
+}
+SIGNATURE = ("Thanks,\nJD\n\nJD Gross | Director of Bakery Operations | H&H Bagels\n"
+             "office 646-669-8934\n109 West 27th Street, Suite #3B, New York, NY 10001")
 
 
 def norm_po(s: str) -> str:
@@ -312,6 +338,83 @@ def chase_due(rec: dict, now: datetime) -> Optional[str]:
         if appt and now - appt >= CONFIRM_ASK_AFTER:
             return "confirm_delivery"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Evidence check + the follow-up email (server-side, no LLM needed)
+# ---------------------------------------------------------------------------
+
+_QUOTE_CHARS = str.maketrans({"‘": "'", "’": "'", "“": '"',
+                              "”": '"', "–": "-", "—": "-",
+                              " ": " ", "​": " "})
+
+
+def norm_text(s: str) -> str:
+    """Lower-case, straight quotes, single spaces: how a quote is matched."""
+    return re.sub(r"\s+", " ", (s or "").translate(_QUOTE_CHARS)).strip().lower()
+
+
+def quote_in_text(quote: str, text: str) -> bool:
+    """Is ``quote`` really in ``text``? Whitespace / quote style don't matter;
+    an ellipsis ("..." or "…") may join pieces, each of which must appear in
+    order. Guards the events route: a date only moves on a line the mailbox
+    actually holds."""
+    body = norm_text(text)
+    pieces = [norm_text(p) for p in re.split(r"\.\.\.+|…", quote or "")]
+    pieces = [p for p in pieces if p]
+    if not pieces or sum(len(p) for p in pieces) < 8:
+        return False
+    at = 0
+    for p in pieces:
+        i = body.find(p, at)
+        if i < 0:
+            return False
+        at = i + len(p)
+    return True
+
+
+_US_ZONES = (("ET", "America/New_York"), ("CT", "America/Chicago"),
+             ("MT", "America/Denver"), ("PT", "America/Los_Angeles"))
+
+
+def appt_label(raw: str) -> str:
+    """'2026-10-19T08:00:00-05:00' -> '10/19 8:00 AM CT' (zone read off the
+    offset on that date; '' zone when the offset matches none)."""
+    from zoneinfo import ZoneInfo
+    raw = (raw or "").strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return wall_time(raw)
+    hour = dt.hour % 12 or 12
+    label = f"{dt.month}/{dt.day} {hour}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+    if dt.tzinfo is None:
+        return label
+    off = dt.utcoffset()
+    for abbr, zone in _US_ZONES:
+        if dt.astimezone(ZoneInfo(zone)).utcoffset() == off:
+            return f"{label} {abbr}"
+    return label
+
+
+def followup_body(items: list) -> str:
+    """The follow-up text. items: [{po_number, distributor, warehouse, ask,
+    delivery_appt}] -- one bullet per PO."""
+    lines = []
+    for it in items:
+        where = ", ".join(x for x in (it.get("distributor"), it.get("warehouse")) if x)
+        ask = ASK_TEXT[it["ask"]].format(appt=appt_label(it.get("delivery_appt") or ""))
+        lines.append(f"- PO {it['po_number']}{f' ({where})' if where else ''}: {ask}")
+    return ("Hi team,\n\n" + "\n".join(lines) +
+            "\n\nIf any delivery date changes, please let us know on this thread.\n\n"
+            + SIGNATURE)
+
+
+def reply_subject(subject: str) -> str:
+    s = (subject or "").strip()
+    return s if re.match(r"^re\s*:", s, re.I) else f"RE: {s}"
 
 
 def awaiting_confirmation(rec: dict, now: datetime) -> bool:

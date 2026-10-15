@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta
 from flask import (
     Flask, jsonify, request, render_template, send_file, make_response,
-    session, redirect, url_for,
+    session, redirect, url_for, g,
 )
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
@@ -116,6 +116,7 @@ def _cors_preflight(_any):
 # so blueprints can import them without importing this module.
 from core.auth import (  # noqa: E402
     _user_logged_in, _has_valid_api_token, _is_authenticated, _OPEN_ENDPOINTS,
+    DELIVERY_TOKEN_ENDPOINTS, _has_valid_delivery_token,
 )
 from core.errors import _log_exc, _safe_err  # noqa: E402
 
@@ -146,6 +147,10 @@ def _gate_requests():
     # Everything else -- pages plus /api/* reads and writes -- requires a
     # logged-in session or a valid API token.
     if _is_authenticated():
+        return
+    # The Lineage check's limited token: its few delivery routes only.
+    if request.endpoint in DELIVERY_TOKEN_ENDPOINTS and _has_valid_delivery_token():
+        g.auth_scope = "delivery"
         return
     if request.path.startswith("/api/"):
         return jsonify({"ok": False, "error": "unauthorized"}), 401

@@ -277,20 +277,56 @@ def test_an_operators_explicit_arrival_overrides_the_hold(monkeypatch):
 # Routes
 # ---------------------------------------------------------------------------
 
-def _routes(monkeypatch, inv, tracking, ledger_status="in_transit"):
+ROJEAN_1015 = ("Delivery moved to Monday.\nAppointment: 10/19/2026 8:00 AM\n"
+               "Appointment Confirmation #: 18021721\nPO # 393072B2")
+
+
+def _synced(messages=None, synced_h=0.1, last_h=6.0, errors=None,
+            pos=("393072B2",), reply_id="r1-jd"):
+    """A sync-threads cache as the last read left it."""
+    msgs = {"<a@lineage>": {"from": ROJEAN, "sent": "2026-10-15T14:49:57Z",
+                            "conversation_id": "conv1", "text": ROJEAN_1015},
+            "<d@lineage>": {"from": ROJEAN, "sent": "2026-10-15T16:31:23Z",
+                            "conversation_id": "conv1",
+                            "text": "Delivered 0752AM/15th"}}
+    msgs.update(messages or {})
+    return {"synced_at": (NOW - timedelta(hours=synced_h)).isoformat(),
+            "errors": list(errors or []), "messages": msgs,
+            "threads": {"conv1": {
+                "conversation_id": "conv1", "subject": "Quote and Schedule - 2 Orders",
+                "reply_to_graph_id": reply_id,
+                "reply_subject": "RE: Quote and Schedule - 2 Orders",
+                "last_sent": (NOW - timedelta(hours=last_h)).isoformat(),
+                "last_from": ROJEAN, "po_numbers": list(pos)}}}
+
+
+def _routes(monkeypatch, inv, tracking, ledger_status="in_transit", synced=None,
+            extra_ledger=None):
     import blueprints.delivery as B
     from app import app
-    store = {"tracking": tracking, "inv": inv}
+    store = {"tracking": tracking, "inv": inv,
+             "threads": synced if synced is not None else _synced(),
+             "sent": []}
     monkeypatch.setattr(it, "load_po_delivery", lambda: store["tracking"])
     monkeypatch.setattr(it, "save_po_delivery", lambda d: store.update(tracking=d))
+    monkeypatch.setattr(it, "load_po_delivery_threads", lambda: store["threads"])
+    monkeypatch.setattr(it, "save_po_delivery_threads", lambda d: store.update(threads=d))
     monkeypatch.setattr(it, "load_inventory", lambda: (it._rollover_on_order(store["inv"]), store["inv"])[1])
     monkeypatch.setattr(it, "save_inventory", lambda d: store.update(inv=d))
-    monkeypatch.setattr(B, "_ledger_by_po", lambda: {
-        "393072B2": {"po_number": "393072B2", "status": ledger_status,
-                     "distributor": "US Foods", "warehouse": "Houston, TX",
-                     "total_cs": 1120.0}})
+    ledger = {"393072B2": {"po_number": "393072B2", "status": ledger_status,
+                           "distributor": "US Foods", "warehouse": "Houston, TX",
+                           "total_cs": 1120.0}}
+    ledger.update(extra_ledger or {})
+    monkeypatch.setattr(B, "_ledger_by_po", lambda: ledger)
     monkeypatch.setattr(B, "_now", lambda: NOW)
+
+    def send(sender, reply_to, to, cc, subject, body):
+        store["sent"].append({"from": sender, "reply_to": reply_to, "to": list(to),
+                              "cc": list(cc), "subject": subject, "body": body})
+        return f"draft-{len(store['sent'])}"
+    monkeypatch.setattr(B, "_send_reply", send)
     monkeypatch.setenv("INVENTORY_API_TOKEN", "tok")
+    monkeypatch.setenv("DELIVERY_API_TOKEN", "dtok")
     return app.test_client(), store
 
 
@@ -311,7 +347,8 @@ def test_events_route_moves_dates_and_releases_on_delivery(monkeypatch):
 
     delivered = {"po_number": "393072B2", "event": "delivered",
                  "delivered_at": "2026-10-15T07:52:00-05:00",
-                 "evidence": {"sender": ROJEAN, "sent": "2026-10-15T16:31:23Z",
+                 "evidence": {"message_id": "<d@lineage>", "sender": ROJEAN,
+                              "sent": "2026-10-15T16:31:23Z",
                               "quote": "Delivered 0752AM/15th"}}
     out = c.post("/api/pos/delivery/events", json={"events": [delivered]},
                  headers=h).get_json()
@@ -363,6 +400,12 @@ def test_sync_threads_registers_open_pos_and_returns_jds_reply_id(monkeypatch):
     assert t["open_pos"][0]["destination"].startswith("US Foods, 13400 Hollister")
     assert t["messages"][-1]["text"] == "This order is all set"
     assert store["tracking"]["393072B2"]["status"] == "requested"
+    # what it read is cached for the quote check and the follow-ups
+    th = store["threads"]["threads"]["conv1"]
+    assert th["po_numbers"] == ["393072B2", "014511763291"]
+    assert th["reply_to_graph_id"] == "r1-jd" and th["last_from"] == ROJEAN
+    assert store["threads"]["messages"]["<r1>"]["text"] == "This order is all set"
+    assert store["threads"]["synced_at"] == NOW.isoformat()
     # and the hold is now on: its 10/10 ETA has passed, it stays pending
     it.load_inventory()
     assert store["inv"][KEY]["quantity"] == 72.0
@@ -418,3 +461,130 @@ def test_blocks_without_a_quantity_label_keep_their_own_address():
     assert b[1]["address"].startswith("Dairyland USA")
     assert b[1]["quantity"].startswith("2 pallets (112 cases)")
     assert [x["invoice"] for x in b] == ["1025806", "1025807"]
+
+
+# ---------------------------------------------------------------------------
+# No laptop (10/15): limited key, evidence checked, server-sent follow-ups
+# ---------------------------------------------------------------------------
+
+def test_a_date_only_moves_on_a_line_the_mailbox_really_holds(monkeypatch):
+    rec, _, _ = D.apply_event(None, _requested(), NOW)
+    c, store = _routes(monkeypatch, _inv(eta="2026-10-28T00:00:00"), {"393072B2": rec},
+                       synced=_synced(messages={
+                           "<hh@x>": {"from": "isaiah@hhbagels.com",
+                                      "sent": "2026-10-15T15:00:00Z",
+                                      "conversation_id": "conv1",
+                                      "text": "Lineage says delivered 0752AM/15th"},
+                           "<other@lineage>": {"from": ROJEAN, "sent": "2026-10-15T15:00:00Z",
+                                               "conversation_id": "conv9",
+                                               "text": "Delivered 0752AM/15th"}}))
+    h = {"X-Inventory-Token": "tok"}
+
+    def post(**evid):
+        ev = {"po_number": "393072B2", "event": "delivered",
+              "delivered_at": "2026-10-15T07:52:00-05:00",
+              "evidence": {"sender": ROJEAN, "sent": "2026-10-15T16:31:23Z", **evid}}
+        return c.post("/api/pos/delivery/events", json={"events": [ev]},
+                      headers=h).get_json()["results"][0]
+
+    assert "isn't a message the last sync read" in post(
+        message_id="<made-up>", quote="Delivered 0752AM/15th")["reason"]
+    assert "isn't in that message" in post(
+        message_id="<d@lineage>", quote="Delivered 0700AM/15th")["reason"]
+    assert "doesn't list this PO" in post(
+        message_id="<other@lineage>", quote="Delivered 0752AM/15th")["reason"]
+    # the sender is the mailbox's, not the caller's: H&H can't confirm a delivery
+    assert "can't report a delivery date" in post(
+        message_id="<hh@x>", quote="says delivered 0752AM/15th")["reason"]
+    assert store["inv"][KEY]["on_order"], "nothing released"
+    # line breaks / ellipsis in the quote are fine
+    ok = c.post("/api/pos/delivery/events", json={"events": [SCHEDULED_1015]},
+                headers=h).get_json()["results"][0]
+    assert ok["applied"], ok
+    assert store["tracking"]["393072B2"]["events"][-1]["evidence"]["sender"] == ROJEAN
+
+
+def test_the_delivery_key_opens_only_the_delivery_routes(monkeypatch):
+    rec, _, _ = D.apply_event(None, _requested(), NOW)
+    c, store = _routes(monkeypatch, _inv(), {"393072B2": rec})
+    d = {"X-Inventory-Token": "dtok"}
+    assert c.get("/api/pos/delivery", headers=d).get_json()["ok"]
+    assert c.get("/api/pos/ledger", headers=d).status_code == 401
+    assert c.post("/api/email/send", json={"to": "x@y.com"}, headers=d).status_code == 401
+    assert c.post("/api/email/ingest-events", json={}, headers=d).status_code == 401
+    assert c.post("/api/pos/delivery/chased", json={"po_numbers": ["393072B2"],
+                                                    "ask": "schedule"},
+                  headers=d).status_code == 401
+    r = c.post("/api/pos/delivery/events", json={"events": [
+        {"po_number": "393072B2", "event": "released"}]}, headers=d).get_json()
+    assert "isn't allowed with the delivery key" in r["results"][0]["reason"]
+    assert store["tracking"]["393072B2"]["status"] == "requested"
+    r = c.post("/api/pos/delivery/events", json={"events": [SCHEDULED_1015]},
+               headers=d).get_json()
+    assert r["results"][0]["applied"], r
+    assert c.get("/api/pos/delivery", headers={"X-Inventory-Token": "nope"}).status_code == 401
+
+
+def test_server_sends_one_threaded_follow_up_per_thread_and_records_it(monkeypatch):
+    houston, _, _ = D.apply_event(None, _requested(sent="2026-10-12T19:16:29Z"), NOW)
+    houston, _, _ = D.apply_event(houston, dict(
+        SCHEDULED_1015, delivery_appt="2026-10-15T08:00:00-05:00"), NOW)
+    cheney, _, _ = D.apply_event(None, _requested("014511763291",
+                                                  sent="2026-10-12T19:16:29Z"), NOW)
+    c, store = _routes(
+        monkeypatch, _inv(), {"393072B2": houston, "014511763291": cheney},
+        synced=_synced(pos=("393072B2", "014511763291")),
+        extra_ledger={"014511763291": {"po_number": "014511763291",
+                                       "status": "in_transit",
+                                       "distributor": "Cheney Brothers",
+                                       "warehouse": "Riviera Beach, FL"}})
+    d = {"X-Inventory-Token": "dtok"}
+    dry = c.post("/api/pos/delivery/send-followups", json={"dry_run": True},
+                 headers=d).get_json()
+    assert dry["ok"] and dry["emails"][0]["would_send"] and store["sent"] == []
+
+    out = c.post("/api/pos/delivery/send-followups", json={}, headers=d).get_json()
+    assert out["ok"] and out["sent"] == 1, out
+    [mail] = store["sent"]
+    assert mail["from"] == "jd@hhbagels.com" and mail["reply_to"] == "r1-jd"
+    assert mail["to"] == list(D.FOLLOWUP_TO) and mail["cc"] == list(D.FOLLOWUP_CC)
+    assert mail["subject"] == "RE: Quote and Schedule - 2 Orders"
+    assert ("- PO 393072B2 (US Foods, Houston, TX): can you confirm it delivered at "
+            "its 10/15 8:00 AM CT appointment?") in mail["body"]
+    assert ("- PO 014511763291 (Cheney Brothers, Riviera Beach, FL): could you send "
+            "the pickup date and the delivery appointment") in mail["body"]
+    assert mail["body"].rstrip().endswith("New York, NY 10001")
+    asks = {k: [x["ask"] for x in v["chases"]] for k, v in store["tracking"].items()}
+    assert asks == {"393072B2": ["confirm_delivery"], "014511763291": ["schedule"]}
+
+    again = c.post("/api/pos/delivery/send-followups", json={}, headers=d).get_json()
+    assert again["sent"] == 0 and again["emails"] == [], "never twice within 16 h"
+
+
+def test_follow_ups_wait_for_a_fresh_full_read_and_a_quiet_thread(monkeypatch):
+    rec, _, _ = D.apply_event(None, _requested(sent="2026-10-12T19:16:29Z"), NOW)
+    for synced, why in ((_synced(synced_h=2), "not synced"),
+                        (_synced(errors=["info@: list: boom"]), "partial read")):
+        c, store = _routes(monkeypatch, _inv(), {"393072B2": dict(rec)}, synced=synced)
+        out = c.post("/api/pos/delivery/send-followups", json={},
+                     headers={"X-Inventory-Token": "dtok"}).get_json()
+        assert not out["ok"] and why in out["error"] and store["sent"] == []
+
+    c, store = _routes(monkeypatch, _inv(), {"393072B2": dict(rec)},
+                       synced=_synced(last_h=1))
+    out = c.post("/api/pos/delivery/send-followups", json={},
+                 headers={"X-Inventory-Token": "dtok"}).get_json()
+    assert out["ok"] and out["sent"] == 0 and "giving them time" in out["emails"][0]["skipped"]
+    assert store["sent"] == [] and store["tracking"]["393072B2"]["chases"] == []
+
+
+def test_appt_label_reads_the_zone_off_the_offset():
+    assert D.appt_label("2026-10-19T08:00:00-05:00") == "10/19 8:00 AM CT"
+    assert D.appt_label("2026-10-21T07:00:00-04:00") == "10/21 7:00 AM ET"
+    assert D.appt_label("2026-12-02T13:30:00-05:00") == "12/2 1:30 PM ET"   # EST
+    assert D.appt_label("2026-10-20T09:00:00-07:00") == "10/20 9:00 AM PT"
+    assert D.quote_in_text("Delivery moved ... Appointment: 10/19/2026 8:00 AM",
+                           ROJEAN_1015)
+    assert not D.quote_in_text("Appointment: 10/19/2026 8:00 AM ... Delivery moved",
+                               ROJEAN_1015), "pieces must appear in order"
+    assert not D.quote_in_text("...", ROJEAN_1015)

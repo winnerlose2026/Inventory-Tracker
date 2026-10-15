@@ -1,27 +1,34 @@
 """Lineage delivery tracking routes -- scheduled ETA, changes, confirmed arrival.
 
 The free-text reading of Lineage's replies happens in the "Lineage PO delivery
-check" scheduled task; these routes are what it talks to:
+check" scheduled task (a cloud task since 10/15 -- no laptop -- holding only
+the limited DELIVERY_API_TOKEN); these routes are what it talks to:
 
-  POST /api/pos/delivery/sync-threads  fetch the "Quote and Schedule" threads
-                                       (server-side Graph), register each open
-                                       PO they list, return the threads + the
-                                       messages to read
-  POST /api/pos/delivery/events        apply what the task read (scheduled /
-                                       rescheduled / delivered), each with its
-                                       evidence; moves the PO's dates and, on
-                                       delivery, releases it into on-hand
-  POST /api/pos/delivery/chased        record the follow-ups it sent
-  GET  /api/pos/delivery               tracked POs + what follow-up is due
+  POST /api/pos/delivery/sync-threads    fetch the "Quote and Schedule" threads
+                                         (server-side Graph), register each open
+                                         PO they list, return the threads + the
+                                         messages to read; caches what it read
+  POST /api/pos/delivery/events          apply what the task read (scheduled /
+                                         rescheduled / delivered), each with its
+                                         evidence -- which must quote a message
+                                         the sync actually read, from Lineage or
+                                         the DC; moves the PO's dates and, on
+                                         delivery, releases it into on-hand
+  POST /api/pos/delivery/send-followups  the SERVER writes and sends the due
+                                         follow-ups (fixed recipients/wording),
+                                         threaded, and records them
+  POST /api/pos/delivery/chased          record a follow-up sent by hand
+  GET  /api/pos/delivery                 tracked POs + what follow-up is due
 
 Rules live in integrations/po_delivery.py; the rollover hold in
 inventory_tracker._delivery_gate.
 """
+import json
 import os
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from core.errors import _log_exc, _safe_err
 from core.util import with_data_lock
@@ -29,10 +36,17 @@ from core.util import with_data_lock
 delivery_bp = Blueprint("delivery", __name__)
 
 THREAD_SUBJECT = "Quote and Schedule"
+MESSAGE_CACHE_DAYS = 120
 
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _scope() -> str:
+    """'delivery' when the caller holds only the limited DELIVERY_API_TOKEN
+    (set by the app's auth gate), else 'full' (session or the main token)."""
+    return getattr(g, "auth_scope", "") or "full"
 
 
 def _ledger_by_po() -> dict:
@@ -181,9 +195,12 @@ def api_delivery_sync_threads():
     """Fetch the Quote and Schedule threads, register each open PO they list
     (status "requested"), and return the threads that still have an open PO,
     with their messages oldest-first and the id to reply on."""
-    from inventory_tracker import load_po_delivery, save_po_delivery
+    from inventory_tracker import (
+        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+        save_po_delivery_threads,
+    )
     from integrations.po_delivery import (
-        apply_event, is_hh, norm_po, parse_request_blocks, summary,
+        apply_event, is_hh, norm_po, parse_dt, parse_request_blocks, summary,
     )
     try:
         body = request.get_json(silent=True) or {}
@@ -196,9 +213,22 @@ def api_delivery_sync_threads():
         tracking = load_po_delivery()
         ledger = _ledger_by_po()
         now = _now()
+        # What this read saw -- the events route checks quotes against it and
+        # send-followups replies off it. A mirror of the mailbox, not tracker
+        # state, so it is refreshed even on a dry run.
+        cache = load_po_delivery_threads() or {}
+        cutoff = now - timedelta(days=MESSAGE_CACHE_DAYS)
+        cached_msgs = {k: v for k, v in (cache.get("messages") or {}).items()
+                       if (parse_dt(v.get("sent") or "") or now) >= cutoff}
+        cache_threads = {}
         threads, registered, not_in_tracker = [], [], []
         for conv, ms in convs.items():
             ms.sort(key=lambda m: m["sent"])
+            for m in ms:
+                if m["message_id"]:
+                    cached_msgs[m["message_id"]] = {
+                        k: m[k] for k in ("from", "sent", "conversation_id",
+                                          "subject", "text", "graph_id", "mailbox")}
             requested = []
             for m in ms:
                 if not is_hh(m["from"]):
@@ -209,6 +239,15 @@ def api_delivery_sync_threads():
                                           "request_sent": m["sent"]})
             if not requested:
                 continue
+            jd_copy = next((m for m in reversed(ms)
+                            if m["mailbox"].lower().startswith("jd@")), None)
+            cache_threads[conv] = {
+                "conversation_id": conv, "subject": ms[0]["subject"],
+                "reply_to_graph_id": (jd_copy or {}).get("graph_id", ""),
+                "reply_subject": (jd_copy or ms[-1])["subject"],
+                "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
+                "po_numbers": [norm_po(b["po_number"]) for b in requested],
+            }
             open_pos = []
             for blk in requested:
                 key = norm_po(blk["po_number"])
@@ -258,6 +297,14 @@ def api_delivery_sync_threads():
             })
         if registered and not dry_run:
             save_po_delivery(tracking)
+        # A partial read is still cached (its messages are real, so quotes can
+        # be checked against them) but marked, and send-followups won't chase
+        # off it: a reply in the mailbox we couldn't read might answer the ask.
+        save_po_delivery_threads({"synced_at": now.isoformat(),
+                                  "lookback_days": lookback,
+                                  "errors": list(errors),
+                                  "messages": cached_msgs,
+                                  "threads": cache_threads})
         threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
         return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
                         "threads": threads, "registered": registered,
@@ -268,6 +315,28 @@ def api_delivery_sync_threads():
         return jsonify({"ok": False, "error": _safe_err(exc), "threads": []}), 200
 
 
+def _verify_evidence(ev: dict, po_key: str, cache: dict) -> tuple:
+    """Check an event's evidence against what the last sync read from the
+    mailbox. Returns (event, None) with sender / sent replaced by the
+    mailbox's own values, or (event, reason) when it can't be trusted: the
+    message wasn't read, its thread doesn't list this PO, or the quote isn't in
+    it. (The sender rule -- Lineage or the DC only -- is apply_event's.)"""
+    from integrations.po_delivery import quote_in_text
+    evid = dict(ev.get("evidence") or {})
+    msg = (cache.get("messages") or {}).get(str(evid.get("message_id") or ""))
+    if not msg:
+        return ev, ("evidence.message_id isn't a message the last sync read "
+                    "(run sync-threads, then quote a message from it)")
+    th = (cache.get("threads") or {}).get(msg.get("conversation_id") or "") or {}
+    if po_key not in (th.get("po_numbers") or []):
+        return ev, "that message's thread doesn't list this PO"
+    if not quote_in_text(str(evid.get("quote") or ""), msg.get("text") or ""):
+        return ev, "evidence.quote isn't in that message (quote it word for word)"
+    evid["sender"] = msg.get("from") or ""
+    evid["sent"] = msg.get("sent") or evid.get("sent") or ""
+    return {**ev, "evidence": evid}, None
+
+
 @delivery_bp.route("/api/pos/delivery/events", methods=["POST"])
 @with_data_lock
 def api_delivery_events():
@@ -275,7 +344,9 @@ def api_delivery_events():
     delivery_appt?, pickup_at?, delivered_at?, confirmation_no?, evidence:
     {message_id, sender, sent, quote}}], dry_run}. Dates are ISO with the
     receiving dock's UTC offset. Each result says what moved, or why not."""
-    from inventory_tracker import load_po_delivery, save_po_delivery
+    from inventory_tracker import (
+        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+    )
     from integrations.po_delivery import apply_event, norm_po, summary
     try:
         body = request.get_json(silent=True) or {}
@@ -285,16 +356,31 @@ def api_delivery_events():
             return jsonify({"ok": False, "error": "events must be a list"}), 400
         tracking = load_po_delivery()
         ledger = _ledger_by_po()
+        cache = load_po_delivery_threads() or {}
+        limited = _scope() == "delivery"
         now = _now()
         results, touched = [], []
         for ev in events:
-            ev = ev if isinstance(ev, dict) else {}
+            ev = dict(ev) if isinstance(ev, dict) else {}
             key = norm_po(ev.get("po_number") or "")
             lr = ledger.get(key)
             if lr is None and key not in tracking:
                 results.append({"po_number": ev.get("po_number"), "applied": False,
                                 "reason": "PO not in the tracker"})
                 continue
+            kind = str(ev.get("event") or "").strip().lower()
+            if limited:
+                ev.pop("force", None)
+                if kind not in ("scheduled", "rescheduled", "delivered"):
+                    results.append({"po_number": ev.get("po_number"), "applied": False,
+                                    "reason": f"'{kind}' isn't allowed with the delivery key"})
+                    continue
+            if kind in ("scheduled", "rescheduled", "delivered"):
+                ev, why = _verify_evidence(ev, key, cache)
+                if why:
+                    results.append({"po_number": ev.get("po_number"), "applied": False,
+                                    "reason": why})
+                    continue
             rec, change, err = apply_event(tracking.get(key), ev, now)
             if err:
                 results.append({"po_number": ev.get("po_number"), "applied": False,
@@ -354,3 +440,155 @@ def api_delivery_chased():
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-chased")
         return jsonify({"ok": False, "error": _safe_err(exc)}), 200
+
+
+def _send_reply(sender: str, reply_to_graph_id: str, to, cc, subject: str,
+                body_text: str) -> str:
+    """Reply in-thread from ``sender``'s mailbox (createReply -> patch -> send),
+    the same Graph calls /api/email/send makes. Returns the draft id."""
+    import urllib.request
+    from core.http import _TRUSTED_OUTBOUND_HOSTS
+    from integrations.email_scanner import GRAPH_BASE, EmailInboxClient
+    token = EmailInboxClient()._ms365_token()
+    uq = urllib.parse.quote
+
+    def call(method, url, data=None):
+        if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
+            raise ValueError("refusing outbound request to untrusted host")
+        payload = None if data is None else json.dumps(data).encode("utf-8")
+        headers = {"Authorization": f"Bearer {token}"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return raw.decode("utf-8", "replace") if raw else ""
+
+    box = f"{GRAPH_BASE}/users/{uq(sender)}/messages"
+    draft = json.loads(call("POST", f"{box}/{uq(reply_to_graph_id)}/createReply") or "{}")
+    draft_id = draft.get("id")
+    if not draft_id:
+        raise RuntimeError("createReply returned no draft id")
+    rc = lambda addrs: [{"emailAddress": {"address": a}} for a in addrs]
+    call("PATCH", f"{box}/{uq(draft_id)}", {
+        "subject": subject, "body": {"contentType": "Text", "content": body_text},
+        "toRecipients": rc(to), "ccRecipients": rc(cc)})
+    call("POST", f"{box}/{uq(draft_id)}/send")
+    return draft_id
+
+
+@delivery_bp.route("/api/pos/delivery/send-followups", methods=["POST"])
+@with_data_lock
+def api_delivery_send_followups():
+    """Write and send the follow-ups that are due, one threaded email per
+    Quote and Schedule thread, then record them. Body {dry_run}.
+
+    Everything about the email is decided here, not by the caller: who is due
+    (po_delivery.chase_due), the recipients (FOLLOWUP_TO / FOLLOWUP_CC), the
+    wording (ASK_TEXT), and the thread (from the last sync). Guards: the sync
+    must be fresh (SYNC_FRESH_FOR) and complete; a thread someone wrote on in
+    the last THREAD_QUIET_FOR is left alone; at most MAX_FOLLOWUP_EMAILS."""
+    from inventory_tracker import (
+        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+    )
+    from integrations.po_delivery import (
+        FOLLOWUP_CC, FOLLOWUP_FROM, FOLLOWUP_TO, MAX_FOLLOWUP_EMAILS,
+        SYNC_FRESH_FOR, THREAD_QUIET_FOR, chase_due, followup_body,
+        parse_dt, record_chase, reply_subject,
+    )
+    try:
+        body = request.get_json(silent=True) or {}
+        dry_run = bool(body.get("dry_run", False))
+        now = _now()
+        cache = load_po_delivery_threads() or {}
+        synced = parse_dt(cache.get("synced_at") or "")
+        if synced is None or now - synced > SYNC_FRESH_FOR:
+            return jsonify({"ok": False, "error": "threads not synced in the last "
+                            f"{int(SYNC_FRESH_FOR.total_seconds() // 60)} min -- "
+                            "run sync-threads first", "emails": []}), 200
+        if cache.get("errors"):
+            return jsonify({"ok": False, "error": "the last sync couldn't read every "
+                            "mailbox; not following up off a partial read",
+                            "sync_errors": cache["errors"], "emails": []}), 200
+        threads = cache.get("threads") or {}
+        tracking = load_po_delivery()
+        ledger = _ledger_by_po()
+
+        groups, no_thread = {}, []
+        for key, rec in tracking.items():
+            lr = ledger.get(key)
+            if not _is_open(lr, rec):
+                continue
+            ask = chase_due(rec, now)
+            if not ask:
+                continue
+            conv = (rec.get("thread") or {}).get("conversation_id") or ""
+            if conv not in threads:
+                conv = next((c for c, t in sorted(threads.items(),
+                                                  key=lambda kv: kv[1].get("last_sent") or "",
+                                                  reverse=True)
+                             if key in (t.get("po_numbers") or [])), "")
+            if not conv:
+                no_thread.append(rec.get("po_number") or key)
+                continue
+            groups.setdefault(conv, []).append({
+                "key": key, "po_number": rec.get("po_number") or key, "ask": ask,
+                "distributor": (lr or {}).get("distributor", ""),
+                "warehouse": (lr or {}).get("warehouse", ""),
+                "delivery_appt": rec.get("delivery_appt") or ""})
+
+        emails, sent_any = [], False
+        for conv, items in sorted(groups.items(),
+                                  key=lambda kv: threads[kv[0]].get("last_sent") or ""):
+            th = threads[conv]
+            items.sort(key=lambda i: i["po_number"])
+            out = {"conversation_id": conv, "subject": reply_subject(th.get("reply_subject")
+                                                                     or th.get("subject")),
+                   "po_numbers": [i["po_number"] for i in items],
+                   "asks": {i["po_number"]: i["ask"] for i in items},
+                   "to": list(FOLLOWUP_TO), "cc": list(FOLLOWUP_CC),
+                   "sent": False}
+            last = parse_dt(th.get("last_sent") or "")
+            if last and now - last < THREAD_QUIET_FOR:
+                out["skipped"] = (f"{th.get('last_from') or 'someone'} wrote on this "
+                                  f"thread {int((now - last).total_seconds() // 60)} min "
+                                  "ago -- giving them time")
+                emails.append(out)
+                continue
+            if not th.get("reply_to_graph_id"):
+                out["skipped"] = "no copy of this thread in JD's mailbox to reply on"
+                emails.append(out)
+                continue
+            if len([e for e in emails if e.get("sent") or e.get("would_send")]) >= MAX_FOLLOWUP_EMAILS:
+                out["skipped"] = f"over the {MAX_FOLLOWUP_EMAILS}-email cap for one run"
+                emails.append(out)
+                continue
+            out["body"] = followup_body(items)
+            if dry_run:
+                out["would_send"] = True
+                emails.append(out)
+                continue
+            try:
+                draft_id = _send_reply(FOLLOWUP_FROM, th["reply_to_graph_id"],
+                                       FOLLOWUP_TO, FOLLOWUP_CC, out["subject"],
+                                       out["body"])
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = _safe_err(exc, "graph send")
+                emails.append(out)
+                continue
+            out["sent"] = True
+            sent_any = True
+            for i in items:
+                tracking[i["key"]] = record_chase(tracking[i["key"]], i["ask"], now,
+                                                  draft_id)
+            emails.append(out)
+        if sent_any:
+            save_po_delivery(tracking)
+        return jsonify({"ok": True, "dry_run": dry_run,
+                        "synced_at": cache.get("synced_at"),
+                        "emails": emails,
+                        "sent": sum(1 for e in emails if e.get("sent")),
+                        "due_without_thread": no_thread})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "delivery-send-followups")
+        return jsonify({"ok": False, "error": _safe_err(exc), "emails": []}), 200
