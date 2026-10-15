@@ -95,6 +95,15 @@ services:
     # Before 10/8 local mode was the live cron path and stamped
     # receivedDateTime, so the two paths re-ordered each other's PO copies.
     #
+    # HOUSTON SCREENSHOTS (2026-10-15). After the two scans, server mode asks
+    # GET /api/email/usf-screenshots whether a Houston reply (Tom Foley's
+    # buyer-screen picture + typed cs/wk) newer than the last count is
+    # waiting. Only then does it pip-install requirements-ocr-usf.txt into
+    # /tmp (~40 s, ~370 MB on disk, ~370 MB RAM peak while reading) and run
+    # scripts/usf_screenshot_ocr.py --commit. So neither build carries an OCR
+    # engine and a normal run costs one GET. A blocked read fails the run.
+    # USF_SCREENSHOT_OCR=off disables the step.
+    #
     # Server mode needs only APP_URL + INVENTORY_API_TOKEN; the MS365_* vars
     # are used by local mode alone.
     schedule: "0 */6 * * *"

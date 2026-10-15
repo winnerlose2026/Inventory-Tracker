@@ -20,6 +20,16 @@ service to scan (POST /api/email/scan, then /api/freight/scan for Lineage).
 Every ingest -- this cron, the laptop task, "Scan now" in the UI -- runs the
 same deployed code under the same ingest lock.
 
+The one exception is Houston (since 2026-10-15): Tom Foley reports as a
+PICTURE of his USF buyer screen, which the web service can't read (no OCR
+engine there, by design). So server mode then asks
+GET /api/email/usf-screenshots whether a Houston reply newer than the last
+count is waiting; only if one is does it pip-install the OCR deps
+(requirements-ocr-usf.txt) into /tmp and run scripts/usf_screenshot_ocr.py,
+which posts the counts to /api/email/ingest-events. A reader that blocks (a
+row it can't prove) fails the run so Render emails JD. Off switch:
+`--no-screenshot-ocr` or USF_SCREENSHOT_OCR=off.
+
 `--mode local` (or SCAN_MODE=local) keeps the old Graph-direct parse for when
 the web service itself cannot reach Graph. It now stamps documents with
 `sentDateTime`, which IS the MIME Date header the server uses, and is the same
@@ -519,13 +529,128 @@ def _run_server_mode(args) -> int:
         text = fbody if isinstance(fbody, str) else json.dumps(fbody)[:400]
         print(f"ERROR: /api/freight/scan HTTP {fstatus}: "
               f"{_redact(str(text)[:400], [token])}", file=sys.stderr)
-        return 1
-    frep = fbody.get("report") or {}
-    print("freight-scan: seen={s} parsed={p} added={a} updated={u} "
-          "notes={e}".format(
-              s=frep.get("messages_seen"), p=frep.get("invoices_parsed"),
-              a=frep.get("invoices_added"), u=frep.get("invoices_updated"),
-              e=frep.get("error_count", len(frep.get("errors") or []))))
+        rc = 1
+    else:
+        frep = fbody.get("report") or {}
+        print("freight-scan: seen={s} parsed={p} added={a} updated={u} "
+              "notes={e}".format(
+                  s=frep.get("messages_seen"), p=frep.get("invoices_parsed"),
+                  a=frep.get("invoices_added"), u=frep.get("invoices_updated"),
+                  e=frep.get("error_count", len(frep.get("errors") or []))))
+
+    # 3) Screenshot warehouses (Houston): the one rep who reports as a picture.
+    #    Independent of the two scans above, so it runs even if they failed.
+    if args.screenshot_ocr:
+        if _run_screenshot_ocr(app_url, token, dry_run=bool(args.dry_run)):
+            rc = 1
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# Screenshot warehouses (Houston) -- OCR off the web service
+# ---------------------------------------------------------------------------
+
+SCREENSHOT_WAREHOUSES = ("Houston, TX",)
+OCR_REQUIREMENTS = REPO / "requirements-ocr-usf.txt"
+OCR_DEPS_DIR = os.environ.get("USF_OCR_DEPS_DIR", "/tmp/usf-ocr-deps")
+
+
+def _ocr_env(app_url: str, token: str) -> dict:
+    env = os.environ.copy()
+    env["APP_URL"] = app_url
+    env["INVENTORY_API_TOKEN"] = token
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (OCR_DEPS_DIR, str(REPO), env.get("PYTHONPATH", "")) if p)
+    return env
+
+
+def _ensure_ocr_deps(env: dict) -> str:
+    """Make rapidocr importable for the OCR subprocess; '' when ready, else
+    the reason. Installs into OCR_DEPS_DIR (pip --target) so the cron build
+    itself stays OCR-free -- this only happens on a run with a screenshot
+    waiting, i.e. about once a week."""
+    import subprocess
+    probe = [sys.executable, "-c", "import rapidocr, onnxruntime"]
+    if subprocess.run(probe, env=env, capture_output=True).returncode == 0:
+        return ""
+    print(f"usf-screenshots: installing OCR deps into {OCR_DEPS_DIR} ...")
+    try:
+        pip = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "--no-warn-script-location",
+             "--target", OCR_DEPS_DIR, "-r", str(OCR_REQUIREMENTS)],
+            env=env, capture_output=True, text=True, timeout=900)
+    except Exception as exc:  # noqa: BLE001 -- timeout / no pip
+        return f"pip install failed: {exc}"
+    if pip.returncode != 0:
+        return "pip install failed: " + (pip.stderr or pip.stdout)[-600:]
+    if subprocess.run(probe, env=env, capture_output=True).returncode != 0:
+        return "OCR deps installed but rapidocr still won't import"
+    return ""
+
+
+def _run_screenshot_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
+    """Ingest a screenshot warehouse's pending reply. 0 = fine (including
+    nothing to do), 1 = blocked or failed (the cron run fails, Render emails
+    JD; the reply stays pending and is retried every run).
+
+    The cheap pre-check (meta_only) decides whether anything is waiting; the
+    OCR deps are installed and the reader run only when something is."""
+    import subprocess
+    rc = 0
+    for wh in SCREENSHOT_WAREHOUSES:
+        q = urllib.parse.urlencode({"warehouse": wh, "lookback_days": 10,
+                                    "pending_only": 1, "meta_only": 1})
+        try:
+            req = urllib.request.Request(
+                f"{app_url}/api/email/usf-screenshots?{q}", method="GET",
+                headers={"X-Inventory-Token": token})
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: usf-screenshots {wh}: pre-check failed: "
+                  f"{_redact(str(exc), [token])}", file=sys.stderr)
+            rc = 1
+            continue
+        if not data.get("ok"):
+            print(f"ERROR: usf-screenshots {wh}: {data.get('error')}",
+                  file=sys.stderr)
+            rc = 1
+            continue
+        pending = data.get("messages") or []
+        if not pending:
+            print(f"usf-screenshots: {wh} nothing pending "
+                  f"(last count {data.get('last_count_at')})")
+            continue
+        env = _ocr_env(app_url, token)
+        if any(m.get("images") for m in pending):
+            why = _ensure_ocr_deps(env)
+            if why:
+                print(f"ERROR: usf-screenshots {wh}: {_redact(why, [token])}",
+                      file=sys.stderr)
+                rc = 1
+                continue
+        cmd = [sys.executable, str(HERE / "usf_screenshot_ocr.py"),
+               "--warehouse", wh, "--lookback-days", "10"]
+        if not dry_run:
+            cmd.append("--commit")
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                  timeout=900)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: usf-screenshots {wh}: reader did not finish: {exc}",
+                  file=sys.stderr)
+            rc = 1
+            continue
+        for line in (proc.stdout or "").splitlines():
+            print(_redact(line, [token]))
+        for line in (proc.stderr or "").splitlines()[-20:]:
+            print(_redact(line, [token]), file=sys.stderr)
+        if proc.returncode != 0:
+            what = "BLOCKED" if proc.returncode == 3 else f"exit {proc.returncode}"
+            print(f"ERROR: usf-screenshots {wh}: {what} -- the reply stays "
+                  "pending and is retried next run", file=sys.stderr)
+            rc = 1
     return rc
 
 
@@ -581,6 +706,12 @@ def run(argv: list[str] | None = None) -> int:
                         "date (default 14). A Lineage invoice arrives once; a "
                         "14-day window re-read 4x a day catches it with two "
                         "weeks of retries. A deep backfill is a manual call.")
+    p.add_argument("--no-screenshot-ocr", dest="screenshot_ocr",
+                   action="store_false",
+                   default=(os.environ.get("USF_SCREENSHOT_OCR", "on")
+                            .strip().lower() != "off"),
+                   help="server mode: skip the Houston buyer-screen OCR step "
+                        "(env USF_SCREENSHOT_OCR=off does the same).")
     args = p.parse_args(argv)
 
     if args.mode == "server":

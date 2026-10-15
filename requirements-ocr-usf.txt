@@ -1,0 +1,10 @@
+# OCR for the Houston buyer-screen screenshots (scripts/usf_screenshot_ocr.py).
+# Deliberately NOT in requirements.txt: neither the web service nor the cron
+# build carries an OCR engine. scripts/cowork_graph_scan.py pip-installs these
+# into /tmp on demand, only on a cron run that finds a screenshot waiting
+# (about once a week), and runs the OCR in a subprocess.
+# rapidocr 3.10 bundles the PP-OCRv6 models the reader was validated on
+# (Tom Foley's 9/22, 9/29 and 10/13 screens, 39/39 Hand values); it pulls
+# opencv-python-headless (no libGL needed), numpy and pillow itself.
+rapidocr==3.10.0
+onnxruntime>=1.20,<2

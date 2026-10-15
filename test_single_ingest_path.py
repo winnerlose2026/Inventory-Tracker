@@ -104,6 +104,9 @@ def _cron_env(monkeypatch):
     monkeypatch.setenv("MS365_TENANT_ID", "t")
     monkeypatch.setenv("MS365_CLIENT_ID", "c")
     monkeypatch.setenv("MS365_CLIENT_SECRET", "s")
+    # The Houston screenshot step has its own tests (test_usf_screenshot.py
+    # and the one below); keep these about the two scans.
+    monkeypatch.setenv("USF_SCREENSHOT_OCR", "off")
 
 
 # The Render cron's startCommand, verbatim (dashboard, not render.yaml).
@@ -131,6 +134,33 @@ def test_cron_command_asks_the_server_to_scan(monkeypatch, capsys):
     assert "email-scan: status=ok" in out.out
     assert "freight-scan: seen=2098 parsed=12 added=0 updated=2" in out.out
     assert "tok-xyz" not in out.out + out.err
+
+
+def test_cron_also_checks_houston_screenshots(monkeypatch, capsys):
+    """After the two scans the cron asks for a pending Houston reply (cheap,
+    no image bytes) -- and with none waiting, installs and runs nothing."""
+    _cron_env(monkeypatch)
+    monkeypatch.delenv("USF_SCREENSHOT_OCR", raising=False)
+    cgs = _script()
+    calls = []
+    scans = _fake_server(calls, [(200, _EMAIL_OK)])
+
+    def urlopen(req, timeout=None):
+        if "/api/email/usf-screenshots?" in req.full_url:
+            calls.append((req.full_url, None, req.get_header("X-inventory-token")))
+            return _Resp(200, {"ok": True, "messages": [],
+                               "last_count_at": "2026-10-13T14:26:49Z"})
+        return scans(req, timeout)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("nothing pending: no install, no reader")))
+    assert cgs.run(CRON_ARGS) == 0
+    last = calls[-1]
+    assert last[0].startswith("https://inv.example/api/email/usf-screenshots?")
+    assert "meta_only=1" in last[0] and "pending_only=1" in last[0]
+    assert last[2] == "tok-xyz"
+    assert "usf-screenshots: Houston, TX nothing pending" in capsys.readouterr().out
 
 
 def test_server_mode_waits_out_a_concurrent_scan(monkeypatch):

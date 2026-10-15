@@ -537,6 +537,171 @@ def api_cheney_stock_images():
         return jsonify({"ok": False, "error": _safe_err(exc), "facilities": []}), 200
 
 
+def _graph_json(url, token, extra_headers=None, timeout=30):
+    """GET a Microsoft Graph URL as JSON (module-level so tests can stub it)."""
+    import json as _json
+    import urllib.request
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers.update(extra_headers or {})
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read())
+
+
+def _graph_token():
+    from integrations.email_scanner import EmailInboxClient
+    client = EmailInboxClient()
+    if not client._has_ms365_credentials():
+        return None
+    return client._ms365_token()
+
+
+@email_bp.route("/api/email/usf-screenshots", methods=["GET"])
+def api_usf_screenshots():
+    """Serve a screenshot rep's recent replies (Houston: Tom Foley) so the OCR
+    reader can turn them into counts -- see scripts/usf_screenshot_ocr.py.
+
+    Tom's weekly numbers are an INLINE picture of his USF buyer screen plus
+    usage typed in the body. The mailbox scan can't read a picture and the web
+    service deliberately carries no OCR engine, so this route only fetches:
+    each message from the warehouse's mapped reps in the lookback window, its
+    plain-text body, and its pictures (>= 40 KB, so signature logos are left
+    out). Graph reports inline-only mail as hasAttachments=false, so the
+    attachments are fetched for every message rather than filtered on that.
+
+    A message is "pending" when it was SENT after the warehouse's latest
+    count: once its count is applied (stamped with that send time) it stops
+    being pending, which is what makes the 6-hourly cron run a no-op the rest
+    of the week.
+
+    Query: warehouse (default "Houston, TX"), lookback_days (default 10,
+    1-30), pending_only (default 1), meta_only (default 0: include image
+    bytes base64; 1: names and sizes only -- the cron's cheap pre-check).
+    Returns {ok, warehouse, last_count_at, messages:[{id, message_id, mailbox,
+    sender, subject, sent, received, pending, body_text, images:[{name,
+    content_type, size, b64?}]}], errors}.
+    """
+    import urllib.parse
+    from datetime import timezone
+    try:
+        expected = os.environ.get("INVENTORY_API_TOKEN", "")
+        if expected and request.headers.get("X-Inventory-Token") != expected:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        from integrations.email_scanner import GRAPH_BASE
+        from integrations.usf_screenshot import (
+            MIN_SCREEN_IMAGE_BYTES, SCREENSHOT_DIST_BY_WAREHOUSE,
+            senders_for_warehouse,
+        )
+        from inventory_tracker import _parse_iso_utc, warehouse_freshness
+
+        warehouse = (request.args.get("warehouse") or "Houston, TX").strip()
+        if warehouse not in SCREENSHOT_DIST_BY_WAREHOUSE:
+            return jsonify({"ok": False, "messages": [],
+                            "error": f"{warehouse!r} is not a screenshot warehouse"}), 400
+        try:
+            lookback = int(request.args.get("lookback_days") or 10)
+        except (TypeError, ValueError):
+            lookback = 10
+        lookback = max(1, min(lookback, 30))
+        pending_only = (request.args.get("pending_only") or "1") != "0"
+        meta_only = (request.args.get("meta_only") or "0") == "1"
+
+        last_count = next((r.get("last_count_at") for r in warehouse_freshness()
+                           if r.get("warehouse") == warehouse), None) or ""
+        last_dt = _parse_iso_utc(last_count)
+
+        token = _graph_token()
+        if not token:
+            return jsonify({"ok": False, "error": "MS365 not configured",
+                            "messages": []}), 200
+        since = datetime.now(timezone.utc) - timedelta(days=lookback)
+        users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",")
+                 if u.strip()]
+
+        found, errors = {}, []
+        for user in users:
+            uq = urllib.parse.quote(user)
+            for sender in senders_for_warehouse(warehouse):
+                # $search (KQL): a from-address $filter plus a date range
+                # trips Graph's InefficientFilter. Dates are checked below.
+                search = urllib.parse.quote(f'"from:{sender}"')
+                url = (f"{GRAPH_BASE}/users/{uq}/messages?$search={search}"
+                       "&$select=id,subject,sentDateTime,receivedDateTime,"
+                       "internetMessageId,from&$top=25")
+                try:
+                    msgs = _graph_json(url, token, {"ConsistencyLevel": "eventual"}
+                                       ).get("value", [])
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{user}/{sender}: list: {_safe_err(exc)}")
+                    continue
+                for m in msgs:
+                    sent_dt = _parse_iso_utc(m.get("sentDateTime") or "")
+                    if sent_dt is None or sent_dt < since:
+                        continue
+                    frm = (((m.get("from") or {}).get("emailAddress") or {})
+                           .get("address") or "").lower()
+                    if frm != sender:
+                        continue   # KQL from: also matches display names
+                    pending = last_dt is None or sent_dt > last_dt
+                    if pending_only and not pending:
+                        continue
+                    key = m.get("internetMessageId") or m.get("id")
+                    if key in found:
+                        continue   # same mail delivered to JD@ and info@
+                    found[key] = {"user": user, "graph": m, "pending": pending}
+
+        out = []
+        for key, f in found.items():
+            m, uq = f["graph"], urllib.parse.quote(f["user"])
+            mid = urllib.parse.quote(m.get("id") or "")
+            base = f"{GRAPH_BASE}/users/{uq}/messages/{mid}"
+            body_text, images = "", []
+            try:
+                body = _graph_json(base + "?$select=body", token,
+                                   {"Prefer": 'outlook.body-content-type="text"'})
+                body_text = ((body.get("body") or {}).get("content") or "")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{key}: body: {_safe_err(exc)}")
+            try:
+                att_url = base + "/attachments"
+                if meta_only:
+                    att_url += "?$select=name,contentType,size,isInline"
+                for a in _graph_json(att_url, token).get("value", []):
+                    ctype = (a.get("contentType") or "").lower()
+                    if not ctype.startswith("image/"):
+                        continue
+                    if int(a.get("size") or 0) < MIN_SCREEN_IMAGE_BYTES:
+                        continue
+                    img = {"name": a.get("name") or "", "content_type": ctype,
+                           "size": int(a.get("size") or 0)}
+                    if not meta_only:
+                        if not a.get("contentBytes"):
+                            continue
+                        img["b64"] = a["contentBytes"]
+                    images.append(img)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{key}: attachments: {_safe_err(exc)}")
+            out.append({
+                "id": m.get("id"), "message_id": m.get("internetMessageId") or "",
+                "mailbox": f["user"],
+                "sender": (((m.get("from") or {}).get("emailAddress") or {})
+                           .get("address") or "").lower(),
+                "subject": m.get("subject") or "",
+                "sent": m.get("sentDateTime") or "",
+                "received": m.get("receivedDateTime") or "",
+                "pending": f["pending"], "body_text": body_text,
+                "images": images,
+            })
+        out.sort(key=lambda r: r["sent"])
+        return jsonify({"ok": True, "warehouse": warehouse,
+                        "last_count_at": last_count or None,
+                        "lookback_days": lookback, "pending_only": pending_only,
+                        "messages": out, "errors": errors})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "usf-screenshots")
+        return jsonify({"ok": False, "error": _safe_err(exc), "messages": []}), 200
+
+
 @email_bp.route("/api/email/ingest-events", methods=["POST"])
 def api_email_ingest_events():
     with _ingest_lock() as got:
