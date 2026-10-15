@@ -282,13 +282,13 @@ ROJEAN_1015 = ("Delivery moved to Monday.\nAppointment: 10/19/2026 8:00 AM\n"
 
 
 def _synced(messages=None, synced_h=0.1, last_h=6.0, errors=None,
-            pos=("393072B2",), reply_id="r1-jd"):
+            pos=("393072B2",), reply_id="r1-jd", base=True):
     """A sync-threads cache as the last read left it."""
     msgs = {"<a@lineage>": {"from": ROJEAN, "sent": "2026-10-15T14:49:57Z",
                             "conversation_id": "conv1", "text": ROJEAN_1015},
             "<d@lineage>": {"from": ROJEAN, "sent": "2026-10-15T16:31:23Z",
                             "conversation_id": "conv1",
-                            "text": "Delivered 0752AM/15th"}}
+                            "text": "Delivered 0752AM/15th"}} if base else {}
     msgs.update(messages or {})
     return {"synced_at": (NOW - timedelta(hours=synced_h)).isoformat(),
             "errors": list(errors or []), "messages": msgs,
@@ -533,7 +533,7 @@ def test_server_sends_one_threaded_follow_up_per_thread_and_records_it(monkeypat
                                                   sent="2026-10-12T19:16:29Z"), NOW)
     c, store = _routes(
         monkeypatch, _inv(), {"393072B2": houston, "014511763291": cheney},
-        synced=_synced(pos=("393072B2", "014511763291")),
+        synced=_synced(pos=("393072B2", "014511763291"), base=False),
         extra_ledger={"014511763291": {"po_number": "014511763291",
                                        "status": "in_transit",
                                        "distributor": "Cheney Brothers",
@@ -561,21 +561,50 @@ def test_server_sends_one_threaded_follow_up_per_thread_and_records_it(monkeypat
     assert again["sent"] == 0 and again["emails"] == [], "never twice within 16 h"
 
 
-def test_follow_ups_wait_for_a_fresh_full_read_and_a_quiet_thread(monkeypatch):
+def test_follow_ups_wait_for_a_fresh_full_read_and_a_quiet_po(monkeypatch):
     rec, _, _ = D.apply_event(None, _requested(sent="2026-10-12T19:16:29Z"), NOW)
-    for synced, why in ((_synced(synced_h=2), "not synced"),
-                        (_synced(errors=["info@: list: boom"]), "partial read")):
+    for synced, why in ((_synced(synced_h=2, base=False), "not synced"),
+                        (_synced(errors=["info@: list: boom"], base=False), "partial read")):
         c, store = _routes(monkeypatch, _inv(), {"393072B2": dict(rec)}, synced=synced)
         out = c.post("/api/pos/delivery/send-followups", json={},
                      headers={"X-Inventory-Token": "dtok"}).get_json()
         assert not out["ok"] and why in out["error"] and store["sent"] == []
 
-    c, store = _routes(monkeypatch, _inv(), {"393072B2": dict(rec)},
-                       synced=_synced(last_h=1))
-    out = c.post("/api/pos/delivery/send-followups", json={},
-                 headers={"X-Inventory-Token": "dtok"}).get_json()
-    assert out["ok"] and out["sent"] == 0 and "giving them time" in out["emails"][0]["skipped"]
+    def recent(text, h=1, sender=ROJEAN):
+        return {"<n@x>": {"from": sender, "conversation_id": "conv1", "text": text,
+                          "sent": (NOW - timedelta(hours=h)).isoformat()}}
+    cheney, _, _ = D.apply_event(None, _requested("014511763291",
+                                                  sent="2026-10-12T19:16:29Z"), NOW)
+    cheney_ledger = {"014511763291": {"po_number": "014511763291", "status": "in_transit",
+                                      "distributor": "Cheney Brothers",
+                                      "warehouse": "Riviera Beach, FL"}}
+
+    def run(msgs):
+        c, store = _routes(monkeypatch, _inv(),
+                           {"393072B2": dict(rec), "014511763291": dict(cheney)},
+                           synced=_synced(msgs, pos=("393072B2", "014511763291"),
+                                          base=False),
+                           extra_ledger=cheney_ledger)
+        out = c.post("/api/pos/delivery/send-followups", json={},
+                     headers={"X-Inventory-Token": "dtok"}).get_json()
+        return out, store
+
+    # a reply naming no PO ("This order is all set") holds the whole thread
+    out, store = run(recent("This order is all set"))
+    assert out["sent"] == 0 and "giving them time" in out["emails"][0]["skipped"]
     assert store["sent"] == [] and store["tracking"]["393072B2"]["chases"] == []
+    # a reply about one PO holds only that one
+    out, store = run(recent("Checking on PO 393072B2, will advise"))
+    assert out["sent"] == 1 and out["emails"][0]["po_numbers"] == ["014511763291"]
+    assert list(out["emails"][0]["held_back"]) == ["393072B2"]
+    assert "393072B2" not in store["sent"][0]["body"]
+    assert store["tracking"]["393072B2"]["chases"] == []
+    # older than 4 h, or an internal test reply: not activity
+    for msgs in (recent("This order is all set", h=5),
+                 recent("TEST (internal, ignore): threading check", sender="jd@hhbagels.com")):
+        out, store = run(msgs)
+        assert out["sent"] == 1 and out["emails"][0]["po_numbers"] == ["014511763291",
+                                                                      "393072B2"]
 
 
 def test_appt_label_reads_the_zone_off_the_offset():

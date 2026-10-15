@@ -412,6 +412,34 @@ def followup_body(items: list) -> str:
             + SIGNATURE)
 
 
+INTERNAL_TEST_PREFIX = "TEST (internal"   # H&H-only test replies: never "activity"
+
+
+def quiet_pos(messages: list, po_numbers: list, now: datetime) -> dict:
+    """POs on a thread that someone wrote about within THREAD_QUIET_FOR ->
+    {po_key: reason}. A message that names some of the thread's POs quiets
+    only those; one that names none ("This order is all set", "checking,
+    will advise") quiets them all. A busy thread about one PO therefore
+    doesn't hold back the follow-up on another."""
+    quiet = {}
+    for m in sorted(messages, key=lambda m: m.get("sent") or ""):
+        sent = parse_dt(m.get("sent") or "")
+        if not sent or now - sent >= THREAD_QUIET_FOR:
+            continue
+        text = m.get("text") or ""
+        if text.lstrip().startswith(INTERNAL_TEST_PREFIX):
+            continue
+        up = text.upper()
+        named = [p for p in po_numbers
+                 if re.search(r"(?<![A-Z0-9])" + re.escape(p) + r"(?![A-Z0-9])", up)]
+        mins = int((now - sent).total_seconds() // 60)
+        why = (f"{m.get('from') or 'someone'} wrote about it {mins} min ago "
+               "-- giving them time")
+        for p in (named or po_numbers):
+            quiet[p] = why
+    return quiet
+
+
 def reply_subject(subject: str) -> str:
     s = (subject or "").strip()
     return s if re.match(r"^re\s*:", s, re.I) else f"RE: {s}"

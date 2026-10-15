@@ -486,15 +486,16 @@ def api_delivery_send_followups():
     Everything about the email is decided here, not by the caller: who is due
     (po_delivery.chase_due), the recipients (FOLLOWUP_TO / FOLLOWUP_CC), the
     wording (ASK_TEXT), and the thread (from the last sync). Guards: the sync
-    must be fresh (SYNC_FRESH_FOR) and complete; a thread someone wrote on in
-    the last THREAD_QUIET_FOR is left alone; at most MAX_FOLLOWUP_EMAILS."""
+    must be fresh (SYNC_FRESH_FOR) and complete; a PO someone wrote about in
+    the last THREAD_QUIET_FOR is held back (po_delivery.quiet_pos); at most
+    MAX_FOLLOWUP_EMAILS."""
     from inventory_tracker import (
         load_po_delivery, load_po_delivery_threads, save_po_delivery,
     )
     from integrations.po_delivery import (
         FOLLOWUP_CC, FOLLOWUP_FROM, FOLLOWUP_TO, MAX_FOLLOWUP_EMAILS,
-        SYNC_FRESH_FOR, THREAD_QUIET_FOR, chase_due, followup_body,
-        parse_dt, record_chase, reply_subject,
+        SYNC_FRESH_FOR, chase_due, followup_body, parse_dt, quiet_pos,
+        record_chase, reply_subject,
     )
     try:
         body = request.get_json(silent=True) or {}
@@ -538,21 +539,25 @@ def api_delivery_send_followups():
                 "delivery_appt": rec.get("delivery_appt") or ""})
 
         emails, sent_any = [], False
+        all_msgs = list((cache.get("messages") or {}).values())
         for conv, items in sorted(groups.items(),
                                   key=lambda kv: threads[kv[0]].get("last_sent") or ""):
             th = threads[conv]
             items.sort(key=lambda i: i["po_number"])
+            quiet = quiet_pos([m for m in all_msgs if m.get("conversation_id") == conv],
+                              th.get("po_numbers") or [], now)
+            held = {i["po_number"]: quiet[i["key"]] for i in items if i["key"] in quiet}
+            items = [i for i in items if i["key"] not in quiet]
             out = {"conversation_id": conv, "subject": reply_subject(th.get("reply_subject")
                                                                      or th.get("subject")),
                    "po_numbers": [i["po_number"] for i in items],
                    "asks": {i["po_number"]: i["ask"] for i in items},
                    "to": list(FOLLOWUP_TO), "cc": list(FOLLOWUP_CC),
                    "sent": False}
-            last = parse_dt(th.get("last_sent") or "")
-            if last and now - last < THREAD_QUIET_FOR:
-                out["skipped"] = (f"{th.get('last_from') or 'someone'} wrote on this "
-                                  f"thread {int((now - last).total_seconds() // 60)} min "
-                                  "ago -- giving them time")
+            if held:
+                out["held_back"] = held
+            if not items:
+                out["skipped"] = "; ".join(sorted(set(held.values())))
                 emails.append(out)
                 continue
             if not th.get("reply_to_graph_id"):
