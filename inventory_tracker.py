@@ -751,6 +751,44 @@ def save_status_overrides(data: dict):
     _write_json(STATUS_OVERRIDES_FILE, data)
 
 
+PO_DELIVERY_FILE = DATA_DIR / "po_delivery.json"
+
+
+def load_po_delivery() -> dict:
+    """{normalized_po_key: record} -- Lineage delivery tracking per PO
+    (integrations/po_delivery.py): requested / scheduled appointment /
+    confirmed delivery, with the evidence for each change."""
+    return _read_json(PO_DELIVERY_FILE, {})
+
+
+def save_po_delivery(data: dict):
+    _write_json(PO_DELIVERY_FILE, data)
+
+
+def _delivery_gate(entry: dict, tracking: dict):
+    """How Lineage tracking changes one pending entry's rollover.
+
+    Returns ("hold", None) while the PO is tracked and NOT yet confirmed
+    delivered -- it stays in Pending POs even after its appointment passes
+    (JD 2026-10-15: arrival is confirmation-driven). Returns ("delivered",
+    dt) once confirmed, so the entry rolls over dated to the actual delivery.
+    ("none", None) when untracked or when an operator typed an explicit
+    arrival on the Pending tab (arrival_source="operator"), which wins.
+    """
+    if not tracking or (entry.get("arrival_source") or "") == "operator":
+        return "none", None
+    from integrations.po_delivery import HOLD_STATUSES, norm_po
+    rec = tracking.get(norm_po(entry.get("po_number") or ""))
+    if not rec:
+        return "none", None
+    st = rec.get("status") or ""
+    if st in HOLD_STATUSES:
+        return "hold", None
+    if st == "delivered":
+        return "delivered", _parse_sane_dt(rec.get("delivered_at") or "")
+    return "none", None
+
+
 
 # ---------------------------------------------------------------------------
 # On-order rollover
@@ -872,6 +910,10 @@ def _rollover_on_order(inv: dict) -> bool:
     _PENDING_ROLLOVER_ABSORBED = stage["absorbed"]
     now = datetime.now()
     changed = False
+    try:
+        tracking = load_po_delivery()
+    except Exception:  # noqa: BLE001 -- a bad tracking file must not stop reads
+        tracking = {}
     for key, item in inv.items():
         pending = item.get("on_order") or []
         if not pending:
@@ -879,6 +921,14 @@ def _rollover_on_order(inv: dict) -> bool:
         kept = []
         for entry in pending:
             trigger = _rollover_trigger(entry)
+            gate, delivered_at = _delivery_gate(entry, tracking)
+            if gate == "hold":
+                # Sent to Lineage, not yet confirmed delivered: stays pending
+                # whatever its dates say.
+                kept.append(entry)
+                continue
+            if gate == "delivered" and delivered_at is not None:
+                trigger = delivered_at
             if trigger is None:
                 # No usable trigger date — leave pending so an operator
                 # can correct it (typically via /api/on-order/ship-date).

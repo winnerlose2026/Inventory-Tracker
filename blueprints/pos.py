@@ -988,12 +988,17 @@ def build_po_ledger() -> list:
     """Assemble one canonical record per PO across all sources. Pure read."""
     from inventory_tracker import (
         load_inventory, load_usage, load_chefs_warehouse_pos,
-        load_canceled_pos, load_status_overrides,
+        load_canceled_pos, load_status_overrides, load_po_delivery,
     )
     from integrations.planning_config import transfer_group_for
+    from integrations import po_delivery as _pd
 
     now = datetime.now()
     canceled = load_canceled_pos() or {}
+    try:
+        tracking = load_po_delivery() or {}
+    except Exception:  # noqa: BLE001 -- tracking is an overlay; never fatal
+        tracking = {}
     overrides = load_status_overrides() or {}
     freight_idx = _freight_ship_date_index()
     recs: dict = {}
@@ -1123,6 +1128,25 @@ def build_po_ledger() -> list:
         sd = freight_idx.get(_norm_po_key(po))
         if sd:
             r["ship_date"] = sd; r["ship_date_source"] = "freight"; r["sources"].add("freight")
+        # Lineage delivery tracking (blueprints/delivery.py): the appointment
+        # Lineage booked is the arrival to show, a confirmed delivery is the
+        # real arrival, and until that confirmation a passed date does NOT
+        # make the PO arrived -- the rollover holds it too.
+        held = False
+        trk = tracking.get(_pd.norm_po(po))
+        if trk and trk.get("status") != "released":
+            from datetime import timezone as _tz
+            dsum = _pd.summary(trk, datetime.now(_tz.utc))
+            r["delivery"] = dsum
+            if dsum["status"] == "scheduled" and dsum["delivery_appt_local"]:
+                r["arrival_date"] = dsum["delivery_appt_local"]
+                r["eta"] = dsum["delivery_appt_local"]
+            elif dsum["status"] == "delivered" and dsum["delivered_local"]:
+                r["arrival_date"] = dsum["delivered_local"]
+            if dsum["pickup_at"] and r.get("ship_date_source") != "freight":
+                r["ship_date"] = _pd.wall_time(dsum["pickup_at"])
+                r["ship_date_source"] = "lineage"
+            held = dsum["status"] in _pd.HOLD_STATUSES
         ov = overrides.get(_norm_po_key(po)) or overrides.get(po)
         if r["_canceled"] or po in canceled or ov in ("cancelled", "canceled"):
             status = "canceled"
@@ -1131,7 +1155,7 @@ def build_po_ledger() -> list:
         elif r["_pending"] and r["_arrived"]:
             # Partially rolled: the pending lines are still on order.
             status = "in_transit" if r.get("ship_date") else "pending"
-        elif r["_arrived"] or _date_le(r.get("arrival_date"), now):
+        elif r["_arrived"] or (not held and _date_le(r.get("arrival_date"), now)):
             status = "arrived"
         elif r.get("ship_date"):
             status = "in_transit"

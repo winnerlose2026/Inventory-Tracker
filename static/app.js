@@ -2535,6 +2535,7 @@ function _groupsFromLedger(records) {
                                          arrived: !!L.arrived })),
       partial: !!r.partial,
       rolled_at: r.rolled_at || '',
+      delivery: r.delivery || null,
       _source: src,
     };
     // The server is the authority on arrived vs pending: on-hand is only
@@ -2751,6 +2752,40 @@ function togglePoRowEdit(po) {
   renderPendingPOs();
 }
 
+// Lineage delivery line under the Arrival date: the booked appointment, the
+// "awaiting confirmation" warning once it passes (the PO is held out of
+// on-hand until Lineage confirms), or the confirmed delivery time.
+function _deliveryTime(iso) {
+  const m = String(iso || '').match(/T(\d{2}):(\d{2})/);
+  if (!m || (m[1] === '00' && m[2] === '00')) return '';
+  let h = Number(m[1]); const ap = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return ` ${h}:${m[2]} ${ap}`;
+}
+
+function _deliveryNoteHtml(g) {
+  const d = g && g.delivery;
+  if (!d || !d.status) return '';
+  const q = (d.last_event && d.last_event.quote) ? d.last_event.quote : '';
+  const who = (d.last_event && d.last_event.sender) ? d.last_event.sender : '';
+  const tip = escAttr(q ? `"${q}" (${who})` : `${d.carrier || 'Lineage'} delivery tracking`);
+  const st = 'font-size:11px;white-space:normal;line-height:1.3;cursor:help';
+  if (d.status === 'delivered') {
+    return `<div title="${tip}" style="${st};color:var(--green);font-weight:600">&#10003; Delivered ${formatDate(d.delivered_local)}${_deliveryTime(d.delivered_local)} (confirmed)</div>`;
+  }
+  if (d.status === 'scheduled' && d.awaiting_confirmation) {
+    return `<div title="${tip}" style="${st};color:var(--red);font-weight:600">Awaiting delivery confirmation &middot; appt ${formatDate(d.delivery_appt_local)}${_deliveryTime(d.delivery_appt_local)}</div>`;
+  }
+  if (d.status === 'scheduled') {
+    const conf = d.confirmation_no ? ` &middot; #${escHtml(d.confirmation_no)}` : '';
+    return `<div title="${tip}" style="${st};color:var(--muted)">${escHtml(d.carrier || 'Lineage')} appt${_deliveryTime(d.delivery_appt_local)}${conf}</div>`;
+  }
+  if (d.status === 'requested') {
+    return `<div title="${tip}" style="${st};color:var(--muted)">Sent to ${escHtml(d.carrier || 'Lineage')} &middot; awaiting schedule</div>`;
+  }
+  return '';
+}
+
 function _pendingRowHtml(g, now) {
   now = now || new Date();
   const state = g._state || _poState(g, now);
@@ -2802,7 +2837,7 @@ function _pendingRowHtml(g, now) {
   // Arrival is the field that decides whether a delivery sits inside a count,
   // so on an arrived inventory PO it is the most important thing to be able
   // to correct -- that is what "it landed after we counted" means.
-  let arrivalCell = arrival;
+  let arrivalCell = arrival + _deliveryNoteHtml(g);
   if (invArrived && editing) {
     const arrISO = (g.arrival_date || '').slice(0, 10);
     arrivalCell = `<input type="date" class="ship-date-input" value="${escAttr(arrISO)}" title="The date the truck actually landed" onclick="try{this.showPicker()}catch(e){}" onchange="onArrivedPoAdjust('${poAttr}', 'arrival_date', this.value, false)" />`;
@@ -2844,7 +2879,7 @@ function renderInProductionSection(list) {
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">—</span>';
-    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
+    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>') + _deliveryNoteHtml(g);
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
@@ -2880,7 +2915,7 @@ function renderInTransitSection(list) {
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">&mdash;</span>';
-    const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>';
+    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>') + _deliveryNoteHtml(g);
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>

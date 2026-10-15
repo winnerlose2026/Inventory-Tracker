@@ -24,6 +24,7 @@ from blueprints.webhooks import webhooks_bp  # noqa: E402
 from blueprints.freight import freight_bp  # noqa: E402
 from blueprints.production import production_bp  # noqa: E402
 from blueprints.pos import pos_bp  # noqa: E402
+from blueprints.delivery import delivery_bp  # noqa: E402
 from blueprints.inventory import inventory_bp  # noqa: E402
 from blueprints.admin import admin_bp  # noqa: E402
 from blueprints.email import email_bp  # noqa: E402
@@ -34,6 +35,7 @@ app.register_blueprint(webhooks_bp)
 app.register_blueprint(freight_bp)
 app.register_blueprint(production_bp)
 app.register_blueprint(pos_bp)
+app.register_blueprint(delivery_bp)
 app.register_blueprint(inventory_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(email_bp)
