@@ -369,8 +369,13 @@ def _cron(monkeypatch, pending, reader_rc=0, deps_ok=True):
     import subprocess
     import cowork_graph_scan as G
     calls = []
-    monkeypatch.setattr(G.urllib.request, "urlopen", lambda req, timeout=0: _Resp(
-        {"ok": True, "last_count_at": "2026-10-13T14:26:49Z", "messages": pending}))
+    selftest = os.environ.get("USF_SCREENSHOT_SELFTEST") == "1"
+
+    def urlopen(req, timeout=0):
+        assert ("pending_only=0" in req.full_url) == selftest
+        return _Resp({"ok": True, "last_count_at": "2026-10-13T14:26:49Z",
+                      "messages": pending})
+    monkeypatch.setattr(G.urllib.request, "urlopen", urlopen)
 
     def run(cmd, **kw):
         calls.append(cmd)
@@ -380,6 +385,14 @@ def _cron(monkeypatch, pending, reader_rc=0, deps_ok=True):
     monkeypatch.setattr(subprocess, "run", run)
     rc = G._run_screenshot_ocr("https://app", "tok", dry_run=False)
     return rc, calls
+
+
+def test_cron_self_test_rereads_counted_replies_as_a_dry_run(monkeypatch):
+    monkeypatch.setenv("USF_SCREENSHOT_SELFTEST", "1")
+    rc, calls = _cron(monkeypatch, [{"images": [{"name": "image001.png"}]}])
+    assert rc == 0
+    reader = calls[-1]
+    assert "--all" in reader and "--commit" not in reader
 
 
 def test_cron_does_nothing_when_no_reply_is_pending(monkeypatch):

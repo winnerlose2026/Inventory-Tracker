@@ -598,9 +598,17 @@ def _run_screenshot_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
     OCR deps are installed and the reader run only when something is."""
     import subprocess
     rc = 0
+    # USF_SCREENSHOT_SELFTEST=1 (cron env): re-read the replies already
+    # counted, as a DRY RUN -- proves the on-demand install and the OCR fit
+    # this instance without waiting for Tom's next reply. Changes nothing.
+    selftest = os.environ.get("USF_SCREENSHOT_SELFTEST", "").strip() == "1"
+    if selftest:
+        dry_run = True
+        print("usf-screenshots: SELF-TEST -- re-reading counted replies, dry run")
     for wh in SCREENSHOT_WAREHOUSES:
         q = urllib.parse.urlencode({"warehouse": wh, "lookback_days": 10,
-                                    "pending_only": 1, "meta_only": 1})
+                                    "pending_only": 0 if selftest else 1,
+                                    "meta_only": 1})
         try:
             req = urllib.request.Request(
                 f"{app_url}/api/email/usf-screenshots?{q}", method="GET",
@@ -632,6 +640,8 @@ def _run_screenshot_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
                 continue
         cmd = [sys.executable, str(HERE / "usf_screenshot_ocr.py"),
                "--warehouse", wh, "--lookback-days", "10"]
+        if selftest:
+            cmd.append("--all")
         if not dry_run:
             cmd.append("--commit")
         try:
