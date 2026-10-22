@@ -1051,7 +1051,11 @@ def api_forecast_decrement_daily():
             continue
         if e.get("reversed"):
             continue
-        ts = (e.get("timestamp") or "")[:10]
+        # Keyed on the day the burn is FOR (forecast_date), not the day it was
+        # written: a backfill call with {"date": <missed day>} made before the
+        # 05:05 run stamped today's timestamp, and today's real burn then
+        # skipped as "already done". Rows predating forecast_date fall back.
+        ts = (e.get("forecast_date") or e.get("timestamp") or "")[:10]
         if not ts:
             continue
         have_today.add((e.get("item_key") or "", ts))

@@ -1001,6 +1001,16 @@ def _rollover_on_order(inv: dict) -> bool:
                 # whatever its dates say.
                 kept.append(entry)
                 continue
+            if entry.get("rebooked_after_count") and gate != "delivered":
+                # Re-sent after a count already absorbed this PO's earlier
+                # delivery (sync_inventory._apply_events). A genuine new
+                # shipment (Houston 393072B2) and a duplicate copy look the
+                # same, so it waits for an operator ship / arrival date
+                # (/api/on-order/ship-date clears the flag) or a Lineage
+                # delivery confirmation. The flag used to be write-only and
+                # the copy rolled in a second time on its ETA.
+                kept.append(entry)
+                continue
             if gate == "delivered" and delivered_at is not None:
                 trigger = delivered_at
             if trigger is None:
@@ -1519,8 +1529,22 @@ def _record_usage(key: str, display_name: str, amount: float,
     save_usage(usage)
 
 
-def reverse_usage(timestamp: str) -> dict:
-    """Reverse a usage/restock entry identified by its ISO timestamp.
+_REVERSE_PO_ROW_SOURCES = ("on_order_rollover", "on_order_absorbed",
+                           "arrived-po-adjust")
+_REVERSE_PO_ROW_ERROR = (
+    "This entry is a PO receipt. Use Reopen (it hasn't arrived) or tick the "
+    "PO's row and Adjust it (wrong arrival date or quantity) on the Pending "
+    "POs tab -- those keep the PO, the count and on-hand consistent.")
+_REVERSE_COUNT_ROW_ERROR = (
+    "This entry is a distributor count. A count is corrected by the next "
+    "report, or by editing the SKU's quantity (recorded as a manual "
+    "correction) -- reversing it would leave the count stamped as applied.")
+
+
+def reverse_usage(timestamp: str, item_key: Optional[str] = None,
+                  amount=None, po_number: Optional[str] = None) -> dict:
+    """Reverse a usage/restock entry identified by its ISO timestamp, plus its
+    item_key / amount / po_number.
 
     Effects:
       - Inverts the original entry's effect on item quantity (clamped at 0).
@@ -1529,21 +1553,59 @@ def reverse_usage(timestamp: str) -> dict:
         shows up in the activity log.
       - Refuses to double-reverse, reverse a reversal record, or operate on
         a missing item.
+
+    The timestamp alone does NOT identify a row: every scan, rollover pass and
+    daily burn stamps one `now` on all the rows it writes (live 2026-10-22:
+    21,461 rows over 424 timestamps), and taking the first match reversed
+    Riviera Beach Plain when the operator clicked Zebulon Onion. The match must
+    now be unique, or nothing is reversed.
+
+    PO rows (rollover / absorbed / adjust / PO reversal audit) and count rows
+    are refused: undoing one here skips the count-absorption rule and leaves
+    the PO and count records inconsistent -- Reopen / Adjust handle those.
     """
     inv = load_inventory()
     usage = load_usage()
 
-    target = None
-    for entry in usage:
-        if entry.get("timestamp") == timestamp:
-            target = entry
-            break
-    if target is None:
+    cands = [e for e in usage if e.get("timestamp") == timestamp]
+    if item_key:
+        cands = [e for e in cands if (e.get("item_key") or "") == item_key]
+    if amount is not None:
+        try:
+            amt_f = float(amount)
+            cands = [e for e in cands
+                     if abs(float(e.get("amount") or 0) - amt_f) < 1e-6]
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "amount must be a number."}
+    if po_number:
+        cands = [e for e in cands if (e.get("po_number") or "") == po_number]
+    if not cands:
         return {"ok": False, "error": "Activity entry not found."}
+    if len(cands) > 1:
+        # Identical twins (same SKU, amount, PO): only a live one can be undone.
+        live = [e for e in cands if not e.get("reversed")]
+        if len(live) == 1:
+            cands = live
+        elif not live:
+            return {"ok": False, "error": "This entry has already been reversed."}
+        else:
+            return {"ok": False,
+                    "error": (f"{len(cands)} activity entries match that "
+                              "timestamp -- refusing to guess which one to "
+                              "reverse. Reload the Activity log and try again.")}
+    target = cands[0]
     if target.get("reversed"):
         return {"ok": False, "error": "This entry has already been reversed."}
     if target.get("source") == "reversal":
         return {"ok": False, "error": "Cannot reverse a reversal record."}
+    if (target.get("source") in _REVERSE_PO_ROW_SOURCES
+            or target.get("po_number") or "reversal_of_revision" in target):
+        return {"ok": False, "error": _REVERSE_PO_ROW_ERROR}
+    _note = str(target.get("note") or "")
+    if (target.get("source") == "vendor-truth"
+            or _note.startswith("Email on-hand sync")
+            or _note.startswith("Synced from ")):
+        return {"ok": False, "error": _REVERSE_COUNT_ROW_ERROR}
 
     key = target.get("item_key", "")
     if key not in inv:

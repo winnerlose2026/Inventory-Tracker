@@ -15,6 +15,28 @@ def _norm_po_key(s: str) -> str:
     return t.strip().strip(".").strip()
 
 
+def row_superseded(e: dict) -> bool:
+    """Has a newer copy of this row's PO retired it?
+
+    ``sync_inventory._reverse_po_entries`` stamps ``superseded_by_revision``
+    with the NEW document's revision -- which is "" for every Cheney PO (they
+    carry no revision number) -- and ``superseded_at`` with the time. Testing
+    the revision tag's truthiness left a retired Cheney row LIVE: PO
+    014511743693 (Riviera Beach) was re-applied 2026-08-28, its 08-28 arrival
+    rows kept reading as receipts next to the 09-05 re-arrival, and the ledger
+    showed 336 cs for a 168 cs PO. Either stamp retires the row.
+    """
+    return bool(e.get("superseded_by_revision") or e.get("superseded_at"))
+
+
+def is_po_reversal_row(e: dict) -> bool:
+    """Is this the audit row _reverse_po_entries appends when a newer PO copy
+    takes an arrival back out of on-hand? Identified by the KEY, because the
+    value is the reversed row's revision -- "" on every Cheney PO, which read
+    as "not a reversal" and let the +cs audit row count as a booked receipt."""
+    return "reversal_of_revision" in e
+
+
 def rollover_row_live(e: dict) -> bool:
     """Is this usage row a LIVE on_order_rollover receipt?
 
@@ -37,7 +59,7 @@ def rollover_row_live(e: dict) -> bool:
     """
     if (e.get("source") or "") != "on_order_rollover":
         return False
-    return not e.get("reversed") and not e.get("superseded_by_revision")
+    return not e.get("reversed") and not row_superseded(e)
 
 
 def absorbed_row_live(e: dict) -> bool:
@@ -52,7 +74,7 @@ def absorbed_row_live(e: dict) -> bool:
     """
     if (e.get("source") or "") != "on_order_absorbed":
         return False
-    return not e.get("reversed") and not e.get("superseded_by_revision")
+    return not e.get("reversed") and not row_superseded(e)
 
 
 def absorbed_row_qty(e: dict) -> float:

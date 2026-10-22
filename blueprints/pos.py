@@ -60,6 +60,30 @@ def _cw_po_summary(record: dict) -> dict:
     }
 
 
+def _booked_eta(entry: dict, distributor: str) -> str:
+    """The ETA the PO was booked with -- sync_inventory._apply_po_on_order's
+    rule: the later of the PO date and the day its email arrived, plus the
+    entry's lead_days (30 for US Foods / Cheney, none for everyone else, who
+    wait for a ship date). Used when a ship date is cleared."""
+    from datetime import timedelta
+    from sync_inventory import _AUTO_ETA_DISTRIBUTORS, _po_lead_days
+    from integrations.po_revision import parse_dt
+    if "lead_days" in entry:
+        lead = int(entry.get("lead_days") or 0)
+    else:                                   # legacy row without the field
+        lead = _po_lead_days() if distributor in _AUTO_ETA_DISTRIBUTORS else 0
+    if lead <= 0:
+        return ""
+    try:
+        anchor = _naive_dt(entry.get("ordered_at") or "")
+    except ValueError:
+        return ""                           # no usable date: wait for an operator
+    rcv = parse_dt(entry.get("source_received_at") or "")
+    if rcv is not None and rcv.date() > anchor.date():
+        anchor = datetime.combine(rcv.date(), datetime.min.time())
+    return (anchor + timedelta(days=lead)).isoformat()
+
+
 @pos_bp.route("/api/on-order/ship-date", methods=["POST"])
 @with_data_lock
 def api_on_order_ship_date():
@@ -153,6 +177,10 @@ def api_on_order_ship_date():
             if (entry.get("po_number") or "") != po_number:
                 continue
             entry["ship_date"] = ship_iso
+            if ship_iso:
+                # An operator giving the ship date is the confirmation a
+                # re-sent-after-count PO waits for (see _rollover_on_order).
+                entry.pop("rebooked_after_count", None)
             if ship_iso and not arrival_explicit:
                 arrival_iso, transit_days, transit_basis = LT.estimate_arrival(
                     ship_iso, item.get("distributor") or "",
@@ -163,8 +191,16 @@ def api_on_order_ship_date():
             elif not ship_iso:
                 for k in ("transit_days", "transit_basis"):
                     entry.pop(k, None)
-                if (entry.get("arrival_source") or "") in LT.DERIVED_SOURCES:
+                # Clearing must undo what setting did. Setting overwrote `eta`
+                # with the ship+transit (or operator) arrival and stamped
+                # arrival_source="operator"; leaving both meant a cleared PO
+                # still rolled into on-hand on the cleared date, and the
+                # operator stamp bypassed the Lineage hold for good. Restore
+                # the booking-time ETA (Lineage-set dates are left alone).
+                _src = entry.get("arrival_source") or ""
+                if _src in LT.DERIVED_SOURCES or _src == "operator":
                     entry.pop("arrival_source", None)
+                    entry["eta"] = _booked_eta(entry, item.get("distributor") or "")
             entry["arrival_date"] = arrival_iso
             if ship_iso and not arrival_explicit:
                 entry["eta"] = arrival_iso
@@ -318,8 +354,29 @@ def api_pending_reopen():
             "reverses_timestamp": e.get("timestamp") or "",
         })
         restored += 1
+    delivery_status = None
     if restored:
         usage.extend(new_rows)
+        # A Lineage-CONFIRMED delivery would roll the restored lines straight
+        # back on the next read (_delivery_gate -> "delivered"): Reopen
+        # reported "back to pending" and silently did nothing. Reopening the
+        # PO reopens its delivery record too, so the gate HOLDS until a new
+        # confirmation or an operator arrival date.
+        from datetime import timezone as _tz
+        from inventory_tracker import load_po_delivery, save_po_delivery
+        from integrations.po_delivery import norm_po, reopen_delivered
+        try:
+            tracking = load_po_delivery() or {}
+        except Exception as exc:  # noqa: BLE001 -- never block a reopen on it
+            _log_exc(exc, "reopen: po_delivery")
+            tracking = {}
+        trk = tracking.get(norm_po(po_number))
+        if trk and trk.get("status") == "delivered":
+            tracking[norm_po(po_number)] = reopen_delivered(
+                trk, datetime.now(_tz.utc),
+                note=f"Reopened from Pending POs ({restored} line(s))")
+            delivery_status = tracking[norm_po(po_number)].get("status")
+            save_po_delivery(tracking)
         save_inventory(inv)
         save_usage(usage)
     return jsonify({
@@ -328,6 +385,7 @@ def api_pending_reopen():
         "source": source,
         "restored_lines": restored,
         "removed_cs": round(removed_cs, 2),
+        "delivery_reopened": delivery_status,
         "error": None if restored else "No rolled-over lines found for this PO",
     })
 
@@ -429,7 +487,10 @@ def api_arrived_po_adjust():
         if q < 0:
             return jsonify({"ok": False,
                             "error": f"qty for {k} cannot be negative"}), 400
-        qty_by_key[k] = q
+        # SUMMED per SKU: the Pending tab sends one input per ledger line, and
+        # a split-line PO (Riviera Beach 014511649940 Poppy 48 + 32) has two
+        # lines for one SKU. Last-wins kept 32 and wrote it onto BOTH rows.
+        qty_by_key[k] = qty_by_key.get(k, 0.0) + q
 
     if arrival_iso is None and ship_iso is None and not qty_by_key:
         return jsonify({"ok": False,
@@ -475,6 +536,25 @@ def api_arrived_po_adjust():
                                  " - adding new lines is a PO revision, not "
                                  "an adjustment"}), 400
 
+    # A received quantity is a per-SKU TOTAL. Move only the difference, onto
+    # the newest live row of that SKU (spilling onto older rows only when a
+    # reduction exceeds it, never below 0). Writing the same N onto every row
+    # of a split-line SKU recorded 2N.
+    new_row_qty: dict = {}
+    for k, target in qty_by_key.items():
+        krows = [e for e in rows if (e.get("item_key") or "") == k]
+        delta_k = target - sum(abs(float(e.get("amount") or 0)) for e in krows)
+        newest_first = [e for _i, e in sorted(
+            enumerate(krows), key=lambda t: (t[1].get("timestamp") or "", t[0]),
+            reverse=True)]
+        for e in newest_first:
+            if abs(delta_k) < 1e-9:
+                break
+            q_old = abs(float(e.get("amount") or 0))
+            q_new = max(0.0, q_old + delta_k)
+            new_row_qty[id(e)] = q_new
+            delta_k -= (q_new - q_old)
+
     changes = []
     audit_rows = []
     onhand_delta_total = 0.0
@@ -514,8 +594,8 @@ def api_arrived_po_adjust():
                 else "operator"
 
         # 2) Received quantity, judged against the FINAL arrival date.
-        if ik in qty_by_key:
-            new_qty = qty_by_key[ik]
+        if id(e) in new_row_qty:
+            new_qty = new_row_qty[id(e)]
             entry["new_qty"] = new_qty
             e["amount"] = -new_qty
             e["qty_adjusted_from"] = old_qty
@@ -1047,6 +1127,8 @@ def build_po_ledger() -> list:
 
     now = datetime.now()
     canceled = load_canceled_pos() or {}
+    # Same normalised matching as sync_inventory._apply_events' canceled filter.
+    canceled_norm = {_norm_po_key(k): v for k, v in canceled.items()}
     try:
         tracking = load_po_delivery() or {}
     except Exception:  # noqa: BLE001 -- tracking is an overlay; never fatal
@@ -1089,6 +1171,9 @@ def build_po_ledger() -> list:
             r["lines"].append({"variety": _ledger_variety(item.get("name") or key),
                                "qty": qty, "unit": o.get("unit") or "cs",
                                "item_key": key})
+            if o.get("rebooked_after_count"):
+                # Held out of on-hand until confirmed (_rollover_on_order).
+                r["rebooked_after_count"] = o["rebooked_after_count"]
 
     # 2) arrived USF/Cheney -- usage rollover rows grouped by PO
     meta = {k: {"distributor": it.get("distributor") or "",
@@ -1242,16 +1327,42 @@ def build_po_ledger() -> list:
             r.pop("transit_days", None)
             r.pop("transit_basis", None)
         ov = overrides.get(_norm_po_key(po)) or overrides.get(po)
-        if r["_canceled"] or po in canceled or ov in ("cancelled", "canceled"):
+        _cx = canceled.get(po)
+        if _cx is None:
+            _cx = canceled_norm.get(_norm_po_key(po))
+        if _cx is not None and not isinstance(_cx, dict):
+            _cx = {}                    # legacy entry: canceled, no details
+        # "In transit" means it has SHIPPED: a ship date still in the future
+        # (Chicago 7402733Y / Alcoa 7236706H on 10-22, shipping 10-23) is
+        # pending. The Pending tab computes its own In Production / In Transit
+        # display; this is what the planner and the ledger API read.
+        _shipped = _date_le(r.get("ship_date"), now)
+        if r["_canceled"] or ov in ("cancelled", "canceled"):
+            status = "canceled"
+        elif _cx is not None and r["_arrived"]:
+            # Canceled after part (or all) of it ARRIVED. The arrived lines are
+            # real cases in on-hand -- calling the PO "canceled" said they were
+            # not. Show it as arrived with only its arrived lines (remove-po
+            # dropped the pending ones) and flag the canceled remainder.
+            status = "arrived"
+            _rm = _cx.get("removed_rows") or []
+            r["canceled_remainder"] = {
+                "canceled_at": _cx.get("canceled_at") or "",
+                "reason": _cx.get("reason") or "",
+                "removed_entries": _cx.get("removed_entries"),
+                "removed_cs": round(sum(float((x.get("entry") or {}).get("qty") or 0)
+                                        for x in _rm), 2) if _rm else None,
+            }
+        elif _cx is not None:
             status = "canceled"
         elif ov:
             status = ov
         elif r["_pending"] and r["_arrived"]:
             # Partially rolled: the pending lines are still on order.
-            status = "in_transit" if r.get("ship_date") else "pending"
+            status = "in_transit" if _shipped else "pending"
         elif r["_arrived"] or (not held and _date_le(r.get("arrival_date"), now)):
             status = "arrived"
-        elif r.get("ship_date"):
+        elif _shipped:
             status = "in_transit"
         else:
             status = "pending"

@@ -217,12 +217,20 @@ def api_usage():
 @inventory_bp.route("/api/usage/reverse", methods=["POST"])
 @with_data_lock
 def api_usage_reverse():
-    """Undo a single usage/restock entry by its timestamp."""
+    """Undo a single usage/restock entry.
+
+    Body: {timestamp, item_key, amount, po_number?}. A timestamp alone is
+    ambiguous (one scan / burn stamps the same `now` on every row it writes),
+    so the row is matched on all four and refused unless exactly one matches.
+    """
     d = request.json or {}
     ts = (d.get("timestamp") or "").strip()
     if not ts:
         return jsonify({"ok": False, "error": "timestamp required"}), 400
-    result = reverse_usage(ts)
+    result = reverse_usage(ts,
+                           item_key=(d.get("item_key") or "").strip() or None,
+                           amount=d.get("amount"),
+                           po_number=(d.get("po_number") or "").strip() or None)
     return jsonify(result)
 
 

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from typing import Iterable
 
 from core.util import rollover_row_live, _norm_po_key
+from core.util import row_superseded, is_po_reversal_row, with_data_lock
 from integrations import (
     CheneyBrothersClient, USFoodsClient,
     DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
@@ -279,7 +280,7 @@ def _find_local_key(inv: dict, item: SyncItem) -> str | None:
 
 
 def _sync_one(client: DistributorClient, inv: dict, usage: list,
-              dry_run: bool) -> dict:
+              dry_run: bool, prefetched=None) -> dict:
     report = {
         "distributor": client.name,
         "source": "live" if client._has_live_credentials() else "csv",
@@ -292,8 +293,13 @@ def _sync_one(client: DistributorClient, inv: dict, usage: list,
         "error": None,
     }
 
+    if isinstance(prefetched, NotConfiguredError):
+        report["status"] = "not_configured"
+        report["error"] = str(prefetched)
+        return report
     try:
-        items: Iterable[SyncItem] = client.fetch_inventory()
+        items: Iterable[SyncItem] = (prefetched if prefetched is not None
+                                     else client.fetch_inventory())
     except NotConfiguredError as e:
         report["status"] = "not_configured"
         report["error"] = str(e)
@@ -376,12 +382,23 @@ def sync_all(clients: list[DistributorClient] | None = None,
              dry_run: bool = False) -> list[dict]:
     if clients is None:
         clients = [CheneyBrothersClient(), USFoodsClient()]
-    inv = load_inventory()
-    usage = load_usage()
-    reports = [_sync_one(c, inv, usage, dry_run) for c in clients]
-    if not dry_run:
-        save_inventory(inv)
-        save_usage(usage)
+    # Fetch first (a live distributor API is network I/O), then load -> apply
+    # -> save under data_lock so /api/sync can't overwrite a concurrent writer.
+    fetched = []
+    for c in clients:
+        try:
+            fetched.append(list(c.fetch_inventory()))
+        except NotConfiguredError as e:
+            fetched.append(e)
+    from inventory_tracker import data_lock
+    with data_lock():
+        inv = load_inventory()
+        usage = load_usage()
+        reports = [_sync_one(c, inv, usage, dry_run, prefetched=f)
+                   for c, f in zip(clients, fetched)]
+        if not dry_run:
+            save_inventory(inv)
+            save_usage(usage)
     return reports
 
 
@@ -441,10 +458,11 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple:
     for idx, entry in enumerate(usage):
         if entry.get("po_number") != po_number:
             continue
-        if entry.get("superseded_by_revision"):
+        if row_superseded(entry):
             continue
-        if entry.get("reversal_of_revision"):
+        if is_po_reversal_row(entry):
             # Reversal audit rows aren't themselves "applied restock" — skip.
+            # (By key: a Cheney row's reversal_of_revision is "".)
             continue
         if entry.get("reversed"):
             # Un-rolled by Reopen (or a true-up): its cases are already out of
@@ -470,6 +488,11 @@ def _highest_applied_rev(usage: list, po_number: str) -> tuple:
     return highest, indices, best_rev, best_received, best_sender
 
 
+#: Revision tag stored on rows retired by a PO copy that has no revision
+#: number (every Cheney PO). Must be non-empty -- see _reverse_po_entries.
+NO_REV_TAG = "(no rev)"
+
+
 def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
                         inv: dict, usage: list, now: str, report: dict,
                         dry_run: bool) -> None:
@@ -477,7 +500,10 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
     can replace them. Inventory on-hand is rolled back; entries are marked
     with superseded_by_revision=<new_rev>; a mirror reversal entry is
     appended for audit."""
-    new_rev_tag = str(new_rev or "")
+    # Never an empty tag: Cheney POs carry no revision number, and an empty
+    # superseded_by_revision read as "still live" everywhere (PO 014511743693,
+    # 2026-08-28 -- see core.util.row_superseded).
+    new_rev_tag = str(new_rev or "") or NO_REV_TAG
     for idx in active_indices:
         entry = usage[idx]
         key = entry.get("item_key", "")
@@ -756,7 +782,7 @@ def _booked_skus_for_po(inv: dict, usage: list, po_number: str) -> set:
     for entry in usage:
         if entry.get("po_number") != po_number:
             continue
-        if entry.get("superseded_by_revision") or entry.get("reversal_of_revision"):
+        if row_superseded(entry) or is_po_reversal_row(entry):
             continue
         if entry.get("reversed") or entry.get("source") in _NOT_APPLIED_RESTOCK_SOURCES:
             continue
@@ -839,7 +865,7 @@ def _booked_content_for_po(inv: dict, usage: list, po_number: str) -> dict:
     for row in usage:
         if row.get("po_number") != po_number:
             continue
-        if (row.get("superseded_by_revision") or row.get("reversal_of_revision")
+        if (row_superseded(row) or is_po_reversal_row(row)
                 or row.get("reversed")
                 or row.get("source") in _NOT_APPLIED_RESTOCK_SOURCES):
             continue
@@ -1161,6 +1187,9 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     usage.append(entry)
 
 
+# Under data_lock: load -> merge -> save of chefs_warehouse_pos.json must not
+# interleave with the CW ship-date / cancel endpoints (which hold the lock).
+@with_data_lock
 def _apply_cw_pos(cw_pos: list,
                   dry_run: bool = False,
                   source: str = "Email Inbox") -> dict:
@@ -1310,6 +1339,16 @@ def _apply_cw_pos(cw_pos: list,
     return report
 
 
+# Under data_lock, load through save. The scan / ingest-events / Cheney-CSV
+# routes only held _ingest_lock (which serialises ingests against EACH OTHER),
+# so the 05:05 forecast burn, an operator's ship date / Adjust / Reopen, a
+# delivery confirmation or a GET-triggered rollover landing mid-apply was
+# overwritten by this function's stale snapshot -- e.g. the burn's ledger rows
+# survived but its on-hand decrement vanished, and the burn never re-ran
+# because its rows existed. Callers do the Graph fetch BEFORE calling this, so
+# the lock is never held across network I/O. Lock order is always
+# _ingest_lock -> data_lock (and _ingest_lock never blocks).
+@with_data_lock
 def _apply_events(events: list,
                   messages_seen: int = 0,
                   messages_parsed: int = 0,

@@ -94,7 +94,9 @@ def test_tz_aware_ship_date_does_not_break_every_read():
             assert c.get(path, headers=H).status_code == 200, path
         led = c.get("/api/pos/ledger", headers=H).get_json()
         po = next(p for p in led["pos"] if p["po_number"] == "9999991O")
-        assert po["status"] == "in_transit"
+        # Ship date 10 days out: not shipped yet, so pending (2026-10-22 --
+        # "in_transit" now means the ship date has passed).
+        assert po["status"] == "pending"
 
 
 def test_admin_po_order_date_accepts_z_and_marks_operator():

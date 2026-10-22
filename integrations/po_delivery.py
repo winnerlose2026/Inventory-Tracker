@@ -326,6 +326,32 @@ def record_chase(rec: dict, ask: str, now: datetime, message_id: str = "") -> di
     return rec
 
 
+def reopen_delivered(rec: dict, now: datetime, note: str = "") -> dict:
+    """An operator reopened a PO whose delivery was confirmed: undo the
+    confirmation so the rollover gate HOLDS the PO again (Pending POs Reopen;
+    before this, the restored lines rolled straight back on the next read).
+
+    Status goes back to "scheduled" if an appointment was on file, else
+    "requested"; delivered_at is cleared; the old confirmation is kept in the
+    history entry so it can be audited. ``now`` is aware UTC. No-op unless the
+    record is "delivered".
+    """
+    rec = dict(rec or {})
+    if rec.get("status") != "delivered":
+        return rec
+    new_status = "scheduled" if rec.get("delivery_appt") else "requested"
+    entry = {"event": "reopened", "by": "operator", "at": now.isoformat(),
+             "status": new_status, "delivered_at": "",
+             "reopened_delivered_at": rec.get("delivered_at") or "",
+             "note": str(note or "")[:300],
+             "evidence": {"message_id": "", "sender": "", "sent": "", "quote": ""}}
+    rec["status"] = new_status
+    rec["delivered_at"] = ""
+    rec["events"] = (list(rec.get("events") or []) + [entry])[-60:]
+    rec["updated"] = now.isoformat()
+    return rec
+
+
 def _last_chase(rec: dict) -> Optional[datetime]:
     ts = [parse_dt(c.get("at") or "") for c in rec.get("chases") or []]
     ts = [t for t in ts if t]

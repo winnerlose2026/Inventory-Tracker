@@ -326,13 +326,22 @@ function renderActivityRow(e, _colspan) {
   const noteHtml = escHtml(e.note || '')
     + (alreadyReversed ? ' <span class="badge badge-yellow" style="margin-left:6px">reversed</span>' : '');
 
+  // PO receipts and distributor counts are corrected on the Pending POs tab
+  // (Reopen / Adjust) or by the next count -- the server refuses them here.
+  const poOrCountRow = ['on_order_rollover', 'on_order_absorbed', 'arrived-po-adjust', 'vendor-truth'].includes(e.source)
+    || !!e.po_number || ('reversal_of_revision' in e)
+    || /^(Email on-hand sync|Synced from )/.test(e.note || '');
   let actionHtml = '';
   if (isReversal) {
     actionHtml = '<span style="color:var(--muted);font-size:11px">—</span>';
   } else if (alreadyReversed) {
     actionHtml = '<span style="color:var(--muted);font-size:11px">—</span>';
+  } else if (poOrCountRow) {
+    actionHtml = '<span style="color:var(--muted);font-size:11px" title="PO receipts: Reopen / Adjust on the Pending POs tab. Counts: corrected by the next report or a quantity edit.">—</span>';
   } else {
-    actionHtml = `<button class="btn btn-ghost btn-sm" onclick="reverseActivity('${escAttr(e.timestamp)}')" title="Undo this entry">↶ Reverse</button>`;
+    // Timestamp alone is shared by every row of one scan / burn; send the
+    // SKU and amount (and PO) so the server reverses THIS row or none.
+    actionHtml = `<button class="btn btn-ghost btn-sm" onclick="reverseActivity('${escAttr(e.timestamp)}', '${escAttr(e.item_key || '')}', ${Number(e.amount) || 0}, '${escAttr(e.po_number || '')}')" title="Undo this entry">↶ Reverse</button>`;
   }
 
   const rowStyle = (alreadyReversed || isReversal)
@@ -348,12 +357,13 @@ function renderActivityRow(e, _colspan) {
   </tr>`;
 }
 
-async function reverseActivity(timestamp) {
+async function reverseActivity(timestamp, itemKey, amount, poNumber) {
   if (!timestamp) return;
   if (!confirm('Reverse this entry? This will undo its effect on inventory and add a reversal record to the log.')) return;
   let res;
   try {
-    res = await api('/api/usage/reverse', 'POST', { timestamp });
+    res = await api('/api/usage/reverse', 'POST', {
+      timestamp, item_key: itemKey || '', amount, po_number: poNumber || '' });
   } catch (err) {
     toast('Reverse failed: ' + String(err), 'error');
     return;
@@ -2428,6 +2438,25 @@ function _poTagHtml(state) {
   return `<span class="badge ${t.cls}" style="font-size:10px">${t.label}</span>`;
 }
 
+// Ledger flags shown next to the status tag:
+//  - rebooked_after_count: the PO was re-sent after a count already absorbed
+//    its earlier delivery; the server holds it out of on-hand until someone
+//    confirms it is a new shipment by setting its ship date.
+//  - canceled_remainder: canceled after part of it arrived; the arrived lines
+//    stay (they are real stock), the rest was canceled.
+function _poFlagsHtml(g) {
+  let h = '';
+  if (g.rebooked_after_count) {
+    h += ` <span class="badge badge-red" style="font-size:10px;cursor:help" title="${escHtml('Held out of on-hand. A count on ' + g.rebooked_after_count + ' already included the earlier delivery of this PO.')}">Re-sent after a count — confirm it's a new shipment (set the ship date to confirm)</span>`;
+  }
+  if (g.canceled_remainder) {
+    const c = g.canceled_remainder;
+    const cs = (c.removed_cs === null || c.removed_cs === undefined) ? '' : ` (${Number(c.removed_cs).toFixed(0)} cs)`;
+    h += ` <span class="badge badge-gray" style="font-size:10px;cursor:help" title="${escHtml('Canceled ' + (c.canceled_at || '').slice(0, 10) + (c.reason ? ': ' + c.reason : '') + '. The lines shown arrived and are in on-hand.')}">Rest canceled${cs}</span>`;
+  }
+  return h;
+}
+
 // Parse a stored date (ISO date or datetime) to a local midnight Date.
 function _poDate(s) {
   const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -2534,6 +2563,8 @@ function _groupsFromLedger(records) {
                                          item_key: L.item_key || '',
                                          arrived: !!L.arrived })),
       partial: !!r.partial,
+      rebooked_after_count: r.rebooked_after_count || '',
+      canceled_remainder: r.canceled_remainder || null,
       rolled_at: r.rolled_at || '',
       delivery: r.delivery || null,
       arrival_kind: r.arrival_kind || '',
@@ -2882,7 +2913,7 @@ function _pendingRowHtml(g, now) {
       <td>${shipCell}</td>
       <td style="white-space:nowrap">${arrivalCell}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
-      <td>${_poTagHtml(state)}</td>
+      <td>${_poTagHtml(state)}${_poFlagsHtml(g)}</td>
     </tr>`;
 }
 
@@ -2914,7 +2945,7 @@ function renderInProductionSection(list) {
       <td style="white-space:nowrap;font-weight:600">${ship}</td>
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-      <td>${_poTagHtml(g._state || 'in_production')}</td>
+      <td>${_poTagHtml(g._state || 'in_production')}${_poFlagsHtml(g)}</td>
     </tr>`;
   }).join('');
 }
@@ -2950,7 +2981,7 @@ function renderInTransitSection(list) {
       <td style="white-space:nowrap">${ship}</td>
       <td style="white-space:nowrap;font-weight:600">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-      <td>${_poTagHtml(g._state || 'in_transit')}</td>
+      <td>${_poTagHtml(g._state || 'in_transit')}${_poFlagsHtml(g)}</td>
     </tr>`;
   }).join('');
 }

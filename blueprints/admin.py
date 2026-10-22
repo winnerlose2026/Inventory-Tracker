@@ -104,39 +104,78 @@ def api_admin_remove_po():
     body = request.json or {}
     po_number = (body.get("po_number") or "").strip()
     reason = (body.get("reason") or "canceled by distributor").strip()
+    dry_run = bool(body.get("dry_run", False))
     if not po_number:
         return jsonify({"ok": False, "error": "po_number required"}), 400
+    from core.util import _norm_po_key
     from inventory_tracker import (
         load_inventory, save_inventory,
-        load_canceled_pos, save_canceled_pos,
+        load_canceled_pos, save_canceled_pos, append_inventory_audit,
     )
+    # Match the way sync_inventory._apply_events matches the canceled list
+    # (normalised). Exact matching here removed nothing for "hhb-7500000o"
+    # while the scanner, which normalises, then ignored every later revision
+    # of 7500000O -- the stale booking stayed pending and rolled in.
+    key_norm = _norm_po_key(po_number)
     inv = load_inventory()
     removed = 0
     affected = []
+    removed_rows = []           # kept so /api/admin/uncancel-po can restore them
+    stored_po = ""
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    audit = []
     for key, item in inv.items():
         pending = item.get("on_order") or []
-        kept = [e for e in pending if (e.get("po_number") or "") != po_number]
+        kept = [e for e in pending
+                if _norm_po_key(e.get("po_number") or "") != key_norm]
         if len(kept) != len(pending):
-            removed += len(pending) - len(kept)
+            gone = [e for e in pending
+                    if _norm_po_key(e.get("po_number") or "") == key_norm]
+            removed += len(gone)
             affected.append(item.get("name", key))
-        item["on_order"] = kept
-    save_inventory(inv)
-    # Record the PO in the ignore list so the email scanner won't
-    # re-ingest it from a still-sitting source email.
-    canceled = load_canceled_pos()
-    canceled[po_number] = {
-        "canceled_at": datetime.now().isoformat(timespec="seconds"),
-        "reason":      reason,
-        "removed_entries": removed,
-        "affected_items":  affected,
-    }
-    save_canceled_pos(canceled)
+            stored_po = stored_po or (gone[0].get("po_number") or "")
+            removed_rows.extend({"item_key": key, "entry": dict(e)} for e in gone)
+            audit.append({"ts": now_iso, "source": "admin-remove-po",
+                          "name": item.get("name", key),
+                          "warehouse": item.get("warehouse", ""),
+                          "event_type": "po_removed",
+                          "old_quantity": item.get("quantity"),
+                          "new_quantity": item.get("quantity"), "delta": 0,
+                          "po_number": stored_po or po_number,
+                          "on_order_removed_cs": round(sum(
+                              float(e.get("qty") or 0) for e in gone), 2),
+                          "reason": reason})
+        if not dry_run:
+            item["on_order"] = kept
+    # Key the ignore list on the PO number as booked, so the ledger's exact
+    # lookup and the scanner's normalised one both find it.
+    canon = stored_po or key_norm
+    if not dry_run:
+        save_inventory(inv)
+        # Record the PO in the ignore list so the email scanner won't
+        # re-ingest it from a still-sitting source email.
+        canceled = load_canceled_pos()
+        canceled[canon] = {
+            "canceled_at": now_iso,
+            "reason":      reason,
+            "removed_entries": removed,
+            "affected_items":  affected,
+            "removed_rows":    removed_rows,
+        }
+        save_canceled_pos(canceled)
+        try:
+            append_inventory_audit(audit)
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
     return jsonify({
         "ok": True,
-        "po_number": po_number,
+        "dry_run": dry_run,
+        "po_number": canon,
         "removed_entries": removed,
+        "removed_cs": round(sum(float(r["entry"].get("qty") or 0)
+                                for r in removed_rows), 2),
         "affected_items": affected,
-        "added_to_ignore_list": True,
+        "added_to_ignore_list": not dry_run,
     })
 
 
@@ -289,15 +328,57 @@ def api_admin_uncancel_po():
     po_number = (body.get("po_number") or "").strip()
     if not po_number:
         return jsonify({"ok": False, "error": "po_number required"}), 400
-    from inventory_tracker import load_canceled_pos, save_canceled_pos
+    from core.util import _norm_po_key
+    from inventory_tracker import (load_canceled_pos, save_canceled_pos,
+                                   load_inventory, save_inventory,
+                                   append_inventory_audit)
     canceled = load_canceled_pos()
     prior = canceled.pop(po_number, None)
+    if prior is None:           # same normalised matching as remove-po
+        for k in [k for k in canceled if _norm_po_key(k) == _norm_po_key(po_number)]:
+            prior = canceled.pop(k)
+            break
+    # Put back the pending rows remove-po took out (recorded since 10-22), so
+    # an accidental cancel is one click to undo instead of a PO that is gone
+    # once its email ages out of the scan's 14-day lookback. A SKU that has
+    # this PO on order again (re-ingested meanwhile) is left as it is.
+    restored, now_iso, audit = 0, datetime.now().isoformat(timespec="seconds"), []
+    rows = (prior or {}).get("removed_rows") or []
+    if rows:
+        inv = load_inventory()
+        _pk = _norm_po_key(po_number)
+        rebooked = {k for k, it in inv.items()
+                    if any(_norm_po_key(p.get("po_number") or "") == _pk
+                           for p in (it.get("on_order") or []))}
+        for r in rows:
+            item = inv.get(r.get("item_key") or "")
+            entry = r.get("entry") or {}
+            if item is None or (r.get("item_key") or "") in rebooked:
+                continue
+            item.setdefault("on_order", []).append(dict(entry))
+            restored += 1
+            audit.append({"ts": now_iso, "source": "admin-uncancel-po",
+                          "name": item.get("name", r.get("item_key")),
+                          "warehouse": item.get("warehouse", ""),
+                          "event_type": "po_restored",
+                          "old_quantity": item.get("quantity"),
+                          "new_quantity": item.get("quantity"), "delta": 0,
+                          "po_number": entry.get("po_number") or po_number,
+                          "on_order_restored_cs": float(entry.get("qty") or 0)})
+        if restored:
+            save_inventory(inv)
     save_canceled_pos(canceled)
+    if audit:
+        try:
+            append_inventory_audit(audit)
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
     return jsonify({
         "ok": True,
         "po_number": po_number,
         "was_canceled": prior is not None,
         "prior_entry": prior,
+        "restored_entries": restored,
     })
 
 
@@ -311,15 +392,50 @@ def api_sync():
 
 
 @admin_bp.route("/api/seed", methods=["POST"])
+@with_data_lock
 def api_seed():
     from seed_bagels import seed
 
-    reset = bool((request.json or {}).get("reset", False))
+    body = request.json or {}
+    reset = bool(body.get("reset", False))
+    snapshot = None
+    if reset:
+        # reset=true replaces every SKU -- counts, on-hand, pending POs. It
+        # used to need nothing but the flag, and the per-SKU saves that
+        # followed rotated inventory.json.bak away, leaving no local way back.
+        if body.get("confirm") != "RESET":
+            return jsonify({"ok": False,
+                            "error": 'reset wipes every SKU, count and pending '
+                                     'PO; resend with "confirm": "RESET"'}), 400
+        try:
+            snapshot = _snapshot_data_files("pre-seed-reset")
+        except Exception as exc:  # noqa: BLE001 -- no snapshot, no reset
+            return jsonify({"ok": False,
+                            "error": "could not snapshot data before reset: "
+                                     + _safe_err(exc)}), 500
     try:
         summary = seed(reset=reset)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": _safe_err(exc)}), 200
-    return jsonify({"ok": True, **summary})
+    return jsonify({"ok": True, **summary,
+                    **({"snapshot": snapshot} if snapshot else {})})
+
+
+def _snapshot_data_files(tag: str) -> dict:
+    """Copy inventory.json + usage.json to data/backups/<name>-<ts>-<tag>.json
+    before a destructive admin action. Returns {file: snapshot path}."""
+    import shutil
+    import inventory_tracker as it
+    bdir = it.DATA_DIR / "backups"
+    bdir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    out = {}
+    for src in (it.INVENTORY_FILE, it.USAGE_FILE):
+        if src.exists():
+            dst = bdir / f"{src.stem}-{ts}-{tag}.json"
+            shutil.copyfile(src, dst)
+            out[src.name] = str(dst)
+    return out
 
 
 # Fields /api/inventory adds on the way out (see blueprints/inventory.py
@@ -396,6 +512,7 @@ def api_admin_restore_inventory():
 
 
 @admin_bp.route("/api/migrate-units", methods=["POST"])
+@with_data_lock
 def api_migrate_units():
     from inventory_tracker import migrate_units_to_case
 

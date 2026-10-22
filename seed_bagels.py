@@ -38,7 +38,7 @@ Usage:
 """
 
 import sys
-from inventory_tracker import add_item, load_inventory, save_inventory
+from inventory_tracker import add_item, load_inventory, save_inventory  # noqa: F401
 
 
 # Flat case cost per distributor. Both distributors ship 5 doz (60) per case.
@@ -126,31 +126,39 @@ BAGELS = _build_bagels()
 
 
 def seed(reset: bool = False):
+    # ONE save. This used to blank the file and then add_item() each SKU with
+    # its own load+save, so inventory.json.bak (the previous file, kept by
+    # every write) was rotated 117 times and ended up holding the half-seeded
+    # catalog instead of the data a reset destroyed. Same fields as add_item.
+    from datetime import datetime
     if reset:
         print("  Resetting inventory...")
-        save_inventory({}, allow_empty=True)
-
-    existing = load_inventory()
+    inv = {} if reset else load_inventory()
     added = 0
     skipped = 0
+    now = datetime.now().isoformat()
     for b in BAGELS:
-        if b["name"].lower() in existing:
+        key = b["name"].lower().strip()
+        if key in inv:
             skipped += 1
             continue
-        add_item(
-            name=b["name"],
-            quantity=b["quantity"],
-            unit=b["unit"],
-            category=b["category"],
-            low_stock_threshold=b["threshold"],
-            price=b["price"],
-            distributor=b["distributor"],
-            warehouse=b["warehouse"],
-            case_cost=b["case_cost"],
-            case_size=b["case_size"],
-            weekly_usage=b["weekly_usage"],
-        )
+        inv[key] = {
+            "name": b["name"],
+            "quantity": b["quantity"],
+            "unit": b["unit"],
+            "category": b["category"],
+            "low_stock_threshold": b["threshold"],
+            "price": b["price"],
+            "distributor": b["distributor"],
+            "warehouse": b["warehouse"],
+            "case_cost": b["case_cost"],
+            "case_size": b["case_size"],
+            "weekly_usage": b["weekly_usage"],
+            "added": now,
+        }
         added += 1
+    if added or reset:
+        save_inventory(inv, allow_empty=reset)
 
     cheney = sum(1 for b in BAGELS if b["distributor"] == "Cheney Brothers")
     usf = sum(1 for b in BAGELS if b["distributor"] == "US Foods")
