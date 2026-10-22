@@ -42,7 +42,7 @@ from typing import Optional
 CARRIER = "Lineage"
 
 HOLD_STATUSES = ("requested", "scheduled")
-EVENTS = ("requested", "scheduled", "rescheduled", "delivered", "released")
+EVENTS = ("requested", "scheduled", "rescheduled", "picked_up", "delivered", "released")
 
 # Senders whose word can move a date. H&H's own staff only open requests.
 CARRIER_DOMAINS = ("onelineage.com", "lineagelogistics.com")
@@ -232,13 +232,17 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     if kind not in EVENTS:
         return rec, None, f"event must be one of {EVENTS}"
     evid = _evidence(ev)
+    rec_in = rec
     rec = dict(rec) if rec else new_record(po)
     rec.setdefault("events", [])
     rec.setdefault("chases", [])
     old = {k: rec.get(k, "") for k in
            ("status", "delivery_appt", "pickup_at", "delivered_at", "confirmation_no")}
 
-    if kind in ("scheduled", "rescheduled", "delivered"):
+    if kind == "picked_up" and not rec_in:
+        return rec_in, None, ("PO isn't tracked yet -- a pickup is recorded on a PO "
+                              "Lineage has a request, schedule or delivery for")
+    if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
         if not evid["quote"]:
             return rec, None, "evidence.quote required (the line that says it)"
         if not sender_may_report(evid["sender"]):
@@ -276,6 +280,19 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
             rec["pickup_at"] = str(ev["pickup_at"]).strip()
         if ev.get("confirmation_no"):
             rec["confirmation_no"] = str(ev["confirmation_no"]).strip()[:40]
+    elif kind == "picked_up":
+        # When the truck actually left Woodside (Lineage: "picked up
+        # 1556PM/13th"). Doesn't change status; it is the start of the
+        # lead-time measurement (integrations/lead_times.py).
+        at = parse_dt(ev.get("pickup_at") or "")
+        if at is None:
+            return rec, None, "pickup_at must be an ISO date/datetime"
+        if at > now + DELIVERED_FUTURE_SLACK:
+            return rec, None, f"pickup_at {ev.get('pickup_at')} is in the future"
+        dl = parse_dt(rec.get("delivered_at") or "")
+        if dl and at > dl:
+            return rec, None, "pickup_at is after the confirmed delivery"
+        rec["pickup_at"] = str(ev["pickup_at"]).strip()
     elif kind == "delivered":
         at = parse_dt(ev.get("delivered_at") or "")
         if at is None:

@@ -689,8 +689,13 @@ def rederive_estimated_arrivals(dry_run: bool = False, model: dict = None) -> di
     def _redo(entry, distributor, warehouse, where):
         if not LT.arrival_is_derived(entry):
             return False
-        ship = (idx.get(_norm_po_key(entry.get("po_number") or "")) or
-                entry.get("ship_date") or "")
+        # Same order as the samples: a Lineage-reported pickup, then the
+        # freight invoice, then whatever ship date the row carries.
+        if (entry.get("ship_date_source") or "") == "lineage" and entry.get("ship_date"):
+            ship = entry["ship_date"]
+        else:
+            ship = (idx.get(_norm_po_key(entry.get("po_number") or "")) or
+                    entry.get("ship_date") or "")
         if not ship:
             return False
         cur = (entry.get("arrival_date") or "").strip()

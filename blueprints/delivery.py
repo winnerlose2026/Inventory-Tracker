@@ -103,6 +103,10 @@ def _apply_to_inventory(po_key: str, rec: dict) -> dict:
                 e["arrival_date"] = local
                 e["eta"] = local
                 e["arrival_source"] = "lineage-delivered"
+            if (rec.get("pickup_at") and st != "delivered"
+                    and e.get("ship_date_source") != "freight"):
+                e["ship_date"] = wall_time(rec["pickup_at"])
+                e["ship_date_source"] = "lineage"
             if e != before:
                 updated += 1
                 if item.get("name") not in items:
@@ -433,11 +437,11 @@ def api_delivery_events():
             kind = str(ev.get("event") or "").strip().lower()
             if limited:
                 ev.pop("force", None)
-                if kind not in ("scheduled", "rescheduled", "delivered"):
+                if kind not in ("scheduled", "rescheduled", "picked_up", "delivered"):
                     results.append({"po_number": ev.get("po_number"), "applied": False,
                                     "reason": f"'{kind}' isn't allowed with the delivery key"})
                     continue
-            if kind in ("scheduled", "rescheduled", "delivered"):
+            if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
                 ev, why = _verify_evidence(ev, key, cache)
                 if why:
                     results.append({"po_number": ev.get("po_number"), "applied": False,

@@ -8,9 +8,9 @@ capacity crunch, Houston took 3 (Fri pickup -> Mon 8:00 AM appointment).
 
 A *sample* is one PO whose delivery Lineage (or the receiving DC) CONFIRMED --
 a ``delivered`` record in data/po_delivery.json, each one tied to a quoted
-email -- paired with the date it left Woodside: the Lineage freight invoice's
-ship date (authoritative), else Lineage's pickup time, else the PO's own ship
-date. Transit = delivered date - ship date, in calendar days, both read in the
+email -- paired with the date it left Woodside: the pickup Lineage reported,
+else the Lineage freight invoice's ship date (often the booking/BOL date, a
+few days early), else the PO's own ship date. Transit = delivered date - ship date, in calendar days, both read in the
 local wall time of where they happened.
 
 Per location (distributor + DC) the model keeps every sample and a *trend*:
@@ -76,11 +76,14 @@ def collect_samples(tracking: dict, po_meta: dict, freight_idx: dict,
         meta = po_meta.get(key) or po_meta.get(norm(po)) or {}
         delivered_local = wall_time(rec.get("delivered_at") or "")
         dd = _d(delivered_local)
+        # Lineage's reported pickup first: the invoice "ship date" is often the
+        # booking / BOL date -- 305202B2 invoiced 8/14, picked up 8/17;
+        # 5903413Y invoiced 9/30, picked up 10/5 -- which would inflate transit.
         ship, ship_src = "", ""
-        if freight_idx.get(norm(po)):
-            ship, ship_src = freight_idx[norm(po)][:10], "freight invoice"
-        elif rec.get("pickup_at"):
+        if rec.get("pickup_at"):
             ship, ship_src = wall_time(rec["pickup_at"])[:10], "Lineage pickup"
+        elif freight_idx.get(norm(po)):
+            ship, ship_src = freight_idx[norm(po)][:10], "freight invoice"
         elif meta.get("ship_date"):
             ship, ship_src = str(meta["ship_date"])[:10], "PO ship date"
         sd = _d(ship)

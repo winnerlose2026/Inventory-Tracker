@@ -63,13 +63,40 @@ def test_transit_is_ship_to_confirmed_delivery_in_local_dates():
     assert s[0]["order_to_delivery_days"] == 21
 
 
-def test_freight_invoice_ship_date_wins():
+def test_lineage_pickup_beats_the_invoice_ship_date():
+    """The invoice date is often the booking/BOL date: 305202B2 was invoiced
+    with ship 8/14 but picked up 8/17 (delivered 8/21 after a breakdown)."""
     trk = {"1209205": _delivered("1209205", "2026-10-12T12:25:00-04:00",
                                  pickup="2026-10-10T09:00:00-04:00")}
     s, _ = _samples(trk, freight={"1209205": "2026-10-09"})
+    assert s[0]["ship_date"] == "2026-10-10" and s[0]["ship_source"] == "Lineage pickup"
+    assert s[0]["transit_days"] == 2
+    assert s[0]["location"] == "Bronx, NY (CW)"
+
+
+def test_invoice_ship_date_when_no_pickup_was_reported():
+    trk = {"1209205": _delivered("1209205", "2026-10-12T12:25:00-04:00")}
+    s, _ = _samples(trk, freight={"1209205": "2026-10-09"})
     assert s[0]["ship_date"] == "2026-10-09" and s[0]["ship_source"] == "freight invoice"
     assert s[0]["transit_days"] == 3
-    assert s[0]["location"] == "Bronx, NY (CW)"
+
+
+def test_pickup_event_rules():
+    rec = _delivered("305202B2", "2026-08-21T06:51:00-05:00")
+    ok = {"po_number": "305202B2", "event": "picked_up",
+          "pickup_at": "2026-08-17T10:00:00-04:00",
+          "evidence": {"message_id": "<p>", "sender": BELINDA, "sent": "2026-08-14T15:00:00Z",
+                       "quote": "The driver will arrive for pickup at 1000AM/17th Monday"}}
+    r2, change, err = D.apply_event(rec, ok, NOW)
+    assert err is None and r2["pickup_at"] == "2026-08-17T10:00:00-04:00"
+    assert r2["status"] == "delivered"                     # status unchanged
+    _, _, err = D.apply_event(rec, dict(ok, pickup_at="2026-08-22T10:00:00-04:00"), NOW)
+    assert err == "pickup_at is after the confirmed delivery"
+    _, _, err = D.apply_event(None, ok, NOW)
+    assert err and "isn't tracked" in err                   # never creates a record
+    _, _, err = D.apply_event(rec, dict(ok, evidence=dict(ok["evidence"],
+                                                          sender="isaiah@hhbagels.com")), NOW)
+    assert err and "can't report" in err
 
 
 def test_unusable_deliveries_are_reported_not_used():
