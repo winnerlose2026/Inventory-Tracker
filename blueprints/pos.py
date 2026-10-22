@@ -9,7 +9,7 @@ from flask import Blueprint, jsonify, request
 # Cross-blueprint (acyclic): the Pending POs view surfaces freight-verified
 # ship dates. freight imports only core/, so no cycle.
 from blueprints.freight import _freight_ship_date_index
-from core.errors import _safe_err
+from core.errors import _log_exc, _safe_err
 from core.util import _norm_po_key, rollover_row_live, absorbed_row_live, absorbed_row_qty
 from core.util import with_data_lock
 from inventory_tracker import (
@@ -129,9 +129,22 @@ def api_on_order_ship_date():
                 }), 400
             arrival_explicit = True
 
+    # No explicit arrival: estimate it from this location's learned transit
+    # (integrations/lead_times.py) instead of a flat 7 days.
+    model = {}
+    if ship_iso and not arrival_explicit:
+        try:
+            from blueprints.freight import current_lead_time_model
+            model = current_lead_time_model()["model"]
+        except Exception as exc:  # noqa: BLE001 -- defaults still apply
+            _log_exc(exc, "lead-time model")
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
+
     inv = load_inventory()
     updated = 0
     touched_items = []
+    transit_days, transit_basis = None, ""
     for key, item in inv.items():
         if item_key and key != item_key:
             continue
@@ -140,7 +153,21 @@ def api_on_order_ship_date():
             if (entry.get("po_number") or "") != po_number:
                 continue
             entry["ship_date"] = ship_iso
+            if ship_iso and not arrival_explicit:
+                arrival_iso, transit_days, transit_basis = LT.estimate_arrival(
+                    ship_iso, item.get("distributor") or "",
+                    item.get("warehouse") or "", model, transit_days_for)
+                entry["arrival_source"] = "ship+transit"
+                entry["transit_days"] = transit_days
+                entry["transit_basis"] = transit_basis
+            elif not ship_iso:
+                for k in ("transit_days", "transit_basis"):
+                    entry.pop(k, None)
+                if (entry.get("arrival_source") or "") in LT.DERIVED_SOURCES:
+                    entry.pop("arrival_source", None)
             entry["arrival_date"] = arrival_iso
+            if ship_iso and not arrival_explicit:
+                entry["eta"] = arrival_iso
             if arrival_explicit:
                 # Surface the operator's date as the ETA too -- the ledger
                 # reads eta off the on_order entry for the Pending POs tab.
@@ -155,7 +182,9 @@ def api_on_order_ship_date():
         "po_number": po_number,
         "ship_date": ship_iso,
         "arrival_date": arrival_iso,
-        "arrival_source": "operator" if arrival_explicit else "ship+7",
+        "arrival_source": "operator" if arrival_explicit else "ship+transit",
+        "transit_days": transit_days,
+        "transit_basis": transit_basis,
         "entries_updated": updated,
         "items": touched_items,
     })
@@ -716,7 +745,20 @@ def api_chefs_warehouse_ship_date():
             return jsonify({"ok": False,
                             "error": "ship_date must be YYYY-MM-DD"}), 400
         ship_iso = ship_dt.isoformat()
-        arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+        try:
+            from blueprints.freight import current_lead_time_model
+            _model = current_lead_time_model()["model"]
+        except Exception as exc:  # noqa: BLE001 -- defaults still apply
+            _log_exc(exc, "lead-time model")
+            _model = {}
+        from integrations import lead_times as LT
+        from integrations.planning_config import transit_days_for
+        _rec = next((r for r in load_chefs_warehouse_pos()
+                     if (r.get("po_number") or "").strip() == po_number), {})
+        arrival_iso, transit_days, transit_basis = LT.estimate_arrival(
+            ship_iso, "Chefs Warehouse", _rec.get("warehouse") or "", _model,
+            transit_days_for)
+        arrival_source = "ship+transit"
         if arrival_raw:
             # A CW truck that lands on day 5 or day 9 could not be recorded;
             # status flipped at ship+7 regardless. Mirror /api/on-order/ship-date.
@@ -725,9 +767,11 @@ def api_chefs_warehouse_ship_date():
             except ValueError:
                 return jsonify({"ok": False,
                                 "error": "arrival_date must be YYYY-MM-DD"}), 400
+            arrival_source, transit_days, transit_basis = "operator", None, ""
     else:
         ship_iso = ""
         arrival_iso = ""
+        arrival_source, transit_days, transit_basis = "", None, ""
 
     records = load_chefs_warehouse_pos()
     found = False
@@ -736,6 +780,9 @@ def api_chefs_warehouse_ship_date():
             continue
         r["ship_date"]    = ship_iso
         r["arrival_date"] = arrival_iso
+        r["arrival_source"] = arrival_source
+        r["transit_days"] = transit_days
+        r["transit_basis"] = transit_basis
         r["updated_at"]   = datetime.now().isoformat()
         found = True
     if not found:
@@ -747,6 +794,9 @@ def api_chefs_warehouse_ship_date():
         "po_number": po_number,
         "ship_date": ship_iso,
         "arrival_date": arrival_iso,
+        "arrival_source": arrival_source,
+        "transit_days": transit_days,
+        "transit_basis": transit_basis,
     })
 
 
@@ -1031,6 +1081,10 @@ def build_po_ledger() -> list:
                 r["ship_date"] = o["ship_date"]; r["ship_date_source"] = "operator"
             if o.get("arrival_date") and not r["arrival_date"]:
                 r["arrival_date"] = o["arrival_date"]
+                r["_arrival_source"] = o.get("arrival_source") or ""
+                if o.get("transit_days") is not None:
+                    r["transit_days"] = o.get("transit_days")
+                    r["transit_basis"] = o.get("transit_basis") or ""
             qty = float(o.get("qty") or 0); r["total_cs"] += qty
             r["lines"].append({"variety": _ledger_variety(item.get("name") or key),
                                "qty": qty, "unit": o.get("unit") or "cs",
@@ -1132,6 +1186,10 @@ def build_po_ledger() -> list:
             r["ship_date"] = sm["ship_date"]; r["ship_date_source"] = "operator"
         if sm.get("arrival_date") and not r["arrival_date"]:
             r["arrival_date"] = sm["arrival_date"]
+            r["_arrival_source"] = cw.get("arrival_source") or ""
+            if cw.get("transit_days") is not None:
+                r["transit_days"] = cw.get("transit_days")
+                r["transit_basis"] = cw.get("transit_basis") or ""
         r["total_cs"] = sm.get("total_cs") or r["total_cs"]
         r["lines"] = sm.get("lines") or r["lines"]
         r["dc_code"] = r["dc_code"] or (sm.get("dc_code") or "")
@@ -1163,6 +1221,26 @@ def build_po_ledger() -> list:
                 r["ship_date"] = _pd.wall_time(dsum["pickup_at"])
                 r["ship_date_source"] = "lineage"
             held = dsum["status"] in _pd.HOLD_STATUSES
+        # How the Arrival date was obtained, for the Pending tab to say so.
+        dst = (r.get("delivery") or {}).get("status")
+        _asrc = r.pop("_arrival_source", "")
+        if dst == "delivered":
+            r["arrival_kind"] = "delivered"
+        elif dst == "scheduled" and (r.get("delivery") or {}).get("delivery_appt_local"):
+            r["arrival_kind"] = "lineage_appt"
+        elif r.get("_arrived"):
+            r["arrival_kind"] = "arrived"
+        elif _asrc in ("operator", "lineage", "lineage-delivered", "sibling-lines"):
+            r["arrival_kind"] = "operator" if _asrc == "operator" else "lineage_appt"
+        elif r.get("arrival_date") and r.get("ship_date"):
+            r["arrival_kind"] = "estimate"
+        elif r.get("arrival_date"):
+            r["arrival_kind"] = "eta"
+        else:
+            r["arrival_kind"] = ""
+        if r["arrival_kind"] != "estimate":
+            r.pop("transit_days", None)
+            r.pop("transit_basis", None)
         ov = overrides.get(_norm_po_key(po)) or overrides.get(po)
         if r["_canceled"] or po in canceled or ov in ("cancelled", "canceled"):
             status = "canceled"

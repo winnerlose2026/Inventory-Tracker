@@ -585,10 +585,17 @@ def apply_freight_ship_dates(dry_run: bool = False) -> dict:
     set. Idempotent; rows that already carry a ship_date are left alone.
     """
     from inventory_tracker import load_inventory, save_inventory, data_lock
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
     idx = _freight_ship_date_index()
     stamped: list[dict] = []
     if not idx:
         return {"stamped": 0, "rows": stamped}
+    try:
+        model = current_lead_time_model()["model"]
+    except Exception as exc:  # noqa: BLE001 -- fall back to the defaults
+        _log_exc(exc, "lead-time model")
+        model = {}
     with data_lock():
         inv = load_inventory()
         changed = False
@@ -604,10 +611,13 @@ def apply_freight_ship_dates(dry_run: bool = False) -> dict:
                     ship_dt = datetime.fromisoformat(sd[:10])
                 except ValueError:
                     continue
-                arrival_iso = (ship_dt + timedelta(days=7)).isoformat()
+                arrival_iso, tdays, basis = LT.estimate_arrival(
+                    sd, item.get("distributor") or "", item.get("warehouse") or "",
+                    model, transit_days_for)
                 stamped.append({"item_key": key, "po_number": po,
                                 "ship_date": ship_dt.isoformat(),
-                                "arrival_date": arrival_iso})
+                                "arrival_date": arrival_iso,
+                                "transit_days": tdays, "transit_basis": basis})
                 if dry_run:
                     continue
                 entry["ship_date"] = ship_dt.isoformat()
@@ -616,10 +626,122 @@ def apply_freight_ship_dates(dry_run: bool = False) -> dict:
                     entry["arrival_date"] = arrival_iso
                     entry["eta"] = arrival_iso
                     entry["arrival_source"] = "freight"
+                    entry["transit_days"] = tdays
+                    entry["transit_basis"] = basis
                 changed = True
         if changed and not dry_run:
             save_inventory(inv)
-    return {"stamped": len(stamped), "rows": stamped}
+    out = {"stamped": len(stamped), "rows": stamped}
+    try:
+        out["rederived"] = rederive_estimated_arrivals(dry_run=dry_run, model=model)
+    except Exception as exc:  # noqa: BLE001 -- never fail the stamp over this
+        _log_exc(exc, "rederive arrivals")
+    return out
+
+
+def current_lead_time_model() -> dict:
+    """Learned transit per location from confirmed deliveries.
+
+    {"model": {location_key: ...}, "samples": [...], "excluded": [...]}.
+    PO warehouse / distributor / ship / order dates come from the PO ledger;
+    ship dates prefer the Lineage freight invoice.
+    """
+    from blueprints.pos import build_po_ledger
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
+    from integrations.po_delivery import norm_po, wall_time
+    from inventory_tracker import load_po_delivery
+    tracking = load_po_delivery() or {}
+    po_meta = {norm_po(r.get("po_number") or ""): {
+                   "distributor": r.get("distributor") or "",
+                   "warehouse": r.get("warehouse") or "",
+                   "ship_date": r.get("ship_date") or "",
+                   "ordered_at": r.get("ordered_at") or ""}
+               for r in build_po_ledger()}
+    idx = {norm_po(k): v for k, v in _freight_ship_date_index().items()}
+    samples, excluded = LT.collect_samples(tracking, po_meta, idx, norm_po, wall_time)
+    return {"model": LT.build_model(samples, transit_days_for),
+            "samples": samples, "excluded": excluded}
+
+
+def rederive_estimated_arrivals(dry_run: bool = False, model: dict = None) -> dict:
+    """Re-estimate every not-yet-arrived arrival that was derived from a ship
+    date (ship + transit), using the current learned transit per location.
+
+    Touches only estimates (lead_times.arrival_is_derived): a Lineage
+    appointment, a confirmed delivery or an operator's arrival is never moved.
+    Pending inventory rows and Chefs Warehouse POs whose arrival is still in
+    the future. Moving an inventory row's arrival moves its rollover (when it
+    is credited to on-hand) -- Lineage-tracked POs stay held until confirmed
+    regardless.
+    """
+    from inventory_tracker import (data_lock, load_chefs_warehouse_pos,
+                                   load_inventory, save_chefs_warehouse_pos,
+                                   save_inventory)
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
+    if model is None:
+        model = current_lead_time_model()["model"]
+    idx = _freight_ship_date_index()
+    now = datetime.now()
+    changes: list = []
+
+    def _redo(entry, distributor, warehouse, where):
+        if not LT.arrival_is_derived(entry):
+            return False
+        ship = (idx.get(_norm_po_key(entry.get("po_number") or "")) or
+                entry.get("ship_date") or "")
+        if not ship:
+            return False
+        cur = (entry.get("arrival_date") or "").strip()
+        if cur and cur[:10] < now.date().isoformat() and where == "cw":
+            return False          # a CW PO already past its date: history
+        arr, days, basis = LT.estimate_arrival(ship, distributor, warehouse,
+                                               model, transit_days_for)
+        if not arr or (cur[:10] == arr[:10] and entry.get("transit_days") == days):
+            return False
+        changes.append({"po_number": entry.get("po_number") or "", "where": where,
+                        "warehouse": warehouse, "ship_date": ship[:10],
+                        "old_arrival": cur[:10], "new_arrival": arr[:10],
+                        "transit_days": days, "basis": basis})
+        if not dry_run:
+            entry["arrival_date"] = arr
+            entry["eta"] = arr
+            if (entry.get("arrival_source") or "") not in ("freight",):
+                entry["arrival_source"] = "ship+transit"
+            entry["transit_days"] = days
+            entry["transit_basis"] = basis
+        return True
+
+    with data_lock():
+        inv = load_inventory()
+        inv_changed = False
+        for item in inv.values():
+            for e in (item.get("on_order") or []):
+                if _redo(e, item.get("distributor") or "", item.get("warehouse") or "",
+                         "inventory"):
+                    inv_changed = True
+        cw = load_chefs_warehouse_pos()
+        cw_changed = False
+        for r in cw:
+            if r.get("canceled"):
+                continue
+            if _redo(r, "Chefs Warehouse", r.get("warehouse") or "", "cw"):
+                cw_changed = True
+        if not dry_run:
+            if inv_changed:
+                save_inventory(inv)
+            if cw_changed:
+                save_chefs_warehouse_pos(cw)
+    # One line per PO (an inventory PO has a row per SKU).
+    seen, per_po = set(), []
+    for c in changes:
+        k = (c["po_number"], c["where"])
+        if k not in seen:
+            seen.add(k)
+            per_po.append(c)
+    return {"dry_run": dry_run, "pos_changed": len(per_po), "rows_changed": len(changes),
+            "changes": per_po}
 
 
 @freight_bp.route("/api/freight/apply-ship-dates", methods=["POST"])
@@ -674,116 +796,95 @@ def api_freight_ship_date_index():
 
 @freight_bp.route("/api/freight/lead-times")
 def api_freight_lead_times():
-    """Lead-time metrics for the Freight tab.
+    """Measured transit (ship -> CONFIRMED delivery) per location, for the
+    Freight tab, and the transit the Pending POs tab uses for each location.
 
-    Per PO we gather: ordered_at (from the live on_order entry), ship_date
-    (the ACTUAL Lineage freight ship date when available, else the PO's),
-    and arrival (the on_order arrival estimate, or the recorded rollover
-    timestamp once arrived). From those:
-      - order_to_arrival = arrival - ordered_at
-      - ship_to_arrival  = arrival - ship_date
-    Aggregated overall and by warehouse (avg / median / n / min / max).
-    Differences outside 0..120 days are dropped as data noise.
+    Built from Lineage-confirmed deliveries (data/po_delivery.json) and the
+    Lineage invoice ship dates -- see integrations/lead_times.py. Until
+    2026-10-22 this endpoint measured ship -> the system's own ship + 7
+    estimate, so every location read ~7 days.
+
+    Returns:
+      locations  one row per receiving location seen on a PO: n, trend_avg
+                 (last TREND_WINDOW), median, min/max, used_days + basis
+                 (what the Pending tab adds to a ship date), its samples
+      deliveries every confirmed delivery used, newest first
+      excluded   confirmed deliveries that couldn't be used, with why
+      overall    transit + order->delivery stats across all samples
+      (by_warehouse kept for older page builds)
     """
-    sig = _data_sig("inventory.json", "usage.json", "freight_invoices.json")
+    sig = _data_sig("inventory.json", "usage.json", "freight_invoices.json",
+                    "po_delivery.json", "chefs_warehouse_pos.json")
     _c = _AGG_CACHE.get("lead-times")
     if _c and _c[0] == sig:
         return jsonify(_c[1])
-    import re as _re
-    from datetime import date as _date
-    from inventory_tracker import load_inventory, load_usage
+    from blueprints.pos import build_po_ledger
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
+    try:
+        m = current_lead_time_model()
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "lead-times")
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 200
+    model, samples = m["model"], m["samples"]
 
-    inv = load_inventory()
-    usage = load_usage()
-    freight_idx = _freight_ship_date_index()
-
-    def _d(s):
-        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", str(s or ""))
-        if not m:
-            return None
-        try:
-            return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            return None
-
-    pos: dict = {}  # po_number -> {ordered, ship, arrival, warehouse}
-    for it in inv.values():
-        wh = it.get("warehouse") or ""
-        for e in (it.get("on_order") or []):
-            po = (e.get("po_number") or "").strip()
-            if not po:
-                continue
-            r = pos.setdefault(po, {"ordered": "", "ship": "", "arrival": "", "warehouse": wh})
-            if not r["ordered"] and e.get("ordered_at"):
-                r["ordered"] = e["ordered_at"]
-            if not r["ship"] and e.get("ship_date"):
-                r["ship"] = e["ship_date"]
-            if not r["arrival"] and (e.get("arrival_date") or e.get("eta")):
-                r["arrival"] = e.get("arrival_date") or e.get("eta")
-            if not r["warehouse"]:
-                r["warehouse"] = wh
-
-    meta = {k: (it.get("warehouse") or "") for k, it in inv.items()}
-    for ev in usage:
-        if not rollover_row_live(ev):
+    # Every receiving location on a live PO, so a lane with no confirmed
+    # delivery yet still shows what the Pending tab assumes for it.
+    seen = {}
+    for r in build_po_ledger():
+        if (r.get("status") or "") in ("canceled", "cancelled"):
             continue
-        po = (ev.get("po_number") or "").strip()
-        if not po:
+        wh, dist = r.get("warehouse") or "", r.get("distributor") or ""
+        if wh and dist in ("US Foods", "Cheney Brothers", "Chefs Warehouse"):
+            seen[LT.location_key(dist, wh)] = (dist, wh)
+    locations = []
+    for key in sorted(set(seen) | set(model)):
+        if key in model:
+            locations.append(model[key])
             continue
-        r = pos.setdefault(po, {"ordered": "", "ship": "", "arrival": "", "warehouse": ""})
-        # Use the dates preserved on the rollover row (the PO's own order /
-        # ship / arrival), NOT the processing timestamp, so transit stays
-        # coherent (arrival - ship) and order->arrival is the longer total.
-        if not r["ordered"] and ev.get("ordered_at"):
-            r["ordered"] = ev["ordered_at"]
-        if not r["ship"] and ev.get("ship_date"):
-            r["ship"] = ev["ship_date"]
-        if not r["arrival"] and ev.get("arrival_date"):
-            r["arrival"] = ev["arrival_date"]
-        if not r["warehouse"]:
-            r["warehouse"] = meta.get(ev.get("item_key") or "", "")
-
-    def _days(a, b):
-        da, db = _d(a), _d(b)
-        if not da or not db:
-            return None
-        n = (db - da).days
-        return n if 0 <= n <= 120 else None
-
-    per_po = []
-    for po, r in pos.items():
-        o2a = _days(r["ordered"], r["arrival"])
-        s2a = _days(r["ship"], r["arrival"])
-        if o2a is None and s2a is None:
-            continue
-        per_po.append({"warehouse": r["warehouse"] or "Unassigned",
-                       "order_to_arrival": o2a, "ship_to_arrival": s2a})
+        dist, wh = seen[key]
+        days, basis = LT.transit_for(model, dist, wh, transit_days_for)
+        locations.append({"distributor": dist, "warehouse": wh,
+                          "location": LT.location_label(dist, wh),
+                          "transit_n": 0, "trend_avg": None, "used_days": days,
+                          "default_days": days, "learned": False, "basis": basis,
+                          "samples": []})
+    locations.sort(key=lambda x: (not x.get("learned"), -(x.get("transit_n") or 0),
+                                  x["location"]))
 
     def _agg(vals):
-        vals = sorted(v for v in vals if v is not None)
-        if not vals:
-            return {"n": 0, "avg": None, "median": None, "min": None, "max": None}
-        n = len(vals)
-        mid = n // 2
-        med = vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2
-        return {"n": n, "avg": round(sum(vals) / n, 1), "median": round(med, 1),
-                "min": vals[0], "max": vals[-1]}
+        return LT._stats(vals)
 
-    overall = {
-        "order_to_arrival": _agg([p["order_to_arrival"] for p in per_po]),
-        "ship_to_arrival": _agg([p["ship_to_arrival"] for p in per_po]),
-    }
-    by_wh: dict = {}
-    for p in per_po:
-        b = by_wh.setdefault(p["warehouse"], {"o": [], "s": []})
-        b["o"].append(p["order_to_arrival"])
-        b["s"].append(p["ship_to_arrival"])
-    by_warehouse = [{"warehouse": wh,
-                     "order_to_arrival": _agg(v["o"]),
-                     "ship_to_arrival": _agg(v["s"])}
-                    for wh, v in by_wh.items()]
-    by_warehouse.sort(key=lambda x: x["warehouse"])
-    result = {"ok": True, "overall": overall,
-              "by_warehouse": by_warehouse, "po_count": len(per_po)}
+    overall = {"transit": _agg([s["transit_days"] for s in samples]),
+               "order_to_delivery": _agg([s.get("order_to_delivery_days")
+                                          for s in samples])}
+    # Legacy keys (older page builds read these).
+    overall["ship_to_arrival"] = overall["transit"]
+    overall["order_to_arrival"] = overall["order_to_delivery"]
+    by_warehouse = [{"warehouse": l["location"],
+                     "ship_to_arrival": _agg([x["transit_days"] for x in l["samples"]]),
+                     "order_to_arrival": l.get("order_to_delivery") or _agg([])}
+                    for l in locations if l.get("samples")]
+    result = {"ok": True, "min_samples": LT.MIN_SAMPLES,
+              "trend_window": LT.TREND_WINDOW,
+              "locations": locations,
+              "deliveries": list(reversed(samples)),
+              "excluded": m["excluded"],
+              "overall": overall, "by_warehouse": by_warehouse,
+              "po_count": len(samples)}
     _AGG_CACHE["lead-times"] = (sig, result)
     return jsonify(result)
+
+
+@freight_bp.route("/api/freight/lead-times/apply", methods=["POST"])
+def api_freight_lead_times_apply():
+    """Re-estimate pending arrivals from the learned transit. Body {dry_run}
+    (default true). Only ship-date-derived estimates move -- never a Lineage
+    appointment, a confirmed delivery or an operator's arrival."""
+    body = request.get_json(silent=True) or {}
+    dry_run = body.get("dry_run", True) is not False
+    try:
+        return jsonify({"ok": True, **rederive_estimated_arrivals(dry_run=dry_run)})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "lead-times apply")
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 200

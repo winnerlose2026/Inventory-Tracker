@@ -36,6 +36,12 @@ from core.util import with_data_lock
 delivery_bp = Blueprint("delivery", __name__)
 
 THREAD_SUBJECT = "Quote and Schedule"
+# Lineage also answers on one-off threads ("H&H Bagels PO Delivery Status",
+# "H&H Bagels PO 3795383T Delivery Status", "... PO Delivery - PO 0145...").
+# Those are read as EVIDENCE only -- their delivery confirmations can be
+# quoted (lead times, history), but nothing is ever registered or chased on
+# them and no follow-up is ever sent on them.
+EVIDENCE_SUBJECT = "Delivery"
 MESSAGE_CACHE_DAYS = 120
 
 
@@ -133,9 +139,20 @@ def api_delivery_list():
         return jsonify({"ok": False, "error": _safe_err(exc), "pos": []}), 200
 
 
-def _fetch_thread_messages(lookback_days: int) -> tuple:
-    """Every "Quote and Schedule" message in the mailboxes, deduped across
-    them (preferring JD's copy, whose Graph id a threaded reply needs)."""
+def _is_evidence_subject(subject: str) -> bool:
+    """A one-off Lineage delivery thread about our POs (not Quote and Schedule)."""
+    import re as _re
+    s = (subject or "").lower()
+    return ("delivery" in s and THREAD_SUBJECT.lower() not in s
+            and bool(_re.search(r"\bpo\b|po#|h&h", s)))
+
+
+def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
+                           keep=None) -> tuple:
+    """Every message whose subject matches ``subject`` (default: the "Quote
+    and Schedule" threads) in the mailboxes, deduped across them (preferring
+    JD's copy, whose Graph id a threaded reply needs). ``keep`` filters by
+    subject; the default keeps subjects containing ``subject``."""
     from blueprints.email import _graph_json, _graph_token
     from integrations.email_scanner import GRAPH_BASE
     from integrations.po_delivery import clean_body, parse_dt
@@ -146,7 +163,9 @@ def _fetch_thread_messages(lookback_days: int) -> tuple:
     users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
     users.sort(key=lambda u: 0 if u.lower().startswith("jd@") else 1)
     found, errors = {}, []
-    search = urllib.parse.quote(f'"subject:{THREAD_SUBJECT}"')
+    search = urllib.parse.quote(f'"subject:{subject}"')
+    if keep is None:
+        keep = lambda subj: subject.lower() in (subj or "").lower()  # noqa: E731
     for user in users:
         url = (f"{GRAPH_BASE}/users/{urllib.parse.quote(user)}/messages?"
                f"$search={search}&$top=100&$select=id,subject,conversationId,"
@@ -163,7 +182,7 @@ def _fetch_thread_messages(lookback_days: int) -> tuple:
                 errors.append(f"{user}: list: {_safe_err(exc)}")
                 break
             for m in page.get("value", []):
-                if THREAD_SUBJECT.lower() not in (m.get("subject") or "").lower():
+                if not keep(m.get("subject") or ""):
                     continue
                 sent = parse_dt(m.get("sentDateTime") or "")
                 if sent is None or sent < since:
@@ -200,7 +219,8 @@ def api_delivery_sync_threads():
         save_po_delivery_threads,
     )
     from integrations.po_delivery import (
-        apply_event, is_hh, norm_po, parse_dt, parse_request_blocks, summary,
+        apply_event, is_hh, norm_po, parse_dt, parse_request_blocks,
+        sender_may_report, summary,
     )
     try:
         body = request.get_json(silent=True) or {}
@@ -210,6 +230,15 @@ def api_delivery_sync_threads():
         convs: dict = {}
         for m in msgs:
             convs.setdefault(m["conversation_id"], []).append(m)
+        try:
+            ev_msgs, ev_errors = _fetch_thread_messages(
+                lookback, subject=EVIDENCE_SUBJECT, keep=_is_evidence_subject)
+        except Exception as exc:  # noqa: BLE001 -- evidence is optional
+            ev_msgs, ev_errors = [], [f"evidence threads: {_safe_err(exc)}"]
+        ev_convs: dict = {}
+        for m in ev_msgs:
+            if m["conversation_id"] not in convs:
+                ev_convs.setdefault(m["conversation_id"], []).append(m)
         tracking = load_po_delivery()
         ledger = _ledger_by_po()
         now = _now()
@@ -295,6 +324,37 @@ def api_delivery_sync_threads():
                                                     "to", "cc")},
                               "text": m["text"][:1500]} for m in ms],
             })
+        # Evidence-only threads: cache what Lineage wrote, with the POs each
+        # thread names (ledger PO numbers found in its subject / messages), so
+        # a delivery confirmation there can be quoted. Never registered,
+        # never chased, never replied on (send-followups skips them).
+        import re as _re
+        evidence_threads = []
+        for conv, ms in ev_convs.items():
+            if not any(sender_may_report(m["from"]) for m in ms):
+                continue
+            ms.sort(key=lambda m: m["sent"])
+            blob = " ".join([ms[0]["subject"]] + [m["text"] for m in ms]).upper()
+            pos = sorted({t for t in _re.findall(r"[A-Z0-9]{5,14}", blob)
+                          if t in ledger or t in tracking})
+            if not pos:
+                continue
+            for m in ms:
+                if m["message_id"]:
+                    cached_msgs[m["message_id"]] = {
+                        k: m[k] for k in ("from", "sent", "conversation_id",
+                                          "subject", "text", "graph_id", "mailbox")}
+            cache_threads[conv] = {
+                "conversation_id": conv, "subject": ms[0]["subject"],
+                "reply_to_graph_id": "", "reply_subject": ms[-1]["subject"],
+                "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
+                "po_numbers": pos, "evidence_only": True,
+            }
+            evidence_threads.append({"conversation_id": conv,
+                                     "subject": ms[0]["subject"],
+                                     "po_numbers": pos, "messages": len(ms)})
+        # ev_errors stay out of `errors`: the cache's errors gate follow-ups,
+        # and an unread evidence thread can't change whether one is due.
         if registered and not dry_run:
             save_po_delivery(tracking)
         # A partial read is still cached (its messages are real, so quotes can
@@ -309,6 +369,8 @@ def api_delivery_sync_threads():
         return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
                         "threads": threads, "registered": registered,
                         "not_in_tracker": sorted(set(not_in_tracker)),
+                        "evidence_threads": evidence_threads,
+                        "evidence_errors": ev_errors,
                         "errors": errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-sync-threads")
@@ -396,17 +458,30 @@ def api_delivery_events():
                             "change": change, "tracking": summary(rec, now),
                             "ledger_status_before": (lr or {}).get("status", "")})
         inventory = {}
+        rederived = None
         if touched and not dry_run:
             save_po_delivery(tracking)
             for key in dict.fromkeys(touched):
                 inventory[key] = _apply_to_inventory(key, tracking[key])
+            if any(tracking[k].get("status") == "delivered" for k in touched):
+                # A new confirmed delivery is a new lead-time sample: re-estimate
+                # the arrivals still derived from a ship date.
+                try:
+                    from blueprints.freight import rederive_estimated_arrivals
+                    rederived = rederive_estimated_arrivals(dry_run=False)
+                except Exception as exc:  # noqa: BLE001 -- never fail the event
+                    _log_exc(exc, "delivery-events rederive")
             after = _ledger_by_po()
             for r in results:
                 if r.get("applied"):
                     k = norm_po(r["po_number"])
                     r["inventory"] = inventory.get(k, {})
                     r["ledger_status_after"] = (after.get(k) or {}).get("status", "")
-        return jsonify({"ok": True, "dry_run": dry_run, "results": results})
+        out = {"ok": True, "dry_run": dry_run, "results": results}
+        if rederived is not None:
+            out["arrivals_rederived"] = {k: rederived.get(k)
+                                         for k in ("pos_changed", "changes")}
+        return jsonify(out)
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-events")
         return jsonify({"ok": False, "error": _safe_err(exc), "results": []}), 200
@@ -524,11 +599,12 @@ def api_delivery_send_followups():
             if not ask:
                 continue
             conv = (rec.get("thread") or {}).get("conversation_id") or ""
-            if conv not in threads:
+            if conv not in threads or threads[conv].get("evidence_only"):
                 conv = next((c for c, t in sorted(threads.items(),
                                                   key=lambda kv: kv[1].get("last_sent") or "",
                                                   reverse=True)
-                             if key in (t.get("po_numbers") or [])), "")
+                             if key in (t.get("po_numbers") or [])
+                             and not t.get("evidence_only")), "")
             if not conv:
                 no_thread.append(rec.get("po_number") or key)
                 continue

@@ -984,16 +984,40 @@
         </div>
       </div>
 
-      <!-- Lead times: PO placed -> arrival (total) vs departure -> arrival (transit), by warehouse. -->
+      <!-- Lead times: measured ship -> CONFIRMED delivery (Lineage / Belinda), by
+           location, and the transit the Pending POs tab adds to a ship date. -->
       <div class="card" id="freight-leadtime-card" style="padding:14px 20px">
         <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px">
           <strong style="font-size:16px">Lead Times</strong>
-          <span class="subtitle" style="margin:0">PO placed &rarr; arrival (total) vs. departure &rarr; arrival (transit), by warehouse</span>
+          <span class="subtitle" style="margin:0">Ship &rarr; confirmed delivery, by location &middot; drives the Pending POs Arrival estimate</span>
         </div>
         <div id="freight-leadtime-kpis" style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));margin-bottom:10px"></div>
-        <div style="position:relative;height:320px">
+        <div style="overflow-x:auto;margin:0 -20px 12px">
+          <table id="freight-leadtime-table">
+            <thead><tr>
+              <th>Location</th>
+              <th style="text-align:right">Confirmed deliveries</th>
+              <th style="text-align:right">Trend avg</th>
+              <th style="text-align:right">Median</th>
+              <th style="text-align:right">Range</th>
+              <th>Last delivered</th>
+              <th>Pending tab uses</th>
+            </tr></thead>
+            <tbody id="freight-leadtime-tbody"></tbody>
+          </table>
+        </div>
+        <div style="position:relative;height:280px">
           <canvas id="freight-leadtime-chart"></canvas>
         </div>
+        <details id="freight-leadtime-deliveries-wrap" style="margin-top:10px">
+          <summary class="subtitle" style="cursor:pointer;margin:0">Confirmed deliveries used</summary>
+          <div style="overflow-x:auto;margin:8px -20px 0">
+            <table>
+              <thead><tr><th>PO</th><th>Location</th><th>Shipped</th><th>Delivered</th><th style="text-align:right">Transit</th><th>Confirmed by</th></tr></thead>
+              <tbody id="freight-leadtime-deliveries"></tbody>
+            </table>
+          </div>
+        </details>
         <div id="freight-leadtime-note" class="subtitle" style="margin:8px 0 0;font-size:11px"></div>
       </div>
 

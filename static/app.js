@@ -2536,6 +2536,9 @@ function _groupsFromLedger(records) {
       partial: !!r.partial,
       rolled_at: r.rolled_at || '',
       delivery: r.delivery || null,
+      arrival_kind: r.arrival_kind || '',
+      transit_days: (r.transit_days === undefined || r.transit_days === null) ? null : Number(r.transit_days),
+      transit_basis: r.transit_basis || '',
       _source: src,
     };
     // The server is the authority on arrived vs pending: on-hand is only
@@ -2603,7 +2606,8 @@ function _assemblePendingGroupsLegacy() {
 
   // Freight verification: a matching Lineage freight invoice carries the
   // ACTUAL ship date, so it is authoritative -- it overrides any manual
-  // entry, sets a derived arrival (ship + 7) for not-yet-arrived POs, and
+  // entry, sets a derived arrival (ship + 7; legacy fallback only -- the
+  // ledger path uses the learned per-location transit) for not-yet-arrived POs, and
   // tags the source so the UI shows a verified check mark. Arrived POs keep
   // their real arrival_date (the rollover timestamp).
   groups.forEach(g => {
@@ -2786,6 +2790,21 @@ function _deliveryNoteHtml(g) {
   return '';
 }
 
+// Under an estimated Arrival: how it was estimated -- this location's
+// learned ship -> delivery transit (Freight tab > Lead Times), or the 7-day
+// default until enough Lineage-confirmed deliveries exist.
+function _arrivalEstimateNoteHtml(g, state) {
+  if (g.arrival_kind !== 'estimate' || state === 'arrived' || state === 'cancelled') return '';
+  if (g.delivery && g.delivery.status) return '';     // Lineage note already shown
+  const d = g.transit_days;
+  const basis = g.transit_basis || '';
+  const label = (d === null || d === undefined) ? 'est.' : `est. &middot; ${d}-day transit`;
+  const learned = /^avg of/.test(basis);
+  const tip = escAttr('Ship date + ' + (d === null || d === undefined ? '?' : d) + ' days: '
+    + (basis || 'default transit') + '. See Freight > Lead Times.');
+  return `<div title="${tip}" style="font-size:11px;color:var(--muted);cursor:help">${label}${learned ? '' : ' (default)'}</div>`;
+}
+
 function _pendingRowHtml(g, now) {
   now = now || new Date();
   const state = g._state || _poState(g, now);
@@ -2837,7 +2856,7 @@ function _pendingRowHtml(g, now) {
   // Arrival is the field that decides whether a delivery sits inside a count,
   // so on an arrived inventory PO it is the most important thing to be able
   // to correct -- that is what "it landed after we counted" means.
-  let arrivalCell = arrival + _deliveryNoteHtml(g);
+  let arrivalCell = arrival + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, state);
   if (invArrived && editing) {
     const arrISO = (g.arrival_date || '').slice(0, 10);
     arrivalCell = `<input type="date" class="ship-date-input" value="${escAttr(arrISO)}" title="The date the truck actually landed" onclick="try{this.showPicker()}catch(e){}" onchange="onArrivedPoAdjust('${poAttr}', 'arrival_date', this.value, false)" />`;
@@ -2879,7 +2898,7 @@ function renderInProductionSection(list) {
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">—</span>';
-    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>') + _deliveryNoteHtml(g);
+    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
@@ -2915,7 +2934,7 @@ function renderInTransitSection(list) {
   if (countEl) countEl.textContent = `· ${list.length} PO${list.length === 1 ? '' : 's'}`;
   tbody.innerHTML = list.map(g => {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">&mdash;</span>';
-    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>') + _deliveryNoteHtml(g);
+    const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
       <td>${distributorBadge(g.distributor)}</td>
@@ -3078,7 +3097,7 @@ function onModifyPoSelect() {
     ? 'Ship date is verified by a freight invoice and is locked.'
     : invArrived
       ? 'This PO has already arrived \u2014 use Reopen on its row to change it.'
-      : 'Arrival auto-sets to ship + 7 days. Leave blank to use the 30-day ETA.';
+      : 'Arrival auto-sets to ship date + this location\u2019s learned transit (Freight > Lead Times; 7 days until it has 2 confirmed deliveries). Leave blank to use the 30-day ETA.';
 }
 
 async function saveModifyPO() {
@@ -3358,36 +3377,80 @@ async function loadFreightLeadTimes() {
   const kpis = document.getElementById('freight-leadtime-kpis');
   const note = document.getElementById('freight-leadtime-note');
   const canvas = document.getElementById('freight-leadtime-chart');
+  const tbody = document.getElementById('freight-leadtime-tbody');
+  const dbody = document.getElementById('freight-leadtime-deliveries');
   if (!kpis || !canvas) return;
   let data;
   try { data = await api('/api/freight/lead-times'); }
   catch (e) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; return; }
   if (!data || !data.ok) { kpis.innerHTML = '<div class="subtitle">Lead-time data unavailable.</div>'; return; }
-  const o = data.overall || {};
-  const kpi = (label, a) => `<div><div class="subtitle" style="margin-bottom:2px">${label}</div>` +
-    `<div style="font-size:22px;font-weight:700">` +
-    ((a && a.n) ? `${a.avg} days <span style="color:var(--muted);font-size:12px;font-weight:400">(median ${a.median}, n=${a.n})</span>` : '<span style="color:var(--muted)">&mdash;</span>') +
+  const locs = data.locations || [];
+  const dels = data.deliveries || [];
+  const o = (data.overall || {}).transit || {};
+  const learned = locs.filter(l => l.learned).length;
+  const kpi = (label, value, sub) => `<div><div class="subtitle" style="margin-bottom:2px">${label}</div>` +
+    `<div style="font-size:22px;font-weight:700">${value}` +
+    (sub ? ` <span style="color:var(--muted);font-size:12px;font-weight:400">${sub}</span>` : '') +
     `</div></div>`;
-  kpis.innerHTML = kpi('PO placed &rarr; arrival (total)', o.order_to_arrival) +
-                   kpi('Departure &rarr; arrival (transit)', o.ship_to_arrival);
-  const whs = (data.by_warehouse || []).filter(w => (w.order_to_arrival.n || w.ship_to_arrival.n));
+  const dash = '<span style="color:var(--muted)">&mdash;</span>';
+  kpis.innerHTML =
+    kpi('Confirmed deliveries', String(dels.length), 'Lineage / DC confirmations') +
+    kpi('Avg transit, all lanes', o.n ? `${o.avg} days` : dash, o.n ? `(median ${o.median}, range ${o.min}&ndash;${o.max})` : '') +
+    kpi('Locations dialed in', `${learned} of ${locs.length}`, `need ${data.min_samples || 2}+ deliveries`);
+
+  const days = v => (v === null || v === undefined) ? dash : `${v} d`;
+  if (tbody) {
+    tbody.innerHTML = locs.map(l => {
+      const range = l.transit_n ? `${l.transit_min}&ndash;${l.transit_max} d` : dash;
+      const uses = l.learned
+        ? `<strong>${l.used_days} days</strong> <span style="color:var(--muted);font-size:11px">${escHtml(l.basis)}</span>`
+        : `<span style="color:var(--muted)">${l.used_days} days &middot; ${escHtml(l.basis)}</span>`;
+      return `<tr>
+        <td>${escHtml(l.location)}</td>
+        <td style="text-align:right">${l.transit_n || 0}</td>
+        <td style="text-align:right;font-weight:600">${days(l.trend_avg)}</td>
+        <td style="text-align:right">${days(l.transit_median)}</td>
+        <td style="text-align:right">${range}</td>
+        <td>${l.last_delivered ? formatDate(l.last_delivered) : dash}</td>
+        <td>${uses}</td></tr>`;
+    }).join('') || `<tr><td colspan="7" style="color:var(--muted)">No locations yet.</td></tr>`;
+  }
+  if (dbody) {
+    dbody.innerHTML = dels.map(d => {
+      const ev = d.evidence || {};
+      const who = escHtml((ev.sender || '').split('@')[0] || '');
+      const quote = escAttr(ev.quote || '');
+      return `<tr>
+        <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(d.po_number)}</td>
+        <td>${escHtml(d.location)}</td>
+        <td>${formatDate(d.ship_date)} <span style="color:var(--muted);font-size:11px">${escHtml(d.ship_source || '')}</span></td>
+        <td>${formatDate(d.delivered_at)}${d.delivered_at && d.delivered_at.slice(11, 16) !== '00:00' ? ' ' + d.delivered_at.slice(11, 16) : ''}</td>
+        <td style="text-align:right;font-weight:600">${d.transit_days} d</td>
+        <td title="${quote}" style="color:var(--muted);cursor:help">${who}</td></tr>`;
+    }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No confirmed deliveries yet.</td></tr>`;
+  }
+
   if (_leadtimeChart) { _leadtimeChart.destroy(); _leadtimeChart = null; }
-  if (!whs.length || typeof Chart === 'undefined') {
-    if (note) note.textContent = 'Not enough dated POs yet to chart lead times.';
+  const charted = locs.filter(l => l.transit_n);
+  if (!charted.length || typeof Chart === 'undefined') {
+    if (note) note.textContent = 'No confirmed deliveries yet. Until a location has '
+      + (data.min_samples || 2) + ' confirmed deliveries, its arrival estimate is ship date + 7 days.';
     return;
   }
-  if (note) note.textContent = 'Total lead counts from the day the PO hits our inbox to arrival (includes production + transit); transit is ship date to arrival. POs with gaps over 120 days are excluded.';
+  if (note) note.textContent = 'Transit = confirmed delivery date minus the ship date (Lineage invoice ship date when we have it, else the pickup Lineage reported). '
+    + 'Trend avg = the last ' + (data.trend_window || 5) + ' deliveries to that location. A location needs '
+    + (data.min_samples || 2) + '+ confirmed deliveries before its trend replaces the 7-day default in the Pending POs Arrival column.';
   _leadtimeChart = new Chart(canvas.getContext('2d'), {
     type: 'bar',
     data: {
-      labels: whs.map(w => w.warehouse),
+      labels: charted.map(l => l.location),
       datasets: [
-        { label: 'PO placed to arrival (total days)',
-          data: whs.map(w => w.order_to_arrival.avg),
-          backgroundColor: 'rgba(5, 23, 71, 0.80)' },
-        { label: 'Departure to arrival (transit days)',
-          data: whs.map(w => w.ship_to_arrival.avg),
-          backgroundColor: 'rgba(21, 101, 192, 0.75)' },
+        { label: 'Measured transit (trend avg, days)',
+          data: charted.map(l => l.trend_avg),
+          backgroundColor: 'rgba(21, 101, 192, 0.80)' },
+        { label: 'Old blanket estimate (days)',
+          data: charted.map(l => l.default_days),
+          backgroundColor: 'rgba(120, 120, 120, 0.30)' },
       ],
     },
     options: {
@@ -4077,10 +4140,12 @@ async function onShipDateChange(poNumber, shipDate, source) {
       : { po_number: poNumber, ship_date: shipDate || null };
     const r = await api(endpoint, 'POST', payload);
     if (r && r.ok) {
+      const est = (shipDate && r.arrival_date && r.transit_days)
+        ? ` \u2014 arrival est. ${formatDate(r.arrival_date)} (${r.transit_days}-day transit)` : '';
       if (isCW) {
-        toast(`Ship date ${shipDate || 'cleared'} for CW PO ${poNumber}`);
+        toast(`Ship date ${shipDate || 'cleared'} for CW PO ${poNumber}${est}`);
       } else {
-        toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})`);
+        toast(`Ship date ${shipDate || 'cleared'} for PO ${poNumber} (${r.entries_updated} line${r.entries_updated === 1 ? '' : 's'})${est}`);
       }
       loadPendingPOs();
     } else {
