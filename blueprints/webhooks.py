@@ -15,9 +15,14 @@ from core.errors import _log_exc, _safe_err
 
 webhooks_bp = Blueprint("webhooks", __name__)
 
-# Character allowlist for the Graph webhook validation-token echo.
+# Character allowlist for the Graph webhook validation-token echo. Graph's
+# real token is "Validation: Testing client application reachability for
+# subscription Request-Id: <guid>" -- it contains COLONS. The 2026-06-10
+# CodeQL hardening left ':' out, every handshake got a 400, and Graph refused
+# to renew or recreate the subscriptions: no real-time Daily Production
+# notification has arrived since that day. ':' is inert in text/plain.
 _VALIDATION_TOKEN_CHARS = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~+/= ")
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~+/=: ")
 
 
 @webhooks_bp.route("/webhooks/graph/notifications", methods=["POST"])
@@ -35,7 +40,7 @@ def graph_webhook_notifications():
     validation_token = request.args.get("validationToken")
     if validation_token:
         import re as _re_vt
-        if not _re_vt.fullmatch(r"[A-Za-z0-9_\-.~+/= ]{1,4096}", validation_token):
+        if not _re_vt.fullmatch(r"[A-Za-z0-9_\-.~+/=: ]{1,4096}", validation_token):
             return make_response("invalid validation token", 400)
         # Rebuild from a fixed character allowlist so no request-derived value is
         # ever reflected verbatim (CodeQL py/reflective-xss); the fullmatch above

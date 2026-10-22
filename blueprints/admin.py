@@ -313,6 +313,125 @@ def api_admin_restore_absorbed_po():
                     "lines": lines, "skipped": skipped})
 
 
+@admin_bp.route("/api/admin/absorb-po-into-count", methods=["POST"])
+@with_data_lock
+def api_admin_absorb_po_into_count():
+    """The inverse of restore-absorbed-po: a PO rolled into on-hand AFTER a
+    count that already contained it, so its cases are counted twice.
+
+    Manassas 7199415O: picked up 10/13, Bozel's ETA 1300 on 10/16; never
+    tracked by Lineage, so it rolled on the flat 7-day rule on 10/20 -- after
+    the 10/19 count, which already showed it (Plain 13 -> 20 and Everything
+    21 -> 54 in a week with 9 and 12 cs/wk burn). On-hand carried 112 cs twice.
+
+    Body: {po_number, count_at, arrived_on (YYYY-MM-DD, on/before the count),
+           reason, dry_run=true, force=false}
+    Each live on_order_rollover row of the PO whose SKU still carries
+    last_count_at == count_at is converted IN PLACE into the
+    on_order_absorbed row it should have been (amount 0, absorbed_qty =
+    cases, arrival_date = arrived_on) and the cases come off quantity.
+    Refused when the counted figures prove the count could NOT contain the
+    delivery (core.util.count_missed_delivery), unless force=true.
+    """
+    from core.util import count_missed_delivery, naive_local_dt, rollover_row_live
+    from inventory_tracker import load_usage, save_usage, append_inventory_audit
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    count_at = (body.get("count_at") or "").strip()
+    arrived_on = (body.get("arrived_on") or "").strip()[:10]
+    reason = (body.get("reason") or "").strip()
+    dry_run = body.get("dry_run", True) is not False
+    force = bool(body.get("force"))
+    if not po_number or not count_at or not arrived_on:
+        return jsonify({"ok": False, "error": "po_number, count_at and arrived_on required"}), 400
+    if arrived_on > count_at[:10]:
+        return jsonify({"ok": False, "error": "arrived_on is after the count -- "
+                        "the count could not contain it"}), 400
+    if not dry_run and not reason:
+        return jsonify({"ok": False, "error": "reason required for a live run"}), 400
+
+    inv = load_inventory()
+    usage = load_usage()
+    rows, skipped = [], []
+    for idx, e in enumerate(usage):
+        if ((e.get("po_number") or "") != po_number
+                or e.get("source") != "on_order_rollover" or not rollover_row_live(e)):
+            continue
+        key = e.get("item_key") or ""
+        item = inv.get(key)
+        if item is None:
+            skipped.append(f"{key}: SKU not in inventory")
+            continue
+        if (item.get("last_count_at") or "") != count_at:
+            skipped.append(f"{item.get('name', key)}: last count is "
+                           f"{item.get('last_count_at') or 'none'}, not {count_at}")
+            continue
+        rows.append((idx, key, item, abs(float(e.get("amount") or 0))))
+    if not rows:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": "no live rollover lines for this PO on that count",
+                        "skipped": skipped}), 404
+
+    adt = naive_local_dt(arrived_on + "T12:00:00")
+    cdt = naive_local_dt(count_at)
+    hrs = ((cdt - adt).total_seconds() / 3600.0) if (adt and cdt) else 0.0
+    by_key: dict = {}
+    for _idx, key, item, qty in rows:
+        line = by_key.setdefault(key, {"receipt": 0.0,
+                                       "counted": float(item.get("last_count_qty") or 0),
+                                       "weekly_usage": float(item.get("weekly_usage") or 0)})
+        line["receipt"] += qty
+    missed, why = count_missed_delivery(list(by_key.values()), hrs)
+    if missed and not force:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": f"the counted figures can't contain this delivery ({why})",
+                        "lines": by_key}), 409
+
+    now = datetime.now().isoformat()
+    lines, audit = [], []
+    for idx, key, item, qty in rows:
+        old_q = float(item.get("quantity") or 0)
+        lines.append({"name": item.get("name", key), "qty": qty,
+                      "counted": item.get("last_count_qty"),
+                      "old_quantity": round(old_q, 4),
+                      "new_quantity": round(old_q - qty, 4)})
+        if dry_run:
+            continue
+        row = usage[idx]
+        row["rollover_note"] = row.get("note") or ""
+        row["rolled_arrival_date"] = row.get("arrival_date") or ""
+        row["source"] = "on_order_absorbed"
+        row["amount"] = 0
+        row["absorbed_qty"] = qty
+        row["arrival_date"] = arrived_on + "T00:00:00"
+        row["absorbed_into_count_at"] = count_at
+        row["absorbed_at"] = now
+        row["absorbed_reason"] = reason
+        row["note"] = (f"PO {po_number} arrived {arrived_on} - absorbed by the "
+                       f"{count_at[:10]} count - {qty:g} cs already on hand, not "
+                       f"re-added (operator {now[:10]}: {reason})")
+        item["quantity"] = old_q - qty
+        item["updated"] = now
+        audit.append({"ts": now, "source": "admin-absorb-po-into-count",
+                      "name": item.get("name", key),
+                      "warehouse": item.get("warehouse", ""),
+                      "event_type": "correction", "old_quantity": old_q,
+                      "new_quantity": old_q - qty, "delta": -qty,
+                      "po_number": po_number})
+    if not dry_run:
+        save_inventory(inv)
+        save_usage(usage)
+        try:
+            append_inventory_audit(audit)
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
+    return jsonify({"ok": True, "dry_run": dry_run, "po_number": po_number,
+                    "count_at": count_at, "arrived_on": arrived_on,
+                    "hours_before_count": round(hrs, 2), "forced": bool(force and missed),
+                    "absorbed_cs": round(sum(l["qty"] for l in lines), 2),
+                    "lines": lines, "skipped": skipped})
+
+
 @admin_bp.route("/api/admin/uncancel-po", methods=["POST"])
 @with_data_lock
 def api_admin_uncancel_po():

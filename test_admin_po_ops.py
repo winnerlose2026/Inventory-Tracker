@@ -172,3 +172,49 @@ def test_fully_pending_cancel_is_still_canceled(env):
     from blueprints.pos import build_po_ledger
     with app.test_request_context():
         assert not any(r["po_number"] == "7700000O" for r in build_po_ledger())
+
+
+def _rolled_twice(it, counted=20.0, receipt=16.0, weekly=9.0):
+    """A PO that rolled in AFTER the count that already contained it."""
+    inv = it.load_inventory()
+    inv[KEY].update(last_count_at="2026-10-19T13:16:00", last_count_qty=counted,
+                    quantity=counted + receipt, weekly_usage=weekly)
+    it.save_inventory(inv)
+    it.save_usage([{"item_key": KEY, "item_name": inv[KEY]["name"], "amount": -receipt,
+                    "unit": "cs", "source": "on_order_rollover", "po_number": "7199415O",
+                    "arrival_date": "2026-10-20T00:00:00",
+                    "timestamp": "2026-10-20T00:01:51",
+                    "note": "PO 7199415O arrived"}])
+
+
+def test_absorb_po_into_count_removes_the_double_count(env):
+    it, _sync, c = env
+    _rolled_twice(it)
+    body = {"po_number": "7199415O", "count_at": "2026-10-19T13:16:00",
+            "arrived_on": "2026-10-16"}
+    dry = c.post("/api/admin/absorb-po-into-count", json=body, headers=H).get_json()
+    assert dry["ok"] and dry["dry_run"] and dry["absorbed_cs"] == 16
+    assert it.load_inventory()[KEY]["quantity"] == 36          # dry run wrote nothing
+    live = c.post("/api/admin/absorb-po-into-count",
+                  json=dict(body, dry_run=False, reason="Bozel ETA 10/16"), headers=H).get_json()
+    assert live["ok"] and not live["dry_run"]
+    assert it.load_inventory()[KEY]["quantity"] == 20
+    row = it.load_usage()[0]
+    assert row["source"] == "on_order_absorbed" and row["amount"] == 0
+    assert row["absorbed_qty"] == 16 and row["arrival_date"].startswith("2026-10-16")
+    again = c.post("/api/admin/absorb-po-into-count",
+                   json=dict(body, dry_run=False, reason="x"), headers=H)
+    assert again.status_code == 404                           # idempotent
+
+
+def test_absorb_refuses_when_the_count_cannot_contain_it(env):
+    it, _sync, c = env
+    _rolled_twice(it, counted=2.0, receipt=56.0, weekly=1.0)
+    r = c.post("/api/admin/absorb-po-into-count",
+               json={"po_number": "7199415O", "count_at": "2026-10-19T13:16:00",
+                     "arrived_on": "2026-10-16"}, headers=H)
+    assert r.status_code == 409
+    late = c.post("/api/admin/absorb-po-into-count",
+                  json={"po_number": "7199415O", "count_at": "2026-10-19T13:16:00",
+                        "arrived_on": "2026-10-20"}, headers=H)
+    assert late.status_code == 400

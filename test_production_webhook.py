@@ -119,3 +119,21 @@ def test_scan_health_reports_production_subscriptions(env, monkeypatch):
         out = em.api_scan_health().get_json()
     assert out["production_subscriptions"]["active"] is False
     assert out["production_subscriptions"]["last_error"] == "token failed"
+
+
+def test_graph_validation_handshake_with_colons_is_echoed():
+    """Graph's real token contains colons. Rejecting them (2026-06-10 CodeQL
+    hardening) 400'd every handshake, so Graph refused to renew or recreate
+    the subscriptions and real-time production ingest stopped."""
+    from urllib.parse import quote_plus
+    from app import app
+    tok = ("Validation: Testing client application reachability for "
+           "subscription Request-Id: e7b03e20-6072-4dbc-a63d-a5f431647fe0")
+    client = app.test_client()
+    r = client.post("/webhooks/graph/notifications?validationToken=" + quote_plus(tok))
+    assert r.status_code == 200
+    assert r.get_data(as_text=True) == tok
+    assert r.headers["Content-Type"].startswith("text/plain")
+    bad = client.post("/webhooks/graph/notifications?validationToken="
+                      + quote_plus("<script>alert(1)</script>"))
+    assert bad.status_code == 400
