@@ -1705,7 +1705,8 @@ def _pair_on_hand_cs(warehouse: str, variety: str,
 def compute_lot_fifo_state(warehouse: str, variety: str,
                            production_records: Optional[list] = None,
                            usage_records: Optional[list] = None,
-                           inventory_snapshot: Optional[dict] = None) -> list:
+                           inventory_snapshot: Optional[dict] = None,
+                           canceled_pos: Optional[set] = None) -> list:
     """Compute FIFO lot state for a single ``(warehouse, variety)`` pair.
 
     Rule (system-wide): **consume oldest first**. Cumulative consumption for
@@ -1736,11 +1737,24 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
         production_records = load_production()
     if usage_records is None:
         usage_records = load_usage()
+    from core.util import _norm_po_key
+    from integrations.production_pdf_parser import (
+        is_plausible_production_date, lot_date_iso,
+    )
+    if canceled_pos is None:
+        try:
+            from integrations.production_store import canceled_po_keys
+            canceled_pos = canceled_po_keys()
+        except Exception:  # noqa: BLE001 -- best-effort filter
+            canceled_pos = set()
 
-    # 1. Collect every lot for this (warehouse, variety) pair.
+    # 1. Collect every lot for this (warehouse, variety) pair. Lots on a
+    #    canceled PO never reached a warehouse, so they are left out.
     lots: list = []
     for r in production_records:
         if (r.get("warehouse") or "") != warehouse:
+            continue
+        if canceled_pos and _norm_po_key(r.get("po_number") or "") in canceled_pos:
             continue
         for L in r.get("lines", []):
             if (L.get("variety") or "") != variety:
@@ -1748,17 +1762,25 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
             lot = (L.get("lot_number") or "").strip()
             if not lot:
                 continue
+            # Order by the date encoded IN the lot when it is plausible for
+            # this sheet's email; a sheet's own date can be a typo (Riviera
+            # 014511751616 was filed under 2026-03-10, so its September lots
+            # drained first and a July lot showed as "Next out").
+            ld = lot_date_iso(lot)
+            if not is_plausible_production_date(ld, r.get("received_at") or ""):
+                ld = ""
             lots.append({
                 "lot":             lot,
                 "cs_produced":     int(L.get("cs_count") or 0),
                 "production_date": r.get("production_date") or "",
+                "lot_date":        ld,
                 "received_at":     r.get("received_at") or "",
                 "po_number":       r.get("po_number") or "",
             })
 
     # 2. Oldest-first sort. Empty production_date sinks to the top (treated
     #    as "unknown/early") so we don't accidentally hold those lots back.
-    lots.sort(key=lambda L: (L["production_date"] or "0000-00-00",
+    lots.sort(key=lambda L: (L["lot_date"] or L["production_date"] or "0000-00-00",
                              L["received_at"] or "",
                              L["lot"]))
 

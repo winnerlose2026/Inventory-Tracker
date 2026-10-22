@@ -53,16 +53,41 @@ def graph_webhook_notifications():
     except Exception:  # noqa: BLE001
         payload = {}
 
+    # Answer 202 as soon as the batch is validated and do the Graph fetches +
+    # PDF parse in the background. Doing them inside the response (token,
+    # message, attachment list, attachment, pypdf -- per message, for EVERY
+    # inbound mail) is slow enough for Graph to throttle and drop the
+    # endpoint; no notification was ingested after 2026-06-10.
     try:
-        from integrations.graph_subscriptions import handle_notification
-        result = handle_notification(payload)
+        from integrations.graph_subscriptions import valid_notification_batch
+        if not valid_notification_batch(payload):
+            return jsonify({"ok": False,
+                            "error": "no notification carried a valid clientState"}), 202
+        import threading
+        threading.Thread(target=_process_notifications, args=(payload,),
+                         name="graph-notify", daemon=True).start()
     except Exception as exc:  # noqa: BLE001
         # Don't 500 — that makes Graph back off and eventually disable the sub.
         # Log server-side and return a generic 202 so Graph stays happy.
         _log_exc(exc, "webhook")
         return jsonify({"ok": False, "error": "internal error (webhook)"}), 202
 
-    return jsonify(result), 202
+    return jsonify({"ok": True, "accepted": len(payload.get("value") or [])}), 202
+
+
+def _process_notifications(payload: dict) -> None:
+    """Background worker for a validated notification batch."""
+    try:
+        from integrations.graph_subscriptions import (
+            handle_notification, record_notification_event,
+        )
+        handle_notification(payload)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "webhook worker")
+        try:
+            record_notification_event(error="worker crashed (see server log)")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @webhooks_bp.route("/api/graph/subscriptions", methods=["GET", "POST"])

@@ -94,6 +94,60 @@ def _save_state(state: dict) -> None:
     )
 
 
+def _update_state(fn) -> dict:
+    """Load -> fn(state) -> save under data_lock. Network work happens BEFORE
+    this is called; the background notification worker and the daily renew
+    both write this file, and a plain load/save let one erase the other."""
+    from inventory_tracker import data_lock
+    with data_lock():
+        state = _load_state()
+        fn(state)
+        _save_state(state)
+    return state
+
+
+def record_notification_event(*, error: str = "") -> None:
+    """Stamp the last notification time (and the last error, if any) so
+    /api/scan/health can show whether real-time ingest is alive. It had been
+    silently dead since 2026-06-10 with nothing reporting it."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _apply(st):
+        st["last_notification_at"] = now
+        if error:
+            st["last_error"] = error[:300]
+            st["last_error_at"] = now
+    try:
+        _update_state(_apply)
+    except Exception as exc:  # noqa: BLE001 -- observability must never break ingest
+        _log_exc_gs(exc, "record_notification_event")
+
+
+def subscription_health(now: Optional[datetime] = None) -> dict:
+    """Production subscription status for /api/scan/health."""
+    now = now or datetime.now(timezone.utc)
+    st = _load_state()
+    subs = []
+    for s in st.get("subscriptions") or []:
+        exp = s.get("expiration_date_time") or ""
+        expired = True
+        try:
+            expired = datetime.fromisoformat(exp.replace("Z", "+00:00")) <= now
+        except ValueError:
+            pass
+        subs.append({"id": s.get("id"), "user": s.get("user"),
+                     "expiration_date_time": exp, "expired": expired,
+                     "renewed_at": s.get("renewed_at") or s.get("created_at") or ""})
+    return {
+        "subscriptions": subs,
+        "active": any(not x["expired"] for x in subs),
+        "last_notification_at": st.get("last_notification_at") or "",
+        "last_error": st.get("last_error") or "",
+        "last_error_at": st.get("last_error_at") or "",
+        "last_renew_error": st.get("last_renew_error") or "",
+    }
+
+
 def list_subscriptions() -> list[dict]:
     """Return the locally-tracked subscription records (id, user, expiry)."""
     return list(_load_state().get("subscriptions") or [])
@@ -242,16 +296,18 @@ def create_subscriptions() -> dict:
         by_user[user] = rec
         results.append({"user": user, "ok": True, "subscription": rec})
 
-    state["subscriptions"] = list(by_user.values())
-    _save_state(state)
+    new_subs = list(by_user.values())
+    state = _update_state(lambda st: st.update(subscriptions=new_subs))
     return {"ok": True, "results": results, "subscriptions": state["subscriptions"]}
 
 
 def renew_subscriptions() -> dict:
     """PATCH each tracked subscription with a fresh expirationDateTime.
 
-    If Graph reports the subscription is gone (404), recreate it for that
-    mailbox so we don't silently lose coverage.
+    If the PATCH fails for ANY reason -- not only a 404 -- the subscription
+    is recreated for that mailbox. Only recreating on 404 is how a
+    subscription could sit dead for months (no webhook ingest after
+    2026-06-10) while this endpoint kept answering ok.
     """
     client = EmailInboxClient()
     token = client._ms365_token()
@@ -289,41 +345,49 @@ def renew_subscriptions() -> dict:
         except Exception as exc:  # noqa: BLE001
             _log_exc_gs(exc, "renew_subscriptions patch")
             msg = str(exc)
-            if "404" in msg or "ResourceNotFound" in msg:
-                # Subscription expired or was deleted server-side. Recreate.
+            if not ("404" in msg or "ResourceNotFound" in msg):
+                # Still exists but won't renew (403/400/5xx): drop it so the
+                # recreate below doesn't leave two live subscriptions.
                 try:
-                    body = {
-                        "changeType": "created",
-                        "notificationUrl": _webhook_url(),
-                        "resource": _resource_for(user),
-                        "expirationDateTime": new_expiration,
-                        "clientState": _client_state(),
-                    }
-                    created = _graph_request(
-                        "POST", f"{GRAPH_BASE}/subscriptions", token, body=body,
+                    _graph_request(
+                        "DELETE",
+                        f"{GRAPH_BASE}/subscriptions/{urllib.parse.quote(sub_id)}",
+                        token,
                     )
-                    rec = {
-                        "id": created.get("id"),
-                        "user": user,
-                        "resource": created.get("resource"),
-                        "expiration_date_time": created.get("expirationDateTime"),
-                        "notification_url": _webhook_url(),
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "recreated_from": sub_id,
-                    }
-                    by_user[user] = rec
-                    results.append({
-                        "user": user, "ok": True, "subscription": rec,
-                        "note": "recreated after 404",
-                    })
-                except Exception as exc2:  # noqa: BLE001
-                    _log_exc_gs(exc2, "renew_subscriptions recreate")
-                    results.append({
-                        "user": user, "ok": False,
-                        "error": "renew 404, recreate failed (see server log)",
-                    })
-            else:
-                results.append({"user": user, "ok": False, "error": "renew failed (see server log)"})
+                except Exception as exc_del:  # noqa: BLE001
+                    _log_exc_gs(exc_del, "renew_subscriptions delete-before-recreate")
+            # Expired, deleted server-side, or refusing renewal. Recreate.
+            try:
+                body = {
+                    "changeType": "created",
+                    "notificationUrl": _webhook_url(),
+                    "resource": _resource_for(user),
+                    "expirationDateTime": new_expiration,
+                    "clientState": _client_state(),
+                }
+                created = _graph_request(
+                    "POST", f"{GRAPH_BASE}/subscriptions", token, body=body,
+                )
+                rec = {
+                    "id": created.get("id"),
+                    "user": user,
+                    "resource": created.get("resource"),
+                    "expiration_date_time": created.get("expirationDateTime"),
+                    "notification_url": _webhook_url(),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "recreated_from": sub_id,
+                }
+                by_user[user] = rec
+                results.append({
+                    "user": user, "ok": True, "subscription": rec,
+                    "note": "recreated after failed renew",
+                })
+            except Exception as exc2:  # noqa: BLE001
+                _log_exc_gs(exc2, "renew_subscriptions recreate")
+                results.append({
+                    "user": user, "ok": False,
+                    "error": "renew failed, recreate failed (see server log)",
+                })
 
     # Create subscriptions for mailboxes we don't yet cover.
     for user in missing_users:
@@ -355,9 +419,17 @@ def renew_subscriptions() -> dict:
             _log_exc_gs(exc, "renew_subscriptions add mailbox")
             results.append({"user": user, "ok": False, "error": "subscribe failed (see server log)"})
 
-    state["subscriptions"] = list(by_user.values())
-    _save_state(state)
-    return {"ok": True, "results": results, "subscriptions": state["subscriptions"]}
+    new_subs = list(by_user.values())
+    failed = [r for r in results if not r.get("ok")]
+    renew_err = ("; ".join(f"{r.get('user')}: {r.get('error')}" for r in failed)
+                 if failed else "")
+
+    def _apply(st):
+        st["subscriptions"] = new_subs
+        st["last_renew_at"] = datetime.now(timezone.utc).isoformat()
+        st["last_renew_error"] = renew_err
+    state = _update_state(_apply)
+    return {"ok": not failed, "results": results, "subscriptions": state["subscriptions"]}
 
 
 def delete_subscription(sub_id: str) -> dict:
@@ -373,11 +445,9 @@ def delete_subscription(sub_id: str) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
-    state = _load_state()
-    state["subscriptions"] = [
-        s for s in state.get("subscriptions") or [] if s.get("id") != sub_id
-    ]
-    _save_state(state)
+    _update_state(lambda st: st.update(subscriptions=[
+        s for s in st.get("subscriptions") or [] if s.get("id") != sub_id
+    ]))
     return {"ok": err is None, "error": err}
 
 
@@ -445,6 +515,22 @@ def _message_id_from_resource(resource: str) -> Optional[str]:
     return None
 
 
+def valid_notification_batch(payload: dict) -> bool:
+    """Cheap, network-free check that a POST is a genuine notification batch
+    (a list carrying our clientState). The webhook answers 202 right after
+    this and does the slow work in the background."""
+    import hmac as _hmac
+    try:
+        expected = _client_state()
+    except Exception:  # noqa: BLE001 -- not configured: nothing is valid
+        return False
+    notes = (payload or {}).get("value")
+    if not isinstance(notes, list):
+        return False
+    return any(isinstance(n, dict) and _hmac.compare_digest(
+        str(n.get("clientState") or ""), str(expected or "")) for n in notes)
+
+
 def handle_notification(payload: dict) -> dict:
     """Process a Graph change-notification batch.
 
@@ -454,15 +540,20 @@ def handle_notification(payload: dict) -> dict:
       - qualify it (sender on hhbagels.com + subject contains
         "daily production")
       - download the first PDF attachment
-      - ingest via the existing production parse path (idempotent on
-        internetMessageId)
+      - store it through production_store (the same ingest_production_record
+        the scan and /api/production/ingest use: message-id + same-sheet
+        dedup, derived_from kept, tombstones honoured)
 
-    Returns a summary dict for the response body / logs. Always returns
-    HTTP-200-safe output; the Flask layer returns 202 regardless so Graph
-    keeps the subscription healthy.
+    Runs in a background thread off the webhook (see blueprints/webhooks.py):
+    Graph wants a fast 2xx, and fetching + parsing inside the response is
+    the likely reason real-time ingest went silent after 2026-06-10.
+    All Graph I/O happens BEFORE the single locked write.
     """
-    from inventory_tracker import load_production, save_production
+    from inventory_tracker import load_production
     from .production_pdf_parser import parse_production_pdf
+    from .production_store import (
+        load_tombstones, record_from_sheet, seen_message_ids, store_parsed,
+    )
 
     expected_client_state = _client_state()
 
@@ -473,10 +564,7 @@ def handle_notification(payload: dict) -> dict:
     # Reject the batch before doing any outbound work: the webhook is an open
     # endpoint, and an unauthenticated POST used to cost a token round trip
     # to login.microsoftonline.com plus a stack trace in the logs.
-    import hmac as _hmac
-    if not any(_hmac.compare_digest(str(n.get("clientState") or ""),
-                                    str(expected_client_state or ""))
-               for n in notifications if isinstance(n, dict)):
+    if not valid_notification_batch(payload):
         return {"ok": False, "error": "no notification carried a valid clientState"}
 
     client = EmailInboxClient()
@@ -484,14 +572,15 @@ def handle_notification(payload: dict) -> dict:
         token = client._ms365_token()
     except Exception as exc:  # noqa: BLE001
         _log_exc_gs(exc, "handle_notification token")
+        record_notification_event(error="token failed")
         return {"ok": False, "error": "token failed (see server log)"}
 
     ingested = 0
     skipped = 0
     errors: list[str] = []
     summary: list[dict] = []
-    records = load_production()
-    seen_ids = {r.get("source_message_id") for r in records if r.get("source_message_id")}
+    seen_ids = seen_message_ids(load_production(), load_tombstones())
+    to_store = []   # [(record, po_body, po_subject, subject)]
 
     for note in notifications:
         cs = note.get("clientState") or ""
@@ -547,71 +636,38 @@ def handle_notification(payload: dict) -> dict:
             continue
 
         try:
-            sheet = parse_production_pdf(pdf_bytes, subject=subject)
+            sheet = parse_production_pdf(pdf_bytes, subject=subject,
+                                         received_at=received_at)
         except Exception as exc:  # noqa: BLE001
             _log_exc_gs(exc, "handle_notification parse")
             errors.append(f"{subject[:60]!r}: parse failed (see server log)")
             continue
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if sheet.error and not sheet.lines:
-            stub = {
-                "production_date": "",
-                "warehouse": "",
-                "warehouse_raw": "",
-                "distributor": "",
-                "po_number": "",
-                "lines": [],
-                "total_cases": 0,
-                "unmapped_varieties": [],
-                "source_message_id": internet_id,
-                "source_subject": subject,
-                "source_sender": sender,
-                "received_at": received_at or now_iso,
-                "ingested_at": now_iso,
-                "parse_error": sheet.error,
-            }
-            records.append(stub)
-            seen_ids.add(internet_id)
-            summary.append({"subject": subject, "status": "parse_error",
-                            "error": sheet.error})
-            errors.append(f"{subject[:60]!r}: {sheet.error}")
-            continue
-
-        record = {
-            "production_date":    sheet.production_date,
-            "warehouse":          sheet.warehouse,
-            "warehouse_raw":      sheet.warehouse_raw,
-            "distributor":        sheet.distributor,
-            "po_number":          sheet.po_number,
-            "lines": [
-                {"variety": L.variety, "raw_variety": L.raw_variety,
-                 "cs_count": L.cs_count, "lot_number": L.lot_number}
-                for L in sheet.lines
-            ],
-            "total_cases":        sheet.total_cases,
-            "unmapped_varieties": sheet.unmapped_varieties,
-            "source_message_id":  internet_id,
-            "source_subject":     subject,
-            "source_sender":      sender,
-            "received_at":        received_at or now_iso,
-            "ingested_at":        now_iso,
-            "parse_error":        "",
-        }
-        records.append(record)
+        record = record_from_sheet(sheet, message_id=internet_id, subject=subject,
+                                   sender=sender, received_at=received_at,
+                                   now_iso=datetime.now(timezone.utc).isoformat())
         seen_ids.add(internet_id)
-        ingested += 1
-        summary.append({
-            "subject": subject,
-            "status": "ingested",
-            "production_date": sheet.production_date,
-            "warehouse": sheet.warehouse,
-            "total_cases": sheet.total_cases,
-        })
+        if sheet.error and not sheet.lines:
+            errors.append(f"{subject[:60]!r}: {sheet.error}")
+            to_store.append((record, "", "", subject))
+            continue
+        to_store.append((record, sheet.po_body, sheet.po_subject, subject))
 
-    if ingested or any(s.get("status") == "parse_error" for s in summary):
-        save_production(records)
+    if to_store:
+        results = store_parsed([(r, b, s) for r, b, s, _subj in to_store])
+        for (status, stored), (_r, _b, _s, subject) in zip(results, to_store):
+            if status in ("ingested", "replaced"):
+                ingested += 1
+            entry = {"subject": subject, "status": status}
+            if stored:
+                entry.update({"production_date": stored.get("production_date"),
+                              "warehouse": stored.get("warehouse"),
+                              "total_cases": stored.get("total_cases")})
+            if status == "parse_error":
+                entry["error"] = (stored or {}).get("parse_error") or ""
+            summary.append(entry)
 
+    record_notification_event(error="; ".join(errors)[:300] if errors else "")
     return {
         "ok": True,
         "received": len(notifications),

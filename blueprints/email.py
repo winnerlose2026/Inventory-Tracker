@@ -263,6 +263,14 @@ def api_scan_health():
         if sku_count == 0:
             inventory_error = ("inventory is EMPTY -- 0 SKUs on file; "
                                "warehouse freshness below is meaningless")
+        # Real-time Daily Production ingest (Graph subscription): it sat dead
+        # from 2026-06-10 with no signal anywhere, so say whether it's alive.
+        try:
+            from integrations.graph_subscriptions import subscription_health
+            production_subscriptions = subscription_health()
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "scan health production subscriptions")
+            production_subscriptions = {"error": "unavailable"}
         scan_age_hours = None
         last_ts = health.get("ts") if health else None
         if last_ts:
@@ -284,6 +292,7 @@ def api_scan_health():
             "warehouses": fresh,
             "stale_warehouses": stale,
             "unparsed_reports": load_unparsed_reports(),
+            "production_subscriptions": production_subscriptions,
         })
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "scan health")

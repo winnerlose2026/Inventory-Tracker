@@ -98,11 +98,30 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
             urgency = "ASAP"
         lines = [{"variety": L.get("variety") or "", "qty": float(L.get("qty") or 0),
                   "top4": (L.get("variety") in top4)} for L in (po.get("lines") or [])]
-        total = round(sum(L["qty"] for L in lines) or float(po.get("total_cs") or 0), 1)
         unit = wh_group.get(wh, wh)
         for L in lines:
             queued_unit_variety.add((unit, L["variety"]))
+        # Net out what the bakery already BAKED for this PO (Daily Production
+        # sheets, per variety; the ledger leaves canceled POs' bakes out).
+        # A PO baked but not yet shipped sat in the queue for a median 3 days
+        # -- Houston 305202B2's 1,120 cs for 11 -- inflating committed cs.
+        baked = dict(((po.get("production") or {}).get("by_variety")) or {})
+        ordered_cs = sum(L["qty"] for L in lines)
+        baked_cs = 0.0
+        for L in lines:
+            take = min(L["qty"], max(0.0, float(baked.get(L["variety"]) or 0)))
+            if take:
+                baked[L["variety"]] = float(baked.get(L["variety"]) or 0) - take
+                baked_cs += take
+                L["baked"] = round(take, 1)
+                L["qty"] = round(L["qty"] - take, 1)
+        if lines and baked_cs and not any(L["qty"] > 0 for L in lines):
+            continue   # fully baked: waiting to ship, nothing left to bake
+        lines = [L for L in lines if L["qty"] > 0] if baked_cs else lines
+        total = round(sum(L["qty"] for L in lines) or
+                      (0.0 if baked_cs else float(po.get("total_cs") or 0)), 1)
         queue.append({
+            "ordered_cs": round(ordered_cs, 1), "baked_cs": round(baked_cs, 1),
             "po_number": po.get("po_number") or "", "distributor": dist, "warehouse": wh,
             "transfer_group": po.get("transfer_group"), "status": st,
             "ship_date": ship or None, "produce_by": produce_by, "urgency": urgency,

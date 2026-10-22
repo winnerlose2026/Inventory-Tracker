@@ -1378,6 +1378,16 @@ def build_po_ledger() -> list:
         for k in ("_pending", "_arrived", "_canceled"):
             r.pop(k, None)
         out.append(r)
+    # What the bakery has already baked for each PO (Daily Production
+    # sheets): {baked_cs, by_variety, dates, last_date, lots}. The planner
+    # nets it out of the to-bake queue and the Pending POs row shows it.
+    try:
+        from integrations.production_store import baked_for_ledger
+        _baked = baked_for_ledger()
+    except Exception:  # noqa: BLE001 -- an overlay; never fatal to the ledger
+        _baked = {}
+    for r in out:
+        r["production"] = _baked.get(_norm_po_key(r.get("po_number") or ""))
     out.sort(key=lambda x: (x.get("status") or "", x.get("ordered_at") or "", x.get("po_number") or ""))
     return out
 

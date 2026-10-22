@@ -2575,6 +2575,7 @@ function _groupsFromLedger(records) {
       arrival_kind: r.arrival_kind || '',
       transit_days: (r.transit_days === undefined || r.transit_days === null) ? null : Number(r.transit_days),
       transit_basis: r.transit_basis || '',
+      production: r.production || null,
       _source: src,
     };
     // The server is the authority on arrived vs pending: on-hand is only
@@ -2663,6 +2664,18 @@ function _assemblePendingGroupsLegacy() {
     g._state = ov || _poState(g, now);
   });
   return groups;
+}
+
+// "Baked <date> · N cs" under the PO number, from the ledger's per-PO
+// Daily Production total. Several bake days show the latest plus a count.
+function _poBakedNoteHtml(g) {
+  const p = g && g.production;
+  if (!p || !(Number(p.baked_cs) > 0)) return '';
+  const dates = p.dates || [];
+  const last = p.last_date || dates[dates.length - 1] || '';
+  const more = dates.length > 1 ? ` (+${dates.length - 1} day${dates.length === 2 ? '' : 's'})` : '';
+  const tip = escAttr('Daily Production: ' + dates.join(', ') + ((p.lots || []).length ? '\nLots: ' + p.lots.join(', ') : ''));
+  return `<div title="${tip}" style="font-size:11px;color:var(--muted);cursor:help">Baked ${last ? formatDate(last) : ''}${more} &middot; ${(Number(p.baked_cs) || 0).toFixed(0)} cs</div>`;
 }
 
 // Items column (shared by the main table and the In Production section).
@@ -2909,7 +2922,7 @@ function _pendingRowHtml(g, now) {
     ? 'Tick to edit this arrived PO (arrival date, ship date, received qty)'
     : 'Tick to modify this PO ship date';
   return `<tr${rowStyle}>
-      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="${chkTitle}" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${poAttr}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span></td>
+      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="${chkTitle}" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${poAttr}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span>${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${itemsCell}
@@ -2941,7 +2954,7 @@ function renderInProductionSection(list) {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">—</span>';
     const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
@@ -2977,7 +2990,7 @@ function renderInTransitSection(list) {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">&mdash;</span>';
     const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
@@ -3247,30 +3260,27 @@ async function cancelPendingPO(poNumber, lineCount, totalCs, source) {
 // Build {po_number: aggregated PO info} from the inventory 's on_order
 // entries. Each PO has one ship_date / arrival_date / eta because the
 // API ship-date endpoint fans out across all line items.
-function _buildProdPoLookup(items) {
+// PO status for the Production tab comes from the canonical PO ledger
+// (/api/pos/ledger), keyed by PO number -- USF, Cheney AND Chefs Warehouse.
+// It used to be "not in inventory on_order = Arrived", which showed every
+// Chefs Warehouse PO as Arrived the day it was baked (CWFL 1202942: baked
+// 10/7, arrived 10/21) since CW POs never live in on_order.
+function _prodPoKey(po) {
+  return String(po || '').trim().toUpperCase().replace(/^HHB[- ]/, '').replace(/^\.+|\.+$/g, '').trim();
+}
+function _buildProdPoLookup(ledgerPos) {
   const map = {};
-  items.forEach(item => {
-    (item.on_order || []).forEach(e => {
-      const po = (e.po_number || '').trim();
-      if (!po) return;
-      const existing = map[po];
-      if (!existing) {
-        map[po] = {
-          po_number:    po,
-          ship_date:    e.ship_date || '',
-          arrival_date: e.arrival_date || '',
-          eta:          e.eta || '',
-          warehouses:   new Set([item.warehouse || '']),
-          line_count:   1,
-        };
-      } else {
-        // Prefer a non-empty ship_date / arrival across line items
-        if (!existing.ship_date    && e.ship_date)    existing.ship_date    = e.ship_date;
-        if (!existing.arrival_date && e.arrival_date) existing.arrival_date = e.arrival_date;
-        existing.warehouses.add(item.warehouse || '');
-        existing.line_count += 1;
-      }
-    });
+  (ledgerPos || []).forEach(r => {
+    const k = _prodPoKey(r.po_number);
+    if (!k) return;
+    map[k] = {
+      po_number:    r.po_number || '',
+      status:       r.status || '',
+      ship_date:    r.ship_date || '',
+      arrival_date: r.arrival_date || '',
+      eta:          r.eta || '',
+      warehouse:    r.warehouse || '',
+    };
   });
   return map;
 }
@@ -3869,15 +3879,14 @@ function drawFreightChart() {
 
 async function loadProduction() {
   await ensureWarehouses();
-  // Pull production records AND inventory in parallel — the inventory call
-  // gives us live on_order data so we can show ship/arrival on each
-  // production row by matching po_number.
-  const [records, inventory] = await Promise.all([
+  // Pull production records AND the PO ledger in parallel — the ledger
+  // gives each production row its PO's status / ship / arrival by po_number.
+  const [records, ledger] = await Promise.all([
     api('/api/production'),
-    api('/api/inventory'),
+    api('/api/pos/ledger').catch(() => null),
   ]);
   prodCache = records;
-  prodPoLookup = _buildProdPoLookup(inventory || []);
+  prodPoLookup = _buildProdPoLookup((ledger && ledger.pos) || []);
 
   // Populate warehouse filter from the records actually present
   const wSel = document.getElementById('prod-filter-warehouse');
@@ -4034,6 +4043,21 @@ function _prodSortValue(r, key) {
   return '';
 }
 
+// PDF-header PO vs subject PO: unresolved conflicts are flagged for review;
+// auto-resolved ones say which PO was used and why it isn't the header's.
+function _prodPoConflictHtml(r) {
+  const c = r && r.po_conflict;
+  if (c) {
+    return `<div><span class="badge badge-red" style="font-size:10px" title="${escAttr('The PDF header says PO ' + (c.body || '?') + ' but the subject says PO ' + (c.subject || '?') + '. Neither or both are in the PO ledger, so the header PO is kept. Check which is right.')}">PO conflict: subject ${escHtml(c.subject || '')}</span></div>`;
+  }
+  const v = r && r.po_resolved;
+  if (v && v.chosen) {
+    const other = (v.chosen === v.body) ? v.subject : v.body;
+    return `<div style="font-size:10px;color:var(--muted)" title="${escAttr('Header PO ' + (v.body || '?') + ' vs subject PO ' + (v.subject || '?') + ': used the one in the PO ledger.')}">not ${escHtml(other || '')}</div>`;
+  }
+  return '';
+}
+
 function renderProductionDetail() {
   const tbody = document.getElementById('prod-tbody');
   if (!tbody) return;
@@ -4103,11 +4127,9 @@ function renderProductionDetail() {
       : '';
     const srcSubj = (r.source_subject || '').replace(/^Daily [Pp]roduction\s*/, '');
     const srcSender = (r.source_sender || '').match(/<([^>]+)>/)?.[1] || r.source_sender || '';
-    // Cross-link to live PO data (if any line of this PO is still
-    // pending). When no match is found the PO has already rolled into
-    // the SKU's quantity — show as "Arrived".
+    // Cross-link to the PO ledger's status for this PO number.
     const po = (r.po_number || '').trim();
-    const linked = po ? prodPoLookup[po] : null;
+    const linked = po ? prodPoLookup[_prodPoKey(po)] : null;
     let shipCell, arrivalCell, statusCell;
     if (linked) {
       shipCell = linked.ship_date
@@ -4118,7 +4140,11 @@ function renderProductionDetail() {
         : '<span style="color:var(--muted)">—</span>';
       const trigger = linked.arrival_date || linked.eta;
       const overdue = trigger && new Date(trigger) < new Date();
-      if (overdue) {
+      if (linked.status === 'arrived') {
+        statusCell = `<span class="badge badge-green" style="font-size:10px">Arrived</span>`;
+      } else if (linked.status === 'canceled' || linked.status === 'cancelled') {
+        statusCell = `<span class="badge badge-red" style="font-size:10px">Canceled</span>`;
+      } else if (overdue) {
         statusCell = `<span class="badge badge-red" style="font-size:10px">Overdue</span>`;
       } else if (linked.ship_date) {
         statusCell = `<span class="badge badge-blue" style="font-size:10px">In transit</span>`;
@@ -4126,10 +4152,11 @@ function renderProductionDetail() {
         statusCell = `<span class="badge badge-yellow" style="font-size:10px">Open</span>`;
       }
     } else if (po) {
-      // PO no longer in on_order = it rolled over into quantity
+      // Not in the PO ledger at all (typo'd PO, untracked customer): don't
+      // claim it arrived.
       shipCell    = '<span style="color:var(--muted)">—</span>';
       arrivalCell = '<span style="color:var(--muted)">—</span>';
-      statusCell  = `<span class="badge badge-green" style="font-size:10px">Arrived</span>`;
+      statusCell  = `<span class="badge" style="font-size:10px;color:var(--muted)" title="No PO with this number in the PO ledger">Not on file</span>`;
     } else {
       shipCell    = '<span style="color:var(--muted)">—</span>';
       arrivalCell = '<span style="color:var(--muted)">—</span>';
@@ -4139,7 +4166,7 @@ function renderProductionDetail() {
       <td style="white-space:nowrap;font-weight:600">${r.production_date ? formatDate(r.production_date) : '<span style="color:var(--warning,#c00)">—</span>'}</td>
       <td>${escHtml(r.warehouse || '')}${r.warehouse_raw && r.warehouse_raw !== r.warehouse ? ` <span style="color:var(--muted);font-size:11px">(${escHtml(r.warehouse_raw)})</span>` : ''}</td>
       <td>${distributorBadge(r.distributor || '')}</td>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(r.po_number || '—')}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(r.po_number || '—')}${_prodPoConflictHtml(r)}</td>
       <td title="${escAttr(tipText)}" style="font-size:12px">
         <div>${head}${more}${errBadge}</div>
         <div style="color:var(--muted);font-size:11px">${lines.length} item${lines.length === 1 ? '' : 's'}</div>

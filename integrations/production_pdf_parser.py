@@ -405,6 +405,7 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     # production destined to Cheney's Ocala DC — per JD, route it there.
     "JACKSON VILLE":         ("Ocala, FL",              "Cheney Brothers"),
     "JACKSONVILLE":          ("Ocala, FL",              "Cheney Brothers"),
+    "JACK-VILLE":            ("Ocala, FL",              "Cheney Brothers"),
     # Common typos seen on hand-keyed sheets — route them like the
     # correctly-spelled originals so the operator doesn't have to.
     "MNASSAS":               ("Manassas, VA",           "US Foods"),
@@ -417,7 +418,62 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "CARMELA FOODS":         ("Carmela Foods",          "Carmela Foods"),
     # Bare "CHENEY" without a city defaults to Riviera Beach per JD.
     "CHENEY":                ("Riviera Beach, FL",      "Cheney Brothers"),
+    # Spelled-out forms of the same city-less Cheney label.
+    "CHENEY BROTHERS":       ("Riviera Beach, FL",      "Cheney Brothers"),
+    "CHENEY BROS":           ("Riviera Beach, FL",      "Cheney Brothers"),
+    # US Foods' Chicago-area DC moved from Bensenville to AURORA; the PO
+    # parser already maps AURORA -> "Chicago, IL" (usfoods_po_parser), but
+    # production sheets headed "US FOODS AURORA" (5177033T, 2026-09-14) fell
+    # through to a raw label and never reached the Chicago lots.
+    "AURORA":                ("Chicago, IL",            "US Foods"),
+    # USF's Alcoa DC is the Knoxville metro ("US.FOODS.KNOXVILLE.PO.1...").
+    "KNOXVILLE":             ("Alcoa, TN",              "US Foods"),
+    # "LA MIRANDA" is the recurring misspelling of La Mirada (7324474C,
+    # 5959034C).
+    "LA MIRANDA":            ("La Mirada, CA",          "US Foods"),
+    "CW-CHICAGO":            ("Chefs Warehouse, Chicago", "Chefs Warehouse"),
+    # Sheets baked for H&H's own freezer stock say "INVENTORY" in the subject.
+    "INVENTORY":             ("In-House Inventory",     "H&H Bagels"),
+    "INVENTORI":             ("In-House Inventory",     "H&H Bagels"),
+    "IN HOUSE":              ("In-House Inventory",     "H&H Bagels"),
+    "IN-HOUSE":              ("In-House Inventory",     "H&H Bagels"),
+    "IN HOUSE INVENTORY":    ("In-House Inventory",     "H&H Bagels"),
+    "IN-HOUSE INVENTORY":    ("In-House Inventory",     "H&H Bagels"),
 }
+
+#: Chefs Warehouse production sheets name the DC by region ("Chefs Warehouse,
+#: NY"); the PO ledger names the same DC by its ship-to city ("Bronx, NY").
+#: Stored records keep their production name -- this maps it at LINK time so
+#: a warehouse join against the ledger works. Keyed by (warehouse,
+#: distributor) so CW Chicago can never be confused with US Foods "Chicago, IL".
+CW_PRODUCTION_TO_LEDGER_WAREHOUSE: dict[str, str] = {
+    "Chefs Warehouse, NY":           "Bronx, NY",
+    "Chefs Warehouse, FL":           "Opa Locka, FL",
+    "Chefs Warehouse, Chicago":      "Chicago, IL",
+    "Chefs Warehouse, Mid-Atlantic": "Hanover, MD",
+}
+
+
+def ledger_warehouse_for(warehouse: str, distributor: str) -> str:
+    """The PO-ledger warehouse name for a production record's warehouse.
+
+    Identity for everything except the four Chefs Warehouse DCs, whose
+    production names differ from the ledger's ship-to cities."""
+    if (distributor or "") == "Chefs Warehouse":
+        return CW_PRODUCTION_TO_LEDGER_WAREHOUSE.get(warehouse or "", warehouse or "")
+    return warehouse or ""
+
+
+def warehouse_matches_ledger(warehouse: str, distributor: str,
+                             ledger_warehouse: str, ledger_distributor: str) -> bool:
+    """Does a production record's (warehouse, distributor) name the same DC
+    as a ledger PO's (warehouse, distributor)? Distributor must agree too, so
+    Chefs Warehouse Chicago never matches US Foods Chicago."""
+    if not warehouse or not ledger_warehouse:
+        return False
+    if distributor and ledger_distributor and distributor != ledger_distributor:
+        return False
+    return ledger_warehouse_for(warehouse, distributor) == ledger_warehouse
 
 
 @dataclass
@@ -440,6 +496,12 @@ class ProductionSheet:
     warehouse_raw: str = ""           # exactly as printed on the sheet
     distributor: str = ""             # inferred from warehouse
     po_number: str = ""
+    #: The PO as printed in the PDF header, and as written in the subject.
+    #: Kept apart so a disagreement (a template whose header PO wasn't
+    #: updated -- CWC 7/1 sheet printed CWFL's 1135526) can be resolved
+    #: against the PO ledger instead of the body silently winning.
+    po_body: str = ""
+    po_subject: str = ""
     lines: list = field(default_factory=list)
     total_cases: int = 0
     unmapped_varieties: list = field(default_factory=list)
@@ -538,22 +600,272 @@ def _classify_warehouse(raw: str) -> "tuple[str, str]":
         if cm:
             return cm
 
+    loose = _classify_loose(key)
+    if loose:
+        return loose
+
     return (raw, "")
+
+
+def _squash(s: str) -> str:
+    """Upper-case and drop everything but letters/digits, so "US FOODS LA
+    MIRADA" (double space), "PUNTA.GORDA" and "CWMID-ATL" compare equal to
+    their canonical keys."""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+#: Distributor words typed in front of the city, most specific first. The
+#: hand-keyed sheets misspell these too ("US FOODOS", "CHENEY BROTHEHRS").
+_DIST_PREFIXES = (
+    "USFOOODS", "USFOODOS", "USFOODS", "USF",
+    "CHENEYBROTHEHRS", "CHENEYBROTHERS", "CHENEYBROTHER", "CHENEYBROS",
+    "CHENEYBRO", "CHENEY",
+)
+
+_SQUASHED_CANONICAL: dict = {}
+for _k, _v in _WAREHOUSE_TO_CANONICAL.items():
+    _SQUASHED_CANONICAL.setdefault(_squash(_k), _v)
+
+
+def _classify_loose(key: str):
+    """Last-resort warehouse match for hand-keyed labels.
+
+    The exact-key table missed 64 sheets / 14,285 cs whose label was only a
+    spacing, punctuation, prefix or truncation away from a known DC
+    ("US FOODS LA  MIRADA", "CHENEY BROTHEHRS OCALA", "RIVIERA B",
+    "CW-MID-AT"). Returns (warehouse, distributor) or None.
+    """
+    sq = _squash(key)
+    if not sq:
+        return None
+    hit = _SQUASHED_CANONICAL.get(sq)
+    if hit:
+        return hit
+    # "CHEFS WAREHOUSE MID ATL" -> "CWMIDATL"
+    if sq.startswith("CHEFSWAREHOUSE") and len(sq) > len("CHEFSWAREHOUSE"):
+        sq = "CW" + sq[len("CHEFSWAREHOUSE"):]
+        hit = _SQUASHED_CANONICAL.get(sq)
+        if hit:
+            return hit
+    for pre in _DIST_PREFIXES:
+        if sq.startswith(pre) and len(sq) > len(pre):
+            rest = sq[len(pre):]
+            rest = _squash(_USF_CITY_ALIASES.get(rest, rest)) if pre.startswith("USF") else rest
+            hit = _SQUASHED_CANONICAL.get(rest)
+            if hit:
+                return hit
+            sq = rest
+            break
+    # Truncated label ("RIVIERA B", "CW-MID-AT"): accept a prefix only when
+    # it is long enough to mean something and names exactly one DC.
+    if len(sq) >= 6:
+        hits = {v for k, v in _SQUASHED_CANONICAL.items() if k.startswith(sq)}
+        if len(hits) == 1:
+            return hits.pop()
+    return None
+
+
+#: Daily Production subjects end in the PO: "PO.123", "PO#123", "PO #123",
+#: "P.O. 123", "PO-123", "CWC.PO.1135525". The number must contain a digit,
+#: so "DELIBAG PO. daily production" no longer yields the PO "daily".
+_SUBJECT_PO_RE = re.compile(
+    r"(?<![A-Z0-9])P\.?O\.?(?:\s*(?:#|NO\.?|NUM(?:BER)?\.?))?"
+    r"(?:[\s.:#\-]+|(?=\d))([A-Z0-9]*\d[A-Z0-9]*)",
+    re.IGNORECASE,
+)
+#: Where the PO part of a subject starts (with or without a number), so the
+#: DC label in front of it can be cut out.
+_SUBJECT_PO_START_RE = re.compile(r"(?<![A-Z0-9])P\.?O(?![A-Z])", re.IGNORECASE)
+
+
+def subject_po(subject: str) -> str:
+    """The PO number written in a Daily Production subject, or ''."""
+    m = _SUBJECT_PO_RE.search(subject or "")
+    if m:
+        return m.group(1).strip().upper()
+    # "PO.US FOODS MANASSAS 8750515O" / "US FOOS.PO.KNOXVILLE 8764076H": the
+    # DC sits between the PO marker and the number. Take the last
+    # number-bearing token (5+ chars, so a date's 10/13 never qualifies).
+    pm = _SUBJECT_PO_START_RE.search(subject or "")
+    if pm:
+        toks = [t for t in re.split(r"[^A-Z0-9]+", subject[pm.end():].upper())
+                if len(t) >= 5 and any(c.isdigit() for c in t)]
+        if toks:
+            return toks[-1]
+    return ""
+
+
+def _subject_rest(subject: str) -> str:
+    s = re.sub(r"^\s*(?:(?:FW|FWD|RE)\s*:\s*)+", "", subject or "", flags=re.IGNORECASE)
+    # No \b after "production": "Daily ProductionUS FOODS.MANASSAS.PO.." is real.
+    m = re.search(r"daily\s*production(?:\s+sheet\b)?(.*)$", s, re.IGNORECASE)
+    if not m:
+        return ""
+    if not m.group(1).strip(" .-_#,:\t") and m.start() > 0:
+        # "DELIBAG PO. daily production": the label comes first.
+        return s[:m.start()]
+    return m.group(1)
+
+
+def subject_warehouse_labels(subject: str) -> list:
+    """Candidate DC labels in a Daily Production subject, best first: the
+    text before the PO marker ("US FOODS HOUSTON" in "... US FOODS HOUSTON
+    PO.393072B2"), then the text after it minus the PO number ("US FOODS
+    MANASSAS" in "... PO.US FOODS MANASSAS 8750515O")."""
+    rest = _subject_rest(subject)
+    if not rest:
+        return []
+    out = []
+    pm = _SUBJECT_PO_START_RE.search(rest)
+    before = rest[:pm.start()] if pm else rest
+    before = before.strip(" .-_#,:\t").strip()
+    if before:
+        out.append(before)
+    if pm:
+        po = subject_po(subject)
+        after = rest[pm.end():]
+        if po:
+            after = re.sub(re.escape(po), " ", after, flags=re.IGNORECASE)
+        after = re.sub(r"^[\s.:#\-]*(?:#|NO\.?)?", "", after).strip(" .-_#,:\t").strip()
+        if after and after not in out:
+            out.append(after)
+    return out
+
+
+def subject_warehouse_label(subject: str) -> str:
+    """The DC label a Daily Production subject names, e.g. "US FOODS HOUSTON"
+    from "Daily Production US FOODS HOUSTON PO.393072B2". '' when absent."""
+    labels = subject_warehouse_labels(subject)
+    for lab in labels:
+        if _classify_warehouse(lab)[1]:
+            return lab
+    return labels[0] if labels else ""
+
+
+def classify_warehouse_with_subject(warehouse_raw: str, subject: str = "") -> "tuple[str, str]":
+    """_classify_warehouse, falling back to the DC named in the SUBJECT when
+    the body label is blank or unmatched.
+
+    Records ingested before a label was known (Houston 393072B2 stored as
+    "US FOODS HOUSTON") or whose PDF header didn't parse (64 sheets / 14,285
+    cs stored with no warehouse) still carry the DC in their subject line.
+    """
+    wh, dist = _classify_warehouse(warehouse_raw)
+    if dist and (warehouse_raw or "").strip():
+        return wh, dist
+    for label in subject_warehouse_labels(subject):
+        swh, sdist = _classify_warehouse(label)
+        if sdist:
+            return swh, sdist
+    return wh, dist
+
+
+# --------------------------------------------------------------------------
+# Production date
+# --------------------------------------------------------------------------
+
+#: A sheet is emailed within days of the bake. A lot or typed date more than
+#: this far before the email -- or after it -- is a typo, not a bake date.
+PLAUSIBLE_PRODUCTION_WINDOW_DAYS = 21
+_LOCAL_TZ = "America/New_York"   # the bakery's calendar
+
+
+def received_local_date(received_at: str):
+    """The bakery-local calendar date of an email's received_at, or None.
+
+    Graph stamps receivedDateTime in UTC ("...Z"); a naive value is treated as
+    UTC too (the server's datetime.now() on Render). A sheet received at
+    8 pm ET is still that day's sheet."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    s = (received_at or "").strip()
+    if not s:
+        return None
+    try:
+        dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = _dt.fromisoformat(s[:10])
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo(_LOCAL_TZ)).date()
+    except Exception:  # noqa: BLE001 -- no tz database: fixed EST offset
+        return (dt.astimezone(_tz.utc) - _td(hours=5)).date()
+
+
+def lot_date_iso(lot: str) -> str:
+    """The production date encoded in an H&H lot code, as ISO, or ''.
+
+    <4-digit item><MMDDYYYY> (12 digits) or legacy <item><MMDDYY> (10)."""
+    from datetime import date as _date
+    d = re.sub(r"\D", "", lot or "")
+    try:
+        if len(d) == 12:
+            return _date(int(d[8:12]), int(d[4:6]), int(d[6:8])).isoformat()
+        if len(d) == 10:
+            return _date(2000 + int(d[8:10]), int(d[4:6]), int(d[6:8])).isoformat()
+    except ValueError:
+        return ""
+    return ""
+
+
+def is_plausible_production_date(iso: str, received_at: str) -> bool:
+    """Within [received - 21 days, received] on the bakery's calendar."""
+    from datetime import date as _date, timedelta as _td
+    recv = received_local_date(received_at)
+    if recv is None or not iso:
+        return False
+    try:
+        d = _date.fromisoformat(str(iso)[:10])
+    except ValueError:
+        return False
+    return recv - _td(days=PLAUSIBLE_PRODUCTION_WINDOW_DAYS) <= d <= recv
+
+
+def choose_production_date(lot_dates, slash_dates, received_at: str,
+                           default: str = "") -> str:
+    """The sheet's production date.
+
+    Was: the first typed date, else the EARLIEST lot date -- so one mistyped
+    lot (1189031026 for 091026 on Riviera 014511751616) back-dated the whole
+    sheet six months and FIFO drained it first. Now: the most common
+    PLAUSIBLE lot date (ties -> earliest), else a plausible typed date, else
+    the received date. Without a received_at nothing can be judged, so the
+    caller's ``default`` (the old rule) stands.
+    """
+    from collections import Counter as _Counter
+    recv = received_local_date(received_at)
+    if recv is None:
+        return default
+    lots = [d for d in (lot_dates or []) if d and is_plausible_production_date(d, received_at)]
+    if lots:
+        counts = _Counter(lots)
+        top = max(counts.values())
+        return min(d for d, n in counts.items() if n == top)
+    for d in (slash_dates or []):
+        if d and is_plausible_production_date(d, received_at):
+            return str(d)[:10]
+    return recv.isoformat()
 
 
 # --------------------------------------------------------------------------
 # Parse entrypoints
 # --------------------------------------------------------------------------
 
-def parse_production_pdf(pdf_bytes: bytes, subject: str = "") -> ProductionSheet:
+def parse_production_pdf(pdf_bytes: bytes, subject: str = "",
+                         received_at: str = "") -> ProductionSheet:
     try:
         text = _extract_text(pdf_bytes)
     except Exception as exc:  # noqa: BLE001
         return ProductionSheet(error=f"PDF text extraction failed: {exc}")
-    return parse_production_text(text, subject=subject)
+    return parse_production_text(text, subject=subject, received_at=received_at)
 
 
-def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
+def parse_production_text(text: str, subject: str = "",
+                          received_at: str = "") -> ProductionSheet:
     sheet = ProductionSheet(raw_text=text)
     if not text or not text.strip():
         sheet.error = "PDF contained no extractable text (image-only scan?)"
@@ -565,22 +877,26 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
         sheet.total_cases = int(m.group(1))
         sheet.warehouse_raw = m.group(2).strip()
         sheet.po_number = m.group(3).strip()
+        sheet.po_body = sheet.po_number
         sheet.warehouse, sheet.distributor = _classify_warehouse(sheet.warehouse_raw)
+    sheet.po_subject = subject_po(subject)
 
-    # Production date — prefer a slash-format MM/DD/YYYY anywhere in the
-    # document (Riviera Beach / Punta Gorda / CWNY style). Fall back to
-    # the earliest date encoded in the lot-number suffixes (La Mirada
-    # style: lot 1184050726 -> 05/07/26 produced).
-    md = _DATE_RE.search(text)
-    if md:
+    # Production date — legacy rule first (a slash-format MM/DD/YYYY anywhere
+    # in the document, else the earliest lot date). It only stands when there
+    # is no received_at to judge plausibility against; see
+    # choose_production_date below.
+    slash_dates = []
+    for md in _DATE_RE.finditer(text):
         raw = md.group(1) or md.group(2)
         try:
             mm, dd, yyyy = raw.split("/")
-            sheet.production_date = f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}"
+            slash_dates.append(f"{int(yyyy):04d}-{int(mm):02d}-{int(dd):02d}")
         except ValueError:
-            # Only a malformed date string (bad split / int) should fall back to
-            # the raw value; anything else is a real bug and should surface.
-            sheet.production_date = raw
+            slash_dates.append(raw)
+    if slash_dates:
+        # Only a malformed date string (bad split / int) falls back to the raw
+        # value; anything else is a real bug and should surface.
+        sheet.production_date = slash_dates[0]
     else:
         dates_from_lots = sorted(_dates_from_lot_numbers(text))
         if dates_from_lots:
@@ -625,15 +941,30 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     except ImportError:  # standalone test invocation
         from hh_mfg_codes import HH_MFG_CODE_TO_VARIETY  # type: ignore
     lots_by_variety: dict = {}
+    sheet_lot_dates = []
     for lot in _extract_lots(text):
         canonical = HH_MFG_CODE_TO_VARIETY.get(lot["item_code"])
         if not canonical:
             continue
         lots_by_variety.setdefault(canonical, []).append(lot["lot"])
-    for line in sheet.lines:
-        queue = lots_by_variety.get(line.variety)
-        if queue:
-            line.lot_number = queue.pop(0)
+        sheet_lot_dates.append(lot["date_iso"])
+    # Lines read off the sheet claim their lots BEFORE lines derived from an
+    # assorted split. In sheet order, "24 CS ASSORTED" above "56 CS
+    # PARB-PLAIN" handed the only Plain lot to the 6-cs derived Plain share,
+    # leaving the real 56-cs line lot-less and out of FIFO.
+    for derived_pass in (False, True):
+        for line in sheet.lines:
+            if bool(line.derived_from) != derived_pass:
+                continue
+            queue = lots_by_variety.get(line.variety)
+            if queue:
+                line.lot_number = queue.pop(0)
+
+    # The date the sheet is filed under. With a received_at, a mistyped lot
+    # or typed date can no longer drag the sheet months back (Riviera
+    # 014511751616 filed under 2026-03-10; La Mirada 5579094C under 03-23).
+    sheet.production_date = choose_production_date(
+        sheet_lot_dates, slash_dates, received_at, default=sheet.production_date)
 
     # If the header total didn't parse but we got lines, compute it.
     if not sheet.total_cases and sheet.lines:
@@ -642,18 +973,23 @@ def parse_production_text(text: str, subject: str = "") -> ProductionSheet:
     # Subject fallback — pull PO and/or warehouse out of the subject when
     # the PDF body header didn't yield them. Common cases: image-only
     # scan PDFs (no extractable text) and layouts where pypdf splits the
-    # header line in a way the regex above misses.
-    if not sheet.po_number and subject:
-        sm = re.search(r"PO[._\s]\s*([A-Z0-9]+)", subject, re.IGNORECASE)
-        if sm:
-            sheet.po_number = sm.group(1).strip()
-    if not sheet.warehouse_raw and subject:
-        sm = _SUBJECT_WAREHOUSE_RE.search(subject)
-        if sm:
-            sheet.warehouse_raw = sm.group(1).strip()
-            sheet.warehouse, sheet.distributor = _classify_warehouse(
-                sheet.warehouse_raw,
-            )
+    # header line in a way the regex above misses. A body label that IS
+    # present but unmatched ("US FOODS HOUSTON" before Houston was mapped)
+    # also falls back to the DC the subject names.
+    if not sheet.po_number and sheet.po_subject:
+        sheet.po_number = sheet.po_subject
+    if subject and (not sheet.warehouse_raw or not sheet.distributor):
+        label = subject_warehouse_label(subject)
+        if label:
+            swh, sdist = _classify_warehouse(label)
+            # An unrecognised label is kept only when the subject has the
+            # "<DC> PO.<n>" shape (as before), so "Daily Production Sheet
+            # Template.xlsx" doesn't become a warehouse called Template.xlsx.
+            if not sheet.warehouse_raw and (sdist or _SUBJECT_PO_START_RE.search(subject)):
+                sheet.warehouse_raw = label
+                sheet.warehouse, sheet.distributor = swh, sdist
+            elif sdist:
+                sheet.warehouse, sheet.distributor = swh, sdist
 
     if not sheet.lines:
         sheet.error = (sheet.error or "") + " no line items detected".strip()

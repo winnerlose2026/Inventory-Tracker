@@ -582,6 +582,7 @@ def api_traceability_search():
     q_dist = (args.get("distributor") or "").strip()
 
     records = load_production()
+    from integrations.production_pdf_parser import ledger_warehouse_for
 
     # Apply filters.
     out = []
@@ -591,7 +592,10 @@ def api_traceability_search():
             continue
         if q_to and (r.get("production_date") or "") > q_to:
             continue
-        if q_wh and (r.get("warehouse") or "") != q_wh:
+        # Accept the PO ledger's name for a Chefs Warehouse DC too ("Bronx,
+        # NY" for "Chefs Warehouse, NY"); stored records are not renamed.
+        if q_wh and q_wh not in ((r.get("warehouse") or ""), ledger_warehouse_for(
+                r.get("warehouse") or "", r.get("distributor") or "")):
             continue
         if q_dist and (r.get("distributor") or "") != q_dist:
             continue
@@ -629,40 +633,17 @@ def api_traceability_search():
         on_hand[(wh, variety)] = (on_hand.get((wh, variety), 0)
                                   + float(item.get("quantity") or 0))
 
-    # Pending-PO lookup keyed by po_number — first non-empty wins.
-    # Inventory on_order is checked first (USF + Cheney); then Chefs
-    # Warehouse POs (which live in their own file because they don't
-    # touch inventory). A Daily Production sheet stamped with a CW PO#
-    # therefore still resolves to "pending" with the right ship/arrival
-    # data.
-    po_pending = {}
-    for item in inv.values():
-        for e in item.get("on_order") or []:
-            po = (e.get("po_number") or "").strip()
-            if not po:
-                continue
-            slot = po_pending.setdefault(po, {})
-            for k in ("ship_date", "arrival_date", "eta"):
-                if not slot.get(k) and e.get(k):
-                    slot[k] = e[k]
+    # PO status comes from the canonical PO ledger, keyed by PO number --
+    # USF, Cheney AND Chefs Warehouse. Inferring it from on_order + the CW
+    # store marked every DELIVERED Chefs Warehouse PO "pending" (and so red
+    # "overdue" forever: 10 of 10 CW sheets since August).
+    from core.util import _norm_po_key
     try:
-        from inventory_tracker import load_chefs_warehouse_pos
-        for cw in load_chefs_warehouse_pos():
-            po = (cw.get("po_number") or "").strip()
-            if not po or cw.get("canceled"):
-                continue
-            slot = po_pending.setdefault(po, {})
-            for k in ("ship_date", "arrival_date", "eta"):
-                if not slot.get(k) and cw.get(k):
-                    slot[k] = cw[k]
-    except Exception:  # noqa: BLE001
-        # CW POs are auxiliary; failure here must not break traceability.
-        pass
-
-    try:
-        canceled = load_canceled_pos()
-    except Exception:
-        canceled = {}
+        from blueprints.pos import build_po_ledger
+        ledger_by_po = {_norm_po_key(x.get("po_number") or ""): x
+                        for x in build_po_ledger()}
+    except Exception:  # noqa: BLE001 -- status is an overlay; never fatal
+        ledger_by_po = {}
 
     # Usage rollup keyed by (po_number, variety).
     usage_log = load_usage() or []
@@ -683,18 +664,22 @@ def api_traceability_search():
         rcopy = dict(r)
         po = (r.get("po_number") or "").strip()
         wh = r.get("warehouse") or ""
-        pend = po_pending.get(po) if po else None
-        if po and po in canceled:
+        led = ledger_by_po.get(_norm_po_key(po)) if po else None
+        lst = (led or {}).get("status") or ""
+        if led and lst == "canceled":
             rcopy["po_status"] = "canceled"
-        elif pend:
-            rcopy["po_status"]    = "pending"
-            rcopy["ship_date"]    = pend.get("ship_date") or ""
-            rcopy["arrival_date"] = pend.get("arrival_date") or ""
-            rcopy["eta"]          = pend.get("eta") or ""
-        elif po:
-            # PO existed but isn't in on_order anymore -> rolled over.
+        elif led and lst == "arrived":
             rcopy["po_status"] = "arrived"
+            rcopy["arrival_date"] = led.get("arrival_date") or ""
+        elif led:
+            # pending / in_transit / in_production / any override: still open
+            rcopy["po_status"]    = "pending"
+            rcopy["ship_date"]    = led.get("ship_date") or ""
+            rcopy["arrival_date"] = led.get("arrival_date") or ""
+            rcopy["eta"]          = led.get("eta") or ""
         else:
+            # No such PO on file (typo'd / untracked customer PO): say so
+            # rather than claiming it arrived.
             rcopy["po_status"] = "unknown"
 
         enriched_lines = []

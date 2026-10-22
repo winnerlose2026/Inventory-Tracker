@@ -9,6 +9,7 @@ from flask import Blueprint, jsonify, request
 
 from core.cache import _AGG_CACHE, _data_sig
 from core.errors import _log_exc, _safe_err
+from core.util import with_data_lock
 from inventory_tracker import load_inventory, load_usage
 
 production_bp = Blueprint("production", __name__)
@@ -19,19 +20,24 @@ def api_production_list():
     """List production records. Optional query params: distributor,
     warehouse, since (ISO date). Returns newest-first."""
     from inventory_tracker import load_production
+    from integrations.production_pdf_parser import ledger_warehouse_for
     records = load_production()
     dist = (request.args.get("distributor") or "").strip()
     wh   = (request.args.get("warehouse") or "").strip()
     since = (request.args.get("since") or "").strip()
     out = []
     for r in records:
+        # Chefs Warehouse sheets say "Chefs Warehouse, NY"; the PO ledger says
+        # "Bronx, NY". Expose the ledger name (read-time only, the stored
+        # record is untouched) and accept either in the filter.
+        lwh = ledger_warehouse_for(r.get("warehouse") or "", r.get("distributor") or "")
         if dist and (r.get("distributor") or "") != dist:
             continue
-        if wh and (r.get("warehouse") or "") != wh:
+        if wh and wh not in ((r.get("warehouse") or ""), lwh):
             continue
         if since and (r.get("production_date") or "") < since:
             continue
-        out.append(r)
+        out.append(dict(r, ledger_warehouse=lwh))
     out.sort(key=lambda r: (r.get("production_date") or "", r.get("po_number") or ""),
              reverse=True)
     return jsonify(out)
@@ -54,16 +60,22 @@ def api_production_lots_by_pair():
     same numbers. ``cs`` is preserved as an alias for ``cs_produced`` for
     backward compatibility with older JS revisions.
     """
-    sig = _data_sig("production.json", "usage.json", "inventory.json")
+    # canceled_pos / status overrides / CW store decide which lots are on a
+    # canceled PO (excluded), so they are part of the cache signature too.
+    sig = _data_sig("production.json", "usage.json", "inventory.json",
+                    "canceled_pos.json", "po_status_overrides.json",
+                    "chefs_warehouse_pos.json")
     _c = _AGG_CACHE.get("lots-by-pair")
     if _c and _c[0] == sig:
         return jsonify(_c[1])
     from inventory_tracker import (
         load_production, load_usage, load_inventory, compute_lot_fifo_state,
     )
+    from integrations.production_store import canceled_po_keys
     records = load_production()
     usage = load_usage()
     inv_snapshot = load_inventory()
+    canceled = canceled_po_keys()
 
     # Discover all distinct (warehouse, variety) pairs we have lots for.
     pairs: set = set()
@@ -87,6 +99,7 @@ def api_production_lots_by_pair():
             production_records=records,
             usage_records=usage,
             inventory_snapshot=inv_snapshot,
+            canceled_pos=canceled,
         )
         # Surface cs as an alias for cs_produced so any older client that
         # still reads L.cs keeps working until it is redeployed.
@@ -174,18 +187,23 @@ def api_production_ingest():
       pdf_b64       base64-encoded PDF bytes (required)
       subject       email subject (optional, used as a fallback PO source)
       sender        email From address (optional, kept for audit)
-      message_id    Graph internetMessageId or RFC822 Message-Id (required
-                    for idempotency — re-posting the same message is a no-op)
+      message_id    Graph internetMessageId or RFC822 Message-Id. Optional:
+                    without one a stable id is synthesized from the PDF's
+                    content hash, so re-posting the same PDF is a no-op.
       received_at   ISO timestamp (optional)
 
-    Returns 200 with {ok, status: "ingested"|"duplicate"|"parse_error",
-    record, error}. parse_error is surfaced for image-only scan PDFs so
-    the operator can re-request a text PDF.
+    Returns 200 with {ok, status, record, error}. status is one of
+    ingested | replaced | duplicate | superseded | tombstoned | parse_error
+    (see integrations.production_store.ingest_production_record).
+    parse_error is surfaced for image-only scan PDFs so the operator can
+    re-request a text PDF.
     """
     import base64
     from datetime import datetime
-    from inventory_tracker import load_production, save_production
     from integrations.production_pdf_parser import parse_production_pdf
+    from integrations.production_store import (
+        record_from_sheet, store_parsed, synth_message_id,
+    )
 
     body = request.json or {}
     pdf_b64 = body.get("pdf_b64") or ""
@@ -194,106 +212,26 @@ def api_production_ingest():
     subject    = (body.get("subject") or "").strip()
     sender     = (body.get("sender") or "").strip()
     message_id = (body.get("message_id") or "").strip()
-    received_at = (body.get("received_at") or "").strip()
-
-    records = load_production()
-    if message_id:
-        for existing in records:
-            if existing.get("source_message_id") == message_id:
-                return jsonify({
-                    "ok": True,
-                    "status": "duplicate",
-                    "record": existing,
-                })
+    received_at = (body.get("received_at") or "").strip() or datetime.now().isoformat()
 
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": _safe_err(exc, "pdf_b64")}), 400
+    # A record with no message id used to be re-appended by every scan
+    # (2 -> 4 -> 8 copies); a content-hash id makes the same PDF the same row.
+    if not message_id:
+        message_id = synth_message_id(pdf_bytes)
 
-    sheet = parse_production_pdf(pdf_bytes, subject=subject)
-
-    # Content-signature dedup. Same email can land twice with two different
-    # IDs (RFC <...@outlook.com> Message-ID vs. Microsoft Graph
-    # internetMessageId) when more than one scanner path picks it up — see
-    # the 2026-05-19 incident where five Daily Production records got stored
-    # twice. The message_id check above only catches *exact* re-sends; this
-    # block catches the cross-ID dup by matching on (warehouse, po_number,
-    # production_date) + identical line signature. Legitimate amendments
-    # (different lines/cs counts) still pass through.
-    if (sheet.po_number and sheet.warehouse and sheet.production_date
-            and sheet.lines):
-        incoming_sig = tuple(sorted(
-            (L.variety or "", int(L.cs_count or 0), L.lot_number or "")
-            for L in sheet.lines))
-        for existing in records:
-            if (existing.get("warehouse") != sheet.warehouse
-                    or existing.get("po_number") != sheet.po_number
-                    or existing.get("production_date") != sheet.production_date):
-                continue
-            existing_sig = tuple(sorted(
-                (L.get("variety") or "", int(L.get("cs_count") or 0),
-                 L.get("lot_number") or "")
-                for L in (existing.get("lines") or [])))
-            if existing_sig == incoming_sig:
-                return jsonify({
-                    "ok": True,
-                    "status": "duplicate",
-                    "record": existing,
-                    "dedup_reason": "content_signature_match",
-                })
-
-    if sheet.error and not sheet.lines:
-        # Persist a stub for the dashboard so the operator can see the
-        # email arrived but needs manual entry, then surface the error.
-        stub = {
-            "production_date": "",
-            "warehouse": "",
-            "warehouse_raw": "",
-            "distributor": "",
-            "po_number": "",
-            "lines": [],
-            "total_cases": 0,
-            "unmapped_varieties": [],
-            "source_message_id": message_id,
-            "source_subject": subject,
-            "source_sender": sender,
-            "received_at": received_at or datetime.now().isoformat(),
-            "ingested_at": datetime.now().isoformat(),
-            "parse_error": sheet.error,
-        }
-        records.append(stub)
-        save_production(records)
-        return jsonify({
-            "ok": True,
-            "status": "parse_error",
-            "record": stub,
-            "error": sheet.error,
-        })
-
-    record = {
-        "production_date":    sheet.production_date,
-        "warehouse":          sheet.warehouse,
-        "warehouse_raw":      sheet.warehouse_raw,
-        "distributor":        sheet.distributor,
-        "po_number":          sheet.po_number,
-        "lines": [
-            {"variety": L.variety, "raw_variety": L.raw_variety,
-             "cs_count": L.cs_count, "lot_number": L.lot_number}
-            for L in sheet.lines
-        ],
-        "total_cases":        sheet.total_cases,
-        "unmapped_varieties": sheet.unmapped_varieties,
-        "source_message_id":  message_id,
-        "source_subject":     subject,
-        "source_sender":      sender,
-        "received_at":        received_at or datetime.now().isoformat(),
-        "ingested_at":        datetime.now().isoformat(),
-        "parse_error":        "",
-    }
-    records.append(record)
-    save_production(records)
-    return jsonify({"ok": True, "status": "ingested", "record": record})
+    sheet = parse_production_pdf(pdf_bytes, subject=subject, received_at=received_at)
+    record = record_from_sheet(sheet, message_id=message_id, subject=subject,
+                               sender=sender, received_at=received_at)
+    [(status, stored)] = store_parsed(
+        [(record, getattr(sheet, "po_body", ""), getattr(sheet, "po_subject", ""))])
+    out = {"ok": True, "status": status, "record": stored}
+    if status == "parse_error":
+        out["error"] = sheet.error
+    return jsonify(out)
 
 
 def _graph_page(url: str, token: str, *, attempts: int = 3, timeout: int = 45):
@@ -372,7 +310,10 @@ def api_production_scan():
             EmailInboxClient, _distributor_from_sender, GRAPH_BASE,
         )
         from integrations.production_pdf_parser import parse_production_pdf
-        from inventory_tracker import load_production, save_production
+        from integrations.production_store import (
+            load_tombstones, record_from_sheet, seen_message_ids, store_parsed,
+        )
+        from inventory_tracker import load_production
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": _safe_err(exc, "import"),
                         "traceback": ""}), 500
@@ -424,9 +365,13 @@ def api_production_scan():
     # `continue`, so a sheet sent as .xlsx only vanished with no trace.
     skipped_no_pdf = []
     brief_records = []
-    existing = load_production()
-    seen_msg_ids = {r.get("source_message_id") for r in existing if r.get("source_message_id")}
-    touched_msg_ids = set()  # records modified or added in THIS run
+    # Everything already accounted for: stored ids, emails a newer sheet
+    # replaced, and deleted (tombstoned) records -- a delete used to be undone
+    # by the next 14-day-lookback scan.
+    seen_msg_ids = seen_message_ids(load_production(), load_tombstones())
+    # Parsed sheets are collected here and stored in ONE locked write after
+    # all Graph I/O is done (never hold data_lock across the network).
+    to_store = []   # [(record, po_body, po_subject, brief)]
 
     for upn in users:
         user = urllib.parse.quote(upn)
@@ -512,112 +457,52 @@ def api_production_scan():
                         f"{subject[:60]!r}: could not download the PDF "
                         f"({_safe_err(exc, 'graph fetch')})")
                     continue
-                sheet = parse_production_pdf(pdf_bytes, subject=subject)
+                received_at = m.get("receivedDateTime") or ""
+                sheet = parse_production_pdf(pdf_bytes, subject=subject,
+                                             received_at=received_at)
                 if sheet.error and not sheet.lines:
                     parse_errors.append(f"{subject[:60]!r}: {sheet.error}")
                     if dry_run:
                         per_mailbox += 1
                         continue
                     # Persist a stub so the operator sees it in the UI
-                    record = {
-                        "production_date": "", "warehouse": "", "warehouse_raw": "",
-                        "distributor": "", "po_number": "", "lines": [],
-                        "total_cases": 0, "unmapped_varieties": [],
-                        "source_message_id": msg_id,
-                        "source_subject": subject, "source_sender": sender,
-                        "received_at": m.get("receivedDateTime") or "",
-                        "ingested_at": datetime.now().isoformat(),
-                        "parse_error": sheet.error,
-                    }
-                    existing.append(record)
+                    record = record_from_sheet(sheet, message_id=msg_id, subject=subject,
+                                               sender=sender, received_at=received_at)
                     seen_msg_ids.add(msg_id)
-                    if msg_id:
-                        touched_msg_ids.add(msg_id)
-                    brief_records.append({"subject": subject, "po_number": "",
-                                          "warehouse": "", "total_cases": 0,
-                                          "parse_error": sheet.error})
+                    to_store.append((record, "", "", {
+                        "subject": subject, "po_number": "", "warehouse": "",
+                        "total_cases": 0, "parse_error": sheet.error}))
                     per_mailbox += 1
                     continue
                 if dry_run:
                     per_mailbox += 1
                     continue
-                record = {
-                    "production_date":    sheet.production_date,
-                    "warehouse":          sheet.warehouse,
-                    "warehouse_raw":      sheet.warehouse_raw,
-                    "distributor":        sheet.distributor,
-                    "po_number":          sheet.po_number,
-                    "lines": [
-                        {"variety": L.variety, "raw_variety": L.raw_variety,
-                         "cs_count": L.cs_count, "lot_number": L.lot_number,
-                         "derived_from": getattr(L, "derived_from", "")}
-                        for L in sheet.lines
-                    ],
-                    "total_cases":        sheet.total_cases,
-                    "unmapped_varieties": sheet.unmapped_varieties,
-                    "source_message_id":  msg_id,
-                    "source_subject":     subject,
-                    "source_sender":      sender,
-                    "received_at":        m.get("receivedDateTime") or "",
-                    "ingested_at":        datetime.now().isoformat(),
-                    "parse_error":        "",
-                }
-                if refresh and msg_id and msg_id in seen_msg_ids:
-                    # Update in place rather than append a duplicate.
-                    for i, r in enumerate(existing):
-                        if r.get("source_message_id") == msg_id:
-                            # Preserve original received_at if already set;
-                            # overwrite parsed-from-PDF fields with the
-                            # fresh values.
-                            record["received_at"] = r.get("received_at") or record["received_at"]
-                            existing[i] = record
-                            break
-                else:
-                    existing.append(record)
-                    seen_msg_ids.add(msg_id)
-                if msg_id:
-                    touched_msg_ids.add(msg_id)
-                ingested += 1
-                brief_records.append({
+                record = record_from_sheet(sheet, message_id=msg_id, subject=subject,
+                                           sender=sender, received_at=received_at)
+                seen_msg_ids.add(msg_id)
+                to_store.append((record, sheet.po_body, sheet.po_subject, {
                     "subject": subject, "po_number": sheet.po_number,
                     "warehouse": sheet.warehouse, "production_date": sheet.production_date,
                     "total_cases": sheet.total_cases,
-                })
+                }))
                 per_mailbox += 1
             next_url = page.get("@odata.nextLink")
 
-    if not dry_run:
-        # Re-load from disk and merge by source_message_id to avoid a
-        # read-modify-write race when two scan calls overlap (a
-        # symptom: the second call would clobber the first's appended
-        # rows). The in-memory `existing` was loaded at the start of
-        # THIS call and may now be stale.
-        from inventory_tracker import load_production
-        current = load_production()
-        by_msg = {r.get("source_message_id"): r for r in current
-                  if r.get("source_message_id")}
-        # Records this call touched (added OR refreshed in place) live in
-        # `existing` and are keyed by source_message_id in `touched_msg_ids`.
-        # For msg_ids we touched, our in-memory version wins over the disk
-        # version (e.g. refresh=true rewrote the lines with lot codes).
-        # For msg_ids we did NOT touch but are present in BOTH `current` and
-        # `existing`, the disk version wins (it may have been refreshed by a
-        # concurrent scan). For msg_ids only in `existing`, those are new
-        # additions — keep them.
-        existing_by_msg = {r.get("source_message_id"): r for r in existing
-                           if r.get("source_message_id")}
-        for mid in touched_msg_ids:
-            if mid in existing_by_msg:
-                by_msg[mid] = existing_by_msg[mid]
-        for r in existing:
-            mid = r.get("source_message_id")
-            if mid and mid not in by_msg:
-                by_msg[mid] = r
-            elif not mid:
-                current.append(r)
-        merged = [r for r in current if not r.get("source_message_id")] \
-                 + list(by_msg.values())
-        save_production(merged)
+    if not dry_run and to_store:
+        # One locked load -> ingest -> save against the CURRENT file (a
+        # concurrent webhook or admin edit is never clobbered). The old
+        # end-of-run merge re-appended every record that had no message id,
+        # doubling it on each daily run.
+        results = store_parsed([(rec, b, s) for rec, b, s, _brief in to_store],
+                               refresh=refresh)
+        for (status, stored), (_rec, _b, _s, brief) in zip(results, to_store):
+            if status in ("ingested", "replaced", "refreshed"):
+                ingested += 1
+            if status in ("ingested", "replaced", "refreshed", "parse_error"):
+                brief = dict(brief, status=status)
+                if stored and stored.get("po_number"):
+                    brief["po_number"] = stored["po_number"]
+                brief_records.append(brief)
 
     return jsonify({
         "ok": True, "dry_run": dry_run,
@@ -634,6 +519,7 @@ def api_production_scan():
 
 
 @production_bp.route("/api/admin/production/renormalize-varieties", methods=["POST"])
+@with_data_lock
 def api_admin_production_renormalize_varieties():
     """Re-run _normalize_variety on every stored production line.
 
@@ -795,6 +681,7 @@ def api_admin_production_renormalize_varieties():
 
 
 @production_bp.route("/api/admin/production/reclassify", methods=["POST"])
+@with_data_lock
 def api_admin_production_reclassify():
     """Re-run the warehouse classifier on every stored production record.
 
@@ -802,14 +689,16 @@ def api_admin_production_reclassify():
     _classify_warehouse — historical records ingested under the old
     rules keep their warehouse/distributor unchanged unless we ask the
     parser to look at them again. This walks data/production.json,
-    re-classifies each row using its existing warehouse_raw (or empty
-    -> "In-House Inventory" for older sheets without a header), and
-    persists the updates.
+    re-classifies each row using its existing warehouse_raw and -- when that
+    is blank or unmatched -- the DC named in its subject line (Houston
+    393072B2 was stored as "US FOODS HOUSTON"; 64 sheets / 14,285 cs had a
+    blank warehouse but a DC in the subject), and persists the updates.
+    A blank label with no DC in the subject still means In-House Inventory.
 
     Body: { dry_run: bool }
     """
     from inventory_tracker import load_production, save_production
-    from integrations.production_pdf_parser import _classify_warehouse
+    from integrations.production_pdf_parser import classify_warehouse_with_subject
 
     body = request.json or {}
     dry_run = bool(body.get("dry_run", False))
@@ -818,7 +707,8 @@ def api_admin_production_reclassify():
     samples = []
     for r in records:
         raw = r.get("warehouse_raw") or ""
-        new_wh, new_dist = _classify_warehouse(raw)
+        new_wh, new_dist = classify_warehouse_with_subject(
+            raw, r.get("source_subject") or "")
         old_wh   = r.get("warehouse") or ""
         old_dist = r.get("distributor") or ""
         if new_wh == old_wh and new_dist == old_dist:
@@ -845,13 +735,73 @@ def api_admin_production_reclassify():
     })
 
 
+@production_bp.route("/api/admin/production/repair", methods=["POST"])
+def api_admin_production_repair():
+    """One idempotent pass that re-judges every stored production record with
+    today's rules (dry_run defaults to TRUE -- pass {"dry_run": false} to
+    write):
+
+      * warehouse from the subject's DC when blank/unmatched (K2);
+      * PDF-header PO vs subject PO resolved against the PO ledger (C3),
+        e.g. the CWC 7/1 sheet moves from CWFL's 1135526 to 1135525;
+      * production date = the most common plausible lot date (C1), e.g.
+        Riviera 014511751616 moves from 2026-03-10 to 2026-09-10;
+      * duplicate sheets for the same (warehouse, PO, date) collapse to the
+        newest email (C2), e.g. Ocala 054511751617 back to 112 cs.
+
+    Returns per-record before/after, the removed duplicates, and a summary.
+    A real run writes one inventory-audit row.
+    """
+    from datetime import datetime
+    import inventory_tracker as it
+    from integrations.production_store import (
+        ledger_po_index, repair_production_records,
+    )
+    body = request.json or {}
+    dry_run = body.get("dry_run", True) is not False
+    index = ledger_po_index()          # outside the lock (reads only)
+    with it.data_lock():
+        records = it.load_production()
+        new_records, changes, removed, summary = repair_production_records(records, index)
+        if not dry_run and (changes or removed):
+            it.save_production(new_records)
+            it.append_inventory_audit([{
+                "ts": datetime.now().isoformat(), "event_type": "production_repair",
+                "name": "production.json", "warehouse": "",
+                "old_quantity": len(records), "new_quantity": len(new_records),
+                "delta": len(new_records) - len(records),
+                "source": "admin/production-repair",
+                "detail": summary,
+            }])
+    return jsonify({"ok": True, "dry_run": dry_run, "summary": summary,
+                    "changes": changes, "removed_duplicates": removed})
+
+
 @production_bp.route("/api/production/<source_message_id>", methods=["DELETE"])
+@with_data_lock
 def api_production_delete(source_message_id):
-    """Drop a production record by its source_message_id."""
+    """Drop a production record by its source_message_id.
+
+    Leaves a tombstone for the email (and any it had replaced): the daily
+    scan's 14-day lookback used to re-ingest a deleted sheet that same night.
+    """
+    from datetime import datetime
     from inventory_tracker import load_production, save_production
+    from integrations.production_store import load_tombstones, save_tombstones
     records = load_production()
+    gone = [r for r in records if r.get("source_message_id") == source_message_id]
     kept = [r for r in records if r.get("source_message_id") != source_message_id]
     removed = len(records) - len(kept)
     if removed:
         save_production(kept)
+        stones = load_tombstones()
+        now = datetime.now().isoformat()
+        for r in gone:
+            for mid in [source_message_id] + list(r.get("replaced") or []):
+                if mid:
+                    stones[mid] = {"deleted_at": now,
+                                   "po_number": r.get("po_number") or "",
+                                   "warehouse": r.get("warehouse") or "",
+                                   "production_date": r.get("production_date") or ""}
+        save_tombstones(stones)
     return jsonify({"ok": True, "removed": removed})
