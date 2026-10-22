@@ -144,7 +144,11 @@ def receipt_inside_count(row: dict, count_at: str, arrival_day: str) -> bool:
         c, n = naive_local_dt(count_at), naive_local_dt(nic)
         if c is not None and n is not None and c <= n:
             return False
-    if row.get("delivery_confirmed") and "T" in count_at:
+    # The exact-time rule needs a REAL delivery time; a date-only Lineage
+    # confirmation (delivery_time_known False) is judged by day, with
+    # not_in_count_at (the quantity check) as the only override.
+    if (row.get("delivery_confirmed") and row.get("delivery_time_known") is not False
+            and "T" in count_at):
         a, c = naive_local_dt(row.get("arrival_date")), naive_local_dt(count_at)
         if a is not None and c is not None:
             return a <= c

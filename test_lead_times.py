@@ -318,7 +318,8 @@ def test_followups_never_go_out_on_an_evidence_only_thread(monkeypatch):
     monkeypatch.setattr(B, "_ledger_by_po", lambda: {"P9": {"po_number": "P9", "status": "pending"}})
     monkeypatch.setattr(B, "_now", lambda: NOW)
     sent = []
-    monkeypatch.setattr(B, "_send_reply", lambda *a, **k: sent.append(a) or "x")
+    monkeypatch.setattr(B, "_create_reply", lambda *a, **k: sent.append(a) or "x")
+    monkeypatch.setattr(B, "_send_draft", lambda *a, **k: sent.append(a))
     monkeypatch.setenv("INVENTORY_API_TOKEN", "tok")
     r = app.test_client().post("/api/pos/delivery/send-followups",
                                headers={"X-Inventory-Token": "tok"}, json={}).get_json()

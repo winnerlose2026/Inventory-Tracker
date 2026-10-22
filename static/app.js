@@ -2060,22 +2060,27 @@ document.addEventListener('keydown', e => {
 function renderOnOrder(item) {
   const qty = +(item.on_order_qty || 0);
   if (!qty) return '<span style="color:var(--muted)">—</span>';
-  // Prefer the operator-confirmed arrival date; fall back to the 30-day ETA
-  // placeholder. Confirmed arrivals render solid green with a check mark; ETA
-  // estimates render muted + italic with a ~ so the two read differently.
+  // The next arrival date and where it came from (on_order_next_kind). Nothing
+  // still on order is a CONFIRMED arrival -- a confirmed delivery rolls into
+  // on-hand -- so only a date staff typed gets the check ("set by you");
+  // Lineage's appointment reads "appt", anything else "est.".
   const dateStr = item.on_order_next_arrival || item.on_order_next_eta || '';
-  const isActual = !!item.on_order_next_is_actual;
+  const kind = item.on_order_next_kind || (item.on_order_next_is_actual ? 'operator' : 'estimate');
   const dateFormatted = formatDate(dateStr);
   const badge = `<span class="badge badge-blue" title="${escAttr(qty.toFixed(0) + ' cs on order')}">+${qty.toFixed(0)}</span>`;
   if (!dateFormatted) {
     return badge + ` <span style="color:var(--muted);font-size:11px" title="pending lead time">pending</span>`;
   }
-  if (isActual) {
-    const tip = `Confirmed arrival ${dateFormatted}`;
-    return badge + ` <span style="color:var(--green);font-weight:600;font-size:11px" title="${escAttr(tip)}">&#10003; ${dateFormatted}</span>`;
+  if (kind === 'operator') {
+    const tip = `Arrival ${dateFormatted} set by you on the Pending POs tab`;
+    return badge + ` <span style="color:var(--green);font-weight:600;font-size:11px" title="${escAttr(tip)}">&#10003; ${dateFormatted} <span style="font-weight:400">set by you</span></span>`;
   }
-  const tip = `Estimated 30-day ETA ${dateFormatted} - no confirmed arrival yet`;
-  return badge + ` <span style="color:var(--muted);font-style:italic;font-size:11px" title="${escAttr(tip)}">~ ${dateFormatted}</span>`;
+  if (kind === 'appointment') {
+    const tip = `Lineage delivery appointment ${dateFormatted} - not yet confirmed delivered`;
+    return badge + ` <span style="color:var(--muted);font-size:11px" title="${escAttr(tip)}">appt ${dateFormatted}</span>`;
+  }
+  const tip = `Estimated arrival ${dateFormatted} - not confirmed`;
+  return badge + ` <span style="color:var(--muted);font-style:italic;font-size:11px" title="${escAttr(tip)}">est. ${dateFormatted}</span>`;
 }
 
 // -------------------------------------------------------------------------
@@ -3430,7 +3435,10 @@ async function loadFreightLeadTimes() {
     `</div></div>`;
   const dash = '<span style="color:var(--muted)">&mdash;</span>';
   kpis.innerHTML =
-    kpi('Confirmed deliveries', String(dels.length), 'Lineage / DC confirmations') +
+    // A truck carrying several POs is ONE delivery (shipment_count); the
+    // table below still lists every PO.
+    kpi('Confirmed deliveries', String(data.shipment_count != null ? data.shipment_count : dels.length),
+        `trucks &middot; ${dels.length} PO${dels.length === 1 ? '' : 's'}, Lineage / DC confirmations`) +
     kpi('Avg transit, all lanes', o.n ? `${o.avg} days` : dash, o.n ? `(median ${o.median}, range ${o.min}&ndash;${o.max})` : '') +
     kpi('Locations dialed in', `${learned} of ${locs.length}`, `need ${data.min_samples || 2}+ deliveries`);
 
@@ -3456,8 +3464,11 @@ async function loadFreightLeadTimes() {
       const ev = d.evidence || {};
       const who = escHtml((ev.sender || '').split('@')[0] || '');
       const quote = escAttr(ev.quote || '');
+      const mates = (d.shipment_pos || []).filter(p => p !== d.po_number);
+      const truck = mates.length
+        ? `<div style="font-family:inherit;font-size:11px;color:var(--muted)">same truck as ${escHtml(mates.join(', '))}</div>` : '';
       return `<tr>
-        <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(d.po_number)}</td>
+        <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(d.po_number)}${truck}</td>
         <td>${escHtml(d.location)}</td>
         <td>${formatDate(d.ship_date)} <span style="color:var(--muted);font-size:11px">${escHtml(d.ship_source || '')}</span></td>
         <td>${formatDate(d.delivered_at)}${d.delivered_at && d.delivered_at.slice(11, 16) !== '00:00' ? ' ' + d.delivered_at.slice(11, 16) : ''}</td>
@@ -3474,6 +3485,7 @@ async function loadFreightLeadTimes() {
     return;
   }
   if (note) note.textContent = 'Transit = confirmed delivery date minus the ship date (the pickup Lineage reported when we have it, else the Lineage freight invoice ship date, else the PO ship date). '
+    + 'A delivery is one truck: POs that shipped and delivered together count once. '
     + 'Trend avg = the last ' + (data.trend_window || 5) + ' deliveries to that location. A location needs '
     + (data.min_samples || 2) + '+ confirmed deliveries before its trend replaces the 7-day default in the Pending POs Arrival column.';
   _leadtimeChart = new Chart(canvas.getContext('2d'), {

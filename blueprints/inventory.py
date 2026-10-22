@@ -50,31 +50,47 @@ def _enrich_on_order(item: dict) -> dict:
     The inventory On Order column surfaces the *next* arrival date. For each
     pending entry we prefer the operator-confirmed ``arrival_date`` (set via
     the Pending POs ship-date flow) and fall back to the placeholder 30-day
-    ``eta`` when no confirmed arrival exists yet. ``on_order_next_is_actual``
-    lets the frontend distinguish confirmed arrivals from ETA estimates.
+    ``eta`` when no arrival date exists yet. ``on_order_next_kind`` tells the
+    frontend where that date came from (operator / appointment / estimate).
     """
     pending = item.get("on_order") or []
     total = round(sum(float(p.get("qty") or 0) for p in pending), 2)
     # Placeholder-only ETA minimum, kept for backward compatibility.
     etas = [p.get("eta", "") for p in pending if p.get("eta")]
     next_eta = min(etas) if etas else ""
-    # Effective per-entry date: a confirmed arrival_date wins over the eta
-    # estimate. Track whether the soonest effective date is a real arrival.
+    # Effective per-entry date: an arrival_date wins over the eta estimate.
+    #
+    # on_order_next_kind says WHERE that date came from, because nothing still
+    # pending is a confirmed arrival (a confirmed delivery rolls into on-hand):
+    #   "operator"    -- typed by staff on the Pending tab;
+    #   "appointment" -- Lineage's booked delivery appointment (it may pass
+    #                    unconfirmed: the PO is then held, "awaiting
+    #                    confirmation" on the Pending tab);
+    #   "estimate"    -- ship date + transit, a freight invoice, or the ETA.
+    # Until 10/22 every arrival_date counted as "actual", so the Inventory tab
+    # showed "Confirmed arrival" for ship + 7 guesses and for 014511763291's
+    # 10/22 appointment while Pending said "Awaiting delivery confirmation".
     effective = []
     for p in pending:
         arr = (p.get("arrival_date") or "").strip()
         eta = (p.get("eta") or "").strip()
+        src = (p.get("arrival_source") or "").strip()
         if arr:
-            effective.append((arr, True))
+            kind = ("operator" if src == "operator" else
+                    "appointment" if src in ("lineage", "lineage-delivered") else
+                    "estimate")
+            effective.append((arr, kind))
         elif eta:
-            effective.append((eta, False))
-    next_arrival, next_is_actual = ("", False)
+            effective.append((eta, "estimate"))
+    next_arrival, next_kind = ("", "")
     if effective:
-        next_arrival, next_is_actual = min(effective, key=lambda d: d[0])
+        next_arrival, next_kind = min(effective, key=lambda d: d[0])
     item["on_order_qty"] = total
     item["on_order_next_eta"] = next_eta
     item["on_order_next_arrival"] = next_arrival
-    item["on_order_next_is_actual"] = bool(next_is_actual)
+    item["on_order_next_kind"] = next_kind
+    # Kept for older page builds: only a date staff typed is "actual".
+    item["on_order_next_is_actual"] = next_kind == "operator"
     return item
 
 

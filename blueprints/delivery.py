@@ -61,15 +61,48 @@ def _ledger_by_po() -> dict:
     return {norm_po(r.get("po_number") or ""): r for r in build_po_ledger()}
 
 
+def _closed_reason(ledger_rec) -> str:
+    """Why a tracked PO is no longer worth following up, or ''. Canceling a
+    PO removes its pending rows, so a canceled USF/Cheney PO drops out of the
+    ledger altogether; a canceled CW PO stays in it as "canceled"."""
+    if ledger_rec is None:
+        return "no longer in the PO ledger (canceled or removed)"
+    if (ledger_rec.get("status") or "") in ("canceled", "cancelled"):
+        return "canceled in the tracker"
+    return ""
+
+
 def _is_open(ledger_rec, trk) -> bool:
     """Still worth following up: on order (not arrived / canceled), or tracked
-    and not yet confirmed delivered."""
+    and not yet confirmed delivered -- but never a PO the ledger says is
+    canceled or no longer has. Until 10/22 a tracked "requested" PO stayed
+    open forever, so a canceled PO kept getting "could you send the pickup
+    date" emails to Lineage every 44 h."""
     from integrations.po_delivery import HOLD_STATUSES
+    if _closed_reason(ledger_rec):
+        return False
     if trk and trk.get("status") in HOLD_STATUSES:
         return True
-    if ledger_rec is None:
-        return False
     return (ledger_rec.get("status") or "") not in ("arrived", "canceled", "cancelled")
+
+
+def _stamp_closed(tracking: dict, ledger: dict, now) -> list:
+    """Stamp closed_reason on held records whose PO the ledger dropped or
+    canceled (cleared again if it comes back, e.g. /api/admin/uncancel-po).
+    Mutates ``tracking``; returns the keys that changed."""
+    from integrations.po_delivery import HOLD_STATUSES
+    changed = []
+    for key, rec in list(tracking.items()):
+        why = (_closed_reason(ledger.get(key))
+               if rec.get("status") in HOLD_STATUSES else "")
+        if why and rec.get("closed_reason") != why:
+            tracking[key] = {**rec, "closed_reason": why, "closed_at": now.isoformat()}
+            changed.append(key)
+        elif not why and rec.get("closed_reason"):
+            tracking[key] = {k: v for k, v in rec.items()
+                             if k not in ("closed_reason", "closed_at")}
+            changed.append(key)
+    return changed
 
 
 def _apply_to_inventory(po_key: str, rec: dict) -> dict:
@@ -78,7 +111,7 @@ def _apply_to_inventory(po_key: str, rec: dict) -> dict:
     which reads the tracking file -- load_inventory() below already applies it,
     so a confirmed delivery rolls into on-hand right here."""
     from inventory_tracker import load_inventory, save_inventory
-    from integrations.po_delivery import norm_po, wall_time
+    from integrations.po_delivery import delivered_local, norm_po, wall_time
     inv = load_inventory()
     updated = 0
     items = []
@@ -99,7 +132,7 @@ def _apply_to_inventory(po_key: str, rec: dict) -> dict:
                     e["ship_date"] = wall_time(rec["pickup_at"])
                     e["ship_date_source"] = "lineage"
             elif st == "delivered" and rec.get("delivered_at"):
-                local = wall_time(rec["delivered_at"])
+                local = delivered_local(rec)      # date only when no time given
                 e["arrival_date"] = local
                 e["eta"] = local
                 e["arrival_source"] = "lineage-delivered"
@@ -213,13 +246,12 @@ def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
 
 
 @delivery_bp.route("/api/pos/delivery/sync-threads", methods=["POST"])
-@with_data_lock
 def api_delivery_sync_threads():
     """Fetch the Quote and Schedule threads, register each open PO they list
     (status "requested"), and return the threads that still have an open PO,
     with their messages oldest-first and the id to reply on."""
     from inventory_tracker import (
-        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+        data_lock, load_po_delivery, load_po_delivery_threads, save_po_delivery,
         save_po_delivery_threads,
     )
     from integrations.po_delivery import (
@@ -243,151 +275,185 @@ def api_delivery_sync_threads():
         for m in ev_msgs:
             if m["conversation_id"] not in convs:
                 ev_convs.setdefault(m["conversation_id"], []).append(m)
-        tracking = load_po_delivery()
-        ledger = _ledger_by_po()
-        now = _now()
-        # What this read saw -- the events route checks quotes against it and
-        # send-followups replies off it. A mirror of the mailbox, not tracker
-        # state, so it is refreshed even on a dry run.
-        cache = load_po_delivery_threads() or {}
-        cutoff = now - timedelta(days=MESSAGE_CACHE_DAYS)
-        cached_msgs = {k: v for k, v in (cache.get("messages") or {}).items()
-                       if (parse_dt(v.get("sent") or "") or now) >= cutoff}
-        cache_threads = {}
-        threads, registered, not_in_tracker = [], [], []
-        for conv, ms in convs.items():
-            ms.sort(key=lambda m: m["sent"])
-            for m in ms:
-                if m["message_id"]:
-                    cached_msgs[m["message_id"]] = {
-                        k: m[k] for k in ("from", "sent", "conversation_id",
-                                          "subject", "text", "graph_id", "mailbox")}
-            requested = []
-            for m in ms:
-                if not is_hh(m["from"]):
+        # The data lock only from here. The Graph reads above can take tens of
+        # seconds and every load_inventory() -- every page of the app -- waits
+        # on this lock (review 2026-10-22). Tracking is read inside it, so a
+        # concurrent events post is never overwritten.
+        with data_lock():
+            tracking = load_po_delivery()
+            ledger = _ledger_by_po()
+            now = _now()
+            # What this read saw -- the events route checks quotes against it and
+            # send-followups replies off it. A mirror of the mailbox, not tracker
+            # state, so it is refreshed even on a dry run.
+            cache = load_po_delivery_threads() or {}
+            cutoff = now - timedelta(days=MESSAGE_CACHE_DAYS)
+            cached_msgs = {k: v for k, v in (cache.get("messages") or {}).items()
+                           if (parse_dt(v.get("sent") or "") or now) >= cutoff}
+            cache_threads = {}
+            threads, registered, not_in_tracker = [], [], []
+            for conv, ms in convs.items():
+                ms.sort(key=lambda m: m["sent"])
+                for m in ms:
+                    if m["message_id"]:
+                        cached_msgs[m["message_id"]] = {
+                            k: m[k] for k in ("from", "sent", "conversation_id",
+                                              "subject", "text", "graph_id", "mailbox")}
+                requested = []
+                for m in ms:
+                    if not is_hh(m["from"]):
+                        continue
+                    for blk in parse_request_blocks(m["text"]):
+                        if norm_po(blk["po_number"]) not in {norm_po(b["po_number"]) for b in requested}:
+                            requested.append({**blk, "request_message_id": m["message_id"],
+                                              "request_sent": m["sent"]})
+                if not requested:
                     continue
-                for blk in parse_request_blocks(m["text"]):
-                    if norm_po(blk["po_number"]) not in {norm_po(b["po_number"]) for b in requested}:
-                        requested.append({**blk, "request_message_id": m["message_id"],
-                                          "request_sent": m["sent"]})
-            if not requested:
-                continue
-            jd_copy = next((m for m in reversed(ms)
-                            if m["mailbox"].lower().startswith("jd@")), None)
-            cache_threads[conv] = {
-                "conversation_id": conv, "subject": ms[0]["subject"],
-                "reply_to_graph_id": (jd_copy or {}).get("graph_id", ""),
-                "reply_subject": (jd_copy or ms[-1])["subject"],
-                "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
-                "po_numbers": [norm_po(b["po_number"]) for b in requested],
-            }
-            open_pos = []
-            for blk in requested:
-                key = norm_po(blk["po_number"])
-                lr, trk = ledger.get(key), tracking.get(key)
-                if lr is None and trk is None:
-                    not_in_tracker.append(blk["po_number"])
-                    continue
-                if not _is_open(lr, trk):
-                    continue
-                if trk is None:
-                    rec, change, err = apply_event(None, {
+                jd_copy = next((m for m in reversed(ms)
+                                if m["mailbox"].lower().startswith("jd@")), None)
+                cache_threads[conv] = {
+                    "conversation_id": conv, "subject": ms[0]["subject"],
+                    "reply_to_graph_id": (jd_copy or {}).get("graph_id", ""),
+                    "reply_subject": (jd_copy or ms[-1])["subject"],
+                    "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
+                    "po_numbers": [norm_po(b["po_number"]) for b in requested],
+                }
+                open_pos = []
+                for blk in requested:
+                    key = norm_po(blk["po_number"])
+                    lr, trk = ledger.get(key), tracking.get(key)
+                    if lr is None and trk is None:
+                        not_in_tracker.append(blk["po_number"])
+                        continue
+                    if not _is_open(lr, trk):
+                        continue
+                    if trk is None:
+                        rec, change, err = apply_event(None, {
+                            "po_number": (lr or {}).get("po_number") or blk["po_number"],
+                            "event": "requested",
+                            "thread": {"conversation_id": conv, "subject": ms[0]["subject"]},
+                            "request": {k: blk[k] for k in ("quantity", "address",
+                                                            "receiving_hours", "invoice")},
+                            "evidence": {"message_id": blk["request_message_id"],
+                                         "sender": "", "sent": blk["request_sent"],
+                                         "quote": f"PO #: {blk['po_number']}"}}, now)
+                        if not err and change:
+                            tracking[key] = rec
+                            registered.append(rec["po_number"])
+                        trk = tracking.get(key)
+                    open_pos.append({
                         "po_number": (lr or {}).get("po_number") or blk["po_number"],
-                        "event": "requested",
-                        "thread": {"conversation_id": conv, "subject": ms[0]["subject"]},
-                        "request": {k: blk[k] for k in ("quantity", "address",
-                                                        "receiving_hours", "invoice")},
-                        "evidence": {"message_id": blk["request_message_id"],
-                                     "sender": "", "sent": blk["request_sent"],
-                                     "quote": f"PO #: {blk['po_number']}"}}, now)
-                    if not err and change:
-                        tracking[key] = rec
-                        registered.append(rec["po_number"])
-                    trk = tracking.get(key)
-                open_pos.append({
-                    "po_number": (lr or {}).get("po_number") or blk["po_number"],
-                    "distributor": (lr or {}).get("distributor", ""),
-                    "warehouse": (lr or {}).get("warehouse", ""),
-                    "total_cs": (lr or {}).get("total_cs", 0),
-                    "ledger_status": (lr or {}).get("status", ""),
-                    "destination": blk.get("address", ""),
-                    "quantity": blk.get("quantity", ""),
-                    "receiving_hours": blk.get("receiving_hours", ""),
-                    "tracking": summary(trk, now) if trk else None,
+                        "distributor": (lr or {}).get("distributor", ""),
+                        "warehouse": (lr or {}).get("warehouse", ""),
+                        "total_cs": (lr or {}).get("total_cs", 0),
+                        "ledger_status": (lr or {}).get("status", ""),
+                        "destination": blk.get("address", ""),
+                        "quantity": blk.get("quantity", ""),
+                        "receiving_hours": blk.get("receiving_hours", ""),
+                        "tracking": summary(trk, now) if trk else None,
+                    })
+                if not open_pos:
+                    continue
+                reply_to = next((m for m in reversed(ms)
+                                 if m["mailbox"].lower().startswith("jd@")), ms[-1])
+                threads.append({
+                    "conversation_id": conv, "subject": ms[0]["subject"],
+                    "reply_to_graph_id": reply_to["graph_id"],
+                    "reply_subject": reply_to["subject"],
+                    "open_pos": open_pos,
+                    "messages": [{**{k: m[k] for k in ("message_id", "sent", "from",
+                                                        "to", "cc")},
+                                  "text": m["text"][:1500]} for m in ms],
                 })
-            if not open_pos:
-                continue
-            reply_to = next((m for m in reversed(ms)
-                             if m["mailbox"].lower().startswith("jd@")), ms[-1])
-            threads.append({
-                "conversation_id": conv, "subject": ms[0]["subject"],
-                "reply_to_graph_id": reply_to["graph_id"],
-                "reply_subject": reply_to["subject"],
-                "open_pos": open_pos,
-                "messages": [{**{k: m[k] for k in ("message_id", "sent", "from",
-                                                    "to", "cc")},
-                              "text": m["text"][:1500]} for m in ms],
-            })
-        # Evidence-only threads: cache what Lineage wrote, with the POs each
-        # thread names (ledger PO numbers found in its subject / messages), so
-        # a delivery confirmation there can be quoted. Never registered,
-        # never chased, never replied on (send-followups skips them).
-        import re as _re
-        evidence_threads = []
-        for conv, ms in ev_convs.items():
-            if not any(sender_may_report(m["from"]) for m in ms):
-                continue
-            ms.sort(key=lambda m: m["sent"])
-            blob = " ".join([ms[0]["subject"]] + [m["text"] for m in ms]).upper()
-            pos = sorted({t for t in _re.findall(r"[A-Z0-9]{5,14}", blob)
-                          if t in ledger or t in tracking})
-            if not pos:
-                continue
-            for m in ms:
-                if m["message_id"]:
-                    cached_msgs[m["message_id"]] = {
-                        k: m[k] for k in ("from", "sent", "conversation_id",
-                                          "subject", "text", "graph_id", "mailbox")}
-            cache_threads[conv] = {
-                "conversation_id": conv, "subject": ms[0]["subject"],
-                "reply_to_graph_id": "", "reply_subject": ms[-1]["subject"],
-                "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
-                "po_numbers": pos, "evidence_only": True,
-            }
-            evidence_threads.append({"conversation_id": conv,
-                                     "subject": ms[0]["subject"],
-                                     "po_numbers": pos, "messages": len(ms)})
-        # ev_errors stay out of `errors`: the cache's errors gate follow-ups,
-        # and an unread evidence thread can't change whether one is due.
-        if registered and not dry_run:
-            save_po_delivery(tracking)
-        # A partial read is still cached (its messages are real, so quotes can
-        # be checked against them) but marked, and send-followups won't chase
-        # off it: a reply in the mailbox we couldn't read might answer the ask.
-        save_po_delivery_threads({"synced_at": now.isoformat(),
-                                  "lookback_days": lookback,
-                                  "errors": list(errors),
-                                  "messages": cached_msgs,
-                                  "threads": cache_threads})
-        threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
-        return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
-                        "threads": threads, "registered": registered,
-                        "not_in_tracker": sorted(set(not_in_tracker)),
-                        "evidence_threads": evidence_threads,
-                        "evidence_errors": ev_errors,
-                        "errors": errors})
+            # Evidence-only threads: cache what Lineage wrote, with the POs each
+            # thread names (ledger PO numbers found in its subject / messages), so
+            # a delivery confirmation there can be quoted. Never registered,
+            # never chased, never replied on (send-followups skips them).
+            import re as _re
+            evidence_threads = []
+            for conv, ms in ev_convs.items():
+                if not any(sender_may_report(m["from"]) for m in ms):
+                    continue
+                ms.sort(key=lambda m: m["sent"])
+                blob = " ".join([ms[0]["subject"]] + [m["text"] for m in ms]).upper()
+                pos = sorted({t for t in _re.findall(r"[A-Z0-9]{5,14}", blob)
+                              if t in ledger or t in tracking})
+                if not pos:
+                    continue
+                for m in ms:
+                    if m["message_id"]:
+                        cached_msgs[m["message_id"]] = {
+                            k: m[k] for k in ("from", "sent", "conversation_id",
+                                              "subject", "text", "graph_id", "mailbox")}
+                cache_threads[conv] = {
+                    "conversation_id": conv, "subject": ms[0]["subject"],
+                    "reply_to_graph_id": "", "reply_subject": ms[-1]["subject"],
+                    "last_sent": ms[-1]["sent"], "last_from": ms[-1]["from"],
+                    "po_numbers": pos, "evidence_only": True,
+                }
+                evidence_threads.append({"conversation_id": conv,
+                                         "subject": ms[0]["subject"],
+                                         "po_numbers": pos, "messages": len(ms)})
+            # ev_errors stay out of `errors`: the cache's errors gate follow-ups,
+            # and an unread evidence thread can't change whether one is due.
+            closed = _stamp_closed(tracking, ledger, now)
+            if (registered or closed) and not dry_run:
+                save_po_delivery(tracking)
+            # A partial read is still cached (its messages are real, so quotes can
+            # be checked against them) but marked, and send-followups won't chase
+            # off it: a reply in the mailbox we couldn't read might answer the ask.
+            save_po_delivery_threads({"synced_at": now.isoformat(),
+                                      "lookback_days": lookback,
+                                      "errors": list(errors),
+                                      "messages": cached_msgs,
+                                      "threads": cache_threads})
+            threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
+            return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
+                            "threads": threads, "registered": registered,
+                            "closed": [tracking[k].get("po_number") or k for k in closed
+                                       if tracking[k].get("closed_reason")],
+                            "not_in_tracker": sorted(set(not_in_tracker)),
+                            "evidence_threads": evidence_threads,
+                            "evidence_errors": ev_errors,
+                            "errors": errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-sync-threads")
         return jsonify({"ok": False, "error": _safe_err(exc), "threads": []}), 200
 
 
-def _verify_evidence(ev: dict, po_key: str, cache: dict) -> tuple:
+def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> bool:
+    """Is ``msg`` a reply to an H&H message that asked about ``po_key`` and no
+    other PO on the thread? (JD's follow-up "- PO 1209157 (...): can you
+    confirm it delivered" -> Lineage: "This shows delivered.")"""
+    from integrations.po_delivery import (INTERNAL_TEST_PREFIX, is_hh, names_po,
+                                          own_text, parse_dt)
+    sent = parse_dt(msg.get("sent") or "")
+    conv = msg.get("conversation_id") or ""
+    prev = None
+    for m in (cache.get("messages") or {}).values():
+        if m.get("conversation_id") != conv or not is_hh(m.get("from") or ""):
+            continue
+        if (m.get("text") or "").lstrip().startswith(INTERNAL_TEST_PREFIX):
+            continue
+        t = parse_dt(m.get("sent") or "")
+        if t is None or sent is None or t >= sent:
+            continue
+        if prev is None or t > prev[0]:
+            prev = (t, m)
+    if prev is None:
+        return False
+    text = own_text(prev[1].get("text") or "")
+    return [p for p in dict.fromkeys(pos_on_thread) if names_po(text, p)] == [po_key]
+
+
+def _verify_evidence(ev: dict, po_key: str, cache: dict, tracked: bool = True) -> tuple:
     """Check an event's evidence against what the last sync read from the
     mailbox. Returns (event, None) with sender / sent replaced by the
     mailbox's own values, or (event, reason) when it can't be trusted: the
-    message wasn't read, its thread doesn't list this PO, or the quote isn't in
-    it. (The sender rule -- Lineage or the DC only -- is apply_event's.)"""
-    from integrations.po_delivery import quote_in_text
+    message wasn't read, its thread doesn't list this PO, the quote isn't in
+    it, or -- on a thread about several POs -- nothing ties the message to
+    THIS PO. (The sender rule -- Lineage or the DC only -- is apply_event's.)"""
+    from integrations.po_delivery import names_po, own_text, quote_in_text
     evid = dict(ev.get("evidence") or {})
     msg = (cache.get("messages") or {}).get(str(evid.get("message_id") or ""))
     if not msg:
@@ -398,6 +464,25 @@ def _verify_evidence(ev: dict, po_key: str, cache: dict) -> tuple:
         return ev, "that message's thread doesn't list this PO"
     if not quote_in_text(str(evid.get("quote") or ""), msg.get("text") or ""):
         return ev, "evidence.quote isn't in that message (quote it word for word)"
+    # A thread about several POs: a line proves something about THIS PO only
+    # if the message names it in its own text, or answers an H&H message that
+    # asked about it alone. Otherwise "Yes this shows delivered" on the
+    # 393072B2 / 014511763291 thread could release either (review 10/22).
+    pos_on_thread = list(dict.fromkeys(th.get("po_numbers") or []))
+    if (len(pos_on_thread) > 1
+            and not names_po(own_text(msg.get("text") or ""), po_key)
+            and not _answers_only(msg, po_key, pos_on_thread, cache)):
+        return ev, (f"that thread covers {len(pos_on_thread)} POs and the message "
+                    f"doesn't say which -- quote a message that names {po_key}, or "
+                    f"one answering an H&H message that asked about {po_key} alone")
+    # A schedule read off a one-off delivery thread can't START tracking a PO:
+    # tracking holds the PO out of on-hand, and nothing can chase a PO that
+    # isn't on a Quote and Schedule thread (it would sit held, unchased).
+    kind = str(ev.get("event") or "").strip().lower()
+    if th.get("evidence_only") and not tracked and kind in ("scheduled", "rescheduled"):
+        return ev, ("this PO isn't tracked, and a schedule from a one-off delivery "
+                    "thread can't start tracking it (only the Quote and Schedule "
+                    "request does)")
     evid["sender"] = msg.get("from") or ""
     evid["sent"] = msg.get("sent") or evid.get("sent") or ""
     return {**ev, "evidence": evid}, None
@@ -442,7 +527,7 @@ def api_delivery_events():
                                     "reason": f"'{kind}' isn't allowed with the delivery key"})
                     continue
             if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
-                ev, why = _verify_evidence(ev, key, cache)
+                ev, why = _verify_evidence(ev, key, cache, tracked=key in tracking)
                 if why:
                     results.append({"po_number": ev.get("po_number"), "applied": False,
                                     "reason": why})
@@ -521,15 +606,13 @@ def api_delivery_chased():
         return jsonify({"ok": False, "error": _safe_err(exc)}), 200
 
 
-def _send_reply(sender: str, reply_to_graph_id: str, to, cc, subject: str,
-                body_text: str) -> str:
-    """Reply in-thread from ``sender``'s mailbox (createReply -> patch -> send),
-    the same Graph calls /api/email/send makes. Returns the draft id."""
+def _graph_call(sender: str):
+    """(call, box) for Graph requests from ``sender``'s mailbox -- the same
+    calls /api/email/send makes."""
     import urllib.request
     from core.http import _TRUSTED_OUTBOUND_HOSTS
     from integrations.email_scanner import GRAPH_BASE, EmailInboxClient
     token = EmailInboxClient()._ms365_token()
-    uq = urllib.parse.quote
 
     def call(method, url, data=None):
         if (urllib.parse.urlparse(url).hostname or "").lower() not in _TRUSTED_OUTBOUND_HOSTS:
@@ -543,33 +626,80 @@ def _send_reply(sender: str, reply_to_graph_id: str, to, cc, subject: str,
             raw = resp.read()
             return raw.decode("utf-8", "replace") if raw else ""
 
-    box = f"{GRAPH_BASE}/users/{uq(sender)}/messages"
+    return call, f"{GRAPH_BASE}/users/{urllib.parse.quote(sender)}/messages"
+
+
+def _create_reply(sender: str, reply_to_graph_id: str) -> str:
+    """createReply on the thread's latest message; returns the draft id."""
+    call, box = _graph_call(sender)
+    uq = urllib.parse.quote
     draft = json.loads(call("POST", f"{box}/{uq(reply_to_graph_id)}/createReply") or "{}")
     draft_id = draft.get("id")
     if not draft_id:
         raise RuntimeError("createReply returned no draft id")
-    rc = lambda addrs: [{"emailAddress": {"address": a}} for a in addrs]
+    return draft_id
+
+
+def _send_draft(sender: str, draft_id: str, to, cc, subject: str, body_text: str) -> None:
+    """Fill the reply draft (fixed recipients / wording) and send it."""
+    call, box = _graph_call(sender)
+    uq = urllib.parse.quote
+    rc = lambda addrs: [{"emailAddress": {"address": a}} for a in addrs]  # noqa: E731
     call("PATCH", f"{box}/{uq(draft_id)}", {
         "subject": subject, "body": {"contentType": "Text", "content": body_text},
         "toRecipients": rc(to), "ccRecipients": rc(cc)})
     call("POST", f"{box}/{uq(draft_id)}/send")
-    return draft_id
+
+
+def _set_chase_state(keys, claim: str, message_id: str = None, send_state: str = None,
+                     drop: bool = False) -> None:
+    """Under the data lock: re-read tracking and update (or drop) the chases
+    this run recorded with message_id ``claim`` on ``keys``."""
+    from inventory_tracker import data_lock, load_po_delivery, save_po_delivery
+    with data_lock():
+        tracking = load_po_delivery()
+        for key in keys:
+            rec = tracking.get(key)
+            if not rec:
+                continue
+            chases = []
+            for c in rec.get("chases") or []:
+                if c.get("message_id") == claim:
+                    if drop:
+                        continue
+                    c = dict(c)
+                    if message_id is not None:
+                        c["message_id"] = message_id
+                    if send_state is not None:
+                        c["send_state"] = send_state
+                chases.append(c)
+            tracking[key] = {**rec, "chases": chases}
+        save_po_delivery(tracking)
 
 
 @delivery_bp.route("/api/pos/delivery/send-followups", methods=["POST"])
-@with_data_lock
 def api_delivery_send_followups():
     """Write and send the follow-ups that are due, one threaded email per
     Quote and Schedule thread, then record them. Body {dry_run}.
 
     Everything about the email is decided here, not by the caller: who is due
     (po_delivery.chase_due), the recipients (FOLLOWUP_TO / FOLLOWUP_CC), the
-    wording (ASK_TEXT), and the thread (from the last sync). Guards: the sync
-    must be fresh (SYNC_FRESH_FOR) and complete; a PO someone wrote about in
-    the last THREAD_QUIET_FOR is held back (po_delivery.quiet_pos); at most
-    MAX_FOLLOWUP_EMAILS."""
+    wording (ASK_TEXT), and the thread (the NEWEST Quote and Schedule thread
+    listing the PO, from the last sync). Guards: the sync must be fresh
+    (SYNC_FRESH_FOR) and complete; a PO someone wrote about on ANY cached
+    thread in the last THREAD_QUIET_FOR is held back (po_delivery.quiet_pos);
+    a canceled PO, or one the ledger no longer has, is never chased; at most
+    MAX_FOLLOWUP_EMAILS.
+
+    Graph calls run OUTSIDE the data lock (every page waits on it). Each email
+    is claimed under the lock first -- its POs re-checked as still due and a
+    chase recorded -- so two overlapping runs can't both send it; the chase is
+    then stamped "draft" once createReply succeeds and "sent" after the send.
+    A send that fails AFTER the draft exists still counts as chased (no resend
+    within 16 h: Graph may have sent it) and is reported."""
+    import uuid
     from inventory_tracker import (
-        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+        data_lock, load_po_delivery, load_po_delivery_threads, save_po_delivery,
     )
     from integrations.po_delivery import (
         FOLLOWUP_CC, FOLLOWUP_FROM, FOLLOWUP_TO, MAX_FOLLOWUP_EMAILS,
@@ -580,21 +710,34 @@ def api_delivery_send_followups():
         body = request.get_json(silent=True) or {}
         dry_run = bool(body.get("dry_run", False))
         now = _now()
-        cache = load_po_delivery_threads() or {}
-        synced = parse_dt(cache.get("synced_at") or "")
-        if synced is None or now - synced > SYNC_FRESH_FOR:
-            return jsonify({"ok": False, "error": "threads not synced in the last "
-                            f"{int(SYNC_FRESH_FOR.total_seconds() // 60)} min -- "
-                            "run sync-threads first", "emails": []}), 200
-        if cache.get("errors"):
-            return jsonify({"ok": False, "error": "the last sync couldn't read every "
-                            "mailbox; not following up off a partial read",
-                            "sync_errors": cache["errors"], "emails": []}), 200
-        threads = cache.get("threads") or {}
-        tracking = load_po_delivery()
-        ledger = _ledger_by_po()
+        with data_lock():
+            cache = load_po_delivery_threads() or {}
+            synced = parse_dt(cache.get("synced_at") or "")
+            if synced is None or now - synced > SYNC_FRESH_FOR:
+                return jsonify({"ok": False, "error": "threads not synced in the last "
+                                f"{int(SYNC_FRESH_FOR.total_seconds() // 60)} min -- "
+                                "run sync-threads first", "emails": []}), 200
+            if cache.get("errors"):
+                return jsonify({"ok": False, "error": "the last sync couldn't read every "
+                                "mailbox; not following up off a partial read",
+                                "sync_errors": cache["errors"], "emails": []}), 200
+            threads = cache.get("threads") or {}
+            tracking = load_po_delivery()
+            ledger = _ledger_by_po()
+            closed = _stamp_closed(tracking, ledger, now)
+            if closed and not dry_run:
+                save_po_delivery(tracking)
 
-        groups, no_thread = {}, []
+        # "Someone just wrote about it", per PO, across EVERY cached thread that
+        # names it -- a Lineage answer on a newer thread, or on a one-off
+        # "PO ... Delivery Status" thread, holds the chase too.
+        by_conv: dict = {}
+        for m in (cache.get("messages") or {}).values():
+            by_conv.setdefault(m.get("conversation_id") or "", []).append(m)
+        quiet_by_conv = {c: quiet_pos(by_conv.get(c, []), t.get("po_numbers") or [], now)
+                         for c, t in threads.items()}
+
+        groups, no_thread, held_by_conv = {}, [], {}
         for key, rec in tracking.items():
             lr = ledger.get(key)
             if not _is_open(lr, rec):
@@ -602,32 +745,31 @@ def api_delivery_send_followups():
             ask = chase_due(rec, now)
             if not ask:
                 continue
-            conv = (rec.get("thread") or {}).get("conversation_id") or ""
-            if conv not in threads or threads[conv].get("evidence_only"):
-                conv = next((c for c, t in sorted(threads.items(),
-                                                  key=lambda kv: kv[1].get("last_sent") or "",
-                                                  reverse=True)
-                             if key in (t.get("po_numbers") or [])
-                             and not t.get("evidence_only")), "")
+            # The NEWEST Quote and Schedule thread listing the PO -- not the one
+            # it was first registered from: when Isaiah re-requests a PO on a
+            # new thread, that is where Lineage is answering.
+            conv = max((c for c, t in threads.items()
+                        if key in (t.get("po_numbers") or []) and not t.get("evidence_only")),
+                       key=lambda c: threads[c].get("last_sent") or "", default="")
             if not conv:
                 no_thread.append(rec.get("po_number") or key)
                 continue
-            groups.setdefault(conv, []).append({
-                "key": key, "po_number": rec.get("po_number") or key, "ask": ask,
-                "distributor": (lr or {}).get("distributor", ""),
-                "warehouse": (lr or {}).get("warehouse", ""),
-                "delivery_appt": rec.get("delivery_appt") or ""})
+            item = {"key": key, "po_number": rec.get("po_number") or key, "ask": ask,
+                    "distributor": (lr or {}).get("distributor", ""),
+                    "warehouse": (lr or {}).get("warehouse", ""),
+                    "delivery_appt": rec.get("delivery_appt") or ""}
+            why = next((q[key] for q in quiet_by_conv.values() if key in q), None)
+            if why:
+                held_by_conv.setdefault(conv, {})[item["po_number"]] = why
+                continue
+            groups.setdefault(conv, []).append(item)
 
-        emails, sent_any = [], False
-        all_msgs = list((cache.get("messages") or {}).values())
-        for conv, items in sorted(groups.items(),
-                                  key=lambda kv: threads[kv[0]].get("last_sent") or ""):
+        emails = []
+        for conv in sorted(set(groups) | set(held_by_conv),
+                           key=lambda c: threads[c].get("last_sent") or ""):
             th = threads[conv]
-            items.sort(key=lambda i: i["po_number"])
-            quiet = quiet_pos([m for m in all_msgs if m.get("conversation_id") == conv],
-                              th.get("po_numbers") or [], now)
-            held = {i["po_number"]: quiet[i["key"]] for i in items if i["key"] in quiet}
-            items = [i for i in items if i["key"] not in quiet]
+            items = sorted(groups.get(conv, []), key=lambda i: i["po_number"])
+            held = held_by_conv.get(conv, {})
             out = {"conversation_id": conv, "subject": reply_subject(th.get("reply_subject")
                                                                      or th.get("subject")),
                    "po_numbers": [i["po_number"] for i in items],
@@ -644,7 +786,8 @@ def api_delivery_send_followups():
                 out["skipped"] = "no copy of this thread in JD's mailbox to reply on"
                 emails.append(out)
                 continue
-            if len([e for e in emails if e.get("sent") or e.get("would_send")]) >= MAX_FOLLOWUP_EMAILS:
+            if len([e for e in emails if e.get("sent") or e.get("would_send")
+                    or e.get("send_state")]) >= MAX_FOLLOWUP_EMAILS:
                 out["skipped"] = f"over the {MAX_FOLLOWUP_EMAILS}-email cap for one run"
                 emails.append(out)
                 continue
@@ -653,26 +796,65 @@ def api_delivery_send_followups():
                 out["would_send"] = True
                 emails.append(out)
                 continue
+
+            # 1) Claim: still due (an event or another run may have landed
+            #    since the read above)? Record the chase before any Graph call.
+            claim = f"claim:{uuid.uuid4().hex}"
+            with data_lock():
+                tracking = load_po_delivery()
+                still = [i for i in items if i["key"] in tracking
+                         and chase_due(tracking[i["key"]], now) == i["ask"]]
+                for i in still:
+                    tracking[i["key"]] = record_chase(tracking[i["key"]], i["ask"], now,
+                                                      claim, send_state="claimed")
+                if still:
+                    save_po_delivery(tracking)
+            if len(still) != len(items):
+                items = still
+                out["po_numbers"] = [i["po_number"] for i in items]
+                out["asks"] = {i["po_number"]: i["ask"] for i in items}
+                if not items:
+                    out["skipped"] = "no longer due (chased or updated meanwhile)"
+                    out.pop("body", None)
+                    emails.append(out)
+                    continue
+                out["body"] = followup_body(items)
+            keys = [i["key"] for i in items]
+            # 2) createReply. Nothing exists yet if it fails: drop the claim.
             try:
-                draft_id = _send_reply(FOLLOWUP_FROM, th["reply_to_graph_id"],
-                                       FOLLOWUP_TO, FOLLOWUP_CC, out["subject"],
-                                       out["body"])
+                draft_id = _create_reply(FOLLOWUP_FROM, th["reply_to_graph_id"])
             except Exception as exc:  # noqa: BLE001
-                out["error"] = _safe_err(exc, "graph send")
+                _set_chase_state(keys, claim, drop=True)
+                out["error"] = _safe_err(exc, "graph createReply")
                 emails.append(out)
                 continue
+            _set_chase_state(keys, claim, message_id=draft_id, send_state="draft")
+            out["draft_id"] = draft_id
+            out["send_state"] = "draft"
+            # 3) Fill + send. A failure here may still have sent (a timeout on
+            #    the reply): the chase stays recorded as "draft" -- no resend
+            #    within 16 h -- and the error says to check JD's Drafts.
+            try:
+                _send_draft(FOLLOWUP_FROM, draft_id, FOLLOWUP_TO, FOLLOWUP_CC,
+                            out["subject"], out["body"])
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = (_safe_err(exc, "graph send") + " -- the reply draft "
+                                "exists, so this counts as chased (no resend for 16 h); "
+                                "check JD's Drafts / Sent Items")
+                emails.append(out)
+                continue
+            _set_chase_state(keys, draft_id, send_state="sent")
+            out["send_state"] = "sent"
             out["sent"] = True
-            sent_any = True
-            for i in items:
-                tracking[i["key"]] = record_chase(tracking[i["key"]], i["ask"], now,
-                                                  draft_id)
             emails.append(out)
-        if sent_any:
-            save_po_delivery(tracking)
         return jsonify({"ok": True, "dry_run": dry_run,
                         "synced_at": cache.get("synced_at"),
                         "emails": emails,
                         "sent": sum(1 for e in emails if e.get("sent")),
+                        "unconfirmed_sends": [e["conversation_id"] for e in emails
+                                              if e.get("send_state") == "draft"],
+                        "closed": [tracking[k].get("po_number") or k for k in closed
+                                   if (tracking.get(k) or {}).get("closed_reason")],
                         "due_without_thread": no_thread})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-send-followups")

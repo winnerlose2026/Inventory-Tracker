@@ -818,8 +818,19 @@ def api_freight_lead_times():
       overall    transit + order->delivery stats across all samples
       (by_warehouse kept for older page builds)
     """
+    # Every input of the answer: the ledger also reads canceled_pos.json and
+    # status_overrides.json (canceled lanes drop out), and planning_config sets
+    # each location's default transit -- editing it showed stale defaults
+    # until some other file happened to change.
+    from integrations.planning_config import _override_path as _planning_path
+    try:
+        _pc = _planning_path().stat().st_mtime_ns
+    except OSError:
+        _pc = 0
     sig = _data_sig("inventory.json", "usage.json", "freight_invoices.json",
-                    "po_delivery.json", "chefs_warehouse_pos.json")
+                    "po_delivery.json", "chefs_warehouse_pos.json",
+                    "planning_config.json", "canceled_pos.json",
+                    "status_overrides.json") + (_pc,)
     _c = _AGG_CACHE.get("lead-times")
     if _c and _c[0] == sig:
         return jsonify(_c[1])
@@ -860,14 +871,19 @@ def api_freight_lead_times():
     def _agg(vals):
         return LT._stats(vals)
 
-    overall = {"transit": _agg([s["transit_days"] for s in samples]),
+    # Transit is per SHIPMENT (one truck = one delivery, however many POs it
+    # carried); order -> delivery stays per PO.
+    ship_transits = [sh["transit_days"] for l in model.values()
+                     for sh in (l.get("shipments") or [])]
+    overall = {"transit": _agg(ship_transits),
                "order_to_delivery": _agg([s.get("order_to_delivery_days")
                                           for s in samples])}
     # Legacy keys (older page builds read these).
     overall["ship_to_arrival"] = overall["transit"]
     overall["order_to_arrival"] = overall["order_to_delivery"]
     by_warehouse = [{"warehouse": l["location"],
-                     "ship_to_arrival": _agg([x["transit_days"] for x in l["samples"]]),
+                     "ship_to_arrival": _agg([x["transit_days"]
+                                              for x in (l.get("shipments") or l["samples"])]),
                      "order_to_arrival": l.get("order_to_delivery") or _agg([])}
                     for l in locations if l.get("samples")]
     result = {"ok": True, "min_samples": LT.MIN_SAMPLES,
@@ -876,7 +892,7 @@ def api_freight_lead_times():
               "deliveries": list(reversed(samples)),
               "excluded": m["excluded"],
               "overall": overall, "by_warehouse": by_warehouse,
-              "po_count": len(samples)}
+              "po_count": len(samples), "shipment_count": len(ship_transits)}
     _AGG_CACHE["lead-times"] = (sig, result)
     return jsonify(result)
 
@@ -889,7 +905,25 @@ def api_freight_lead_times_apply():
     body = request.get_json(silent=True) or {}
     dry_run = body.get("dry_run", True) is not False
     try:
-        return jsonify({"ok": True, **rederive_estimated_arrivals(dry_run=dry_run)})
+        out = rederive_estimated_arrivals(dry_run=dry_run)
+        if not dry_run and out.get("changes"):
+            # One audit row per PO moved (old -> new arrival), so a re-estimate
+            # run by hand is traceable like any other inventory change.
+            try:
+                from inventory_tracker import append_inventory_audit, data_lock
+                ts = datetime.now().isoformat(timespec="seconds")
+                with data_lock():
+                    append_inventory_audit([{
+                        "ts": ts, "source": "lead-times-apply",
+                        "event_type": "arrival_estimate",
+                        "po_number": c["po_number"], "warehouse": c["warehouse"],
+                        "name": f"PO {c['po_number']} ({c['where']})",
+                        "old_arrival": c["old_arrival"], "new_arrival": c["new_arrival"],
+                        "transit_days": c["transit_days"], "basis": c["basis"]}
+                        for c in out["changes"]])
+            except Exception as exc:  # noqa: BLE001 -- audit is best-effort
+                _log_exc(exc, "lead-times apply audit")
+        return jsonify({"ok": True, **out})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "lead-times apply")
         return jsonify({"ok": False, "error": _safe_err(exc)}), 200

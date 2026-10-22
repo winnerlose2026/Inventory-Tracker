@@ -800,8 +800,22 @@ def _delivery_gate(entry: dict, tracking: dict):
     if st in HOLD_STATUSES:
         return "hold", None
     if st == "delivered":
-        return "delivered", _parse_sane_dt(rec.get("delivered_at") or "")
+        from integrations.po_delivery import delivered_time_known, wall_time
+        raw = rec.get("delivered_at") or ""
+        if not delivered_time_known(rec):
+            # Lineage gave a date only ("This shows it delivered 10/21."): the
+            # delivery DAY at 00:00, never the 12:00 the task filled in -- a
+            # made-up time must not out-rank a same-day count (review 10/22).
+            raw = wall_time(raw)[:10]
+        return "delivered", _parse_sane_dt(raw)
     return "none", None
+
+
+def _delivery_time_known(entry: dict, tracking: dict) -> bool:
+    """Did Lineage / the DC state the delivery TIME of this entry's PO?"""
+    from integrations.po_delivery import delivered_time_known, norm_po
+    rec = (tracking or {}).get(norm_po(entry.get("po_number") or ""))
+    return bool(rec) and delivered_time_known(rec)
 
 
 
@@ -937,7 +951,10 @@ def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
             if delivered_at.date().isoformat() > count_at[:10]:
                 continue            # arrives after the count by day anyway
             po = entry.get("po_number") or ""
-            if "T" in count_at and cdt < delivered_at:
+            # Exact-time rule only for a REAL delivery time; a date-only
+            # confirmation goes to the quantity check below.
+            if ("T" in count_at and cdt < delivered_at
+                    and _delivery_time_known(entry, tracking)):
                 missed[(po, key)] = (count_at, "count stamped before the "
                                      "confirmed delivery time")
                 continue
@@ -1071,6 +1088,9 @@ def _rollover_on_order(inv: dict) -> bool:
                 **_po_doc_identity(entry, item),
                 **({"delivery_confirmed": True}
                    if gate == "delivered" and delivered_at is not None else {}),
+                **({"delivery_time_known": False}
+                   if gate == "delivered" and delivered_at is not None
+                   and not _delivery_time_known(entry, tracking) else {}),
                 **({"not_in_count_at": miss[0], "count_missed_reason": miss[1]}
                    if miss else {}),
             })
@@ -1268,6 +1288,10 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             # receipt, so re-reads of it keep the cases on top.
             **{k: audit[k] for k in ("delivery_confirmed", "not_in_count_at",
                                      "count_missed_reason") if audit.get(k)},
+            # Date-only confirmation: arrival_date is the delivery DAY, not a
+            # time (core.util.receipt_inside_count skips the exact rule).
+            **({"delivery_time_known": False}
+               if audit.get("delivery_time_known") is False else {}),
         })
         if audit.get("not_in_count_at"):
             usage[-1]["note"] += (f" - not in the {audit['not_in_count_at']} "

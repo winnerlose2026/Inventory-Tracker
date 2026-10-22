@@ -320,11 +320,18 @@ def _routes(monkeypatch, inv, tracking, ledger_status="in_transit", synced=None,
     monkeypatch.setattr(B, "_ledger_by_po", lambda: ledger)
     monkeypatch.setattr(B, "_now", lambda: NOW)
 
-    def send(sender, reply_to, to, cc, subject, body):
-        store["sent"].append({"from": sender, "reply_to": reply_to, "to": list(to),
-                              "cc": list(cc), "subject": subject, "body": body})
-        return f"draft-{len(store['sent'])}"
-    monkeypatch.setattr(B, "_send_reply", send)
+    drafts = {}
+
+    def create(sender, reply_to):
+        draft_id = f"draft-{len(drafts) + 1}"
+        drafts[draft_id] = {"from": sender, "reply_to": reply_to}
+        return draft_id
+
+    def send(sender, draft_id, to, cc, subject, body):
+        store["sent"].append({**drafts[draft_id], "to": list(to), "cc": list(cc),
+                              "subject": subject, "body": body})
+    monkeypatch.setattr(B, "_create_reply", create)
+    monkeypatch.setattr(B, "_send_draft", send)
     monkeypatch.setenv("INVENTORY_API_TOKEN", "tok")
     monkeypatch.setenv("DELIVERY_API_TOKEN", "dtok")
     return app.test_client(), store

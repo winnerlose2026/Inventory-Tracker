@@ -122,6 +122,89 @@ def wall_time(raw: str) -> str:
     return f"{m.group(1)}T{t}"
 
 
+# ---------------------------------------------------------------------------
+# Does a delivery confirmation give a TIME, or only a date?
+# ---------------------------------------------------------------------------
+# Half of Lineage's confirmations carry no time ("Yes, this shows delivered
+# 10/07.", "This shows it delivered 10/21.", "This shows delivered."), and the
+# task filled one in (12:00 local, or the appointment). The rollover then
+# treated that made-up time as exact: a 09:00 CT count on the delivery day
+# was "stamped before the confirmed delivery" and the whole PO was added on
+# top of a count that already held it (review 2026-10-22). The record now
+# says whether its time is real (delivered_time_known); only a real time may
+# use the exact-time rules.
+
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+           "nov", "dec")
+_DATE_TOKEN = re.compile(
+    r"\b(?P<iy>\d{4})-(?P<im>\d{2})-(?P<id>\d{2})\b"                    # 2026-10-19
+    r"|\b(?P<m>\d{1,2})/(?P<d>\d{1,2})(?:/\d{2,4})?\b"                  # 10/19[/2026]
+    r"|\b(?P<mn>" + "|".join(_MONTHS) + r")[a-z]*\.?\s+(?P<md>\d{1,2})"
+    r"(?:st|nd|rd|th)?\b(?:,?\s*\d{4}\b)?"                              # Oct 19[, 2026]
+    r"|/?\b(?P<od>\d{1,2})(?:st|nd|rd|th)\b",                           # 19th, /21st
+    re.I)
+_TIME_TOKEN = re.compile(
+    r"\b\d{1,2}:\d{2}\b"                                      # 8:00, 08:00
+    r"|\b\d{1,4}\s*(?:a\.?m\.?|p\.?m\.?)(?![a-z])",           # 8 AM, 0800AM, 1556PM
+    re.I)
+_MILITARY_TIME = re.compile(r"\b(?:[01]\d|2[0-3])[0-5]\d\b")  # 1225 (in "1225/12th")
+
+
+def quote_dates(quote: str) -> list:
+    """[(month or None, day)] for every date a quote states."""
+    out = []
+    for m in _DATE_TOKEN.finditer(quote or ""):
+        if m.group("iy"):
+            out.append((int(m.group("im")), int(m.group("id"))))
+        elif m.group("m"):
+            out.append((int(m.group("m")), int(m.group("d"))))
+        elif m.group("mn"):
+            out.append((_MONTHS.index(m.group("mn").lower()[:3]) + 1, int(m.group("md"))))
+        elif m.group("od"):
+            out.append((None, int(m.group("od"))))
+    return [(mo, d) for mo, d in out if 1 <= d <= 31 and (mo is None or 1 <= mo <= 12)]
+
+
+def quote_has_time(quote: str) -> bool:
+    """Does the quote state a clock time? "8:00", "8 AM", "0800AM/19th",
+    "1556PM/13th", or a bare 24-hour "1225" (Belinda's "1225/12th") when the
+    quote also states a date -- a bare 4-digit number alone isn't trusted."""
+    q = quote or ""
+    has_date = bool(_DATE_TOKEN.search(q))
+    rest = _DATE_TOKEN.sub(" ", q)
+    if _TIME_TOKEN.search(rest):
+        return True
+    return has_date and bool(_MILITARY_TIME.search(rest))
+
+
+def _last_delivered_quote(rec: dict) -> str:
+    ev = next((e for e in reversed(rec.get("events") or [])
+               if e.get("event") == "delivered"), {})
+    return str((ev.get("evidence") or {}).get("quote") or "")
+
+
+def delivered_time_known(rec: dict) -> bool:
+    """Is the record's delivered_at time real (stated by Lineage / the DC)?
+    The stored flag wins; records from before 2026-10-22 have none, so it is
+    read off their delivered quote (no migration)."""
+    raw = str((rec or {}).get("delivered_at") or "")
+    if not re.search(r"T\d{2}:\d{2}", raw):
+        return False                       # a bare date has no time to know
+    flag = (rec or {}).get("delivered_time_known")
+    if isinstance(flag, bool):
+        return flag
+    return quote_has_time(_last_delivered_quote(rec or {}))
+
+
+def delivered_local(rec: dict) -> str:
+    """The dock's wall-clock delivery time -- or, when Lineage gave only a
+    date, that date at 00:00 (shown without a time)."""
+    local = wall_time((rec or {}).get("delivered_at") or "")
+    if local and not delivered_time_known(rec):
+        return local[:10] + "T00:00:00"
+    return local
+
+
 def _domain(addr: str) -> str:
     return (addr or "").rsplit("@", 1)[-1].lower().strip()
 
@@ -237,7 +320,8 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     rec.setdefault("events", [])
     rec.setdefault("chases", [])
     old = {k: rec.get(k, "") for k in
-           ("status", "delivery_appt", "pickup_at", "delivered_at", "confirmation_no")}
+           ("status", "delivery_appt", "pickup_at", "delivered_at", "confirmation_no",
+            "delivered_time_known")}
 
     if kind == "picked_up" and not rec_in:
         return rec_in, None, ("PO isn't tracked yet -- a pickup is recorded on a PO "
@@ -302,8 +386,27 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
         req = parse_dt(rec.get("requested_at") or "")
         if req and at < req - timedelta(days=1):
             return rec, None, "delivered_at is before the PO was even sent to Lineage"
+        # The date posted must be a date the quote states (when it states
+        # any): the evidence check proves the line exists, not that the event
+        # carries its date.
+        local_day = wall_time(str(ev["delivered_at"]))[:10]
+        qd = quote_dates(evid["quote"])
+        if qd and local_day:
+            mo, dy = int(local_day[5:7]), int(local_day[8:10])
+            if not any(d == dy and (m is None or m == mo) for m, d in qd):
+                said = ", ".join(f"{m}/{d}" if m else f"day {d}" for m, d in qd)
+                return rec, None, (f"delivered_at is {mo}/{dy} but the quote says "
+                                   f"{said} -- post the date the quote gives")
+        # Is the TIME real? An explicit time_known wins; otherwise the quote
+        # must state one ("0800AM/19th"). A date-only confirmation keeps its
+        # day but never acts as an exact time (see delivered_time_known).
+        tk = ev.get("time_known")
+        if not isinstance(tk, bool):
+            tk = quote_has_time(evid["quote"])
         rec["status"] = "delivered"
         rec["delivered_at"] = str(ev["delivered_at"]).strip()
+        rec["delivered_time_known"] = bool(tk) and bool(
+            re.search(r"T\d{2}:\d{2}", rec["delivered_at"]))
 
     new = {k: rec.get(k, "") for k in old}
     entry = {"event": kind, "at": now.isoformat(), **{k: new[k] for k in new
@@ -318,11 +421,17 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
                  "before": old, "after": new}, None
 
 
-def record_chase(rec: dict, ask: str, now: datetime, message_id: str = "") -> dict:
+def record_chase(rec: dict, ask: str, now: datetime, message_id: str = "",
+                 send_state: str = "") -> dict:
+    """send_state (server-sent follow-ups): "claimed" before the draft exists,
+    "draft" once createReply made it, "sent" after Graph accepted the send.
+    Any of them counts as chased (REPEAT_ASK_AFTER), so a send that times out
+    after the draft exists is never re-sent within 16 h."""
     rec = dict(rec)
-    rec["chases"] = (list(rec.get("chases") or []) +
-                     [{"at": now.isoformat(), "ask": ask,
-                       "message_id": message_id}])[-40:]
+    chase = {"at": now.isoformat(), "ask": ask, "message_id": message_id}
+    if send_state:
+        chase["send_state"] = send_state
+    rec["chases"] = (list(rec.get("chases") or []) + [chase])[-40:]
     return rec
 
 
@@ -416,6 +525,28 @@ def quote_in_text(quote: str, text: str) -> bool:
     return True
 
 
+# Where a reply's own text ends and the quoted history begins.
+_HISTORY_START = re.compile(
+    r"^\s*(?:From:|-{2,}\s*Original Message|_{8,}|On\b[^\n]*(?:\n[^\n]*)?\bwrote:)",
+    re.I | re.M)
+
+
+def own_text(text: str) -> str:
+    """A message's own words, above any quoted history ("From:", "-----Original
+    Message", "________________", "On ... wrote:")."""
+    text = text or ""
+    m = _HISTORY_START.search(text)
+    return text[:m.start()] if m else text
+
+
+def names_po(text: str, po_key: str) -> bool:
+    """Does ``text`` name the PO (as a whole token -- "PO # 393072B2",
+    "1209205-shows delivered", "HHB-1209205")?"""
+    p = norm_po(po_key)
+    return bool(p) and bool(re.search(r"(?<![A-Z0-9])" + re.escape(p) + r"(?![A-Z0-9])",
+                                      (text or "").upper()))
+
+
 _US_ZONES = (("ET", "America/New_York"), ("CT", "America/Chicago"),
              ("MT", "America/Denver"), ("PT", "America/Los_Angeles"))
 
@@ -505,7 +636,10 @@ def summary(rec: dict, now: datetime) -> dict:
         "delivery_appt_local": wall_time(rec.get("delivery_appt") or ""),
         "pickup_at": rec.get("pickup_at") or "",
         "delivered_at": rec.get("delivered_at") or "",
-        "delivered_local": wall_time(rec.get("delivered_at") or ""),
+        "delivered_local": delivered_local(rec),
+        "delivered_time_known": (delivered_time_known(rec)
+                                 if rec.get("delivered_at") else None),
+        "closed_reason": rec.get("closed_reason") or "",
         "confirmation_no": rec.get("confirmation_no") or "",
         "awaiting_confirmation": awaiting_confirmation(rec, now),
         "chase_due": chase_due(rec, now),

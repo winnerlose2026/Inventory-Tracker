@@ -442,7 +442,8 @@ def _snapshot_data_files(tag: str) -> dict:
 # _enrich_on_order). A snapshot taken from that endpoint carries them, and
 # they must not be written back into the stored item.
 _DERIVED_FIELDS = ("on_order_qty", "on_order_next_eta",
-                   "on_order_next_arrival", "on_order_next_is_actual")
+                   "on_order_next_arrival", "on_order_next_is_actual",
+                   "on_order_next_kind")
 
 
 @admin_bp.route("/api/admin/restore-inventory", methods=["POST"])

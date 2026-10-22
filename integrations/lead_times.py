@@ -113,9 +113,53 @@ def collect_samples(tracking: dict, po_meta: dict, freight_idx: dict,
                                                    else None),
                         "evidence": {"sender": evid.get("sender", ""),
                                      "sent": evid.get("sent", ""),
+                                     "message_id": evid.get("message_id", ""),
                                      "quote": (evid.get("quote") or "")[:200]}})
     samples.sort(key=lambda s: (s["delivered_at"], s["po_number"]))
+    assign_shipments(samples)
     return samples, excluded
+
+
+def _shipment_groups(samples: list) -> list:
+    """Group one location's samples into SHIPMENTS (trucks): same evidence
+    message, or same ship date AND same delivery time. Returns lists of
+    samples, oldest delivery first."""
+    groups: list = []
+    for s in sorted(samples, key=lambda s: (s["delivered_at"], s["po_number"])):
+        msg = ((s.get("evidence") or {}).get("message_id") or "").strip()
+        pair = (str(s.get("ship_date") or "")[:10], s.get("delivered_at") or "")
+        hit = None
+        for g in groups:
+            if (msg and msg in g["msgs"]) or (pair[0] and pair[1] and pair in g["pairs"]):
+                hit = g
+                break
+        if hit is None:
+            hit = {"msgs": set(), "pairs": set(), "samples": []}
+            groups.append(hit)
+        if msg:
+            hit["msgs"].add(msg)
+        hit["pairs"].add(pair)
+        hit["samples"].append(s)
+    return [g["samples"] for g in groups]
+
+
+def assign_shipments(samples: list) -> list:
+    """Stamp each sample with its shipment (one truck can carry several POs:
+    Bronx 1198387 + 1209205, both confirmed in one Lineage message, delivered
+    10/12 12:25). ``shipment`` is an id shared by the POs of one truck;
+    ``shipment_pos`` lists them. Mutates and returns ``samples``."""
+    by: dict = {}
+    for s in samples:
+        by.setdefault(location_key(s["distributor"], s["warehouse"]), []).append(s)
+    for key, ss in by.items():
+        for g in _shipment_groups(ss):
+            first = g[0]
+            sid = f"{key}|{str(first.get('ship_date') or '')[:10]}>{first['delivered_at'][:16]}"
+            pos = [x["po_number"] for x in g]
+            for x in g:
+                x["shipment"] = sid
+                x["shipment_pos"] = pos
+    return samples
 
 
 def _stats(vals: list) -> dict:
@@ -130,7 +174,11 @@ def _stats(vals: list) -> dict:
 
 
 def build_model(samples: list, default_fn: Callable[[str], int]) -> dict:
-    """{location_key: {...stats, trend_avg, used_days, basis, samples}}."""
+    """{location_key: {...stats, trend_avg, used_days, basis, samples}}.
+
+    Counted per SHIPMENT, not per PO: a truck carrying two POs is one
+    delivery. Bronx (CW) was "learned" at 3 days off a single truck
+    (1198387 + 1209205), though one load mustn't move every estimate."""
     by: dict = {}
     for s in samples:
         by.setdefault(location_key(s["distributor"], s["warehouse"]), []).append(s)
@@ -138,11 +186,14 @@ def build_model(samples: list, default_fn: Callable[[str], int]) -> dict:
     for key, ss in by.items():
         ss = sorted(ss, key=lambda s: s["delivered_at"])
         dist, wh = key.split("|", 1)
-        transit = [s["transit_days"] for s in ss]
+        shipments = _shipment_groups(ss)
+        # One transit per truck (its POs normally agree; else their mean).
+        transit = [round(sum(x["transit_days"] for x in g) / len(g), 1) for g in shipments]
+        transit = [int(t) if float(t).is_integer() else t for t in transit]
         recent = transit[-TREND_WINDOW:]
         trend = round(sum(recent) / len(recent), 1)
         default = int(default_fn(wh) or DEFAULT_TRANSIT_DAYS)
-        learned = len(ss) >= MIN_SAMPLES
+        learned = len(shipments) >= MIN_SAMPLES
         used = max(1, int(trend + 0.5)) if learned else default   # half-up
         model[key] = {
             "distributor": dist, "warehouse": wh,
@@ -152,11 +203,17 @@ def build_model(samples: list, default_fn: Callable[[str], int]) -> dict:
             "order_to_delivery": _stats([s.get("order_to_delivery_days") for s in ss]),
             "default_days": default, "used_days": used, "learned": learned,
             "basis": (f"avg of last {len(recent)} deliveries" if learned else
-                      f"{default}-day default ({len(ss)} delivery so far, "
+                      f"{default}-day default ({len(shipments)} delivery so far, "
                       f"need {MIN_SAMPLES})"),
             "last_delivered": ss[-1]["delivered_at"],
-            "samples": [{k: s[k] for k in ("po_number", "ship_date", "ship_source",
-                                           "delivered_at", "transit_days")}
+            "po_n": len(ss),
+            "shipments": [{"pos": [x["po_number"] for x in g],
+                           "ship_date": g[0]["ship_date"],
+                           "delivered_at": g[0]["delivered_at"],
+                           "transit_days": t} for g, t in zip(shipments, transit)],
+            "samples": [{k: s.get(k) for k in ("po_number", "ship_date", "ship_source",
+                                               "delivered_at", "transit_days",
+                                               "shipment")}
                         for s in ss],
         }
     return model
