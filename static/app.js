@@ -2543,7 +2543,8 @@ function _groupsFromLedger(records) {
     };
     // The server is the authority on arrived vs pending: on-hand is only
     // credited when IT rolls the PO over. Freight ship dates are now stamped
-    // onto the pending rows server-side (arrival = ship + 7), so the ledger's
+    // onto the pending rows server-side (arrival = ship + the location's
+    // learned transit, Freight > Lead Times), so the ledger's
     // status already reflects them; inferring an arrival here made the tab
     // hide a PO as "arrived" while the Inventory tab still carried it On
     // Order and the edit path then found nothing to edit.
@@ -2795,7 +2796,11 @@ function _deliveryNoteHtml(g) {
 // default until enough Lineage-confirmed deliveries exist.
 function _arrivalEstimateNoteHtml(g, state) {
   if (g.arrival_kind !== 'estimate' || state === 'arrived' || state === 'cancelled') return '';
-  if (g.delivery && g.delivery.status) return '';     // Lineage note already shown
+  // Scheduled / delivered POs carry Lineage's own date (arrival_kind isn't
+  // 'estimate' then); "Sent to Lineage, awaiting schedule" still rides on our
+  // estimate, so show how it was made under that note too.
+  const ds = g.delivery && g.delivery.status;
+  if (ds && ds !== 'requested') return '';
   const d = g.transit_days;
   const basis = g.transit_basis || '';
   const label = (d === null || d === undefined) ? 'est.' : `est. &middot; ${d}-day transit`;
@@ -3437,7 +3442,7 @@ async function loadFreightLeadTimes() {
       + (data.min_samples || 2) + ' confirmed deliveries, its arrival estimate is ship date + 7 days.';
     return;
   }
-  if (note) note.textContent = 'Transit = confirmed delivery date minus the ship date (Lineage invoice ship date when we have it, else the pickup Lineage reported). '
+  if (note) note.textContent = 'Transit = confirmed delivery date minus the ship date (the pickup Lineage reported when we have it, else the Lineage freight invoice ship date, else the PO ship date). '
     + 'Trend avg = the last ' + (data.trend_window || 5) + ' deliveries to that location. A location needs '
     + (data.min_samples || 2) + '+ confirmed deliveries before its trend replaces the 7-day default in the Pending POs Arrival column.';
   _leadtimeChart = new Chart(canvas.getContext('2d'), {

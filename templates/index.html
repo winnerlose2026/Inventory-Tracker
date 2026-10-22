@@ -793,7 +793,7 @@
       <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Pending POs</h1>
-          <p class="subtitle" style="margin-bottom:0">Purchase orders, filterable by status. Only US Foods and Cheney Brothers get an automatic 30-day ETA; every other distributor stays in <em>pending</em> until you type a Ship Date, which locks in arrival = ship + 7 days.</p>
+          <p class="subtitle" style="margin-bottom:0">Purchase orders, filterable by status. Only US Foods and Cheney Brothers get an automatic 30-day ETA; every other distributor stays in <em>pending</em> until you type a Ship Date. Arrival = ship date + that location's learned transit (Freight &rsaquo; Lead Times); a location uses 7 days until Lineage has confirmed 2 deliveries there.</p>
         </div>
         <div class="btn-group">
           <button class="btn btn-primary btn-sm" onclick="openModifyModal()" title="Change a PO's status or ship date, or cancel it">&#9998; Modify PO</button>
