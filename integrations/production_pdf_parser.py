@@ -384,6 +384,7 @@ _WAREHOUSE_TO_CANONICAL: dict[str, tuple[str, str]] = {
     "LA MIRADA":             ("La Mirada, CA",          "US Foods"),
     "CHICAGO":               ("Chicago, IL",            "US Foods"),
     "ALCOA":                 ("Alcoa, TN",              "US Foods"),
+    "HOUSTON":               ("Houston, TX",            "US Foods"),
     "CWNY":                  ("Chefs Warehouse, NY",    "Chefs Warehouse"),
     "CWFL":                  ("Chefs Warehouse, FL",    "Chefs Warehouse"),
     "CWF":                   ("Chefs Warehouse, FL",    "Chefs Warehouse"),

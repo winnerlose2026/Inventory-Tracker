@@ -10,7 +10,7 @@ from flask import Blueprint, jsonify, request
 # ship dates. freight imports only core/, so no cycle.
 from blueprints.freight import _freight_ship_date_index
 from core.errors import _safe_err
-from core.util import _norm_po_key, rollover_row_live
+from core.util import _norm_po_key, rollover_row_live, absorbed_row_live, absorbed_row_qty
 from core.util import with_data_lock
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
@@ -175,10 +175,11 @@ def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
     unconditional reopen would have driven the whole warehouse to ~0.
     """
     from sync_inventory import _rollover_arrival
-    count_date = (item.get("last_count_at") or "")[:10]
-    if not count_date:
+    from core.util import receipt_inside_count
+    count_at = item.get("last_count_at") or ""
+    if not count_at[:10]:
         return True          # never counted -> the rollover is all on-hand has
-    return _rollover_arrival(row) > count_date
+    return not receipt_inside_count(row, count_at, _rollover_arrival(row))
 
 
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
@@ -824,7 +825,8 @@ def api_arrived_pos():
 
     groups: dict = {}
     for e in (load_usage() or []):
-        if not rollover_row_live(e):
+        absorbed = absorbed_row_live(e)
+        if not (rollover_row_live(e) or absorbed):
             continue
         po = (e.get("po_number") or "").strip()
         if not po:
@@ -845,7 +847,7 @@ def api_arrived_pos():
                 "lines":        [],
                 "status":       "arrived",
             }
-        qty = abs(float(e.get("amount") or 0))
+        qty = absorbed_row_qty(e) if absorbed else abs(float(e.get("amount") or 0))
         g["total_cs"] += qty
         name = m.get("name") or e.get("item_name") or ""
         variety = name.split(" Bagel")[0] if " Bagel" in name else name
@@ -919,7 +921,7 @@ def _present_po_numbers() -> set:
             if po:
                 present.add(po)
     for e in (load_usage() or []):
-        if rollover_row_live(e):
+        if rollover_row_live(e) or absorbed_row_live(e):
             po = str(e.get("po_number") or "").strip()
             if po:
                 present.add(po)
@@ -1043,7 +1045,13 @@ def build_po_ledger() -> list:
         # Skips superseded arrivals too, or a revised PO renders its old and
         # new lines side by side -- 2753463T showed 6 lines / 336 cs for a
         # 3-line, 168 cs PO.
-        if not rollover_row_live(e):
+        #
+        # An ABSORBED line (arrived, but a count already contained it, so it
+        # never moved on-hand) is still an arrived PO line. Leaving it out made
+        # a fully-absorbed PO disappear from the ledger and the Pending POs
+        # tab altogether (Houston 393072B2, 2026-10-20).
+        absorbed = absorbed_row_live(e)
+        if not (rollover_row_live(e) or absorbed):
             continue
         po = (e.get("po_number") or "").strip()
         if not po:
@@ -1054,10 +1062,18 @@ def build_po_ledger() -> list:
                                 "arrival_date": "", "ship_date": "", "eta": "",
                                 "rolled_at": "",
                                 "total_cs": 0.0, "lines": []})
-        qty = abs(float(e.get("amount") or 0)); g["total_cs"] += qty
-        g["lines"].append({"variety": _ledger_variety(m.get("name") or ""),
-                           "qty": qty, "unit": e.get("unit") or "cs",
-                           "item_key": e.get("item_key") or ""})
+        qty = absorbed_row_qty(e) if absorbed else abs(float(e.get("amount") or 0))
+        g["total_cs"] += qty
+        line = {"variety": _ledger_variety(m.get("name") or ""),
+                "qty": qty, "unit": e.get("unit") or "cs",
+                "item_key": e.get("item_key") or ""}
+        if absorbed:
+            line["absorbed"] = True
+        g["lines"].append(line)
+        if not g["warehouse"] and e.get("warehouse"):
+            g["warehouse"] = e["warehouse"]
+        if not g["ordered_at"] and e.get("ordered_at"):
+            g["ordered_at"] = e["ordered_at"]
         g["distributor"] = g["distributor"] or m.get("distributor") or ""
         g["warehouse"] = g["warehouse"] or m.get("warehouse") or ""
         ts = e.get("timestamp") or ""

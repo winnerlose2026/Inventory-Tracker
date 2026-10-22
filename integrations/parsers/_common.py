@@ -112,6 +112,8 @@ USF_DC_ALIASES = {
     "la mirada": "La Mirada, CA",
     "chicago": "Chicago, IL",
     "alcoa": "Alcoa, TN",
+    "houston": "Houston, TX",
+    "b2": "Houston, TX",       # NW Houston DC code (PO numbers end in B2)
 }
 
 CHENEY_DC_ALIASES = {

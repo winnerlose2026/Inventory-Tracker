@@ -907,6 +907,61 @@ def _rollover_trigger(entry: dict) -> "datetime | None":
             or _parse_sane_dt(entry.get("eta") or ""))
 
 
+def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
+    """Pending lines of CONFIRMED deliveries that the SKU's last count did not
+    contain, though the calendar-day rule would call them absorbed.
+
+    Returns {(po_number, item_key): (count_at, reason)}. Two cases:
+      * the count is stamped BEFORE the confirmed delivery time (same day);
+      * the count landed within CONFIRMED_DELIVERY_WINDOW_HOURS after it but
+        its figures, summed over the PO's lines at that warehouse, are too
+        low to contain the delivery (core.util.count_missed_delivery).
+    Houston 393072B2 (2026-10-19): delivered 08:00 CT, Tom's 11:20 CT screen
+    still showed all 1,120 cs on order and 404 cs on hand; the day rule
+    zeroed the receipt and the PO vanished from the ledger.
+    """
+    from core.util import CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery
+    missed: dict = {}
+    groups: dict = {}
+    for key, item in inv.items():
+        count_at = item.get("last_count_at") or ""
+        if not count_at:
+            continue
+        cdt = _parse_sane_dt(count_at)
+        if cdt is None:
+            continue
+        for entry in (item.get("on_order") or []):
+            gate, delivered_at = _delivery_gate(entry, tracking)
+            if gate != "delivered" or delivered_at is None or delivered_at > now:
+                continue
+            if delivered_at.date().isoformat() > count_at[:10]:
+                continue            # arrives after the count by day anyway
+            po = entry.get("po_number") or ""
+            if "T" in count_at and cdt < delivered_at:
+                missed[(po, key)] = (count_at, "count stamped before the "
+                                     "confirmed delivery time")
+                continue
+            hrs = (cdt - delivered_at).total_seconds() / 3600.0
+            if hrs > CONFIRMED_DELIVERY_WINDOW_HOURS:
+                continue
+            if item.get("last_count_qty") is None:
+                continue            # no counted figure to test against
+            g = groups.setdefault((po, item.get("warehouse") or "", count_at),
+                                  {"hrs": 0.0, "by_key": {}})
+            g["hrs"] = max(g["hrs"], hrs)
+            line = g["by_key"].setdefault(key, {
+                "receipt": 0.0,
+                "counted": float(item.get("last_count_qty") or 0),
+                "weekly_usage": float(item.get("weekly_usage") or 0)})
+            line["receipt"] += float(entry.get("qty") or 0)
+    for (po, _wh, count_at), g in groups.items():
+        is_missed, why = count_missed_delivery(list(g["by_key"].values()), g["hrs"])
+        if is_missed:
+            for k in g["by_key"]:
+                missed[(po, k)] = (count_at, why)
+    return missed
+
+
 def _rollover_on_order(inv: dict) -> bool:
     """Promote on_order entries whose effective trigger has passed into
     quantity. Mutates ``inv`` in place. Returns True if any entry was
@@ -929,6 +984,10 @@ def _rollover_on_order(inv: dict) -> bool:
         tracking = load_po_delivery()
     except Exception:  # noqa: BLE001 -- a bad tracking file must not stop reads
         tracking = {}
+    try:
+        missed = _counts_that_missed_deliveries(inv, tracking, now) if tracking else {}
+    except Exception:  # noqa: BLE001 -- fall back to the plain day rule
+        missed = {}
     for key, item in inv.items():
         pending = item.get("on_order") or []
         if not pending:
@@ -968,7 +1027,9 @@ def _rollover_on_order(inv: dict) -> bool:
             # of PO 2055126H posted an ETA of 08-14 that promoted instantly,
             # on top of a count taken 08-24 that already contained it.
             count_date = (item.get("last_count_at") or "")[:10]
-            if count_date and trigger.date().isoformat() <= count_date:
+            miss = missed.get((entry.get("po_number") or "", key))
+            if (count_date and trigger.date().isoformat() <= count_date
+                    and miss is None):
                 _PENDING_ROLLOVER_ABSORBED.append({
                     "item_key": key,
                     "item_name": item.get("name", key),
@@ -998,6 +1059,10 @@ def _rollover_on_order(inv: dict) -> bool:
                 "eta": trigger.isoformat(),
                 "timestamp": now.isoformat(),
                 **_po_doc_identity(entry, item),
+                **({"delivery_confirmed": True}
+                   if gate == "delivered" and delivered_at is not None else {}),
+                **({"not_in_count_at": miss[0], "count_missed_reason": miss[1]}
+                   if miss else {}),
             })
             changed = True
         item["on_order"] = kept
@@ -1188,7 +1253,15 @@ def _append_rollover_usage(inv: dict, usage: list) -> None:
             "source_sender": audit.get("source_sender", ""),
             "warehouse": audit.get("warehouse", ""),
             "variety": audit.get("variety", ""),
+            # Confirmed delivery (Lineage/DC): arrival_date is a real time.
+            # not_in_count_at: the count stamped then did NOT contain this
+            # receipt, so re-reads of it keep the cases on top.
+            **{k: audit[k] for k in ("delivery_confirmed", "not_in_count_at",
+                                     "count_missed_reason") if audit.get(k)},
         })
+        if audit.get("not_in_count_at"):
+            usage[-1]["note"] += (f" - not in the {audit['not_in_count_at']} "
+                                  f"count ({audit.get('count_missed_reason', '')})")
     _PENDING_ROLLOVER_AUDIT.clear()
 
     # Absorbed arrivals get a zero-amount audit row under their own source so

@@ -140,6 +140,140 @@ def api_admin_remove_po():
     })
 
 
+@admin_bp.route("/api/admin/restore-absorbed-po", methods=["POST"])
+@with_data_lock
+def api_admin_restore_absorbed_po():
+    """Put a delivered PO back into on-hand when the count that "absorbed" it
+    never actually contained it.
+
+    The rollover marks a PO absorbed when a count is dated on/after its
+    arrival day. A distributor's on-hand screen can lag its own receiving by
+    hours: Houston 393072B2 was delivered 10/19 08:00 CT (Lineage-confirmed),
+    Tom Foley's 11:20 CT buyer screen still listed all 1,120 cs under Order
+    with Hand totalling 404 cs, and the PO was zeroed as "already on hand".
+
+    Body: {po_number, count_at, reason, dry_run=true, force=false}
+      count_at -- the exact last_count_at of the count that missed the PO.
+                  Each line's SKU must still carry it: if the warehouse has
+                  counted again since, that newer count governs and the line
+                  is left alone.
+    Each live on_order_absorbed row of the PO is converted IN PLACE into the
+    on_order_rollover receipt it should have been (amount = -cases,
+    not_in_count_at = count_at) and the cases are added to quantity. Later
+    re-reads of that count keep the receipt on top (_receipts_after_count);
+    the next count absorbs it normally. Refused unless the counted figures
+    prove the count could not contain the delivery
+    (core.util.count_missed_delivery), or force=true.
+    """
+    from core.util import (absorbed_row_live, absorbed_row_qty,
+                           count_missed_delivery, naive_local_dt)
+    from inventory_tracker import (load_usage, save_usage, load_po_delivery,
+                                   append_inventory_audit)
+    from integrations.po_delivery import norm_po
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    count_at = (body.get("count_at") or "").strip()
+    reason = (body.get("reason") or "").strip()
+    dry_run = body.get("dry_run", True) is not False
+    force = bool(body.get("force"))
+    if not po_number or not count_at:
+        return jsonify({"ok": False, "error": "po_number and count_at required"}), 400
+    if not dry_run and not reason:
+        return jsonify({"ok": False, "error": "reason required for a live run"}), 400
+
+    inv = load_inventory()
+    usage = load_usage()
+    try:
+        trk = (load_po_delivery() or {}).get(norm_po(po_number)) or {}
+    except Exception:  # noqa: BLE001
+        trk = {}
+    confirmed = (trk.get("status") == "delivered")
+
+    rows, skipped = [], []
+    for idx, e in enumerate(usage):
+        if (e.get("po_number") or "") != po_number or not absorbed_row_live(e):
+            continue
+        key = e.get("item_key") or ""
+        item = inv.get(key)
+        if item is None:
+            skipped.append(f"{key}: SKU not in inventory")
+            continue
+        if (item.get("last_count_at") or "") != count_at:
+            skipped.append(f"{item.get('name', key)}: last count is "
+                           f"{item.get('last_count_at') or 'none'}, not {count_at} "
+                           f"- the newer count governs")
+            continue
+        rows.append((idx, key, item, absorbed_row_qty(e)))
+    if not rows:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": "no live absorbed lines for this PO on that count",
+                        "skipped": skipped}), 404
+
+    arrival = naive_local_dt(usage[rows[0][0]].get("arrival_date"))
+    cdt = naive_local_dt(count_at)
+    hrs = ((cdt - arrival).total_seconds() / 3600.0) if (arrival and cdt) else 0.0
+    by_key: dict = {}
+    for _idx, key, item, qty in rows:
+        line = by_key.setdefault(key, {"receipt": 0.0,
+                                       "counted": float(item.get("last_count_qty") or 0),
+                                       "weekly_usage": float(item.get("weekly_usage") or 0)})
+        line["receipt"] += qty
+    missed, why = count_missed_delivery(list(by_key.values()), hrs)
+    if arrival and cdt and cdt < arrival:
+        missed, why = True, "count stamped before the delivery time"
+    if not missed and not force:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": "the counted figures could contain this delivery; "
+                                 "pass force=true only if you are sure they do not",
+                        "lines": by_key, "hours_after_delivery": round(hrs, 2)}), 409
+
+    now = datetime.now().isoformat()
+    lines, audit = [], []
+    for idx, key, item, qty in rows:
+        old_q = float(item.get("quantity") or 0)
+        lines.append({"name": item.get("name", key), "qty": qty,
+                      "counted": item.get("last_count_qty"),
+                      "old_quantity": round(old_q, 4),
+                      "new_quantity": round(old_q + qty, 4)})
+        if dry_run:
+            continue
+        row = usage[idx]
+        row["absorbed_note"] = row.get("note") or ""
+        row["was_absorbed_qty"] = qty
+        row.pop("absorbed_qty", None)
+        row["source"] = "on_order_rollover"
+        row["amount"] = -qty
+        row["not_in_count_at"] = count_at
+        row["count_missed_reason"] = why or "operator: count did not contain it"
+        row["restored_at"] = now
+        row["restored_reason"] = reason
+        if confirmed:
+            row["delivery_confirmed"] = True
+        row["note"] = (f"PO {po_number} arrived ({(row.get('arrival_date') or '')[:16]})"
+                       f" - not in the {count_at} count; restored {now[:10]}: {reason}")
+        item["quantity"] = old_q + qty
+        item["updated"] = now
+        audit.append({"ts": now, "source": "admin-restore-absorbed-po",
+                      "name": item.get("name", key),
+                      "warehouse": item.get("warehouse", ""),
+                      "event_type": "restock", "old_quantity": old_q,
+                      "new_quantity": old_q + qty, "delta": qty,
+                      "po_number": po_number})
+    if not dry_run:
+        save_inventory(inv)
+        save_usage(usage)
+        try:
+            append_inventory_audit(audit)
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
+    return jsonify({"ok": True, "dry_run": dry_run, "po_number": po_number,
+                    "count_at": count_at, "delivery_confirmed": confirmed,
+                    "hours_after_delivery": round(hrs, 2),
+                    "count_missed": missed, "why": why, "forced": bool(force and not missed),
+                    "restored_cs": round(sum(l["qty"] for l in lines), 2),
+                    "lines": lines, "skipped": skipped})
+
+
 @admin_bp.route("/api/admin/uncancel-po", methods=["POST"])
 @with_data_lock
 def api_admin_uncancel_po():

@@ -24,6 +24,7 @@ WAREHOUSES = {
         "La Mirada, CA",
         "Chicago, IL",
         "Alcoa, TN",
+        "Houston, TX",   # NW Houston DC (B2); must match seed_bagels.WAREHOUSES
     ],
     # Chefs Warehouse DCs receive their own POs but DO NOT appear in
     # the Inventory tab -- they're surfaced only on the Pending POs

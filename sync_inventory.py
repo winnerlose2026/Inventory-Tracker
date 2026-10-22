@@ -111,6 +111,7 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
     cd = (count_date or "")[:10]
     if not cd or not item_key:
         return 0.0
+    from core.util import receipt_inside_count
     total = 0.0
     for e in usage:
         # A superseded arrival is not a live addend: _reverse_po_entries either
@@ -121,9 +122,83 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
             continue
         if (e.get("item_key") or "") != item_key:
             continue
-        if _rollover_arrival(e) > cd:
+        # By day, refined for confirmed deliveries (exact time, and a count
+        # proven to have missed the receipt) -- core.util.receipt_inside_count.
+        if not receipt_inside_count(e, count_date, _rollover_arrival(e)):
             total += abs(float(e.get("amount") or 0))
     return total
+
+
+def _mark_counts_that_missed_deliveries(events: list, inv: dict, usage: list,
+                                        report: dict) -> None:
+    """Before a batch of on_hand counts is applied: stamp ``not_in_count_at``
+    on CONFIRMED-delivery receipts the incoming count plainly does not contain,
+    so _receipts_after_count keeps them on top of that count.
+
+    The mirror of inventory_tracker._counts_that_missed_deliveries, for the
+    other order of events -- Lineage confirms the delivery first, the
+    distributor's on-hand screen (which lags its own receiving) arrives a few
+    hours later. Tested per PO across its lines at the warehouse, inside
+    CONFIRMED_DELIVERY_WINDOW_HOURS of the delivery, with the counted figures
+    from THIS batch. Only ever keeps a receipt; never removes one.
+    """
+    from core.util import (CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery,
+                           naive_local_dt, receipt_inside_count)
+    counts: dict = {}           # item_key -> (count_at, counted, weekly_usage)
+    for evt in events:
+        if getattr(evt, "event_type", "") != "on_hand":
+            continue
+        cat = getattr(evt, "count_date", "") or ""
+        if "T" not in cat:
+            continue
+        key = _find_local_key(inv, evt.item)
+        if not key:
+            continue
+        item = inv[key]
+        if (item.get("last_count_at") or "") > cat:
+            continue            # older than what we hold -- will be skipped
+        prev = counts.get(key)
+        if prev and prev[0] >= cat:
+            continue
+        wu = evt.item.weekly_usage
+        counts[key] = (cat, float(evt.item.quantity or 0),
+                       float(wu if wu is not None else (item.get("weekly_usage") or 0)))
+    if not counts:
+        return
+    groups: dict = {}
+    for idx, e in enumerate(usage):
+        if not rollover_row_live(e) or not e.get("delivery_confirmed"):
+            continue
+        key = e.get("item_key") or ""
+        if key not in counts:
+            continue
+        cat, counted, wu = counts[key]
+        if not receipt_inside_count(e, cat, _rollover_arrival(e)):
+            continue            # already kept on top of this count
+        a, c = naive_local_dt(e.get("arrival_date")), naive_local_dt(cat)
+        if a is None or c is None:
+            continue
+        hrs = (c - a).total_seconds() / 3600.0
+        if hrs < 0 or hrs > CONFIRMED_DELIVERY_WINDOW_HOURS:
+            continue
+        wh = (e.get("warehouse") or inv.get(key, {}).get("warehouse") or "")
+        g = groups.setdefault((e.get("po_number") or "", wh, cat),
+                              {"hrs": 0.0, "by_key": {}, "rows": []})
+        g["hrs"] = max(g["hrs"], hrs)
+        line = g["by_key"].setdefault(key, {"receipt": 0.0, "counted": counted,
+                                            "weekly_usage": wu})
+        line["receipt"] += abs(float(e.get("amount") or 0))
+        g["rows"].append(idx)
+    for (po, wh, cat), g in groups.items():
+        is_missed, why = count_missed_delivery(list(g["by_key"].values()), g["hrs"])
+        if not is_missed:
+            continue
+        for idx in g["rows"]:
+            usage[idx]["not_in_count_at"] = cat
+            usage[idx]["count_missed_reason"] = why
+        report.setdefault("count_missed_delivery", []).append(
+            f"PO {po} ({wh}): the {cat} count does not contain the confirmed "
+            f"delivery -- {why}; receipt kept on top of it.")
 
 
 # Ledger sources that represent a real movement of cases AFTER a count and
@@ -429,7 +504,9 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
         if item is not None:
             _count_date = (item.get("last_count_at") or "")[:10]
             _arrival = _rollover_arrival(entry)
-            if _count_date and _arrival and _arrival <= _count_date:
+            from core.util import receipt_inside_count as _inside
+            if _count_date and _arrival and _inside(
+                    entry, item.get("last_count_at") or "", _arrival):
                 report.setdefault("reversals_absorbed", []).append(
                     f"PO {po_number} rev {new_rev_tag}: kept "
                     f"{abs(float(entry.get('amount') or 0)):g} cs of "
@@ -1644,6 +1721,10 @@ def _apply_events(events: list,
                 f"If this is NOT a new shipment, remove it with /api/admin/remove-po "
                 f"before it rolls into on-hand."
             )
+
+    # A count that lands just after a confirmed delivery but before the
+    # distributor's screen shows it must not swallow the receipt.
+    _mark_counts_that_missed_deliveries(non_po_events, inv, usage, report)
 
     # Apply non-PO events (on_hand, usage_rate, body usage) oldest-count
     # first, so when several reports for the same warehouse land in one scan
