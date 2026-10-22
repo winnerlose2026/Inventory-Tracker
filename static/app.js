@@ -404,6 +404,33 @@ function renderWarehouseFreshness(iso) {
   return `<span class="wh-fresh ${cls}" title="Latest count received ${dateStr} (${ageStr})">${mark} Counted ${dateStr}</span>`;
 }
 
+// SKUs the warehouse's count does NOT cover. The "Counted" chip is the newest
+// count across the warehouse's SKUs, so a SKU no report ever lists looked
+// counted too (Pumpernickel at Manassas / Chicago: 20 cs on file since 8/28,
+// never counted, under "Counted Oct 19"). Same rule as /api/scan/health
+// sku_count_gaps: never counted, or last counted > 7 days before the
+// warehouse's newest count.
+function renderWarehouseCountGaps(items) {
+  const STALE_DAYS = 7;
+  const t = i => { const d = Date.parse(i.last_count_at || ''); return isNaN(d) ? null : d; };
+  const times = (items || []).map(t).filter(x => x !== null);
+  if (!times.length) return '';               // whole warehouse uncounted: the chip says so
+  const newest = Math.max(...times);
+  const gaps = (items || []).filter(i => {
+    const d = t(i);
+    return d === null || (newest - d) > STALE_DAYS * 86400000;
+  });
+  if (!gaps.length) return '';
+  const label = i => {
+    const v = String(i.name || '').split(' Bagel')[0];
+    const d = t(i);
+    return v + (d === null ? ' (never counted)'
+      : ' (last ' + new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ')');
+  };
+  const list = gaps.map(label).join(', ');
+  return ` <span class="wh-fresh wh-fresh-red" title="${escHtml('Not covered by the latest count: ' + list)}">⚠ ${gaps.length} SKU${gaps.length === 1 ? '' : 's'} not in count: ${escHtml(list)}</span>`;
+}
+
 // Bottom-of-page SKU editor. Per-row actions were removed to slim the table;
 // pick a SKU here and edit it. Options are rebuilt from inventoryCache on
 // every inventory load.
@@ -479,7 +506,7 @@ async function loadInventory() {
         ${g.warehouses.map(w => {
           const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
           const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
-          const whFresh = renderWarehouseFreshness(w.last_count_at);
+          const whFresh = renderWarehouseFreshness(w.last_count_at) + renderWarehouseCountGaps(w.items);
           return `
           <div style="padding:14px 16px 4px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;gap:12px;flex-wrap:wrap">

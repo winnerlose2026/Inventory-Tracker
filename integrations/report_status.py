@@ -50,6 +50,14 @@ WAREHOUSE_REPS: "dict[str, list[dict]]" = {
         {"name": "Thomas Paxson", "email": "thomas.paxson@usfoods.com"},
         {"name": "Jasmin Gomez", "email": "jasmin.gomez@usfoods.com"},
         {"name": "USF Manassas coordination", "email": "5o-dl-streetsalescoordination@usfoods.com"},
+        # The weekly "Product Usage Report" itself now comes from USF's
+        # Salesforce customer-contact alias (Stephanie Warfle, MDC); the
+        # scanner already maps it to Manassas
+        # (usfoods_inventory_report.REPORT_SENDER_TO_WAREHOUSE). Without it here
+        # the page read MISSING the weeks Paxson didn't forward it. Never
+        # chased -- it's a no-reply system alias.
+        {"name": "USF Customer Contact (Sales Coordination)",
+         "email": "usfcustomercontact@usfoods.com", "no_chase": True},
     ],
     "Zebulon, NC": [
         {"name": "Maria Hernandez", "email": "maria.hernandez@usfoods.com"},
@@ -279,14 +287,22 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
     rep_wh = _rep_to_warehouses()
     names = _email_to_name()
     best: "dict[str, dict]" = {}
+    failed_reps: "set[str]" = set()
     scanned = 0
     for rep_email, whs in rep_wh.items():
         found = None
         for mailbox in mailboxes:
             try:
                 msgs = _rep_messages(token, mailbox, rep_email, since_iso)
-            except Exception:  # noqa: BLE001
-                continue  # a rep we can't query just stays unconfirmed (missing)
+            except Exception as exc:  # noqa: BLE001
+                # A failed query proves nothing either way. It used to leave
+                # the warehouse "missing" -- cached 30 min and written to disk
+                # -- which reads as "the rep didn't send". Now: "unknown".
+                import sys as _sys
+                print(f"[report_status] {rep_email} @ {mailbox}: "
+                      f"{type(exc).__name__}: {exc}", file=_sys.stderr)
+                failed_reps.add(rep_email)
+                continue
             for msg in msgs:
                 scanned += 1
                 is_rep, fmt = _classify(msg)
@@ -306,17 +322,82 @@ def compute_report_status(now: "_dt.datetime | None" = None) -> dict:
                     best[wh] = found
 
     result["scanned"] = scanned
+    result["unknown"] = 0
+    result["not_ingested"] = 0
+    result["query_errors"] = sorted(failed_reps)
+    last_count = _last_count_by_warehouse()
     for wh, reps in WAREHOUSE_REPS.items():
         detail = best.get(wh)
         chase = [r for r in reps if not r.get("no_chase")]
+        if detail:
+            # Email presence is not ingestion: a report that arrived but failed
+            # to parse (Manassas 10/12, RFC 2047 filename) showed "received"
+            # while inventory never moved. Cross-check the warehouse's newest
+            # stamped count -- a count is dated to its email's send time, or
+            # to the subject's count date (at most 5 days earlier), so allow 6.
+            status = "received"
+            if last_count is not None and not _count_covers(
+                    last_count.get(wh), detail.get("received_at") or ""):
+                status = "received_not_ingested"
+        elif any(r["email"].lower() in failed_reps for r in reps):
+            status = "unknown"
+        else:
+            status = "missing"
         result["warehouses"].append({
             "warehouse": wh, "distributor": DISTRIBUTOR_OF.get(wh, ""),
             "reps": reps, "chase_reps": chase, "watch_only": not chase,
-            "status": "received" if detail else "missing",
+            "status": status,
             "detail": detail,
+            "last_count_at": (last_count or {}).get(wh),
         })
-        result["received" if detail else "missing"] += 1
+        if status == "received_not_ingested":
+            result["received"] += 1
+            result["not_ingested"] += 1
+        elif status == "unknown":
+            result["unknown"] += 1
+        else:
+            result[status] += 1
     return result
+
+
+def _last_count_by_warehouse():
+    """{warehouse: newest last_count_at} from inventory_tracker's warehouse
+    freshness, or None when it can't be read (then no ingest cross-check)."""
+    try:
+        from inventory_tracker import warehouse_freshness
+        return {r.get("warehouse"): r.get("last_count_at")
+                for r in warehouse_freshness()}
+    except Exception as exc:  # noqa: BLE001
+        import sys as _sys
+        print(f"[report_status] freshness unavailable: {type(exc).__name__}: {exc}",
+              file=_sys.stderr)
+        return None
+
+
+_INGEST_SLACK = _dt.timedelta(days=6)
+
+
+def _parse_utc(value: str):
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        d = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.astimezone(_dt.timezone.utc)
+
+
+def _count_covers(last_count_at, received_at: str) -> bool:
+    """Did the warehouse record a count from (about) this email? True when its
+    newest count is no more than _INGEST_SLACK older than the email."""
+    rcv = _parse_utc(received_at)
+    if rcv is None:
+        return True          # can't judge -> don't cry wolf
+    cnt = _parse_utc(last_count_at or "")
+    return cnt is not None and cnt >= rcv - _INGEST_SLACK
 
 
 def _status_path() -> "_pathlib.Path":
@@ -341,7 +422,15 @@ def _write_disk(data: dict) -> None:
     try:
         path = _status_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps(data), encoding="utf-8")
+        try:
+            # Atomic replace under the shared data lock (two workers can
+            # recompute at once; a plain write_text could leave a torn file).
+            from inventory_tracker import _write_json, data_lock
+        except Exception:  # noqa: BLE001 -- stand-alone use
+            path.write_text(_json.dumps(data), encoding="utf-8")
+            return
+        with data_lock():
+            _write_json(path, data)
     except Exception:  # noqa: BLE001
         pass
 
@@ -366,7 +455,9 @@ def get_status(max_age_sec: int = 1800, force: bool = False) -> dict:
         data = {"generated_at": "", "configured": False, "warehouses": [],
                 "received": 0, "missing": 0, "scanned": 0,
                 "error": "error computing report status (see server log)"}
-    if not data.get("error"):
+    # A result with any "unknown" warehouse (a Graph query failed) is shown but
+    # never cached, so the next view retries instead of serving it for 30 min.
+    if not data.get("error") and not data.get("unknown"):
         _CACHE.update(at=now, data=data)
         _write_disk(data)
     out = dict(data); out["cached"] = False; return out
@@ -391,7 +482,9 @@ def render_html(status: dict) -> str:
     since_et = _fmt_et(status.get("since_iso") or "")
     received = status.get("received", 0)
     missing = status.get("missing", 0)
-    total = received + missing
+    unknown = status.get("unknown", 0)
+    not_ingested = status.get("not_ingested", 0)
+    total = received + missing + unknown
     err = status.get("error")
 
     rows = []
@@ -401,12 +494,20 @@ def render_html(status: dict) -> str:
         if dist != last_dist:
             rows.append(f'<tr class="grp"><td colspan="3">{esc(dist)}</td></tr>')
             last_dist = dist
-        if wh.get("status") == "received":
+        if wh.get("status") in ("received", "received_not_ingested"):
             d = wh.get("detail") or {}
             badge = '<span class="ok">✅ received</span>'
             note = (f'from {esc(d.get("rep_name") or "")} · '
                     f'{esc(_fmt_et(d.get("received_at") or ""))} · '
                     f'{esc(d.get("format") or "report")}')
+            if wh.get("status") == "received_not_ingested":
+                badge = '<span class="warn">⚠️ received, not ingested</span>'
+                note += ('<br><span class="muted">the inventory has no count '
+                         'from it yet -- check /api/scan/health</span>')
+        elif wh.get("status") == "unknown":
+            badge = '<span class="warn">❔ unknown</span>'
+            note = ('<span class="muted">mailbox query failed -- '
+                    'refresh to retry</span>')
         else:
             badge = '<span class="no">❌ missing</span>'
             chase = wh.get("chase_reps", wh.get("reps", []))
@@ -426,9 +527,20 @@ def render_html(status: dict) -> str:
     if err:
         banner = f'<div class="err">⚠️ {esc(err)}</div>'
     elif total:
-        tone = "allin" if missing == 0 else "pending"
-        msg = ("All warehouses have reported this week 🎉" if missing == 0
-               else f"{missing} of {total} warehouses still missing this week's report")
+        all_in = missing == 0 and unknown == 0 and not_ingested == 0
+        tone = "allin" if all_in else "pending"
+        if all_in:
+            msg = "All warehouses have reported this week 🎉"
+        else:
+            parts = []
+            if missing:
+                parts.append(f"{missing} of {total} warehouses still missing "
+                             "this week's report")
+            if not_ingested:
+                parts.append(f"{not_ingested} received but not ingested")
+            if unknown:
+                parts.append(f"{unknown} unknown (mailbox query failed)")
+            msg = "; ".join(parts)
         banner = f'<div class="summary {tone}">{esc(msg)}</div>'
     else:
         banner = ""
@@ -461,6 +573,7 @@ def render_html(status: dict) -> str:
   td.dt {{ color: #374151; }}
   .ok {{ color: #1a6b39; font-weight: 600; }}
   .no {{ color: #b42318; font-weight: 600; }}
+  .warn {{ color: #8a4b00; font-weight: 600; }}
   .muted {{ color: #6b7280; }}
   .foot {{ color: #9097a1; font-size: 12px; margin-top: 16px; line-height: 1.5; }}
   a.btn {{ display: inline-block; margin-top: 14px; padding: 9px 14px; background: #1c1d21;

@@ -370,6 +370,46 @@ def parse_usage_lines(text: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Which pictures belong to THIS reply (not the quoted thread)
+# ---------------------------------------------------------------------------
+
+# Where the reply's own HTML ends and the quoted history begins: OWA / new
+# Outlook (divRplyFwdMsg, appendonsend), Outlook desktop (the E1E1E1 rule above
+# a bold "From:"), Gmail, Apple Mail (blockquote), plain "Original Message".
+_HTML_QUOTE_MARKERS = re.compile(
+    r"id=[\"']?divRplyFwdMsg"
+    r"|id=[\"']?appendonsend"
+    r"|class=[\"']?gmail_quote"
+    r"|<blockquote"
+    r"|border-top:\s*solid\s+#E1E1E1"
+    r"|-{3,}\s*Original Message\s*-{3,}"
+    r"|<b>\s*(?:<span[^>]*>\s*)?From:",
+    re.IGNORECASE)
+_CID_REF = re.compile(r"src\s*=\s*[\"']?cid:([^\"'\s>]+)", re.IGNORECASE)
+
+
+def normalize_cid(cid: str) -> str:
+    """Graph contentId ("<image001.png@01DB..>") vs HTML src ("cid:image001...")."""
+    return (cid or "").strip().strip("<>").strip().lower()
+
+
+def cids_above_quote(html: str) -> set:
+    """Content-ids of the inline pictures referenced in the reply's OWN part
+    of an HTML body -- above the first quoted-history marker.
+
+    Outlook carries the quoted thread's inline pictures along on a reply, so a
+    "will do" from Tom used to arrive with LAST week's buyer screen attached;
+    read as a fresh count dated today, it would erase a week of burn and any
+    receipts since (review 2026-10-22). Only a picture placed in the new part
+    of the message is this week's screen.
+    """
+    text = html or ""
+    m = _HTML_QUOTE_MARKERS.search(text)
+    own = text[:m.start()] if m else text
+    return {normalize_cid(c) for c in _CID_REF.findall(own)}
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 
@@ -379,7 +419,7 @@ def _variety(usf_item_no: str) -> str:
 
 def build_events(rows: list, usage: dict, *, warehouse: str, sent_iso: str,
                  message_id: str, subject: str, sender: str,
-                 image_name: str = "") -> list:
+                 image_name: str = "", image_sha256: str = "") -> list:
     """Ingest-event dicts (the /api/email/ingest-events shape).
 
     One ``on_hand`` per screenshot row, carrying ``weekly_usage`` when Tom
@@ -399,6 +439,11 @@ def build_events(rows: list, usage: dict, *, warehouse: str, sent_iso: str,
         "parser_source": f"{PARSER_SOURCE}:{image_name}" if image_name
                          else PARSER_SOURCE,
     }
+    # The screen's content hash rides on each on-hand event; ingest-events
+    # records it, and /api/email/usf-screenshots refuses that picture from
+    # then on -- the same screen re-sent later is never a new count.
+    if image_sha256:
+        common["image_sha256"] = image_sha256
     events = []
     counted = set()
     for r in rows:

@@ -363,7 +363,13 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
         import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"{filename}: cannot open xlsx: {type(exc).__name__}: {exc}")
+        # Exception text goes to the server log only: scan errors are now
+        # returned on /api/email/scan and /api/scan/health (CodeQL
+        # py/stack-trace-exposure).
+        import sys as _sys
+        print(f"[cheney xlsx] {filename}: {type(exc).__name__}: {exc}", file=_sys.stderr)
+        errors.append(f"{filename}: cannot open xlsx (corrupt or not a workbook) "
+                      "-- see server log")
         return events, errors
     try:
         rows_by_sheet = [

@@ -52,6 +52,18 @@ def _ingest_lock():
         fh.close()
 
 
+def _token_header_ok() -> bool:
+    """These mailbox-image routes demand the full API token header whenever one
+    is configured (unchanged policy). Compared in constant time -- a plain !=
+    leaks how many leading characters matched."""
+    import hmac
+    expected = os.environ.get("INVENTORY_API_TOKEN", "")
+    if not expected:
+        return True
+    got = request.headers.get("X-Inventory-Token") or ""
+    return hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _busy_response(what):
     return jsonify({
         "ok": False,
@@ -167,6 +179,12 @@ def _api_email_scan_locked():
             except Exception as exc:  # noqa: BLE001
                 report.setdefault("errors", []).append(
                     f"chefs-warehouse apply failed: {_safe_err(exc)}")
+        # Return the scanner's own errors instead of only "N parse error(s)".
+        # Until 2026-10-22 a mailbox that stopped answering, or a PO dropped
+        # whole for an unknown ship-to DC, left status "ok" and the cron log
+        # said errors=0. Mailbox-level and whole-PO failures make the scan
+        # "partial"; the cron exits non-zero on mailbox failures only.
+        _scan_errors_summarize(report, list(scan.errors or []))
         # Persist a scan-health heartbeat + capture recognized-but-unparsed
         # distributor mail (real runs only) so a missed warehouse or parser
         # gap is observable on /api/scan/health (roadmap #2/#5/#6).
@@ -174,30 +192,40 @@ def _api_email_scan_locked():
             try:
                 from inventory_tracker import (
                     save_scan_health, record_unparsed_reports,
-                    prune_unparsed_reports,
+                    prune_unparsed_reports, data_lock,
                 )
                 _unparsed = list(getattr(scan, "unparsed", []) or [])
-                if _unparsed:
-                    record_unparsed_reports(_unparsed)
-                # Retire entries whose gap has closed (the warehouse counted
-                # after the message we couldn't read) or that have aged out, so
-                # the queue stays a live to-do list instead of an append-only
-                # log that buries real misses. Runs after this scan's events
-                # are applied, so a report ingested just now clears its own
-                # earlier failures.
-                prune_unparsed_reports()
-                save_scan_health({
-                    "ts": datetime.now().isoformat(),
-                    "source": report.get("source"),
-                    "status": report.get("status"),
-                    "messages_seen": report.get("messages_seen"),
-                    "messages_parsed": report.get("messages_parsed"),
-                    "updated": report.get("updated"),
-                    "unchanged": report.get("unchanged"),
-                    "by_event_type": report.get("by_event_type"),
-                    "had_errors": bool(report.get("error")),
-                    "unparsed_count": len(_unparsed),
-                })
+                # Local file writes only (no network I/O) -> under data_lock.
+                with data_lock():
+                    if _unparsed:
+                        record_unparsed_reports(_unparsed)
+                    # Retire entries whose gap has closed (the warehouse
+                    # counted after the message we couldn't read) or that have
+                    # aged out, so the queue stays a live to-do list instead
+                    # of an append-only log that buries real misses. Runs
+                    # after this scan's events are applied, so a report
+                    # ingested just now clears its own earlier failures.
+                    prune_unparsed_reports()
+                    save_scan_health({
+                        "ts": datetime.now().isoformat(),
+                        "source": report.get("source"),
+                        "status": report.get("status"),
+                        "messages_seen": report.get("messages_seen"),
+                        "messages_parsed": report.get("messages_parsed"),
+                        "updated": report.get("updated"),
+                        "unchanged": report.get("unchanged"),
+                        "by_event_type": report.get("by_event_type"),
+                        "had_errors": bool(report.get("error")
+                                           or report.get("errors")),
+                        "unparsed_count": len(_unparsed),
+                        "error_count": len(report.get("errors") or []),
+                        "errors": (report.get("errors") or [])[:_HEALTH_MAX_LINES],
+                        "mailbox_failures": report.get("mailbox_failures") or [],
+                        "po_failures": report.get("po_failures") or [],
+                        "warnings": ((report.get("warnings") or [])
+                                     + (report.get("rejected") or [])
+                                     )[:_HEALTH_MAX_LINES],
+                    })
             except Exception as exc:  # noqa: BLE001 — health is best-effort
                 _log_exc(exc, "scan health persist")
     except Exception as exc:  # noqa: BLE001
@@ -225,9 +253,83 @@ def _api_email_scan_locked():
         print(f"[email scan errors] {_scan_err}", file=_sys.stderr)
         report["error"] = (
             "scan completed with errors (see server log)"
-            if report.get("status") == "ok" else "internal error"
+            if report.get("status") in ("ok", "partial") else "internal error"
         )
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+# Cap on error/warning lines kept on the scan report and in scan_health.json.
+_HEALTH_MAX_LINES = 50
+
+
+def _scan_errors_summarize(report: dict, scan_errors: list) -> dict:
+    """Attach the scanner's errors to an /api/email/scan report, classified.
+
+    report["errors"]            every scan error (capped), then any the route
+                                itself added (Chefs Warehouse apply)
+    report["mailbox_failures"]  a whole mailbox could not be read
+    report["po_failures"]       a whole PO document was dropped
+    status "ok" -> "partial" when either of the last two is non-empty.
+
+    The scanner builds these strings from message data only (exception text
+    goes to the server log -- integrations.email_scanner._log_scan_exc), so
+    they are safe to return; each is still flattened and length-capped.
+    """
+    from integrations.email_scanner import is_mailbox_failure, is_po_failure
+    cleaned = [str(e).replace("\r", " ").replace("\n", " ")[:400]
+               for e in (scan_errors or [])]
+    route_errors = list(report.get("errors") or [])
+    report["errors"] = cleaned[:_HEALTH_MAX_LINES * 2] + route_errors
+    report["mailbox_failures"] = [e for e in cleaned if is_mailbox_failure(e)]
+    report["po_failures"] = [e for e in cleaned if is_po_failure(e)]
+    if report.get("status") == "ok" and (report["mailbox_failures"]
+                                         or report["po_failures"]):
+        report["status"] = "partial"
+    return report
+
+
+def _sku_count_gaps(inv: dict, stale_days: int) -> list:
+    """SKUs the warehouse's count does NOT cover, per (distributor, warehouse).
+
+    warehouse_freshness() is the NEWEST count across a warehouse's SKUs, so a
+    SKU that no weekly report lists looks as fresh as the rest: on 2026-10-22
+    Pumpernickel at Manassas and at Chicago had sat at 20 cs since 8/28, never
+    counted, while both warehouses read "Counted Oct 19". A SKU is a gap when
+    it has never been counted, or its last count is more than ``stale_days``
+    older than its warehouse's newest count. A warehouse with no count at all
+    is left to the stale-warehouse list. Same rule as the Inventory tab
+    (static/app.js renderWarehouseCountGaps).
+    """
+    from inventory_tracker import _parse_iso_utc
+    newest: dict = {}
+    for item in (inv or {}).values():
+        k = (item.get("distributor") or "", item.get("warehouse") or "")
+        dt = _parse_iso_utc(item.get("last_count_at") or "")
+        if dt is not None and (k not in newest or dt > newest[k]):
+            newest[k] = dt
+    gaps = []
+    for key, item in sorted((inv or {}).items()):
+        k = (item.get("distributor") or "", item.get("warehouse") or "")
+        if k not in newest:
+            continue
+        dt = _parse_iso_utc(item.get("last_count_at") or "")
+        if dt is None:
+            reason = "never counted"
+        elif (newest[k] - dt).total_seconds() > stale_days * 86400:
+            reason = (f"last counted {dt.date().isoformat()}, "
+                      f"{(newest[k] - dt).days} days before the warehouse's "
+                      "latest count")
+        else:
+            continue
+        gaps.append({
+            "distributor": k[0], "warehouse": k[1], "sku": key,
+            "name": item.get("name") or key,
+            "quantity": item.get("quantity"),
+            "last_count_at": item.get("last_count_at") or None,
+            "warehouse_last_count_at": newest[k].isoformat(),
+            "reason": reason,
+        })
+    return gaps
 
 
 @email_bp.route("/api/scan/health")
@@ -253,8 +355,11 @@ def api_scan_health():
         # hours. Count the SKUs and say so plainly.
         from inventory_tracker import DataFileCorrupt, load_inventory
         inventory_error = None
+        sku_gaps = []
         try:
-            sku_count = len(load_inventory())
+            _inv = load_inventory()
+            sku_count = len(_inv)
+            sku_gaps = _sku_count_gaps(_inv, STALE_COUNT_DAYS)
         except DataFileCorrupt as exc:
             sku_count, inventory_error = -1, str(exc)
         except Exception as exc:  # noqa: BLE001
@@ -291,12 +396,62 @@ def api_scan_health():
             "stale_warehouse_count": len(stale),
             "warehouses": fresh,
             "stale_warehouses": stale,
+            # SKUs the warehouse's own count doesn't cover (see
+            # _sku_count_gaps): a warehouse can be fresh while one of its SKUs
+            # has never been counted.
+            "sku_count_gaps": sku_gaps,
+            "sku_count_gap_count": len(sku_gaps),
             "unparsed_reports": load_unparsed_reports(),
             "production_subscriptions": production_subscriptions,
         })
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "scan health")
         return jsonify({"ok": False, "error": "internal error"}), 500
+
+
+# /api/email/send recipient policy. Defaults cover every legitimate caller:
+# the Mon/Tue chasers (US Foods + Cheney reps), Chefs Warehouse, Lineage, and
+# the auto-send self-test to jd@. Override with EMAIL_SEND_ALLOWED_DOMAINS.
+_SEND_DEFAULT_DOMAINS = ("usfoods.com", "cheneybrothers.com", "chefswarehouse.com",
+                         "onelineage.com", "hhbagels.com")
+# Extra senders a caller may name in 'from' besides MS365_SEND_AS. Default is
+# the chasers' documented sender; override with EMAIL_SEND_ALLOWED_FROM.
+_SEND_DEFAULT_FROM = ("jd@hhbagels.com",)
+_PLAIN_ADDR_RE = None
+
+
+def _env_list(name: str, default) -> list:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return [d.lower() for d in default]
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+def _send_allowed_domains() -> list:
+    return _env_list("EMAIL_SEND_ALLOWED_DOMAINS", _SEND_DEFAULT_DOMAINS)
+
+
+def _send_allowed_from() -> set:
+    allowed = set(_env_list("EMAIL_SEND_ALLOWED_FROM", _SEND_DEFAULT_FROM))
+    send_as = os.environ.get("MS365_SEND_AS", "").strip().lower()
+    if send_as:
+        allowed.add(send_as)
+    return allowed
+
+
+def _send_recipient_allowed(addr: str) -> bool:
+    """A bare addr-spec (no display name / list syntax) whose domain is an
+    allowed domain or a subdomain of one."""
+    import re as _re
+    global _PLAIN_ADDR_RE
+    if _PLAIN_ADDR_RE is None:
+        _PLAIN_ADDR_RE = _re.compile(
+            r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})$")
+    m = _PLAIN_ADDR_RE.match((addr or "").strip())
+    if not m:
+        return False
+    dom = m.group(1).lower()
+    return any(dom == d or dom.endswith("." + d) for d in _send_allowed_domains())
 
 
 @email_bp.route("/api/email/send", methods=["POST"])
@@ -316,14 +471,21 @@ def api_email_send():
           "subject": "...",                        # subject for new mail
           "body": "plain text",                    # default Text content
           "html": "<p>..</p>",                     # optional; overrides body
-          "from": "jd@hhbagels.com",               # optional sender UPN
+          "from": "jd@hhbagels.com",               # optional; honoured only if
+                                                   #   MS365_SEND_AS or listed in
+                                                   #   EMAIL_SEND_ALLOWED_FROM
           "reply_to_message_id": "<graph id>",     # optional; reply in-thread
           "save_to_sent_items": true,              # optional, default true
           "dry_run": false                         # optional; build, don't send
         }
 
     Always returns a structured 200 (never a bare 500):
-      {"ok": true, "sent": true, ...} or {"ok": false, "error": "..."}.
+      {"ok": true, "sent": true, ...} or {"ok": false, "error": "..."} --
+    except a 400 {"ok": false, "refused": [...]} when any to/cc address is not
+    a plain address in an allowed domain (EMAIL_SEND_ALLOWED_DOMAINS; default
+    usfoods.com, cheneybrothers.com, chefswarehouse.com, onelineage.com,
+    hhbagels.com). "from_overridden": true says a requested 'from' was not
+    allowed and the default sender was used.
     """
     import json as _json
     import traceback as _tb
@@ -346,6 +508,19 @@ def api_email_send():
         cc = _as_list(body.get("cc"))
         if not to:
             return jsonify({"ok": False, "error": "missing required field 'to'"}), 200
+        # Recipients must be plain addresses in an allowed domain (the
+        # distributors, Lineage, ourselves). Anyone holding the API token or
+        # the shared login used to be able to mail ANY address -- with HTML,
+        # from our domain (review 2026-10-22).
+        refused = [a for a in to + cc if not _send_recipient_allowed(a)]
+        if refused:
+            return jsonify({
+                "ok": False,
+                "error": "recipient(s) not allowed: only plain addresses in "
+                         + ", ".join(_send_allowed_domains())
+                         + " (set EMAIL_SEND_ALLOWED_DOMAINS to change)",
+                "refused": refused,
+            }), 400
 
         subject = (body.get("subject") or "").strip()
         html = body.get("html")
@@ -358,17 +533,29 @@ def api_email_send():
         save_to_sent = bool(body.get("save_to_sent_items", True))
         reply_to = (body.get("reply_to_message_id") or "").strip()
 
-        # Sender: explicit 'from' wins, else MS365_SEND_AS, else first MS365_USER.
-        sender = (body.get("from") or os.environ.get("MS365_SEND_AS") or "").strip()
+        # Sender is PINNED: a body 'from' is honoured only when it is
+        # MS365_SEND_AS or listed in EMAIL_SEND_ALLOWED_FROM; anything else
+        # sends as the default (MS365_SEND_AS, else the first MS365_USER).
+        # The app-only Mail.Send token can send as ANY tenant mailbox, so a
+        # caller-chosen 'from' could impersonate anyone @hhbagels.com.
+        sender = os.environ.get("MS365_SEND_AS", "").strip()
         if not sender:
             users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
             sender = users[0] if users else ""
+        requested_from = str(body.get("from") or "").strip()
+        from_overridden = False
+        if requested_from:
+            if requested_from.lower() in _send_allowed_from():
+                sender = requested_from
+            else:
+                from_overridden = True
         if not sender:
             return jsonify({"ok": False, "error": "no sender configured (set MS365_SEND_AS or MS365_USER, or pass 'from')"}), 200
 
         if dry_run:
             return jsonify({"ok": True, "sent": False, "dry_run": True,
-                            "from": sender, "to": to, "cc": cc,
+                            "from": sender, "from_overridden": from_overridden,
+                            "to": to, "cc": cc,
                             "subject": subject, "threaded": bool(reply_to)})
 
         client = EmailInboxClient()
@@ -425,7 +612,8 @@ def api_email_send():
                             "detail": ""}), 200
 
         return jsonify({"ok": True, "sent": True, "dry_run": False,
-                        "from": sender, "to": to, "cc": cc,
+                        "from": sender, "from_overridden": from_overridden,
+                        "to": to, "cc": cc,
                         "subject": subject, "threaded": bool(reply_to)})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": _safe_err(exc),
@@ -455,8 +643,7 @@ def api_cheney_stock_images():
     import urllib.request
     from datetime import timezone
     try:
-        expected = os.environ.get("INVENTORY_API_TOKEN", "")
-        if expected and request.headers.get("X-Inventory-Token") != expected:
+        if not _token_header_ok():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         from integrations.email_scanner import EmailInboxClient, GRAPH_BASE
         from integrations.cheney_inventory_report import extract_stock_image
@@ -489,7 +676,8 @@ def api_cheney_stock_images():
         for user in users:
             uq = urllib.parse.quote(user)
             list_url = (f"{GRAPH_BASE}/users/{uq}/messages?$search={search}"
-                        f"&$select=id,subject,receivedDateTime,hasAttachments&$top=25")
+                        f"&$select=id,subject,receivedDateTime,hasAttachments,from"
+                        f"&$top=25")
             try:
                 _req = urllib.request.Request(list_url, method="GET", headers={
                     "Authorization": f"Bearer {token}",
@@ -502,6 +690,14 @@ def api_cheney_stock_images():
                 continue
             for m in msgs:
                 if not m.get("hasAttachments"):
+                    continue
+                # KQL "from:" also matches DISPLAY NAMES, so a stranger named
+                # "mross@cheneybrothers.com" would be OCR'd into Cheney
+                # on-hand. Graph's from address is authoritative (as in
+                # /api/email/usf-screenshots).
+                frm = (((m.get("from") or {}).get("emailAddress") or {})
+                       .get("address") or "").strip().lower()
+                if frm != sender:
                     continue
                 mid = m.get("id") or ""
                 recv = m.get("receivedDateTime", "") or ""
@@ -565,6 +761,50 @@ def _graph_token():
     return client._ms365_token()
 
 
+def _screenshot_hashes_path():
+    from inventory_tracker import DATA_DIR
+    return DATA_DIR / "usf_screenshot_hashes.json"
+
+
+def _load_screenshot_hashes() -> dict:
+    """{sha256: {message_id, recorded_at}} of buyer-screen pictures already
+    ingested as Houston counts (written by /api/email/ingest-events)."""
+    from inventory_tracker import _read_json
+    data = _read_json(_screenshot_hashes_path(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _record_screenshot_hashes(raw_events: list) -> int:
+    """Remember the picture hash carried by ingested screenshot events, so the
+    same screen re-sent (or carried along on a reply) is never a new count."""
+    new = {}
+    for e in raw_events or []:
+        if not isinstance(e, dict):
+            continue
+        sha = str(e.get("image_sha256") or "").strip().lower()
+        if len(sha) == 64 and all(c in "0123456789abcdef" for c in sha):
+            new.setdefault(sha, str(e.get("source_message_id") or ""))
+    if not new:
+        return 0
+    from inventory_tracker import _write_json, data_lock
+    with data_lock():
+        known = _load_screenshot_hashes()
+        added = 0
+        for sha, mid in new.items():
+            if sha not in known:
+                known[sha] = {"message_id": mid,
+                              "recorded_at": datetime.now().isoformat()}
+                added += 1
+        if added:
+            # Newest 500 is years of weekly screens.
+            if len(known) > 500:
+                keep = sorted(known.items(),
+                              key=lambda kv: kv[1].get("recorded_at") or "")[-500:]
+                known = dict(keep)
+            _write_json(_screenshot_hashes_path(), known)
+    return added
+
+
 @email_bp.route("/api/email/usf-screenshots", methods=["GET"])
 def api_usf_screenshots():
     """Serve a screenshot rep's recent replies (Houston: Tom Foley) so the OCR
@@ -593,13 +833,14 @@ def api_usf_screenshots():
     import urllib.parse
     from datetime import timezone
     try:
-        expected = os.environ.get("INVENTORY_API_TOKEN", "")
-        if expected and request.headers.get("X-Inventory-Token") != expected:
+        if not _token_header_ok():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         from integrations.email_scanner import GRAPH_BASE
+        import base64
+        import hashlib
         from integrations.usf_screenshot import (
             MIN_SCREEN_IMAGE_BYTES, SCREENSHOT_DIST_BY_WAREHOUSE,
-            senders_for_warehouse,
+            cids_above_quote, normalize_cid, senders_for_warehouse,
         )
         from inventory_tracker import _parse_iso_utc, warehouse_freshness
 
@@ -660,20 +901,35 @@ def api_usf_screenshots():
                     found[key] = {"user": user, "graph": m, "pending": pending}
 
         out = []
+        seen_hashes = _load_screenshot_hashes()
         for key, f in found.items():
             m, uq = f["graph"], urllib.parse.quote(f["user"])
             mid = urllib.parse.quote(m.get("id") or "")
             base = f"{GRAPH_BASE}/users/{uq}/messages/{mid}"
-            body_text, images = "", []
+            body_text, images, rejected = "", [], []
             try:
                 body = _graph_json(base + "?$select=body", token,
                                    {"Prefer": 'outlook.body-content-type="text"'})
                 body_text = ((body.get("body") or {}).get("content") or "")
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{key}: body: {_safe_err(exc)}")
+            # The HTML body says which inline pictures sit in the reply's OWN
+            # part; anything else is a quoted-thread copy (see
+            # usf_screenshot.cids_above_quote). No HTML -> no picture counts.
+            own_cids = set()
+            try:
+                hbody = _graph_json(base + "?$select=body", token,
+                                    {"Prefer": 'outlook.body-content-type="html"'})
+                own_cids = cids_above_quote(
+                    ((hbody.get("body") or {}).get("content") or ""))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{key}: html body: {_safe_err(exc)}")
             try:
                 att_url = base + "/attachments"
                 if meta_only:
+                    # contentId lives on the fileAttachment subtype, so it
+                    # can't be $selected here: the cheap pre-check can only
+                    # tell "no picture in the reply's own part" (-> none).
                     att_url += "?$select=name,contentType,size,isInline"
                 for a in _graph_json(att_url, token).get("value", []):
                     ctype = (a.get("contentType") or "").lower()
@@ -683,10 +939,29 @@ def api_usf_screenshots():
                         continue
                     img = {"name": a.get("name") or "", "content_type": ctype,
                            "size": int(a.get("size") or 0)}
-                    if not meta_only:
+                    why = None
+                    if not a.get("isInline"):
+                        why = "not an inline picture in the reply"
+                    elif not own_cids:
+                        why = "no picture in the reply's own text (quoted thread only)"
+                    elif not meta_only and normalize_cid(a.get("contentId")) not in own_cids:
+                        why = "picture is in the quoted thread, not the reply"
+                    if why is None and not meta_only:
                         if not a.get("contentBytes"):
                             continue
-                        img["b64"] = a["contentBytes"]
+                        try:
+                            sha = hashlib.sha256(
+                                base64.b64decode(a["contentBytes"])).hexdigest()
+                        except (ValueError, TypeError):
+                            sha = ""
+                        if sha and sha in seen_hashes:
+                            why = "this exact picture was already ingested"
+                        else:
+                            img["b64"] = a["contentBytes"]
+                            img["sha256"] = sha
+                    if why:
+                        rejected.append({**img, "reason": why})
+                        continue
                     images.append(img)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{key}: attachments: {_safe_err(exc)}")
@@ -699,7 +974,7 @@ def api_usf_screenshots():
                 "sent": m.get("sentDateTime") or "",
                 "received": m.get("receivedDateTime") or "",
                 "pending": f["pending"], "body_text": body_text,
-                "images": images,
+                "images": images, "rejected_images": rejected,
             })
         out.sort(key=lambda r: r["sent"])
         return jsonify({"ok": True, "warehouse": warehouse,
@@ -885,6 +1160,11 @@ def _api_email_ingest_events_locked():
             }],
         }), 500
 
+    if not dry_run:
+        try:
+            _record_screenshot_hashes(raw_events)
+        except Exception as exc:  # noqa: BLE001 -- best-effort bookkeeping
+            _log_exc(exc, "record screenshot hashes")
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 

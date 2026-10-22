@@ -36,6 +36,11 @@ Configuration (env vars)
     SFTP_INCOMING_DIR           default "incoming"
     SFTP_PROCESSED_DIR          default "processed"
     SFTP_CURSOR_PATH            default data/sftp_cursor.json
+    FTPS_TLS_SERVER_NAME        name the FTPS server's TLS certificate is
+                                issued to (shared cPanel: its own
+                                *.secureserver.net host, not sftp.hhbagels.com).
+                                Set -> the cert name is checked against it.
+                                The cert CHAIN is always verified.
 
 Despite the variable names mentioning SFTP, the transport is FTPS
 (port 21 with explicit TLS via ``ftplib.FTP_TLS``). cPanel only
@@ -139,22 +144,31 @@ def _fingerprint(rf: _RemoteFile) -> str:
 
 def _connect(host: str, port: int, user: str, password: str,
              timeout: int = 60) -> ftplib.FTP_TLS:
-    ctx = ssl.create_default_context()
     # GoDaddy shared cPanel hosts the FTPS listener behind a wildcard
     # *.secureserver.net cert; the customer-facing hostname
-    # (sftp.hhbagels.com) is a CNAME and is NOT in the cert's SAN list,
-    # so strict verification fails with "Hostname mismatch". Skip the
-    # hostname/cert check on this connection only -- the TLS handshake
-    # still negotiates encryption and prot_p() still encrypts the data
-    # channel, we just don't pin the peer name. This is the documented
-    # workaround for shared-hosting FTPS endpoints.
+    # (sftp.hhbagels.com) is a CNAME and is NOT in the cert's SAN list, so
+    # checking the cert against the configured host fails "Hostname mismatch".
     #
-    # If the host is ever moved off shared hosting onto a box with a
-    # cert that actually names sftp.hhbagels.com, drop these two lines.
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # This used to be fixed with CERT_NONE, which also skipped verifying the
+    # CHAIN -- anyone on the path could present any cert and collect the FTP
+    # passwords / feed fake files (review 2026-10-22). Now the chain is always
+    # verified against the system CAs (CERT_REQUIRED), and the NAME is checked
+    # whenever FTPS_TLS_SERVER_NAME says which name the server's cert carries
+    # (e.g. the cPanel box's own *.secureserver.net hostname). Unset, only the
+    # name check is skipped.
+    ctx = ssl.create_default_context()
+    tls_name = (os.environ.get("FTPS_TLS_SERVER_NAME") or "").strip()
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = bool(tls_name)
     ftp = ftplib.FTP_TLS(context=ctx, timeout=timeout)
     ftp.connect(host=host, port=port)
+    if tls_name:
+        # FTP_TLS passes self.host as server_hostname to wrap_socket (control
+        # channel in auth(), data channel in ntransfercmd()). The TCP
+        # connection above already used the real host; from here on the name
+        # only drives SNI + the certificate name check. PASV data connections
+        # use the control socket's peer IP, not self.host.
+        ftp.host = tls_name
     ftp.auth()              # explicit TLS handshake
     ftp.login(user=user, passwd=password)
     ftp.prot_p()            # encrypt the data channel too

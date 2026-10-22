@@ -92,7 +92,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from .base import NotConfiguredError, SyncItem
-from .csv_loader import read_csv
+from .csv_loader import read_csv, read_csv_bytes
 from .usfoods_po_parser import (
     UsFoodsPO,
     UsFoodsPOLine,
@@ -230,6 +230,36 @@ class ScanResult:
 
 
 # ---------------------------------------------------------------------------
+# Scan error classes
+# ---------------------------------------------------------------------------
+# ScanResult.errors is a flat list of strings; the scan route and the cron key
+# off these two classes (blueprints/email.py, scripts/cowork_graph_scan.py).
+# Before 2026-10-22 every error collapsed to "N parse error(s)", status stayed
+# "ok" and the cron logged errors=0 -- a mailbox that stopped answering or a
+# PO dropped whole for an unknown ship-to was invisible.
+#
+# A WHOLE MAILBOX could not be read (permission revoked, Graph down).
+MAILBOX_FAILURE_PREFIX = "mailbox scan failed: "
+
+# A WHOLE PO document was dropped (unreadable PDF, no PO number, ship-to DC
+# that doesn't resolve). Item-level gaps (one unmapped SKU) are not this.
+_PO_FAILURE_RE = re.compile(
+    r"PO PDF parse failed"
+    r"|but no PO number found in the PDF -- skipped"
+    r"|did not resolve -- \d+ line\(s\) skipped"
+    r"|no PO# found in PDF -- skipped"
+    r"|^PO PDF '.*': could not be read")
+
+
+def is_mailbox_failure(err) -> bool:
+    return str(err or "").startswith(MAILBOX_FAILURE_PREFIX)
+
+
+def is_po_failure(err) -> bool:
+    return bool(_PO_FAILURE_RE.search(str(err or "")))
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -261,19 +291,39 @@ _FILENAME_TO_EVENT = [
 ]
 
 
+def _filename_words(name: str) -> list:
+    """Lower-case words of a filename: split on anything that isn't a letter
+    and on camelCase humps ("WeeklyUsage" -> weekly, usage; "PO_12345" -> po)."""
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name or "")
+    stem = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", stem)
+    return re.findall(r"[a-z]+", stem.lower())
+
+
 def _infer_event_type_from_filename(name: str) -> EventType:
-    low = name.lower()
+    """Event type from WHOLE words of the filename (a trailing plural "s" is
+    allowed). Substring matching made "Inventory Report.csv" a restock --
+    "report" contains "po" -- and a restock row carries no PO number, so it
+    was added on top of on-hand on every rescan (review 2026-10-22)."""
+    words = _filename_words(name)
     for needle, evt in _FILENAME_TO_EVENT:
-        if needle in low:
-            return evt  # type: ignore[return-value]
+        parts = _filename_words(needle)
+        n = len(parts)
+        for i in range(len(words) - n + 1):
+            window = words[i:i + n]
+            if window[:-1] == parts[:-1] and window[-1] in (parts[-1], parts[-1] + "s"):
+                return evt  # type: ignore[return-value]
     return "on_hand"
 
 
 def _distributor_from_sender(from_header: str) -> Optional[str]:
-    m = re.search(r"@([\w.\-]+)", from_header or "")
-    if not m:
+    # The header's REAL address, not the first "@" in it: a display name of
+    # "po@usfoods.com" on someone else's mail used to route its PDF through
+    # the US Foods PO parser (review 2026-10-22).
+    from .rep_map import sender_address
+    addr = sender_address(from_header)
+    if not addr:
         return None
-    domain = m.group(1).lower()
+    domain = addr.rsplit("@", 1)[1]
     for known, name in DOMAIN_TO_DISTRIBUTOR.items():
         if domain == known or domain.endswith("." + known):
             return name
@@ -571,7 +621,8 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
     try:
         po = _usfoods_parse_po_pdf(pdf_bytes)
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"usfoods PO PDF parse failed ({subject!r}): {exc}")
+        _log_scan_exc(exc, "usfoods PO PDF")
+        errors.append(f"usfoods PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
     if po.unmapped_items:
@@ -672,7 +723,8 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
     try:
         po = _cheney_parse_po_pdf(pdf_bytes)
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"cheney PO PDF parse failed ({subject!r}): {exc}")
+        _log_scan_exc(exc, "cheney PO PDF")
+        errors.append(f"cheney PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
     if po.unmapped_items:
@@ -741,7 +793,8 @@ def _chefs_warehouse_po_to_record(pdf_bytes, msg_id, subject):
         dc_code = _cw_dc_code_from_subject(subject)
         po = _cw_parse_po_pdf(pdf_bytes, dc_code=dc_code)
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"chefs-warehouse PO PDF parse failed ({subject!r}): {exc}")
+        _log_scan_exc(exc, "chefs-warehouse PO PDF")
+        errors.append(f"chefs-warehouse PO PDF parse failed ({subject!r}) -- see server log")
         return None, errors
 
     if not po.po_number:
@@ -879,7 +932,8 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
             xlsx_bytes, distributor=distributor, warehouse=warehouse,
         )
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"inventory worksheet parse failed ({subject!r}): {exc}")
+        _log_scan_exc(exc, "inventory worksheet")
+        errors.append(f"inventory worksheet parse failed ({subject!r}) -- see server log")
         return events, errors
 
     if sheet.unmapped_codes:
@@ -1037,8 +1091,50 @@ def _decode_subject(raw) -> str:
         return str(raw)
 
 
-def parse_message_with_errors(msg):
+def _is_internal_address(addr: str) -> bool:
+    """True for an @hhbagels.com address (incl. the ms.hhbagels.com tenant)."""
+    dom = (addr or "").rsplit("@", 1)[-1].lower() if "@" in (addr or "") else ""
+    return dom == "hhbagels.com" or dom.endswith(".hhbagels.com")
+
+
+def _guarded(errors: list, label: str, fn, *args, **kwargs):
+    """Run one attachment/body parser; on an exception record an error for
+    THAT part and return None, so the rest of the message still parses.
+
+    A ragged or cp1252 .csv riding along with a weekly report used to raise
+    out of parse_message_with_errors, losing every event in the email -- and
+    the caller's except path skipped the unparsed queue, so nothing showed
+    on /api/scan/health (review 2026-10-22). The full exception goes to the
+    server log; the error text carries no exception detail (CodeQL
+    py/stack-trace-exposure -- scan errors are returned to API callers).
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        _log_scan_exc(exc, f"scan part {label}")
+        errors.append(f"{label}: could not be read (see server log) -- "
+                      "the rest of the message was parsed")
+        return None
+
+
+def _log_scan_exc(exc, ctx: str = "") -> None:
+    """Full exception to the server log (stderr) only. Scan error STRINGS are
+    returned to API callers and persisted on /api/scan/health, so they must
+    never carry exception text (CodeQL py/stack-trace-exposure; same rule as
+    core.errors._log_exc, duplicated so integrations/ stays importable
+    stand-alone by the cron scripts)."""
+    import sys as _sys
+    import traceback as _tb
+    print(f"[scan error {ctx}] {type(exc).__name__}: {exc}\n{_tb.format_exc()}",
+          file=_sys.stderr)
+
+
+def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
+
+    ``sender_address`` -- when the caller has Graph's ``from.emailAddress``
+    (the server-side scan does), pass it: it is authoritative over the MIME
+    From: header for every sender -> distributor / rep / warehouse decision.
 
     Attachment precedence:
       1. Distributor PO PDF attachment routed by sender domain:
@@ -1055,13 +1151,24 @@ def parse_message_with_errors(msg):
     """
     subject = _decode_subject(msg.get("Subject", ""))
     msg_id = str(msg.get("Message-ID", ""))
-    from_hdr = str(msg.get("From", ""))
+    # Graph's from address, when the caller has it, is the sender of record:
+    # the MIME header is attacker-shaped text (display names) -- see
+    # rep_map.sender_address.
+    from_hdr = (str(sender_address).strip() if sender_address
+                else str(msg.get("From", "")))
+    from .rep_map import sender_address as _real_address
     sent_iso = _msg_date_iso(msg)
 
     body = _text_body(msg)
     body_tags = {m.group(1).lower(): m.group(2).strip()
                  for m in _TAG_RE.finditer(body or "")}
-    distributor = (body_tags.get("distributor")
+    # The "# distributor:" body tag is an H&H-internal convenience (hand-keyed
+    # test/backfill mail). From anyone else it let a body line re-route the
+    # message's PDFs through a distributor PO parser, so honour it only from
+    # @hhbagels.com.
+    _tag_dist = (body_tags.get("distributor")
+                 if _is_internal_address(_real_address(from_hdr)) else None)
+    distributor = (_tag_dist
                    or _distributor_from_sender(from_hdr)
                    or "Unassigned")
 
@@ -1072,31 +1179,34 @@ def parse_message_with_errors(msg):
     # 1) Distributor PO PDF attachments (real POs arrive as PDFs, not CSVs).
     # The Date header orders two copies of the same PO -- USF amends without
     # bumping the revision number (see integrations/po_revision).
+    # Every part below runs through _guarded(): one unreadable attachment
+    # records an error for itself and the rest of the message still parses.
     received_at = _received_at_from_message(msg)
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".pdf"):
             continue
         if distributor == "US Foods":
-            d_events, d_errs = _usfoods_po_to_events(
-                payload, distributor, msg_id, subject, received_at=received_at,
-                sender=from_hdr,
-            )
-            events.extend(d_events)
-            errors.extend(d_errs)
+            got = _guarded(errors, f"PO PDF {fname!r}", _usfoods_po_to_events,
+                           payload, distributor, msg_id, subject,
+                           received_at=received_at, sender=from_hdr)
+            if got:
+                events.extend(got[0])
+                errors.extend(got[1])
         elif distributor == "Cheney Brothers":
-            d_events, d_errs = _cheney_po_to_events(
-                payload, distributor, msg_id, subject, received_at=received_at,
-                sender=from_hdr,
-            )
-            events.extend(d_events)
-            errors.extend(d_errs)
+            got = _guarded(errors, f"PO PDF {fname!r}", _cheney_po_to_events,
+                           payload, distributor, msg_id, subject,
+                           received_at=received_at, sender=from_hdr)
+            if got:
+                events.extend(got[0])
+                errors.extend(got[1])
         elif distributor == "Chefs Warehouse":
-            record, d_errs = _chefs_warehouse_po_to_record(
-                payload, msg_id, subject,
-            )
-            if record is not None:
-                cw_pos.append(record)
-            errors.extend(d_errs)
+            got = _guarded(errors, f"PO PDF {fname!r}",
+                           _chefs_warehouse_po_to_record, payload, msg_id, subject)
+            if got:
+                record, d_errs = got
+                if record is not None:
+                    cw_pos.append(record)
+                errors.extend(d_errs)
         else:
             continue
 
@@ -1105,23 +1215,29 @@ def parse_message_with_errors(msg):
     #     per FL facility; each mapped row -> on_hand event with weekly_usage.
     if not events and not cw_pos and distributor == "Cheney Brothers":
         from .cheney_inventory_report import parse_report_xlsx as _cheney_report_xlsx
+
+        def _cheney_part(payload, fname):
+            c_events, c_errs = _cheney_report_xlsx(payload, fname)
+            built = [EmailEvent(
+                event_type=d["event_type"],
+                item=SyncItem(**d["item"]),
+                source_message_id=msg_id,
+                source_subject=subject,
+                count_date=d.get("count_date", ""),
+                # Keep the parser's provenance ("cheney-xlsx:<file>#N"):
+                # this on-hand figure came out of the worksheet CELLS, which
+                # outranks an OCR'd screenshot of the same workbook.
+                parser_source=d.get("source_message_id", ""),
+            ) for d in c_events]
+            return built, c_errs
+
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
                 continue
-            c_events, c_errs = _cheney_report_xlsx(payload, fname)
-            for d in c_events:
-                events.append(EmailEvent(
-                    event_type=d["event_type"],
-                    item=SyncItem(**d["item"]),
-                    source_message_id=msg_id,
-                    source_subject=subject,
-                    count_date=d.get("count_date", ""),
-                    # Keep the parser's provenance ("cheney-xlsx:<file>#N"):
-                    # this on-hand figure came out of the worksheet CELLS, which
-                    # outranks an OCR'd screenshot of the same workbook.
-                    parser_source=d.get("source_message_id", ""),
-                ))
-            errors.extend(c_errs)
+            got = _guarded(errors, f"xlsx {fname!r}", _cheney_part, payload, fname)
+            if got:
+                events.extend(got[0])
+                errors.extend(got[1])
 
     # 1b) US Foods inventory & usage report .xlsx attachments (Manassas
     #     "Product Usage" / La Mirada "SM Inventory"). A DC rep attaches an
@@ -1138,9 +1254,10 @@ def parse_message_with_errors(msg):
                 continue
             if distributor != "US Foods" and not _report_warehouse_for_sender(from_hdr)[1]:
                 continue
-            x_events, x_errs = _usfoods_inventory_report_to_events(
-                "", "", from_hdr, msg_id, subject, xlsx=payload,
-            )
+            got = _guarded(errors, f"xlsx {fname!r}",
+                           _usfoods_inventory_report_to_events,
+                           "", "", from_hdr, msg_id, subject, xlsx=payload)
+            x_events, x_errs = got if got else ([], [])
             if x_events or x_errs:
                 events.extend(x_events)
                 errors.extend(x_errs)
@@ -1158,11 +1275,11 @@ def parse_message_with_errors(msg):
             _dist, _wh = _worksheet_warehouse_for_sender(from_hdr)
             if not (_wh or _looks_like_inventory_worksheet(subject)):
                 continue  # not a worksheet rep and subject doesn't look like one
-            w_events, w_errs = _inventory_worksheet_to_events(
-                payload, from_hdr, msg_id, subject,
-            )
-            events.extend(w_events)
-            errors.extend(w_errs)
+            got = _guarded(errors, f"xlsx {fname!r}", _inventory_worksheet_to_events,
+                           payload, from_hdr, msg_id, subject)
+            if got:
+                events.extend(got[0])
+                errors.extend(got[1])
 
     # 1c) Inventory & usage report pasted into the message body (no
     #     attachment). A US Foods DC rep emails an HTML table of current cases
@@ -1171,33 +1288,35 @@ def parse_message_with_errors(msg):
     #     Only runs when nothing else produced events, and self-detects a
     #     report so unrelated mail stays quiet.
     if not events and not cw_pos:
-        r_events, r_errs = _usfoods_inventory_report_to_events(
-            _html_body(msg), body, from_hdr, msg_id, subject,
-        )
-        events.extend(r_events)
-        errors.extend(r_errs)
+        got = _guarded(errors, "body report table",
+                       lambda: _usfoods_inventory_report_to_events(
+                           _html_body(msg), body, from_hdr, msg_id, subject))
+        if got:
+            events.extend(got[0])
+            errors.extend(got[1])
 
-    # 2) CSV attachments
+    # 2) CSV attachments. Read from memory (no /tmp file) through the
+    #    encoding- and ragged-row-tolerant reader; one bad CSV only costs itself.
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".csv"):
             continue
         event_type = _infer_event_type_from_filename(fname)
-        tmp = Path("/tmp") / f"_email_{abs(hash(msg_id + fname))}.csv"
-        tmp.write_bytes(payload)
-        try:
-            for sync_item in read_csv(tmp, distributor=distributor):
-                events.append(EmailEvent(
-                    event_type=event_type,
-                    item=sync_item,
-                    source_message_id=msg_id,
-                    source_subject=subject,
-                ))
-        finally:
-            tmp.unlink(missing_ok=True)
+        items = _guarded(errors, f"csv {fname!r}",
+                         lambda b: list(read_csv_bytes(b, distributor=distributor)),
+                         payload)
+        for sync_item in items or []:
+            events.append(EmailEvent(
+                event_type=event_type,
+                item=sync_item,
+                source_message_id=msg_id,
+                source_subject=subject,
+            ))
 
     # 3) Structured body (only if no attachment produced events or CW POs)
     if body and not events and not cw_pos:
-        event_type, _, items = _parse_body_items(body, distributor, "on_hand")
+        got = _guarded(errors, "body tag lines", _parse_body_items,
+                       body, distributor, "on_hand")
+        event_type, _, items = got if got else ("on_hand", "", [])
         for it in items:
             events.append(EmailEvent(
                 event_type=event_type,
@@ -1395,7 +1514,9 @@ class EmailInboxClient:
             except Exception as exc:  # noqa: BLE001
                 # Keep going so a permission problem on one shared mailbox
                 # doesn't kill the scan of the others.
-                result.errors.append(f"ms365 scan failed for {upn}: {exc}")
+                _log_scan_exc(exc, f"ms365 mailbox {upn}")
+                result.errors.append(f"{MAILBOX_FAILURE_PREFIX}ms365 {upn} -- "
+                                     "see server log")
 
     def _scan_ms365_mailbox(self, result, token, upn, folder, filt, mark_read,
                             max_messages):
@@ -1453,13 +1574,20 @@ class EmailInboxClient:
                     continue
                 fetched += 1
                 mime_url = f"{GRAPH_BASE}/users/{user}/messages/{mid}/$value"
+                # Graph's from address is the sender of record for every
+                # rep/distributor decision -- never the MIME display name.
+                _graph_from = (((m.get("from") or {}).get("emailAddress") or {})
+                               .get("address") or "")
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
                     msg = email.message_from_bytes(mime_bytes)
-                    events, errs, cw_pos = parse_message_with_errors(msg)
+                    events, errs, cw_pos = parse_message_with_errors(
+                        msg, sender_address=_graph_from or None)
                 except Exception as exc:  # noqa: BLE001
+                    _log_scan_exc(exc, f"ms365 message {upn}")
                     result.errors.append(
-                        f"ms365 parse failed for {upn}:{m.get('subject', mid)!r}: {exc}"
+                        f"ms365 parse failed for {upn}:{m.get('subject', mid)!r} -- "
+                        "see server log"
                     )
                     continue
                 result.errors.extend(errs)
@@ -1475,8 +1603,9 @@ class EmailInboxClient:
                                 {"isRead": True},
                             )
                         except Exception as exc:  # noqa: BLE001
+                            _log_scan_exc(exc, "ms365 mark-read")
                             result.errors.append(
-                                f"ms365 mark-read failed for {upn}:{mid}: {exc}"
+                                f"ms365 mark-read failed for {upn}:{mid} -- see server log"
                             )
                 else:
                     # Recognized distributor/rep SENDER but nothing parsed --
@@ -1489,15 +1618,28 @@ class EmailInboxClient:
                     _known = (_distributor_from_sender(_snd)
                               or _report_warehouse_for_sender(_snd)[1]
                               or _worksheet_warehouse_for_sender(_snd)[1])
-                    _fnames = [f for f, _p in _attachments(msg)]
-                    if (_known
-                            and _is_report_shaped(_snd, _subj, _fnames)
-                            and _carries_report_payload(msg, _subj)):
+                    try:
+                        _fnames = [f for f, _p in _attachments(msg)]
+                        _queue = bool(_known
+                                      and _is_report_shaped(_snd, _subj, _fnames)
+                                      and _carries_report_payload(msg, _subj))
+                    except Exception as exc:  # noqa: BLE001
+                        # An odd charset / MIME part must not take the whole
+                        # mailbox loop down (that is now a mailbox failure);
+                        # a known sender's unreadable mail is queued instead.
+                        _log_scan_exc(exc, "unparsed check")
+                        _fnames, _queue = [], bool(_known)
+                    if _queue:
                         result.unparsed.append({
                             "id": m.get("internetMessageId") or mid,
                             "mailbox": upn,
                             "sender": _snd,
                             "subject": m.get("subject") or "",
+                            # The attachment names that made it report-shaped:
+                            # prune_unparsed_reports re-judges with them, or a
+                            # report recognized only by its filename was
+                            # pruned in the very scan that queued it.
+                            "filenames": _fnames,
                             "received": m.get("receivedDateTime") or "",
                             # Date header, normalised like a count_date: a
                             # manual ingest of this message is stamped with it,
@@ -1524,7 +1666,7 @@ class EmailInboxClient:
             imap.select(folder)
             typ, data = imap.search(None, search)
             if typ != "OK":
-                result.errors.append(f"IMAP search failed: {data!r}")
+                result.errors.append(f"{MAILBOX_FAILURE_PREFIX}IMAP search failed: {data!r}")
                 return
             ids = (data[0] or b"").split()[:max_messages]
             result.messages_seen = len(ids)
@@ -1537,7 +1679,8 @@ class EmailInboxClient:
                     msg = email.message_from_bytes(raw)
                     events, errs, cw_pos = parse_message_with_errors(msg)
                 except Exception as exc:  # noqa: BLE001
-                    result.errors.append(f"parse failed for {msg_id!r}: {exc}")
+                    _log_scan_exc(exc, "imap parse")
+                    result.errors.append(f"parse failed for {msg_id!r} -- see server log")
                     continue
                 result.errors.extend(errs)
                 if events or cw_pos:
@@ -1556,7 +1699,8 @@ class EmailInboxClient:
                     msg = email.message_from_bytes(f.read())
                 events, errs, cw_pos = parse_message_with_errors(msg)
             except Exception as exc:  # noqa: BLE001
-                result.errors.append(f"{path.name}: {exc}")
+                _log_scan_exc(exc, "dump parse")
+                result.errors.append(f"{path.name}: parse failed -- see server log")
                 continue
             result.errors.extend(errs)
             if events or cw_pos:

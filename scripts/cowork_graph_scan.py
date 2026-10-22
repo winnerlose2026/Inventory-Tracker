@@ -481,7 +481,8 @@ def _run_server_mode(args) -> int:
         print("email-scan: status={s} seen={seen} parsed={p} updated={u} "
               "unchanged={uc} skipped_revs={sk} superseded={sup} "
               "gained={g} canceled_skipped={cs} cw_added={cwa} "
-              "cw_updated={cwu} errors={e}".format(
+              "cw_updated={cwu} errors={e} mailbox_failures={mf} "
+              "po_failures={pf}".format(
                   s=rep.get("status"), seen=rep.get("messages_seen"),
                   p=rep.get("messages_parsed"), u=rep.get("updated"),
                   uc=rep.get("unchanged"),
@@ -490,12 +491,23 @@ def _run_server_mode(args) -> int:
                   g=len(rep.get("reparse_gained_skus") or []),
                   cs=len(rep.get("canceled_skipped") or []),
                   cwa=cw.get("added", 0), cwu=cw.get("updated", 0),
-                  e=len(rep.get("errors") or [])))
-        for k in ("warnings", "po_revisions_superseded", "reparse_gained_skus",
+                  e=len(rep.get("errors") or []),
+                  mf=len(rep.get("mailbox_failures") or []),
+                  pf=len(rep.get("po_failures") or [])))
+        for k in ("mailbox_failures", "po_failures", "errors", "warnings",
+                  "po_revisions_superseded", "reparse_gained_skus",
                   "gained_booked", "gained_absorbed", "po_identical_skipped"):
             for line in (rep.get(k) or [])[:10]:
                 print(f"  {k}: {line}")
-        if rep.get("status") not in (None, "ok"):
+        # Exit non-zero (Render emails JD) only when the scan itself failed or
+        # a whole MAILBOX could not be read. "partial" from a dropped PO, and
+        # item-level errors/warnings, are printed above but do not fail the
+        # run -- otherwise the alert fires every 6 h for a week over one
+        # unmapped SKU and stops meaning anything. Before 2026-10-22 the route
+        # never reported mailbox failures at all and this line read a key that
+        # did not exist, so it always logged errors=0.
+        if rep.get("status") not in (None, "ok", "partial") \
+                or rep.get("mailbox_failures"):
             rc = 1
 
     # 2) Lineage freight invoices (actual ship dates). Server-side too, so

@@ -20,6 +20,31 @@ from pathlib import Path
 _CACHE = {"key": None, "data": {}}
 
 
+def sender_address(from_header) -> str:
+    """The REAL address of a From: header, lowercased; "" if there is none.
+
+    Sender -> warehouse/distributor resolution used to take the first
+    ``x@y`` token anywhere in the header, so a display name won:
+    ``"maria.hernandez@usfoods.com" <anyone@evil.example>`` resolved to
+    Zebulon and its pasted table overwrote Zebulon's on-hand (review
+    2026-10-22). getaddresses() returns the addr-spec, and in strict mode
+    (3.13+) an ambiguous header parses to ('', '') -- unknown sender, which
+    fails closed. Plain addresses (Graph's from.emailAddress.address) pass
+    through unchanged.
+    """
+    from email.utils import getaddresses
+    try:
+        pairs = getaddresses([str(from_header or "")])
+    except Exception:  # noqa: BLE001 -- a garbled header is an unknown sender
+        return ""
+    for _name, addr in pairs:
+        addr = (addr or "").strip().lower()
+        if addr.count("@") == 1 and not any(c.isspace() for c in addr) \
+                and addr.split("@")[0] and "." in addr.split("@")[1]:
+            return addr
+    return ""
+
+
 def _map_path() -> Path:
     return Path(os.environ.get("REP_MAP_FILE", "data/rep_warehouse_map.json"))
 

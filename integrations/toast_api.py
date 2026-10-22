@@ -225,10 +225,24 @@ def fetch_product_mix_batch(pairs, max_workers: int = 6,
     """Fetch product mix for many (restaurant_guid, business_date,
     location_name) tuples concurrently. Returns a flat list of rows.
     Per-pair failures are logged but don't kill the batch."""
+    rows, _ok = fetch_product_mix_batch_with_status(
+        pairs, max_workers=max_workers, timeout_s=timeout_s)
+    return rows
+
+
+def fetch_product_mix_batch_with_status(pairs, max_workers: int = 6,
+                                        timeout_s: float = 28.0) -> tuple:
+    """Like fetch_product_mix_batch, plus the set of (restaurant_guid,
+    business_date) pairs whose fetch COMPLETED (rows or genuinely no orders).
+
+    The Report tab needs this to tell "Toast says no sales that day" (safe to
+    remember as empty) from "that request failed / timed out" (retry next
+    view): both used to come back as simply no rows."""
     pairs = list(pairs)
     if not pairs:
-        return []
+        return [], set()
     out: list = []
+    ok_pairs: set = set()
     deadline = time.time() + timeout_s
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -242,13 +256,14 @@ def fetch_product_mix_batch(pairs, max_workers: int = 6,
                     break
                 try:
                     out.extend(fut.result() or [])
+                    ok_pairs.add((guid, date))
                 except Exception as e:
                     print(f"[toast_api] fetch failed "
                           f"{name or guid} {date}: {e}", file=sys.stderr)
         except Exception as e:
             print(f"[toast_api] batch fetch terminated early: {e}",
                   file=sys.stderr)
-    return out
+    return out, ok_pairs
 
 
 def is_configured() -> bool:

@@ -66,6 +66,23 @@ services:
         sync: false  # e.g. https://bagel-inventory.onrender.com
       - key: GRAPH_SUB_CLIENT_STATE
         sync: false  # any long random string; treat like a token
+      # /api/email/send policy (2026-10-22). Recipients must be in these
+      # domains (default below); a body "from" is honoured only if it is
+      # MS365_SEND_AS or listed in EMAIL_SEND_ALLOWED_FROM (default
+      # jd@hhbagels.com, the chasers' sender). Uncomment to override.
+      # - key: EMAIL_SEND_ALLOWED_DOMAINS
+      #   value: usfoods.com,cheneybrothers.com,chefswarehouse.com,onelineage.com,hhbagels.com
+      # - key: EMAIL_SEND_ALLOWED_FROM
+      #   value: jd@hhbagels.com
+      #
+      # FTPS (Cheney / USF cPanel feed: integrations/sftp_inbox.py, used by
+      # scripts/pull_sftp_inbox.py and scripts/sync_cheney_feeds.py wherever
+      # they run). The TLS cert CHAIN is always verified against the system
+      # CAs; set this to the name on the server's certificate (GoDaddy shared
+      # hosting: its *.secureserver.net hostname, NOT sftp.hhbagels.com) to
+      # also check the name. Unset = chain-only verification.
+      # - key: FTPS_TLS_SERVER_NAME
+      #   value: <the cPanel server's own hostname>
 
   - type: cron
     name: bagel-inventory-6h-scan

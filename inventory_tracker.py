@@ -449,7 +449,11 @@ def prune_unparsed_reports(now: Optional[datetime] = None,
         if _AUTO_REPLY_SUBJECT_RE is not None and \
                 _AUTO_REPLY_SUBJECT_RE.match(subject):
             continue  # out-of-office / bounce: never a report
-        if _is_report_shaped is not None and not _is_report_shaped(sender, subject):
+        # Re-judge with the attachment names the scanner admitted it on: a
+        # report recognised only by its filename ("FW: numbers" + "Customer
+        # Metric Source.xlsx") was otherwise pruned in the scan that queued it.
+        if _is_report_shaped is not None and not _is_report_shaped(
+                sender, subject, e.get("filenames") or ()):
             continue  # PO / invoice / statement / admin mail, not a report
         received = e.get("received") or ""
         recv_dt = _parse_iso_utc(received)

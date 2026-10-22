@@ -129,7 +129,11 @@ def process_message(msg: dict, warehouse: str) -> dict:
     blocked."""
     subject = msg.get("subject", "")
     usage, unknown = parse_usage_lines(msg.get("body_text", ""))
-    warnings, notes, rows, image_name = [], [], [], ""
+    warnings, notes, rows, image_name, image_sha = [], [], [], "", ""
+    # Pictures the endpoint refused (quoted-thread copies, already-ingested
+    # screens): logged, never read. See integrations/usf_screenshot.cids_above_quote.
+    for rej in msg.get("rejected_images") or []:
+        notes.append(f"{rej.get('name')}: not read -- {rej.get('reason')}")
     if unknown:
         warnings.append(f"usage typed for unmapped USF item #s {sorted(unknown)} "
                         "-- add them to USF_ITEM_NO_TO_MFG")
@@ -141,12 +145,12 @@ def process_message(msg: dict, warehouse: str) -> dict:
         got = read_screenshot(raw, warehouse)
         notes += [f"{img.get('name')}: {n}" for n in got["notes"]]
         if got["table"] is not None:
-            screens.append((img.get("name", ""), got))
+            screens.append((img.get("name", ""), got, img.get("sha256") or ""))
     if len(screens) > 1:
         warnings.append(f"{len(screens)} buyer screens in one email -- "
                         "can't tell which is current")
     elif screens:
-        image_name, got = screens[0]
+        image_name, got, image_sha = screens[0]
         warnings += got["warnings"]
         rows = got["rows"]
     if not screens and not usage:
@@ -165,7 +169,8 @@ def process_message(msg: dict, warehouse: str) -> dict:
     events = build_events(
         rows, usage, warehouse=warehouse, sent_iso=msg.get("sent", ""),
         message_id=msg.get("message_id") or msg.get("id", ""),
-        subject=subject, sender=msg.get("sender", ""), image_name=image_name)
+        subject=subject, sender=msg.get("sender", ""), image_name=image_name,
+        image_sha256=image_sha)
     return {"status": "ok" if rows else "usage-only", "events": events,
             "warnings": [], "notes": notes, "rows": rows, "usage": usage}
 

@@ -4,6 +4,7 @@ PLH (productivity vs labor-hours), bakery sales, the forecast endpoints
 report-status pages, and the xlsx export. Extracted from app.py (refactor —
 see REFACTOR_PLAN.md). Shared helpers come from core/."""
 import io
+import time as _time
 from datetime import datetime, timedelta
 
 from flask import Blueprint, jsonify, request, send_file
@@ -218,6 +219,30 @@ def api_sales_ingest():
                     "total_rows": len(existing)})
 
 
+# Live (today / yesterday) Toast days: when each was last re-pulled, per
+# worker process. In memory on purpose -- a throttle, not data.
+_TOAST_REFRESHED: dict = {}
+_TOAST_REFRESH_S = 15 * 60
+
+
+def _toast_empty_days_path():
+    from inventory_tracker import DATA_DIR
+    return DATA_DIR / "toast_empty_days.json"
+
+
+def _load_toast_empty_days() -> dict:
+    """{"<restaurant_guid>|<YYYY-MM-DD>": marked_at} -- days Toast confirmed
+    had no orders, so the Top Consumed card stops re-requesting them."""
+    from inventory_tracker import _read_json
+    data = _read_json(_toast_empty_days_path(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_toast_empty_days(marks: dict) -> None:
+    from inventory_tracker import _write_json
+    _write_json(_toast_empty_days_path(), marks)
+
+
 @reporting_bp.route("/api/report/toast-sales")
 def api_report_toast_sales():
     """Top-selling items aggregated by week or month, optionally by
@@ -309,10 +334,22 @@ def api_report_toast_sales():
                 if (L.get("status") or "active") == "active"]
 
     def _ensure_bucket_cached(all_rows: list, anchor_iso: str, loc_q: str):
-        """If the bucket containing anchor_iso has no rows for the
-        target locations, pull from Toast and append to sales.json.
-        Returns (updated_rows, meta dict) where meta carries fetch info
-        for the client (rows_fetched, fetch_error, fetched_at)."""
+        """Make sure sales.json covers the bucket containing anchor_iso for the
+        target locations, pulling from Toast what is missing. Returns
+        (updated_rows, meta dict) where meta carries fetch info for the client
+        (rows_fetched, fetch_error, fetched_at).
+
+        Which (location, date) pairs are fetched:
+          * TODAY and YESTERDAY -- always, and the fresh rows REPLACE that
+            day's stored rows. "Any row cached = done" froze a day at whatever
+            had sold by the first view (a 9am look kept showing the 9am
+            numbers forever; review 2026-10-22).
+          * older dates -- only when no rows are stored AND the day isn't
+            marked empty. A completed fetch that returns no orders marks the
+            day empty (data/toast_empty_days.json), so a closed day is not
+            re-requested on every view; a FAILED fetch is not marked and is
+            retried next time.
+        """
         meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None}
         if not live_q:
             return all_rows, meta
@@ -323,14 +360,16 @@ def api_report_toast_sales():
         targets = _target_locations(loc_q)
         if not targets:
             return all_rows, meta
+        fresh_from = (_dt.now().date() - _td(days=1)).isoformat()
         # Which (guid, date) pairs already have at least 1 row?
         cached_keys = set()
         for r in all_rows:
             d = (r.get("business_date") or "").strip()
             if start_iso <= d <= end_iso:
                 cached_keys.add((r.get("restaurant_guid") or "", d))
+        empty_days = _load_toast_empty_days()
         # Enumerate every (target_location, date) pair in the bucket
-        # range; anything not in cached_keys is a fetch candidate.
+        # range and decide which to (re)fetch -- see the docstring.
         missing = []
         s = _dt.strptime(start_iso, "%Y-%m-%d")
         e = _dt.strptime(end_iso,   "%Y-%m-%d")
@@ -338,7 +377,17 @@ def api_report_toast_sales():
         while d_cursor <= e:
             d_iso = d_cursor.strftime("%Y-%m-%d")
             for (guid, name) in targets:
-                if (guid, d_iso) not in cached_keys:
+                if d_iso >= fresh_from:
+                    # Re-pull a live day at most every _TOAST_REFRESH_S per
+                    # worker: the Report tab is opened on today's week, and 17
+                    # locations x 2 days on EVERY view would hammer Toast.
+                    _last = _TOAST_REFRESHED.get((guid, d_iso))
+                    if ((guid, d_iso) in cached_keys and _last is not None
+                            and _time.monotonic() - _last < _TOAST_REFRESH_S):
+                        continue
+                    missing.append((guid, d_iso, name))
+                elif ((guid, d_iso) not in cached_keys
+                      and f"{guid}|{d_iso}" not in empty_days):
                     missing.append((guid, d_iso, name))
             d_cursor += _td(days=1)
         if not missing:
@@ -348,33 +397,45 @@ def api_report_toast_sales():
             if not toast_api.is_configured():
                 meta["fetch_error"] = "toast_not_configured"
                 return all_rows, meta
-            new_rows = toast_api.fetch_product_mix_batch(
+            # Network I/O -- deliberately OUTSIDE data_lock.
+            new_rows, ok_pairs = toast_api.fetch_product_mix_batch_with_status(
                 missing, max_workers=6, timeout_s=28.0)
         except Exception as ex:
             meta["fetch_error"] = _safe_err(ex, "toast fetch")
             return all_rows, meta
-        if not new_rows:
+        meta["fetched_at"] = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        _now_m = _time.monotonic()
+        for (g, d) in (ok_pairs or set()):
+            if d >= fresh_from:
+                _TOAST_REFRESHED[(g, d)] = _now_m
+        got_keys = {(r.get("restaurant_guid") or "", r.get("business_date") or "")
+                    for r in new_rows or []}
+        newly_empty = {f"{g}|{d}" for (g, d) in (ok_pairs or set())
+                       if (g, d) not in got_keys and d < fresh_from}
+        if not new_rows and not newly_empty:
             # No orders for any of the missing (guid, date) pairs is a
-            # legitimate response — still record the attempt so the UI
+            # legitimate response -- still record the attempt so the UI
             # knows a fetch ran.
-            meta["fetched_at"] = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             return all_rows, meta
-        from inventory_tracker import save_sales
-        # Dedupe on (restaurant_guid, business_date, item_guid) — if a
-        # date was partially cached, prefer the fresh row.
-        by_key: dict = {}
-        for r in all_rows:
-            k = (r.get("restaurant_guid"), r.get("business_date"),
-                 r.get("item_guid"))
-            by_key[k] = r
-        for r in new_rows:
-            k = (r.get("restaurant_guid"), r.get("business_date"),
-                 r.get("item_guid"))
-            by_key[k] = r
-        merged = list(by_key.values())
-        save_sales(merged)
-        meta["rows_fetched"] = len(new_rows)
-        meta["fetched_at"]   = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        from inventory_tracker import data_lock, load_sales, save_sales
+        with data_lock():
+            # Re-read under the lock: another view may have merged meanwhile.
+            merged = load_sales() or []
+            if new_rows:
+                # A day that came back with rows is REPLACED wholesale (fresh
+                # totals, and items no longer sold that day drop out). Days
+                # whose fetch failed or came back empty keep what they had.
+                merged = [r for r in merged
+                          if ((r.get("restaurant_guid") or ""),
+                              (r.get("business_date") or "")) not in got_keys]
+                merged.extend(new_rows)
+                save_sales(merged)
+            if newly_empty:
+                marks = _load_toast_empty_days()
+                for k in newly_empty:
+                    marks.setdefault(k, meta["fetched_at"])
+                _save_toast_empty_days(marks)
+        meta["rows_fetched"] = len(new_rows or [])
         return merged, meta
 
     # Load the full row set ONCE. If an anchor date is set we may

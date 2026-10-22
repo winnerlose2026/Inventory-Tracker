@@ -272,13 +272,16 @@ def test_small_images_are_never_ocrd(monkeypatch):
 # /api/email/usf-screenshots
 # ---------------------------------------------------------------------------
 
-def _graph_stub(messages_by_user, attachments, bodies):
+def _graph_stub(messages_by_user, attachments, bodies, html_bodies=None):
     def stub(url, token, extra_headers=None, timeout=30):
         if "/attachments" in url:
             mid = url.split("/messages/")[1].split("/attachments")[0]
             return {"value": attachments.get(mid, [])}
         if "$select=body" in url:
             mid = url.split("/messages/")[1].split("?")[0]
+            if "html" in str((extra_headers or {}).get("Prefer", "")):
+                return {"body": {"contentType": "html",
+                                 "content": (html_bodies or {}).get(mid, "")}}
             return {"body": {"content": bodies.get(mid, "")}}
         user = url.split("/users/")[1].split("/")[0].replace("%40", "@")
         return {"value": messages_by_user.get(user, [])}
@@ -313,13 +316,19 @@ def test_endpoint_returns_pending_replies_with_their_pictures(monkeypatch):
             _gmsg("other", iso(1), sender="x@usfoods.com"),
          ],
          "info@ms.hhbagels.com": [_gmsg("new-copy", iso(1), imid="<new>")]},
+        # Tom's screen is an INLINE picture referenced from his reply's own
+        # HTML (since 2026-10-22 only such pictures are returned).
         {"new": [{"name": "image001.png", "contentType": "image/png",
-                  "size": 561422, "contentBytes": png},
+                  "size": 561422, "contentBytes": png, "isInline": True,
+                  "contentId": "<image001.png@01DB0001>"},
                  {"name": "logo.png", "contentType": "image/png",
                   "size": 20310, "contentBytes": png},
                  {"name": "po.pdf", "contentType": "application/pdf",
                   "size": 90000, "contentBytes": png}]},
-        {"new": "1055010 – 5 cases a week"}))
+        {"new": "1055010 – 5 cases a week"},
+        {"new": '<p>1055010 – 5 cases a week</p>'
+                '<img src="cid:image001.png@01DB0001">',
+         "counted": '<img src="cid:image009.png@01DB0009">'}))
 
     c = app.test_client()
     assert c.get("/api/email/usf-screenshots").status_code == 401

@@ -42,28 +42,38 @@ def _opt_int(v: str):
 
 
 def read_csv(path: Path, distributor: str) -> Iterator[SyncItem]:
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        normalized_fields = [h.lower().strip() for h in (reader.fieldnames or [])]
-        reader.fieldnames = normalized_fields
-        for raw in reader:
-            row = {k.lower().strip(): (v or "").strip() for k, v in raw.items()}
-            if not row.get("quantity"):
-                continue
-            try:
-                qty = float(row["quantity"])
-            except ValueError:
-                continue
-            yield SyncItem(
-                quantity=qty,
-                distributor=distributor,
-                name=row.get("name") or None,
-                variety=row.get("variety") or None,
-                warehouse=row.get("warehouse") or None,
-                unit=row.get("unit") or None,
-                price=_opt_float(row.get("price", "")),
-                distributor_sku=row.get("distributor_sku") or None,
-                case_cost=_opt_float(row.get("case_cost", "")),
-                case_size=_opt_int(row.get("case_size", "")),
-                weekly_usage=_opt_float(row.get("weekly_usage", "")),
-            )
+    yield from read_csv_bytes(Path(path).read_bytes(), distributor=distributor)
+
+
+def read_csv_bytes(content: bytes, distributor: str) -> Iterator[SyncItem]:
+    """Rows of a CSV blob as SyncItems.
+
+    Decoding and row-splitting go through parsers._common.iter_rows: UTF-8
+    (BOM tolerated) with a latin-1 fallback, and DictReader's overflow column
+    (key None, value a list -- any row with a trailing comma) dropped. The
+    old open()/DictReader path raised UnicodeDecodeError on a cp1252 export
+    and AttributeError on a ragged row, which took the WHOLE email down with
+    it, including a weekly report or PO in the same message (review
+    2026-10-22).
+    """
+    from .parsers._common import iter_rows
+    for row in iter_rows(content or b""):
+        if not row.get("quantity"):
+            continue
+        try:
+            qty = float(row["quantity"])
+        except ValueError:
+            continue
+        yield SyncItem(
+            quantity=qty,
+            distributor=distributor,
+            name=row.get("name") or None,
+            variety=row.get("variety") or None,
+            warehouse=row.get("warehouse") or None,
+            unit=row.get("unit") or None,
+            price=_opt_float(row.get("price", "")),
+            distributor_sku=row.get("distributor_sku") or None,
+            case_cost=_opt_float(row.get("case_cost", "")),
+            case_size=_opt_int(row.get("case_size", "")),
+            weekly_usage=_opt_float(row.get("weekly_usage", "")),
+        )
