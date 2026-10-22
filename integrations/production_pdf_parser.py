@@ -831,8 +831,9 @@ def choose_production_date(lot_dates, slash_dates, received_at: str,
 
     Was: the first typed date, else the EARLIEST lot date -- so one mistyped
     lot (1189031026 for 091026 on Riviera 014511751616) back-dated the whole
-    sheet six months and FIFO drained it first. Now: the most common
-    PLAUSIBLE lot date (ties -> earliest), else a plausible typed date, else
+    sheet six months and FIFO drained it first. Now: a PLAUSIBLE typed date
+    on the sheet (what the bakery wrote; FIFO orders lots by their own codes
+    anyway), else the most common plausible lot date (ties -> earliest), else
     the received date. Without a received_at nothing can be judged, so the
     caller's ``default`` (the old rule) stands.
     """
@@ -840,14 +841,14 @@ def choose_production_date(lot_dates, slash_dates, received_at: str,
     recv = received_local_date(received_at)
     if recv is None:
         return default
+    for d in (slash_dates or []):
+        if d and is_plausible_production_date(d, received_at):
+            return str(d)[:10]
     lots = [d for d in (lot_dates or []) if d and is_plausible_production_date(d, received_at)]
     if lots:
         counts = _Counter(lots)
         top = max(counts.values())
         return min(d for d, n in counts.items() if n == top)
-    for d in (slash_dates or []):
-        if d and is_plausible_production_date(d, received_at):
-            return str(d)[:10]
     return recv.isoformat()
 
 

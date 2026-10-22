@@ -1712,10 +1712,15 @@ def _apply_events(events: list,
         # added. Snapshot them per SKU and put them back on the re-booked
         # rows below.
         _carry_dates: dict = {}
+        # The "confirm before it rolls" flag must survive a re-apply too
+        # (parser gain / re-sent copy), or the hold silently lifts.
+        _carry_rebooked: dict = {}
         for _key, _item in inv.items():
             for _p in (_item.get("on_order") or []):
                 if _p.get("po_number") != po_num:
                     continue
+                if _p.get("rebooked_after_count"):
+                    _carry_rebooked[_key] = _p["rebooked_after_count"]
                 if _p.get("ship_date") or _p.get("arrival_date"):
                     _carry_dates[_key] = {
                         k: _p.get(k) for k in
@@ -1741,6 +1746,8 @@ def _apply_events(events: list,
                         continue
                     if _key in _carry_dates and not _p.get("ship_date"):
                         _p.update(_carry_dates[_key])
+                    if _key in _carry_rebooked and not _p.get("rebooked_after_count"):
+                        _p["rebooked_after_count"] = _carry_rebooked[_key]
                     if _absorbed_now:
                         # The previous booking of this PO was delivered and a
                         # physical count already absorbed it. Re-booking the

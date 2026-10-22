@@ -263,3 +263,28 @@ def test_future_ship_date_is_pending_past_is_in_transit(env):
                                                 "arrival_date": _day(6)}, headers=H)
     assert _ledger("7500001O")["status"] == "pending"
     assert _ledger("7500002O")["status"] == "in_transit"
+
+
+def test_reopened_confirmation_cannot_be_reposted_from_the_same_message():
+    """The cloud Lineage task re-reads the thread twice a day: re-posting the
+    line an operator reopened must not undo the Reopen; a NEW message can."""
+    from integrations.po_delivery import apply_event, reopen_delivered
+    now = datetime(2026, 10, 22, 15, 0, tzinfo=timezone.utc)
+    ev = {"po_number": "X", "event": "delivered",
+          "delivered_at": "2026-10-19T08:00:00-05:00",
+          "evidence": {"message_id": "m1", "sender": "bmorris@onelineage.com",
+                       "sent": "2026-10-19T16:00:00Z",
+                       "quote": "this shows delivered 0800AM/19th"}}
+    rec = {"po_number": "X", "status": "scheduled", "events": [],
+           "delivery_appt": "2026-10-19T08:00:00-05:00",
+           "requested_at": "2026-10-15T12:00:00Z"}
+    rec, change, err = apply_event(rec, ev, now)
+    assert err is None and rec["status"] == "delivered"
+    rec = reopen_delivered(rec, now, note="wrong PO")
+    assert rec["delivered_time_known"] is False
+    again, change, err = apply_event(rec, ev, now)
+    assert err and "reopened" in err and again["status"] == "scheduled"
+    newer = dict(ev, evidence=dict(ev["evidence"], message_id="m2",
+                                   sent="2026-10-22T14:00:00Z"))
+    rec2, change, err = apply_event(rec, newer, now)
+    assert err is None and rec2["status"] == "delivered"

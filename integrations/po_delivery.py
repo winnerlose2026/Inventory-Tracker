@@ -386,6 +386,19 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
         req = parse_dt(rec.get("requested_at") or "")
         if req and at < req - timedelta(days=1):
             return rec, None, "delivered_at is before the PO was even sent to Lineage"
+        # An operator Reopen undoes a confirmation; the cloud task re-reads the
+        # same thread twice a day and would re-post the line it came from,
+        # silently undoing the Reopen. Only a NEW message can re-confirm.
+        evs = list(rec.get("events") or [])
+        last_reopen = max((i for i, e in enumerate(evs)
+                           if e.get("event") == "reopened"), default=-1)
+        reopened_ids = {(e.get("evidence") or {}).get("message_id")
+                        for e in evs[:max(last_reopen, 0)]
+                        if e.get("event") == "delivered"} - {"", None}
+        if (last_reopen >= 0 and evid["message_id"] in reopened_ids
+                and not ev.get("force")):
+            return rec, None, ("an operator reopened this PO after that confirmation "
+                               "-- only a newer message can confirm it again")
         # The date posted must be a date the quote states (when it states
         # any): the evidence check proves the line exists, not that the event
         # carries its date.
@@ -456,6 +469,7 @@ def reopen_delivered(rec: dict, now: datetime, note: str = "") -> dict:
              "evidence": {"message_id": "", "sender": "", "sent": "", "quote": ""}}
     rec["status"] = new_status
     rec["delivered_at"] = ""
+    rec["delivered_time_known"] = False
     rec["events"] = (list(rec.get("events") or []) + [entry])[-60:]
     rec["updated"] = now.isoformat()
     return rec
