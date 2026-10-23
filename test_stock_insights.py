@@ -180,3 +180,27 @@ def test_insights_endpoint(env):
     _book(sync, "7800001O", order_day=_day(-3))
     r = c.get("/api/insights", headers=H).get_json()
     assert r["ok"] and "warehouses" in r["reorder"] and "items" in r["count_checks"]
+
+
+def test_po_booked_after_the_count_explains_an_overage():
+    """Manassas 10/19: PO 7199415O landed 10/16, rolled in 10/20 after the
+    count (later absorbed), so the count was ~112 cs over the projection."""
+    count_day = 4
+    inv, audit, lines = {}, [], []
+    for v in ("Plain", "Everything", "Sesame", "Asiago"):
+        name = f"{v} Bagel 4oz [USF - Manassas]"
+        inv[name.lower()] = _item(name=name, warehouse="Manassas, VA", weekly_usage=6.0,
+                                  last_count_qty=40.0, quantity=36.0)
+        audit += _audit_counts(name, [(count_day, 12.0, 40.0)])
+        lines.append({"variety": v, "qty": 28.0, "absorbed": True})
+    ledger = [{"po_number": "7199415O", "warehouse": "Manassas, VA", "status": "arrived",
+               "distributor": "US Foods", "lines": lines,
+               "arrival_date": (NOW - timedelta(days=7)).isoformat(),
+               "rolled_at": (NOW - timedelta(days=3)).isoformat()},
+              {"po_number": "8228405O", "warehouse": "Manassas, VA", "status": "pending",
+               "distributor": "US Foods",
+               "lines": [{"variety": v, "qty": 28.0} for v in ("Plain", "Everything",
+                                                                 "Sesame", "Asiago")]}]
+    hints = count_checks(inv, [], audit, ledger=ledger)["warehouses"][0]["hints"]
+    assert hints[0].startswith("PO 7199415O") and "booked after the count" in hints[0]
+    assert len(hints) == 1

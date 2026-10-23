@@ -281,18 +281,22 @@ def _po_hints(w: dict, ledger) -> list:
         if (r.get("warehouse") or "") != w["warehouse"] or \
                 r.get("distributor") == "Chefs Warehouse":
             continue
-        lines = [l for l in (r.get("lines") or []) if not l.get("absorbed")]
-        total = sum(_f(l.get("qty")) for l in lines)
+        all_lines = list(r.get("lines") or [])
+        lines = [l for l in all_lines if not l.get("absorbed")]
         status = r.get("status") or ""
-        if total <= 0 or status == "canceled":
+        if status == "canceled":
             continue
         arr = naive_local_dt(r.get("arrival_date") or "")
         rolled = naive_local_dt(r.get("rolled_at") or "")
+        bonus = 1.0
         if status != "arrived":
             sign, why = 1, ("is still on order, but the count is OVER by about that "
                             "much on its lines — it may have arrived early")
         elif arr is not None and count_dt - timedelta(days=10) <= arr <= count_dt + timedelta(days=1):
             if rolled is not None and rolled > count_dt:
+                # Absorbed lines count here: they are exactly the cases the
+                # count already held (Manassas 7199415O, 10/19).
+                lines, bonus = all_lines, 1.05
                 sign, why = 1, (f"arrived {arr.date().isoformat()} but was booked after "
                                 "the count, so the projection did not have it — that "
                                 "explains the overage")
@@ -302,8 +306,11 @@ def _po_hints(w: dict, ledger) -> list:
                                  "it actually landed before the count")
         else:
             continue
-        score = sum(min(_f(l.get("qty")), max(0.0, sign * var.get(l.get("variety") or "", 0)))
-                    for l in lines)
+        total = sum(_f(l.get("qty")) for l in lines)
+        if total <= 0:
+            continue
+        score = bonus * sum(min(_f(l.get("qty")), max(0.0, sign * var.get(l.get("variety") or "", 0)))
+                            for l in lines)
         if score >= 0.6 * total and score >= 0.4 * abs(w["net_variance"] or 1):
             if sign not in best or score > best[sign][0]:
                 best[sign] = (score, f"PO {r.get('po_number')} ({total:g} cs) {why}.")
@@ -322,10 +329,14 @@ def _hints(w: dict, ledger, cfg: dict) -> list:
         hints.append(f"Stock ROSE between counts on {len(rises)} SKUs (+{tot:.0f} cs) with no "
                      "delivery on record — either a delivery we have no PO/arrival for, "
                      "or the previous count was short.")
-    elif len(flagged) >= 3:
+    elif len(flagged) >= 3 and not hints:
         hi = sum(1 for l in flagged if (l["variance"] or 0) > 0)
         lo = len(flagged) - hi
-        if max(hi, lo) >= 0.75 * len(flagged):
+        agrees = True
+        if w.get("usage_4w_skus") and w.get("weekly_usage"):
+            # "usage set too high" only when the counts' own usage is lower
+            agrees = (w["usage_4w"] < w["weekly_usage"]) == (hi > lo)
+        if max(hi, lo) >= 0.75 * len(flagged) and agrees:
             tail = ""
             if w.get("usage_4w_skus"):
                 tail = (f" Over the last ~6 weeks the counts show about "
