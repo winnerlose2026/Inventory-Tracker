@@ -1117,6 +1117,18 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
             item["last_count_rank"] = _evt_rank
             item["last_count_received_at"] = _evt_rcv
             item["last_count_qty"] = amount
+            # Count check (integrations/stock_insights.py): what we projected
+            # for this count's date -- on-hand now, less receipts after it, plus
+            # the burn / moves after it. Stamped once per NEW count; a same-date
+            # correction keeps the original projection.
+            if _evt_cd and _cur_cd and _evt_cd != _cur_cd:
+                item["count_check"] = {
+                    "count_at": _evt_cd,
+                    "projected": round(old_qty - _receipts + _moved, 2),
+                    "prev_count_at": _cur_cd,
+                    "prev_counted": _cur_qty_at_count,
+                    "weekly_usage_before": old_wu,
+                }
         if not qty_changed and not wu_changed:
             report["unchanged"] += 1
             return

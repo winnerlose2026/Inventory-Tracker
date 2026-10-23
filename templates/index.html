@@ -293,6 +293,13 @@
   .flow-issue { border-left: 3px solid var(--red); padding: 6px 10px; margin: 8px 0; font-size: 12.5px; background: rgba(236,80,57,.05); }
   .flow-note { border-left: 3px solid #B07F0E; padding: 6px 10px; margin: 8px 0; font-size: 12.5px; background: rgba(240,179,35,.08); }
 
+  .ins-table td, .ins-table th { padding: 7px 10px; font-size: 12.5px; }
+  .ins-note { font-size: 12.5px; margin: 6px 0; padding: 6px 10px; border-left: 3px solid #B07F0E; background: rgba(240,179,35,.08); }
+  .ins-note.info { border-left-color: var(--border); background: var(--surface2); color: var(--muted); }
+  .cc-badge { display:inline-block; font-size:10.5px; font-weight:600; padding:1px 6px; border-radius:999px; margin-left:4px; white-space:nowrap; }
+  .cc-up { background: rgba(240,179,35,.18); color:#8a6400; }
+  .cc-down { background: rgba(236,80,57,.12); color: var(--red); }
+
   .pager-row {
     padding: 10px 20px;
     border-bottom: 1px solid var(--border);
@@ -646,6 +653,10 @@
     .inv-table > tbody > tr.sku-row > td:nth-child(4),
     .inv-table > tbody > tr.sku-row > td:nth-child(5),
     .inv-table > tbody > tr.sku-row > td:nth-child(6) { display: none; }
+    .inv-table.inv-main > thead th:nth-child(3),
+    .inv-table.inv-main > tbody > tr.sku-row > td:nth-child(3) { display: table-cell; }
+    .inv-table.inv-main > thead th:nth-child(7),
+    .inv-table.inv-main > tbody > tr.sku-row > td:nth-child(7) { display: none; }
     .inv-table > thead th,
     .inv-table > tbody > tr.sku-row > td { white-space: normal; word-break: normal; padding: 9px 8px; font-size: 13px; }
     .inv-table > tbody > tr.sku-row > td:first-child { font-size: 14px; }
@@ -772,7 +783,7 @@
       <div class="page-header">
         <div>
           <h1 style="margin-bottom:6px">Inventory</h1>
-          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first. <strong style="color:var(--green)">&#10003;&nbsp;date</strong> = confirmed arrival; <em style="color:var(--muted)">~&nbsp;date</em> = 30-day ETA estimate (On Order column).</p>
+          <p class="subtitle" style="margin-bottom:0">Bagels grouped by distributor &amp; warehouse, with lot-code history per SKU. Inventory is consumed <strong>FIFO</strong> &mdash; the oldest production date is drawn down first. <strong style="color:var(--green)">&#10003;&nbsp;date</strong> = confirmed arrival; <em style="color:var(--muted)">~&nbsp;date</em> = 30-day ETA estimate (On Order column). <strong>Counted</strong> = the distributor&rsquo;s latest count (actual); <strong>Theoretical</strong> = today&rsquo;s estimate (that count, plus deliveries since, minus the daily usage burn).</p>
         </div>
       </div>
       <!-- Low Stock Alerts: moved here from the old Dashboard now that
@@ -784,6 +795,23 @@
           <span id="low-stock-count" style="color:var(--muted);font-size:12px"></span>
         </div>
         <div id="low-stock-body" style="padding:0 4px 8px"></div>
+      </div>
+
+      <!-- Suggested orders + Count check (integrations/stock_insights.py via
+           /api/insights). Same collapsible-by-warehouse pattern as Low Stock. -->
+      <div class="card" id="reorder-card" style="display:none;margin-bottom:20px">
+        <div class="card-header">
+          <span class="card-title" style="font-size:22px">&#128230; Suggested Orders</span>
+          <span id="reorder-count" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <div id="reorder-body" style="padding:0 4px 8px"></div>
+      </div>
+      <div class="card" id="countcheck-card" style="display:none;margin-bottom:20px">
+        <div class="card-header">
+          <span class="card-title" style="font-size:22px">&#129518; Count Check <span style="font-family:var(--font-body,inherit);font-size:12px;font-weight:400;color:var(--muted)">theoretical vs. actual at the latest count</span></span>
+          <span id="countcheck-count" style="color:var(--muted);font-size:12px"></span>
+        </div>
+        <div id="countcheck-body" style="padding:0 4px 8px"></div>
       </div>
 
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>

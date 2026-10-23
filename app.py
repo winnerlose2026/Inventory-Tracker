@@ -31,6 +31,7 @@ from blueprints.email import email_bp  # noqa: E402
 from blueprints.reporting import reporting_bp  # noqa: E402
 from blueprints.planning import planning_bp  # noqa: E402
 from blueprints.activity import activity_bp  # noqa: E402
+from blueprints.insights import insights_bp  # noqa: E402
 app.register_blueprint(health_bp)
 app.register_blueprint(webhooks_bp)
 app.register_blueprint(freight_bp)
@@ -43,6 +44,7 @@ app.register_blueprint(email_bp)
 app.register_blueprint(reporting_bp)
 app.register_blueprint(planning_bp)
 app.register_blueprint(activity_bp)
+app.register_blueprint(insights_bp)
 
 # Session config — 30-day signed cookies. SECRET_KEY should come from Render's
 # environment (otherwise sessions reset on every redeploy when the random

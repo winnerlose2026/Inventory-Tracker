@@ -288,7 +288,7 @@ async function refreshLowStock(groups) {
             </colgroup>
             <thead>
               <tr>
-                <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
+                <th>Variety</th><th title="Today's estimate: the latest count, plus deliveries since, minus the daily usage burn">Theoretical</th><th>On Order</th><th>Unit</th><th>Price</th>
                 <th>Weekly Usage</th><th><span class="wks-full">Weeks Remaining</span><span class="wks-abbr">Wks</span></th><th>Status</th>
               </tr>
             </thead>
@@ -458,12 +458,16 @@ async function loadInventory() {
   // so each row can expand a lot-history sub-table.
   // Inventory is the landing page now. Build the grouped data once and feed
   // it to the Low Stock Alerts card so its rows match the table exactly.
-  const [groups, lotMap] = await Promise.all([
+  const [groups, lotMap, insights] = await Promise.all([
     api('/api/distributors'),
     api('/api/production/lots-by-pair').catch(() => ({})),
+    api('/api/insights').catch(() => null),
   ]);
   window._lotMapByPair = lotMap || {};
+  window._insights = (insights && insights.ok) ? insights : null;
   refreshLowStock(groups);
+  renderReorderCard(window._insights);
+  renderCountCheckCard(window._insights);
   refreshFlowAlerts();
 
   // Cache flat items for Edit/Use/Restock modal lookups.
@@ -508,7 +512,8 @@ async function loadInventory() {
         ${g.warehouses.map(w => {
           const whWeekly = w.items.reduce((a, i) => a + (i.weekly_usage || 0), 0);
           const whShort = w.items.filter(i => (i.weekly_usage || 0) > 0 && (i.quantity / i.weekly_usage) < 4).length;
-          const whFresh = renderWarehouseFreshness(w.last_count_at) + renderWarehouseCountGaps(w.items);
+          const whFresh = renderWarehouseFreshness(w.last_count_at) + renderWarehouseCountGaps(w.items)
+                        + renderWarehouseInsightChips(w.warehouse);
           return `
           <div style="padding:14px 16px 4px">
             <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;gap:12px;flex-wrap:wrap">
@@ -523,20 +528,24 @@ async function loadInventory() {
                 ${w.low_stock_count > 0 ? ` &middot; <span style="color:var(--yellow)">${w.low_stock_count} low</span>` : ''}
               </div>
             </div>
-            <table class="inv-table">
+            <table class="inv-table inv-main">
               <colgroup>
-                <col style="width:28%">
-                <col style="width:8%">
-                <col style="width:13%">
+                <col style="width:23%">
+                <col style="width:11%">
+                <col style="width:9%">
+                <col style="width:12%">
+                <col style="width:5%">
                 <col style="width:7%">
-                <col style="width:9%">
-                <col style="width:13%">
-                <col style="width:13%">
-                <col style="width:9%">
+                <col style="width:10%">
+                <col style="width:11%">
+                <col style="width:12%">
               </colgroup>
               <thead>
                 <tr>
-                  <th>Variety</th><th>Qty</th><th>On Order</th><th>Unit</th><th>Price</th>
+                  <th>Variety</th>
+                  <th title="The distributor's latest count (actual)">Counted</th>
+                  <th title="Today's estimate: the latest count, plus deliveries since, minus the daily usage burn">Theoretical</th>
+                  <th>On Order</th><th>Unit</th><th>Price</th>
                   <th>Weekly Usage</th><th><span class="wks-full">Weeks Remaining</span><span class="wks-abbr">Wks</span></th><th>Status</th>
                 </tr>
               </thead>
@@ -573,7 +582,8 @@ async function loadInventory() {
                     .trim();
                   return `<tr class="sku-row">
                     <td data-label="Variety" style="font-weight:600">${chevron} ${escHtml(displayName)}${hasLots ? ' <span class="badge badge-blue" title="' + activeLotCount + ' active lot(s), ' + fmtCs(lotRemainingCs) + ' cs counted toward on-hand (FIFO). ' + lots.length + ' lot(s) on record, ' + fmtCs(lotCs) + ' cs total.">' + activeLotCount + ' lot' + (activeLotCount === 1 ? '' : 's') + '</span>' : ''}${lotInTransitCs > 0 ? ' <span class="badge" style="background:rgba(5,23,71,.06);color:var(--muted)" title="Produced but not yet arrived; not counted toward on-hand until the arrival date.">+' + fmtCs(lotInTransitCs) + ' in transit</span>' : ''}</td>
-                    <td data-label="Qty" style="font-weight:600;${qtyCritical ? 'color:var(--red)' : ''}">${i.quantity.toFixed(0)}</td>
+                    <td data-label="Counted">${renderCountedCell(i)}</td>
+                    <td data-label="Theoretical" style="font-weight:600;${qtyCritical ? 'color:var(--red)' : ''}" title="Today's estimate: the latest count, plus deliveries since, minus the daily usage burn">${i.quantity.toFixed(0)}</td>
                     <td data-label="On Order">${renderOnOrder(i)}</td>
                     <td data-label="Unit">${escHtml(i.unit)}</td>
                     <td data-label="Price">${i.price > 0 ? '$' + i.price.toFixed(2) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
@@ -594,7 +604,7 @@ async function loadInventory() {
                     const activeCount = lots.filter(L => !L.is_in_transit && (L.cs_remaining ?? L.cs ?? 0) > 0).length;
                     const depletedCount = lots.filter(L => !L.is_in_transit && (L.cs_remaining ?? L.cs ?? 0) <= 0 && (L.cs_produced ?? 0) > 0).length;
                     return `<tr id="${rowId}" class="lot-detail-row" style="display:none;background:var(--surface-alt,#f7f7f9)">
-                    <td colspan="8" style="padding:8px 16px 12px 30px">
+                    <td colspan="9" style="padding:8px 16px 12px 30px">
                       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">
                         <strong style="color:var(--text)">FIFO &middot; oldest production date first.</strong>
                         ${lots.length} lot${lots.length === 1 ? '' : 's'} &middot;
@@ -5009,3 +5019,182 @@ function renderActivity() {
   }).join('') || '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:24px">Nothing here yet.</td></tr>';
 }
 
+
+// -------------------------------------------------------------------------
+// Theoretical vs actual (Count Check) + Suggested Orders
+// (/api/insights -- integrations/stock_insights.py)
+// -------------------------------------------------------------------------
+function _insItemCheck(item) {
+  const ins = window._insights;
+  if (!ins || !ins.count_checks) return null;
+  return (ins.count_checks.items || {})[String(item.name || '').toLowerCase()] || null;
+}
+
+function _insMd(iso) {
+  if (!iso) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso).trim());
+  const d = m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(5, 10);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function _insNum(v, dp) {
+  const n = Number(v) || 0;
+  return (dp === undefined) ? ((Math.abs(n - Math.round(n)) < 0.05) ? n.toFixed(0) : n.toFixed(1)) : n.toFixed(dp);
+}
+
+function _ccBadge(c, short) {
+  if (!c || !c.flag) return '';
+  const v = Number(c.variance) || 0;
+  const cls = v > 0 ? 'cc-up' : 'cc-down';
+  return `<span class="cc-badge ${cls}">${v > 0 ? '+' : '−'}${_insNum(Math.abs(v))}${short ? '' : ' vs proj.'}</span>`;
+}
+
+function renderCountedCell(i) {
+  const counted = i.last_count_qty;
+  if (counted === null || counted === undefined || !i.last_count_at) {
+    return '<span style="color:var(--muted)" title="No count on file for this SKU">&mdash;</span>';
+  }
+  const c = _insItemCheck(i);
+  let tip = `Counted ${_insNum(counted)} cs on ${_insMd(i.last_count_at)} (distributor report).`;
+  if (c) {
+    const v = Number(c.variance) || 0;
+    tip += `\nProjected for that date: ${_insNum(c.projected)} cs → ${v >= 0 ? '+' : '−'}${_insNum(Math.abs(v))} cs`;
+    if (c.variance_weeks !== null && c.variance_weeks !== undefined) tip += ` (${Math.abs(c.variance_weeks).toFixed(1)} wk of usage)`;
+    tip += '.';
+    if (c.usage_4w !== undefined && c.usage_4w !== null) tip += `\nCounts show ~${_insNum(c.usage_4w)} cs/wk used over the last ~${Math.round((c.usage_4w_days || 0) / 7)} wk, vs ${_insNum(c.weekly_usage)} cs/wk forecast.`;
+    if (c.unexplained_rise) tip += `\nStock rose ${_insNum(c.unexplained_rise)} cs since the previous count with no delivery on record.`;
+  }
+  return `<span title="${escAttr(tip)}" style="cursor:help">${_insNum(counted, 0)}</span>`
+    + ` <span style="color:var(--muted);font-size:11px">${_insMd(i.last_count_at)}</span>`
+    + _ccBadge(c, true);
+}
+
+function renderWarehouseInsightChips(warehouse) {
+  const ins = window._insights;
+  if (!ins) return '';
+  let h = '';
+  const cw = ((ins.count_checks || {}).warehouses || []).find(w => w.warehouse === warehouse);
+  if (cw && cw.flag) {
+    const v = Number(cw.net_variance) || 0;
+    const tip = (cw.hints || []).join('\n\n');
+    h += ` <span class="wh-fresh ${v >= 0 ? '' : 'wh-fresh-red'}" style="${v >= 0 ? 'background:rgba(240,179,35,.16);color:#8a6400;' : ''}cursor:help" title="${escAttr(tip)}" onclick="document.getElementById('countcheck-card').scrollIntoView({behavior:'smooth'})">Count ${_insMd(cw.count_at)}: ${v >= 0 ? '+' : '−'}${_insNum(Math.abs(v))} cs vs projected</span>`;
+  }
+  const rw = ((ins.reorder || {}).warehouses || []).find(w => w.warehouse === warehouse);
+  if (rw && (rw.short_count || rw.suggest_total_cs)) {
+    const label = rw.short_count
+      ? `${rw.short_count} SKU${rw.short_count === 1 ? '' : 's'} run short`
+      : `Suggest ${rw.suggest_total_cs} cs`;
+    h += ` <span class="wh-fresh ${rw.short_count ? 'wh-fresh-red' : ''}" style="${rw.short_count ? '' : 'background:rgba(5,23,71,.08);color:var(--accent);'}cursor:pointer" title="See Suggested Orders" onclick="document.getElementById('reorder-card').scrollIntoView({behavior:'smooth'})">&#128230; ${escHtml(label)}</span>`;
+  }
+  return h;
+}
+
+function renderReorderCard(ins) {
+  const card = document.getElementById('reorder-card');
+  const body = document.getElementById('reorder-body');
+  const countEl = document.getElementById('reorder-count');
+  if (!card || !body) return;
+  const whs = ((ins && ins.reorder) || {}).warehouses || [];
+  const act = whs.filter(w => w.short_count || w.suggest_total_cs);
+  if (!act.length) { card.style.display = 'none'; body.innerHTML = ''; return; }
+  card.style.display = '';
+  const shorts = act.reduce((a, w) => a + (w.short_count || 0), 0);
+  const total = act.reduce((a, w) => a + (w.suggest_total_cs || 0), 0);
+  const p = (ins.reorder || {}).params || {};
+  if (countEl) countEl.textContent = `· ${act.length} warehouse${act.length === 1 ? '' : 's'} · ${total} cs suggested` + (shorts ? ` · ${shorts} SKU${shorts === 1 ? '' : 's'} run short before a new order could land` : '');
+  const excl = ((ins.reorder || {}).excluded_varieties || []);
+  body.innerHTML = `<div class="ins-note info" style="margin:8px 12px">Covers lead time + ${p.review_days || 7}-day order cycle + ${p.safety_days_top4 || 14} days safety (top-4) / ${p.safety_days_other || 10} (others), in ${p.line_multiple_cs || 8}-cs layers, DC total rounded to ${p.pallet_cs || 56}-cs pallets. Usage = what the counts show was actually used (last ~6 weeks) where there is enough history, else the forecast.${excl.length ? ' Not suggested: ' + escHtml(excl.join(', ')) + ' (LTO).' : ''}</div>` +
+  act.map((w, idx) => {
+    const boxId = 'reorder-wh-' + idx;
+    const lines = (w.lines || []).filter(l => l.urgency !== 'ok' || l.suggest_cs > 0);
+    const notes = [w.usage_note, w.pool_note].filter(Boolean).map(n => `<div class="ins-note">${escHtml(n)}</div>`).join('');
+    return `
+      <div style="border-top:1px solid var(--border)">
+        <div onclick="toggleAlertWh('${boxId}', this)" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;user-select:none;flex-wrap:wrap">
+          <span class="chev" style="display:inline-block;width:12px;color:var(--muted)">&#9656;</span>
+          <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w.warehouse)}</span>
+          ${w.short_count ? `<span class="badge badge-red">${w.short_count} run short</span>` : ''}
+          ${w.suggest_total_cs ? `<span class="badge badge-blue">suggest ${w.suggest_total_cs} cs · ${_insNum(w.suggest_pallets)} pallet${w.suggest_pallets === 1 ? '' : 's'}</span>` : ''}
+          <span style="color:var(--muted);font-size:12px">lead ${w.lead_days} d (${escHtml(w.lead_basis || '')}) · an order placed today lands ~${_insMd(w.new_order_lands)}</span>
+        </div>
+        <div id="${boxId}" style="display:none;padding:0 16px 12px">
+          ${notes}
+          <div style="overflow-x:auto"><table class="ins-table">
+            <thead><tr>
+              <th>Variety</th><th style="text-align:right">Theoretical</th><th style="text-align:right">Usage /wk</th>
+              <th>On order</th><th style="text-align:right">Cover w/ orders</th><th>Runs out</th>
+              <th style="text-align:right">Suggest</th><th>Status</th>
+            </tr></thead>
+            <tbody>${lines.map(l => `<tr>
+              <td style="font-weight:600">${escHtml(l.variety)}</td>
+              <td style="text-align:right">${_insNum(l.theoretical, 0)}</td>
+              <td style="text-align:right" title="${escAttr(l.usage_basis === 'counts' ? 'From the counts (last ~6 wks). Forecast: ' + _insNum(l.forecast_weekly_usage) + '/wk' : 'Forecast weekly usage')}">${_insNum(l.weekly_usage)}${l.usage_basis === 'counts' ? ` <span style="color:var(--muted);font-size:10.5px">(fc ${_insNum(l.forecast_weekly_usage)})</span>` : ''}</td>
+              <td>${l.on_order ? `${_insNum(l.on_order, 0)} cs <span style="color:var(--muted);font-size:11px">${l.next_arrival ? 'next ' + _insMd(l.next_arrival) : ''}</span>` : '<span style="color:var(--muted)">none</span>'}</td>
+              <td style="text-align:right">${_insNum(l.weeks_cover_with_orders, 1)} wk</td>
+              <td style="${l.urgency === 'short' ? 'color:var(--red);font-weight:600' : ''}">${l.stockout_date ? _insMd(l.stockout_date) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+              <td style="text-align:right;font-weight:700">${l.suggest_cs ? l.suggest_cs + ' cs' : '<span style="color:var(--muted);font-weight:400">&mdash;</span>'}</td>
+              <td>${l.urgency === 'short'
+                    ? `<span class="badge badge-red" title="${escAttr('Projected to run out ' + _insMd(l.stockout_date) + ', before an order placed today could land (~' + _insMd(w.new_order_lands) + ')' + (l.on_order ? '. The open PO lands ' + _insMd(l.next_arrival) + '.' : '.'))}">Runs short</span>`
+                    : '<span class="badge badge-yellow">Order</span>'}</td>
+            </tr>`).join('')}</tbody>
+          </table></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderCountCheckCard(ins) {
+  const card = document.getElementById('countcheck-card');
+  const body = document.getElementById('countcheck-body');
+  const countEl = document.getElementById('countcheck-count');
+  if (!card || !body) return;
+  const whs = ((ins && ins.count_checks) || {}).warehouses || [];
+  if (!whs.length) { card.style.display = 'none'; body.innerHTML = ''; return; }
+  card.style.display = '';
+  const flagged = whs.filter(w => w.flag).length;
+  if (countEl) countEl.textContent = flagged
+    ? `· ${flagged} warehouse${flagged === 1 ? '' : 's'} counted well off the projection`
+    : '· every latest count landed close to the projection';
+  const p = (ins.count_checks || {}).params || {};
+  body.innerHTML = `<div class="ins-note info" style="margin:8px 12px">At each new count we compare what the distributor counted with what we projected for that day (previous count + deliveries − daily usage burn). Flagged when the gap is at least ${p.min_cs || 10} cs and ${p.min_weeks || 0.5} week of that SKU's usage.</div>` +
+  whs.map((w, idx) => {
+    const boxId = 'cc-wh-' + idx;
+    const v = Number(w.net_variance) || 0;
+    const hints = (w.hints || []).map(h => `<div class="ins-note">${escHtml(h)}</div>`).join('');
+    return `
+      <div style="border-top:1px solid var(--border)">
+        <div onclick="toggleAlertWh('${boxId}', this)" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;user-select:none;flex-wrap:wrap">
+          <span class="chev" style="display:inline-block;width:12px;color:var(--muted)">&#9656;</span>
+          <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w.warehouse)}</span>
+          <span style="color:var(--muted);font-size:12px">count ${_insMd(w.count_at)}</span>
+          <span class="badge ${w.flag ? (v >= 0 ? 'badge-yellow' : 'badge-red') : 'badge-green'}">${v >= 0 ? '+' : '−'}${Math.round(Math.abs(v))} cs vs projected</span>
+          ${w.flag ? `<span style="color:var(--muted);font-size:12px">${w.flagged} of ${w.skus} SKUs flagged</span>` : ''}
+          ${w.usage_4w_skus ? `<span style="color:var(--muted);font-size:12px">· counts show ~${Math.round(w.usage_4w)} cs/wk used vs ${Math.round(w.weekly_usage)} forecast (last ~6 wks)</span>` : ''}
+        </div>
+        <div id="${boxId}" style="display:none;padding:0 16px 12px">
+          ${hints}
+          <div style="overflow-x:auto"><table class="ins-table">
+            <thead><tr>
+              <th>Variety</th><th style="text-align:right">Projected</th><th style="text-align:right">Counted</th>
+              <th style="text-align:right">Gap</th><th style="text-align:right">Gap (wks)</th>
+              <th style="text-align:right">Forecast /wk</th><th style="text-align:right">Last week (counts)</th><th style="text-align:right">~6 wks (counts)</th>
+            </tr></thead>
+            <tbody>${(w.lines || []).map(l => {
+              const g = Number(l.variance) || 0;
+              return `<tr${l.flag ? ' style="background:rgba(240,179,35,.08)"' : ''}>
+                <td style="font-weight:600">${escHtml(l.variety)}</td>
+                <td style="text-align:right">${_insNum(l.projected)}</td>
+                <td style="text-align:right;font-weight:600">${_insNum(l.counted)}</td>
+                <td style="text-align:right;${l.flag ? 'font-weight:700;' : ''}${g > 0 ? 'color:#8a6400' : (g < 0 ? 'color:var(--red)' : '')}">${g >= 0 ? '+' : '−'}${_insNum(Math.abs(g))}</td>
+                <td style="text-align:right">${l.variance_weeks === null || l.variance_weeks === undefined ? '&mdash;' : (l.variance_weeks >= 0 ? '+' : '−') + Math.abs(l.variance_weeks).toFixed(1)}</td>
+                <td style="text-align:right">${_insNum(l.weekly_usage)}</td>
+                <td style="text-align:right">${l.unexplained_rise ? `<span style="color:var(--red)" title="Stock rose with no delivery on record">rose +${_insNum(l.unexplained_rise)}</span>` : (l.week === null || l.week === undefined ? '&mdash;' : _insNum(l.week))}</td>
+                <td style="text-align:right">${l.usage_4w === null || l.usage_4w === undefined ? '&mdash;' : _insNum(l.usage_4w)}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table></div>
+        </div>
+      </div>`;
+  }).join('');
+}
