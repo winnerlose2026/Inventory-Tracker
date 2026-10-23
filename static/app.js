@@ -466,7 +466,6 @@ async function loadInventory() {
   window._lotMapByPair = lotMap || {};
   window._insights = (insights && insights.ok) ? insights : null;
   refreshLowStock(groups);
-  renderReorderCard(window._insights);
   renderCountCheckCard(window._insights);
   refreshFlowAlerts();
 
@@ -4718,7 +4717,13 @@ async function loadToastSales() {
 // -------------------------------------------------------------------------
 // Production Planning tab -- renders /api/planning/guide (Phase 4 output).
 // -------------------------------------------------------------------------
+function openPlanner() {
+  const nav = document.getElementById('nav-planner');
+  if (nav) nav.click();
+}
+
 async function loadProductionGuide() {
+  loadOrderPlan();
   const sum = document.getElementById('planner-summary');
   const body = document.getElementById('planner-body');
   if (!sum || !body) return;
@@ -5080,68 +5085,14 @@ function renderWarehouseInsightChips(warehouse) {
     const tip = (cw.hints || []).join('\n\n');
     h += ` <span class="wh-fresh ${v >= 0 ? '' : 'wh-fresh-red'}" style="${v >= 0 ? 'background:rgba(240,179,35,.16);color:#8a6400;' : ''}cursor:help" title="${escAttr(tip)}" onclick="document.getElementById('countcheck-card').scrollIntoView({behavior:'smooth'})">Count ${_insMd(cw.count_at)}: ${v >= 0 ? '+' : '−'}${_insNum(Math.abs(v))} cs vs projected</span>`;
   }
-  const rw = ((ins.reorder || {}).warehouses || []).find(w => w.warehouse === warehouse);
-  if (rw && (rw.short_count || rw.suggest_total_cs)) {
+  const rw = ((ins.orders || {}).warehouses || []).find(w => w.warehouse === warehouse);
+  if (rw && (rw.short_count || rw.order_now)) {
     const label = rw.short_count
       ? `${rw.short_count} SKU${rw.short_count === 1 ? '' : 's'} run short`
-      : `Suggest ${rw.suggest_total_cs} cs`;
-    h += ` <span class="wh-fresh ${rw.short_count ? 'wh-fresh-red' : ''}" style="${rw.short_count ? '' : 'background:rgba(5,23,71,.08);color:var(--accent);'}cursor:pointer" title="See Suggested Orders" onclick="document.getElementById('reorder-card').scrollIntoView({behavior:'smooth'})">&#128230; ${escHtml(label)}</span>`;
+      : `Order ${rw.order_now.pallets} pallets`;
+    h += ` <span class="wh-fresh ${rw.short_count ? 'wh-fresh-red' : ''}" style="${rw.short_count ? '' : 'background:rgba(5,23,71,.08);color:var(--accent);'}cursor:pointer" title="See Suggested Orders on the Production Planner" onclick="openPlanner()">&#128230; ${escHtml(label)}</span>`;
   }
   return h;
-}
-
-function renderReorderCard(ins) {
-  const card = document.getElementById('reorder-card');
-  const body = document.getElementById('reorder-body');
-  const countEl = document.getElementById('reorder-count');
-  if (!card || !body) return;
-  const whs = ((ins && ins.reorder) || {}).warehouses || [];
-  const act = whs.filter(w => w.short_count || w.suggest_total_cs);
-  if (!act.length) { card.style.display = 'none'; body.innerHTML = ''; return; }
-  card.style.display = '';
-  const shorts = act.reduce((a, w) => a + (w.short_count || 0), 0);
-  const total = act.reduce((a, w) => a + (w.suggest_total_cs || 0), 0);
-  const p = (ins.reorder || {}).params || {};
-  if (countEl) countEl.textContent = `· ${act.length} warehouse${act.length === 1 ? '' : 's'} · ${total} cs suggested` + (shorts ? ` · ${shorts} SKU${shorts === 1 ? '' : 's'} run short before a new order could land` : '');
-  const excl = ((ins.reorder || {}).excluded_varieties || []);
-  body.innerHTML = `<div class="ins-note info" style="margin:8px 12px">Covers lead time + ${p.review_days || 7}-day order cycle + ${p.safety_days_top4 || 14} days safety (top-4) / ${p.safety_days_other || 10} (others), in ${p.line_multiple_cs || 8}-cs layers, DC total rounded to ${p.pallet_cs || 56}-cs pallets. Usage = what the counts show was actually used (last ~6 weeks) where there is enough history, else the forecast.${excl.length ? ' Not suggested: ' + escHtml(excl.join(', ')) + ' (LTO).' : ''}</div>` +
-  act.map((w, idx) => {
-    const boxId = 'reorder-wh-' + idx;
-    const lines = (w.lines || []).filter(l => l.urgency !== 'ok' || l.suggest_cs > 0);
-    const notes = [w.usage_note, w.pool_note].filter(Boolean).map(n => `<div class="ins-note">${escHtml(n)}</div>`).join('');
-    return `
-      <div style="border-top:1px solid var(--border)">
-        <div onclick="toggleAlertWh('${boxId}', this)" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;user-select:none;flex-wrap:wrap">
-          <span class="chev" style="display:inline-block;width:12px;color:var(--muted)">&#9656;</span>
-          <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w.warehouse)}</span>
-          ${w.short_count ? `<span class="badge badge-red">${w.short_count} run short</span>` : ''}
-          ${w.suggest_total_cs ? `<span class="badge badge-blue">suggest ${w.suggest_total_cs} cs · ${_insNum(w.suggest_pallets)} pallet${w.suggest_pallets === 1 ? '' : 's'}</span>` : ''}
-          <span style="color:var(--muted);font-size:12px">lead ${w.lead_days} d (${escHtml(w.lead_basis || '')}) · an order placed today lands ~${_insMd(w.new_order_lands)}</span>
-        </div>
-        <div id="${boxId}" style="display:none;padding:0 16px 12px">
-          ${notes}
-          <div style="overflow-x:auto"><table class="ins-table">
-            <thead><tr>
-              <th>Variety</th><th style="text-align:right">Theoretical</th><th style="text-align:right">Usage /wk</th>
-              <th>On order</th><th style="text-align:right">Cover w/ orders</th><th>Runs out</th>
-              <th style="text-align:right">Suggest</th><th>Status</th>
-            </tr></thead>
-            <tbody>${lines.map(l => `<tr>
-              <td style="font-weight:600">${escHtml(l.variety)}</td>
-              <td style="text-align:right">${_insNum(l.theoretical, 0)}</td>
-              <td style="text-align:right" title="${escAttr(l.usage_basis === 'counts' ? 'From the counts (last ~6 wks). Forecast: ' + _insNum(l.forecast_weekly_usage) + '/wk' : 'Forecast weekly usage')}">${_insNum(l.weekly_usage)}${l.usage_basis === 'counts' ? ` <span style="color:var(--muted);font-size:10.5px">(fc ${_insNum(l.forecast_weekly_usage)})</span>` : ''}</td>
-              <td>${l.on_order ? `${_insNum(l.on_order, 0)} cs <span style="color:var(--muted);font-size:11px">${l.next_arrival ? 'next ' + _insMd(l.next_arrival) : ''}</span>` : '<span style="color:var(--muted)">none</span>'}</td>
-              <td style="text-align:right">${_insNum(l.weeks_cover_with_orders, 1)} wk</td>
-              <td style="${l.urgency === 'short' ? 'color:var(--red);font-weight:600' : ''}">${l.stockout_date ? _insMd(l.stockout_date) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-              <td style="text-align:right;font-weight:700">${l.suggest_cs ? l.suggest_cs + ' cs' : '<span style="color:var(--muted);font-weight:400">&mdash;</span>'}</td>
-              <td>${l.urgency === 'short'
-                    ? `<span class="badge badge-red" title="${escAttr('Projected to run out ' + _insMd(l.stockout_date) + ', before an order placed today could land (~' + _insMd(w.new_order_lands) + ')' + (l.on_order ? '. The open PO lands ' + _insMd(l.next_arrival) + '.' : '.'))}">Runs short</span>`
-                    : '<span class="badge badge-yellow">Order</span>'}</td>
-            </tr>`).join('')}</tbody>
-          </table></div>
-        </div>
-      </div>`;
-  }).join('');
 }
 
 function renderCountCheckCard(ins) {
@@ -5197,4 +5148,209 @@ function renderCountCheckCard(ins) {
         </div>
       </div>`;
   }).join('');
+}
+
+// -------------------------------------------------------------------------
+// Production Planner: order plan, load, bake schedule, reps vs counts
+// (/api/planning/plan -- integrations/order_plan.py, usage_compare.py)
+// -------------------------------------------------------------------------
+var _planData = null;
+
+function _pal(cs) { return (Number(cs) || 0) / 56; }
+function _palTxt(cs) { const p = _pal(cs); return (Math.abs(p - Math.round(p)) < 0.05 ? p.toFixed(0) : p.toFixed(1)); }
+function _wkLabel(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  if (!m) return iso || '';
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+function _dayLabel(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  if (!m) return iso || '';
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' });
+}
+function _pct(v) { return (v === null || v === undefined) ? '&mdash;' : `${v > 0 ? '+' : ''}${v}%`; }
+
+async function loadOrderPlan() {
+  const basisEl = document.getElementById('plan-basis');
+  const basis = (basisEl && basisEl.value) || 'reps';
+  ['plan-load', 'plan-schedule', 'plan-orders', 'plan-compare'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<div style="color:var(--muted);padding:6px 0">Loading&hellip;</div>';
+  });
+  let r;
+  try { r = await api('/api/planning/plan?basis=' + encodeURIComponent(basis)); }
+  catch (e) { r = null; }
+  if (!r || !r.ok) {
+    const el = document.getElementById('plan-load');
+    if (el) el.innerHTML = '<div style="color:var(--red)">Plan unavailable.</div>';
+    return;
+  }
+  _planData = r;
+  const note = document.getElementById('plan-basis-note');
+  if (note) {
+    note.style.display = r.basis === r.default_basis ? 'none' : '';
+    note.innerHTML = r.basis === 'counts'
+      ? '<strong>What-if view:</strong> usage taken from our count-to-count history (last ~6 weeks) instead of the reps&rsquo; figures. Nothing in the system changes &mdash; the plan, the daily burn and the Inventory tab stay on the reps.'
+      : '';
+  }
+  renderPlanLoad(r);
+  renderPlanSchedule(r);
+  renderPlanOrders(r);
+  renderPlanCompare(r);
+}
+
+function renderPlanLoad(r) {
+  const el = document.getElementById('plan-load');
+  const sub = document.getElementById('plan-load-sub');
+  const L = r.load || {};
+  const weeks = L.weeks || [];
+  const capDay = _palTxt(L.cap_cs_per_day || 336);
+  if (sub) sub.textContent = `capacity ${capDay} pallets/day, Mon–Fri · Chefs Warehouse at its recent run-rate (${_palTxt(L.cw_weekly_runrate_cs)} pallets/wk) from 5 weeks out`;
+  const other = r.basis === 'reps' ? 'counts' : 'reps';
+  const tot = b => ((((r.compare || {}).load_totals || {})[b]) || []).reduce((a, w) => a + (Number(w.total_cs) || 0), 0);
+  const rows = weeks.filter(w => w.capacity_cs || w.total_cs).map(w => {
+    const util = w.capacity_cs ? Math.min(140, Math.round(w.total_cs / w.capacity_cs * 100)) : 0;
+    const over = w.over_cs > 0;
+    const color = over ? 'var(--red)' : (util >= 85 ? '#B07F0E' : 'var(--green)');
+    const note = over
+      ? `<span style="color:var(--red)">${_palTxt(w.over_cs)} pallets over</span>` + (w.pull_forward_possible_cs ? ` &mdash; bake ${_palTxt(w.pull_forward_possible_cs)} early in a lighter week` : ' &mdash; no spare earlier')
+      : (w.capacity_cs ? `${_palTxt(w.capacity_cs - w.total_cs)} pallets free` : 'no production days left');
+    const tip = (w.committed_pos || []).map(p => `${p.po_number} ${p.warehouse} ${p.cs} cs (bake by ${p.bake_by})`)
+      .concat((w.projected || []).map(p => `${p.now ? 'Suggested now' : 'Projected'}: ${p.warehouse} ${p.cs} cs (order ${p.order_date}, bake by ${p.bake_by})`)).join('\n');
+    return `<tr title="${escAttr(tip)}">
+      <td style="white-space:nowrap">${_wkLabel(w.week_of)}</td>
+      <td style="text-align:right">${_palTxt(w.capacity_cs)}</td>
+      <td style="text-align:right">${w.committed_cs ? _palTxt(w.committed_cs) : '&mdash;'}</td>
+      <td style="text-align:right">${w.suggested_now_cs ? _palTxt(w.suggested_now_cs) : '&mdash;'}</td>
+      <td style="text-align:right">${w.projected_cs ? _palTxt(w.projected_cs) : '&mdash;'}</td>
+      <td style="text-align:right">${w.cw_runrate_cs ? _palTxt(w.cw_runrate_cs) : '&mdash;'}</td>
+      <td style="text-align:right;font-weight:700">${_palTxt(w.total_cs)}</td>
+      <td><div class="load-bar"><span style="width:${Math.min(100, util)}%;background:${color}"></span></div><div style="font-size:10.5px;color:var(--muted)">${w.utilization_pct === null ? '' : w.utilization_pct + '%'}</div></td>
+      <td style="font-size:12px">${note}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div style="overflow-x:auto"><table class="ins-table">
+      <thead><tr><th>Week of</th><th style="text-align:right">Capacity</th><th style="text-align:right">POs in hand</th>
+      <th style="text-align:right">Suggested now</th><th style="text-align:right">Projected POs</th><th style="text-align:right">Chefs Whse</th>
+      <th style="text-align:right">Total</th><th>Load</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div style="font-size:12px;color:var(--muted);margin-top:8px">All figures in pallets (56 cs); bake-by = the day before the PO ships (arrival &minus; 7 days transit). Hover a week for its POs.
+    Over 8 weeks: <strong>${_palTxt(tot(r.basis))}</strong> pallets on ${r.basis === 'reps' ? 'the reps&rsquo; usage' : 'our counts'}, vs <strong>${_palTxt(tot(other))}</strong> on ${other === 'reps' ? 'the reps&rsquo; usage' : 'our counts'}.
+    ${(L.overdue_pos || []).length ? `<span style="color:var(--red)">Past their bake-by: ${escHtml(L.overdue_pos.join(', '))}.</span>` : ''}</div>`;
+}
+
+function renderPlanSchedule(r) {
+  const el = document.getElementById('plan-schedule');
+  const sub = document.getElementById('plan-sched-sub');
+  const S = r.schedule || {};
+  const days = S.days || [];
+  const cap = Number(S.cap_pallets_per_day) || 6;
+  if (sub) sub.textContent = 'earliest bake-by first, up to ' + cap + ' pallets a day';
+  const lateSet = new Set((S.late || []).map(l => l.label + '|' + l.warehouse));
+  const warn = (S.late || []).length
+    ? `<div class="flow-issue" style="margin:0 0 8px">Finishes after its bake-by: ${(S.late || []).map(l => `${escHtml(l.label)} (${escHtml(l.warehouse)}) due ${_dayLabel(l.due)}, done ${_dayLabel(l.done)}`).join('; ')}</div>` : '';
+  el.innerHTML = warn + `<div style="overflow-x:auto"><table class="ins-table">
+    <thead><tr><th>Day</th><th style="text-align:right">Pallets</th><th>Load</th><th>Bake</th></tr></thead>
+    <tbody>${days.map(d => {
+      const pct = Math.min(100, Math.round((Number(d.pallets) || 0) / cap * 100));
+      return `<tr>
+        <td style="white-space:nowrap">${_dayLabel(d.date)}</td>
+        <td style="text-align:right;font-weight:600">${d.pallets ? Number(d.pallets).toFixed(1) : '&mdash;'}</td>
+        <td><div class="load-bar" style="min-width:90px"><span style="width:${pct}%;background:${pct >= 100 ? '#B07F0E' : 'var(--green)'}"></span></div></td>
+        <td>${(d.jobs || []).map(j => `<span class="job-chip${j.kind === 'projected' ? ' proj' : ''}${lateSet.has(j.label + '|' + j.warehouse) ? ' late' : ''}" title="${escAttr('bake by ' + j.due)}">${escHtml(j.label)} &middot; ${escHtml((j.warehouse || '').split(',')[0])} &middot; ${j.cs} cs</span>`).join('') || '<span style="color:var(--muted);font-size:12px">open capacity</span>'}</td>
+      </tr>`;
+    }).join('')}</tbody></table></div>`;
+}
+
+function renderPlanOrders(r) {
+  const el = document.getElementById('plan-orders');
+  const sub = document.getElementById('plan-orders-sub');
+  const O = r.orders || {};
+  const whs = O.warehouses || [];
+  const p = O.params || {};
+  const nowCs = whs.reduce((a, w) => a + (w.order_now ? w.order_now.total_cs : 0), 0);
+  const shorts = whs.reduce((a, w) => a + (w.short_count || 0), 0);
+  if (sub) sub.textContent = `${_palTxt(nowCs)} pallets suggested now` + (shorts ? ` · ${shorts} SKU${shorts === 1 ? '' : 's'} run short before a new PO could land` : '');
+  const excl = O.excluded_varieties || [];
+  el.innerHTML = `<div class="ins-note info" style="margin:8px 12px">Lead time ${p.lead_days || 30} days. A DC orders when any SKU&rsquo;s on-hand + on-order drops below ${p.lead_days || 30} days + safety (${p.safety_days_top4 || 14} d top-4, ${p.safety_days_other || 10} d others) of usage; it orders every SKU back up to that + a ${p.review_days || 7}-day cycle, in 8-cs layers mixed on pallets, padded to its PO minimum (${p.min_po_pallets_default || 2} pallets; 6 at Riviera Beach, La Mirada, Ocala, US Foods Chicago, Zebulon). ${excl.length ? 'Not planned: ' + escHtml(excl.join(', ')) + ' (LTO).' : ''}</div>` +
+  whs.map((w, idx) => {
+    const id = 'plan-wh-' + idx;
+    const o = w.order_now;
+    const head = o
+      ? `<span class="badge badge-blue">order now: ${o.pallets} pallets (${o.total_cs} cs)</span>` + (o.padded_cs ? ` <span style="color:var(--muted);font-size:12px">needs ${o.needed_cs} cs, padded +${o.padded_cs} to the ${o.min_pallets}-pallet minimum</span>` : '')
+      : (w.next_order_date ? `<span style="color:var(--muted);font-size:12px">next PO ~${_wkLabel(w.next_order_date)}</span>` : '<span style="color:var(--muted);font-size:12px">no PO needed in the next 8 weeks</span>');
+    const proj = (w.projected_orders || []).map(x => `<tr>
+        <td>${x.now ? '<strong>now</strong>' : _wkLabel(x.order_date)}</td><td style="text-align:right">${x.pallets}</td>
+        <td style="text-align:right">${x.total_cs}</td><td>${_wkLabel(x.bake_by)}</td><td>${_wkLabel(x.ship_date)}</td><td>${_wkLabel(x.arrival_date)}</td>
+        <td style="font-size:11.5px;color:var(--muted)">${x.lines.map(l => escHtml(l.variety) + ' ' + l.qty).join(' · ')}</td></tr>`).join('');
+    return `<div style="border-top:1px solid var(--border)">
+      <div onclick="toggleAlertWh('${id}', this)" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 16px;user-select:none;flex-wrap:wrap">
+        <span class="chev" style="display:inline-block;width:12px;color:var(--muted)">&#9656;</span>
+        <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w.warehouse)}</span>
+        ${w.short_count ? `<span class="badge badge-red">${w.short_count} run short</span>` : ''}
+        ${head}
+        <span style="color:var(--muted);font-size:12px">· ${_actNum(w.weekly_usage)} cs/wk · min ${w.min_pallets} pallets</span>
+      </div>
+      <div id="${id}" style="display:none;padding:0 16px 12px">
+        <div style="overflow-x:auto"><table class="ins-table">
+          <thead><tr><th>Variety</th><th style="text-align:right">Theoretical</th><th style="text-align:right">Usage /wk</th><th>On order</th>
+          <th style="text-align:right">Cover</th><th>Runs out</th><th style="text-align:right">Order now</th></tr></thead>
+          <tbody>${(w.lines || []).map(l => `<tr>
+            <td style="font-weight:600">${escHtml(l.variety)}${l.short ? ' <span class="badge badge-red" style="font-size:10px" title="Runs out before a PO placed today could land">short</span>' : ''}</td>
+            <td style="text-align:right">${_actNum(l.theoretical)}</td>
+            <td style="text-align:right" title="${escAttr('Basis: ' + l.basis + ' · reps say ' + l.reps_weekly_usage + '/wk')}">${_actNum(l.weekly_usage)}</td>
+            <td>${l.on_order ? `${_actNum(l.on_order)} cs <span style="color:var(--muted);font-size:11px">next ${_wkLabel(l.next_arrival)}</span>` : '<span style="color:var(--muted)">none</span>'}</td>
+            <td style="text-align:right">${l.weeks_cover === null ? '&mdash;' : l.weeks_cover + ' wk'}</td>
+            <td style="${l.short ? 'color:var(--red);font-weight:600' : ''}">${l.stockout_date ? _wkLabel(l.stockout_date) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
+            <td style="text-align:right;font-weight:700">${l.suggest_cs ? l.suggest_cs + ' cs' : '<span style="color:var(--muted);font-weight:400">&mdash;</span>'}</td></tr>`).join('')}</tbody>
+        </table></div>
+        ${proj ? `<div style="font-size:12px;font-weight:600;margin:10px 0 4px">Projected POs (next 8 weeks)</div>
+        <div style="overflow-x:auto"><table class="ins-table"><thead><tr><th>Order</th><th style="text-align:right">Pallets</th><th style="text-align:right">cs</th><th>Bake by</th><th>Ships</th><th>Arrives</th><th>Mix</th></tr></thead><tbody>${proj}</tbody></table></div>` : ''}
+      </div></div>`;
+  }).join('');
+}
+
+function renderPlanCompare(r) {
+  const el = document.getElementById('plan-compare');
+  const sub = document.getElementById('plan-compare-sub');
+  const C = r.compare || {};
+  const bt = C.backtest || {};
+  const sc = C.scenarios || {};
+  const whs = bt.warehouses || [];
+  if (sub) sub.textContent = bt.from ? `backtest ${_wkLabel(bt.from)} – ${_wkLabel(bt.to)}` : '';
+  const t = bt.total || {};
+  const orders8 = (b, wh) => { const s = (sc[b] || {})[wh]; return s ? _palTxt(s.ordered_cs) : '&mdash;'; };
+  const rows = whs.map(w => {
+    const better = (w.counts_miss_per_sku_wk !== null && w.reps_miss_same_windows !== null)
+      ? (w.counts_miss_per_sku_wk < w.reps_miss_same_windows ? 'counts' : 'reps') : '';
+    return `<tr>
+      <td style="font-weight:600">${escHtml(w.warehouse)}</td>
+      <td style="text-align:right">${w.windows}${w.excluded_windows ? ` <span style="color:var(--muted);font-size:10.5px" title="Windows left out: stock rose with no delivery on record (or the window before one)">(−${w.excluded_windows})</span>` : ''}</td>
+      <td style="text-align:right">${w.actual_cs}</td>
+      <td style="text-align:right">${w.reps_cs} <span style="color:${Math.abs(w.reps_bias_pct || 0) >= 15 ? 'var(--red)' : 'var(--muted)'};font-size:11px">${_pct(w.reps_bias_pct)}</span></td>
+      <td style="text-align:right">${w.counts_bias_pct === null ? '&mdash;' : `<span style="color:${Math.abs(w.counts_bias_pct) >= 15 ? 'var(--red)' : 'var(--muted)'}">${_pct(w.counts_bias_pct)}</span> <span style="color:var(--muted);font-size:10.5px">(reps ${_pct(w.reps_bias_same_windows_pct)})</span>`}</td>
+      <td style="text-align:right">${w.reps_miss_same_windows === null ? w.reps_miss_per_sku_wk : w.reps_miss_same_windows} / ${w.counts_miss_per_sku_wk === null ? '&mdash;' : w.counts_miss_per_sku_wk}
+        ${better ? `<span class="badge ${better === 'reps' ? 'badge-green' : 'badge-yellow'}" style="font-size:10px;margin-left:4px">${better}</span>` : ''}</td>
+      <td style="text-align:right">${orders8('reps', w.warehouse)} / ${orders8('counts', w.warehouse)}</td>
+    </tr>`;
+  }).join('');
+  const pools = (bt.pools || []).map(pl => `<div class="ins-note info">Cheney FL as one pool (they move cases between DCs): reps ${_pct(pl.reps_bias_pct)} vs what was used, counts ${_pct(pl.counts_bias_pct)}.</div>`).join('');
+  const repsWins = whs.filter(w => w.counts_miss_per_sku_wk !== null && w.reps_miss_same_windows !== null && w.reps_miss_same_windows <= w.counts_miss_per_sku_wk).length;
+  const judged = whs.filter(w => w.counts_miss_per_sku_wk !== null && w.reps_miss_same_windows !== null).length;
+  const big = whs.filter(w => Math.abs(w.reps_bias_pct || 0) >= 20).map(w => `${w.warehouse.split(',')[0]} (${_pct(w.reps_bias_pct)})`);
+  el.innerHTML = `<div class="ins-note" style="border-left-color:var(--accent);background:var(--surface2)">
+      Across all DCs the reps&rsquo; figures came to <strong>${t.reps_cs}</strong> cs against <strong>${t.actual_cs}</strong> cs actually used (${_pct(t.reps_bias_pct)}).
+      SKU by SKU, the reps were as close or closer at <strong>${repsWins} of ${judged}</strong> DCs.
+      ${big.length ? `Where they drift: ${escHtml(big.join(', '))} &mdash; worth a word with those reps before trusting either number there.` : ''}
+    </div>
+    <div style="overflow-x:auto"><table class="ins-table">
+      <thead><tr><th>DC</th><th style="text-align:right" title="SKU count windows judged">Windows</th><th style="text-align:right">Actually used (cs)</th>
+      <th style="text-align:right">Reps predicted</th><th style="text-align:right" title="Counts-based prediction from earlier windows only; reps on the same windows in brackets">Counts predicted</th>
+      <th style="text-align:right" title="Typical miss per SKU per week, in cs: reps / counts (same windows)">Miss/SKU-wk reps / counts</th>
+      <th style="text-align:right" title="Projected POs over the next 8 weeks, in pallets">8-wk POs reps / counts</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${pools}
+    <div style="font-size:12px;color:var(--muted);margin-top:8px">${escHtml(bt.method || '')} Houston&rsquo;s reps figures were placeholders until Tom&rsquo;s 10/13 numbers, so its history understates them.</div>`;
 }

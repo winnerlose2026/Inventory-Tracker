@@ -22,13 +22,13 @@ _VARIETIES = [
 
 _WAREHOUSES = [
     {"distributor": "US Foods", "warehouse": "Manassas, VA", "region": "Mid-Atlantic", "transit_days": 7, "transfer_group": None},
-    {"distributor": "US Foods", "warehouse": "Zebulon, NC", "region": "Southeast", "transit_days": 7, "transfer_group": None},
-    {"distributor": "US Foods", "warehouse": "La Mirada, CA", "region": "West", "transit_days": 7, "transfer_group": None},
-    {"distributor": "US Foods", "warehouse": "Chicago, IL", "region": "Midwest", "transit_days": 7, "transfer_group": None},
+    {"distributor": "US Foods", "warehouse": "Zebulon, NC", "region": "Southeast", "transit_days": 7, "transfer_group": None, "min_po_pallets": 6},
+    {"distributor": "US Foods", "warehouse": "La Mirada, CA", "region": "West", "transit_days": 7, "transfer_group": None, "min_po_pallets": 6},
+    {"distributor": "US Foods", "warehouse": "Chicago, IL", "region": "Midwest", "transit_days": 7, "transfer_group": None, "min_po_pallets": 6},
     {"distributor": "US Foods", "warehouse": "Alcoa, TN", "region": "Southeast", "transit_days": 7, "transfer_group": None},
     {"distributor": "US Foods", "warehouse": "Houston, TX", "region": "South", "transit_days": 7, "transfer_group": None},
-    {"distributor": "Cheney Brothers", "warehouse": "Riviera Beach, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},
-    {"distributor": "Cheney Brothers", "warehouse": "Ocala, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},
+    {"distributor": "Cheney Brothers", "warehouse": "Riviera Beach, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl", "min_po_pallets": 6},
+    {"distributor": "Cheney Brothers", "warehouse": "Ocala, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl", "min_po_pallets": 6},
     {"distributor": "Cheney Brothers", "warehouse": "Punta Gorda, FL", "region": "Florida", "transit_days": 7, "transfer_group": "cheney-fl"},
 ]
 
@@ -40,9 +40,10 @@ DEFAULTS = {
     "freezer_pallet_cap": 110,
     "capacity": {
         "dependable_cs_per_day": 224,   # 4 pallets/day -- the rate we reliably hit
-        "max_cs_per_day": 280,          # 5 pallets/day -- the buffer-building lever
+        # JD 2026-10-23: production caps at 6 pallets/day, Mon-Fri.
+        "max_cs_per_day": 336,
         "production_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
-        "weekend_surge": True,          # Sat/Sun available when needed
+        "weekend_surge": False,
         "expansion_levers": ["packaging-machine efficiency", "true night shift"],
     },
     "top4": TOP4,
@@ -58,6 +59,24 @@ DEFAULTS = {
         "cheney-fl": ["Riviera Beach, FL", "Ocala, FL", "Punta Gorda, FL"],
     },
     "warehouses": _WAREHOUSES,
+    # PO minimums (JD 2026-10-23): 2 pallets everywhere; 6 at Riviera Beach,
+    # La Mirada, Ocala, US Foods Chicago and Zebulon (per-warehouse
+    # "min_po_pallets" above). Varieties mix on a pallet, so only the PO
+    # total has to land on whole pallets.
+    "min_po_pallets_default": 2,
+    # Order planning (integrations/order_plan.py). Lead time is fixed at 30
+    # days (JD 2026-10-23); usage "reps" = the weekly usage the warehouse
+    # reps report, "counts" = what our count-to-count history shows.
+    "ordering": {
+        "lead_days": 30,
+        "review_days": 7,
+        "safety_days_top4": 14,
+        "safety_days_other": 10,
+        "line_multiple_cs": 8,
+        "usage_basis": "reps",
+        "horizon_days": 56,
+        "exclude_categories": ["bagels-lto"],
+    },
     "varieties": [{"name": v, "top4": v in TOP4, "case_size": 60} for v in _VARIETIES],
 }
 
@@ -118,6 +137,15 @@ def transfer_group_for(warehouse: str):
 
 def pool_members(group: str) -> list:
     return list((load_planning_config().get("transfer_groups") or {}).get(group) or [])
+
+
+def min_po_pallets_for(warehouse: str) -> int:
+    cfg = load_planning_config()
+    w = (warehouse or "").strip()
+    for wh in cfg.get("warehouses") or []:
+        if wh.get("warehouse") == w and wh.get("min_po_pallets"):
+            return int(wh["min_po_pallets"])
+    return int(cfg.get("min_po_pallets_default") or 2)
 
 
 def transit_days_for(warehouse: str) -> int:

@@ -1,10 +1,10 @@
-"""Count checks (theoretical vs actual) and reorder suggestions
-(integrations/stock_insights.py, GET /api/insights)."""
+"""Count checks: theoretical vs actual (integrations/stock_insights.py,
+GET /api/insights)."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from integrations.stock_insights import count_checks, reorder_suggestions, lead_times
+from integrations.stock_insights import count_checks
 from test_po_operator_paths import H, KEY, _book, _day, env  # noqa: F401
 
 NOW = datetime(2026, 10, 23, 12, 0)
@@ -112,74 +112,11 @@ def test_stamped_at_the_count(env):
     assert chk["variance"] == -3 and chk["source"] == "recorded"
 
 
-# --- reorder -----------------------------------------------------------------
-
-def _ledger_arrivals(wh, days_list):
-    return [{"status": "arrived", "distributor": "US Foods", "warehouse": wh,
-             "ordered_at": (NOW - timedelta(days=a + d)).isoformat(),
-             "arrival_date": (NOW - timedelta(days=a)).isoformat()}
-            for a, d in days_list]
-
-
-def test_lead_time_is_learned_per_dc():
-    led = _ledger_arrivals("Punta Gorda, FL", [(5, 23), (12, 22), (19, 24)])
-    lt = lead_times(led, NOW, {"lead_history_days": 120, "lead_min_samples": 3,
-                               "distributors": ["US Foods", "Cheney Brothers"]})
-    assert lt["Punta Gorda, FL"][0] == 23
-
-
-def test_short_sku_with_no_po_gets_a_pallet_rounded_suggestion():
-    """Punta Gorda Blueberry: 4.4 cs, 4 cs/wk, nothing on order."""
-    inv = {"blueberry": _item(name="Blueberry Bagel 4oz [CB - Punta Gorda]",
-                              warehouse="Punta Gorda, FL", distributor="Cheney Brothers",
-                              quantity=4.4, weekly_usage=4.0),
-           "plain": _item(name="Plain Bagel 4oz [CB - Punta Gorda]",
-                          warehouse="Punta Gorda, FL", distributor="Cheney Brothers",
-                          quantity=200.0, weekly_usage=5.0)}
-    r = reorder_suggestions(inv, [], {}, now=NOW)
-    w = r["warehouses"][0]
-    bb = next(l for l in w["lines"] if l["variety"] == "Blueberry")
-    assert bb["urgency"] == "short" and bb["stockout_date"] <= "2026-10-31"
-    assert bb["suggest_cs"] % 8 == 0 and bb["suggest_cs"] > 0
-    assert w["suggest_total_cs"] % 56 == 0
-    pl = next(l for l in w["lines"] if l["variety"] == "Plain")
-    assert pl["urgency"] == "ok"
-
-
-def test_open_po_counts_toward_position_but_a_late_one_still_runs_short():
-    """Alcoa Plain: 1.2 cs, 4.2/wk, 32 cs landing in a week -> covered, but
-    it runs out before the PO lands."""
-    inv = {"p": _item(name="Plain Bagel 4oz [USF - Alcoa]", warehouse="Alcoa, TN",
-                      quantity=1.2, weekly_usage=4.2,
-                      on_order=[{"qty": 32.0, "po_number": "7236706H",
-                                 "arrival_date": (NOW + timedelta(days=7)).isoformat()}])}
-    l = reorder_suggestions(inv, [], {}, now=NOW)["warehouses"][0]["lines"][0]
-    assert l["urgency"] == "short" and l["on_order"] == 32
-    assert l["stockout_date"] < (NOW + timedelta(days=7)).date().isoformat()
-
-
-def test_counts_based_usage_drives_the_suggestion_when_history_is_solid():
-    inv = {"p": _item(quantity=150.0, weekly_usage=52.0)}
-    counts = {"p": {"usage_4w": 26.0, "usage_4w_windows": 4, "usage_4w_days": 28}}
-    l = reorder_suggestions(inv, [], {}, now=NOW, count_items=counts)["warehouses"][0]["lines"][0]
-    assert l["usage_basis"] == "counts" and l["weekly_usage"] == 26.0
-    l2 = reorder_suggestions(inv, [], {"usage_basis": "forecast"}, now=NOW,
-                             count_items=counts)["warehouses"][0]["lines"][0]
-    assert l2["usage_basis"] == "forecast" and l2["suggest_cs"] > l["suggest_cs"]
-
-
-def test_lto_is_not_suggested():
-    inv = {"pump": _item(name="Pumpernickel Bagel 4oz [USF - Houston]",
-                         category="bagels-lto", quantity=0.0, weekly_usage=2.0)}
-    r = reorder_suggestions(inv, [], {}, now=NOW)
-    assert r["warehouses"] == [] and r["excluded_varieties"] == ["Pumpernickel"]
-
-
 def test_insights_endpoint(env):
     it, sync, c = env
     _book(sync, "7800001O", order_day=_day(-3))
     r = c.get("/api/insights", headers=H).get_json()
-    assert r["ok"] and "warehouses" in r["reorder"] and "items" in r["count_checks"]
+    assert r["ok"] and "warehouses" in r["orders"] and "items" in r["count_checks"]
 
 
 def test_po_booked_after_the_count_explains_an_overage():

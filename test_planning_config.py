@@ -12,7 +12,7 @@ def test_defaults_shape():
     assert c["top4"] == ["Plain", "Everything", "Sesame", "Cinnamon Raisin"]
     assert c["freezer_pallet_cap"] == 110
     assert c["capacity"]["dependable_cs_per_day"] == 224
-    assert c["capacity"]["max_cs_per_day"] == 280
+    assert c["capacity"]["max_cs_per_day"] == 336      # 6 pallets/day (JD 10/23)
 
 
 def test_top4_helper():

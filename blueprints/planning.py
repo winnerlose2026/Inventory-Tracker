@@ -57,3 +57,58 @@ def api_planning_guide():
         toast_trend=toast_demand_trend(load_sales() or []),
     )
     return jsonify({"ok": True, **guide})
+
+
+@planning_bp.route("/api/planning/plan")
+def api_planning_plan():
+    """Order plan -> production load -> bake schedule, plus the reps-vs-counts
+    usage comparison. ?basis=reps (default: the configured basis) | counts.
+    Read-only; gated by the auth hook."""
+    from datetime import datetime
+    from flask import request
+    from core.errors import _log_exc
+    try:
+        from inventory_tracker import (load_inventory, load_usage, load_sales,
+                                       load_inventory_audit)
+        from integrations.production_planner import build_production_guide
+        from integrations.demand_model import warehouse_demand
+        from integrations.stock_insights import count_checks
+        from integrations.order_plan import (plan_orders, production_load,
+                                             daily_schedule, scenario_summary)
+        from integrations.usage_compare import backtest
+        from blueprints.pos import build_po_ledger
+        cfg = load_planning_config()
+        default_basis = (cfg.get("ordering") or {}).get("usage_basis") or "reps"
+        basis = (request.args.get("basis") or default_basis).strip().lower()
+        if basis not in ("reps", "counts"):
+            basis = default_basis
+        now = datetime.now()
+        inv = load_inventory()
+        usage = load_usage()
+        audit = load_inventory_audit(0)
+        ledger = build_po_ledger()
+        checks = count_checks(inv, usage, audit, cfg.get("count_check") or {}, ledger=ledger)
+        plans = {b: plan_orders(inv, cfg, b, checks["items"], now=now)
+                 for b in ("reps", "counts")}
+        guide = build_production_guide(inv=inv, ledger=ledger,
+                                       demand_rows=warehouse_demand(inv), config=cfg,
+                                       now=now)
+        queue = guide.get("production_queue") or []
+        loads = {b: production_load(queue, plans[b], cfg, ledger, now=now)
+                 for b in plans}
+        return jsonify({
+            "ok": True, "basis": basis, "default_basis": default_basis,
+            "orders": plans[basis],
+            "load": loads[basis],
+            "schedule": daily_schedule(queue, plans[basis], cfg, ledger, now=now),
+            "compare": {
+                "backtest": backtest(inv, usage, audit),
+                "scenarios": {b: scenario_summary(plans[b]) for b in plans},
+                "load_totals": {b: [{"week_of": w["week_of"], "total_cs": w["total_cs"],
+                                     "pallets": w["pallets"]}
+                                    for w in loads[b]["weeks"]] for b in loads},
+            },
+        })
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "planning plan")
+        return jsonify({"ok": False, "error": "internal error"}), 500

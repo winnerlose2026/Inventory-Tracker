@@ -1,4 +1,4 @@
-"""Count checks (theoretical vs actual) and per-DC reorder suggestions.
+"""Count checks: theoretical vs actual at each count.
 
 Pure functions over the inventory / usage / audit / ledger data -- no Flask, no
 file writes -- served by blueprints/insights.py.
@@ -17,42 +17,14 @@ THEORETICAL vs ACTUAL
     first on_hand row ingested at/after the count carries the projection
     (old_quantity) and the reset (new_quantity).
 
-REORDER
-    Inventory position = theoretical on-hand + everything on order. Reorder
-    point = daily usage x (lead + safety days); order-up-to = daily usage x
-    (lead + review + safety days). Below the reorder point -> suggest the gap,
-    each line rounded up to whole layers (8 cs) and the DC's total up to whole
-    pallets (56 cs), extra layers going to the lowest-cover lines. Lead time
-    per DC is the median order -> arrival of its recent arrived POs, else the
-    30-day default. A day-by-day projection with the open POs' arrival dates
-    gives the date the SKU runs out, if it does before a new order could land.
+Suggested orders moved to integrations/order_plan.py (Production Planner).
 """
 from __future__ import annotations
 
-import math
 from datetime import datetime, timedelta
-from statistics import median
 
 from core.util import naive_local_dt, rollover_row_live, absorbed_row_live, absorbed_row_qty
 
-REORDER_DEFAULTS = {
-    "lead_days": 30,           # USF / Cheney auto-ETA when no history
-    "review_days": 7,          # DCs order about weekly
-    "safety_days_top4": 14,
-    "safety_days_other": 10,
-    "line_multiple_cs": 8,
-    "pallet_cs": 56,
-    "lead_history_days": 120,
-    "lead_min_samples": 3,
-    "exclude_categories": ["bagels-lto"],
-    "distributors": ["US Foods", "Cheney Brothers"],
-    # "counts": plan on what the counts show was actually used (last ~6 weeks,
-    # >= 3 clean count windows / 14 days), else the forecast weekly usage.
-    # "forecast": always the weekly usage the distributor reports / we burn.
-    "usage_basis": "counts",
-    "counts_min_windows": 3,
-    "counts_min_days": 14,
-}
 COUNT_CHECK_DEFAULTS = {
     "min_cs": 10,              # below this a gap is noise
     "min_weeks": 0.5,          # ...or under half a week of usage
@@ -368,176 +340,4 @@ def _hints(w: dict, ledger, cfg: dict) -> list:
     return hints
 
 
-# ---------------------------------------------------------------------------
-# Reorder suggestions
-# ---------------------------------------------------------------------------
-
-def lead_times(ledger: list, now: datetime, cfg: dict) -> dict:
-    """{warehouse: (days, basis)} from recent arrived POs' order -> arrival."""
-    by_wh: dict = {}
-    cutoff = now - timedelta(days=int(cfg["lead_history_days"]))
-    for r in ledger or []:
-        if r.get("status") != "arrived" or r.get("distributor") not in cfg["distributors"]:
-            continue
-        o = naive_local_dt(r.get("ordered_at"))
-        a = naive_local_dt(r.get("arrival_date"))
-        if o is None or a is None or a < cutoff:
-            continue
-        d = (a - o).total_seconds() / 86400.0
-        if 3 <= d <= 90:
-            by_wh.setdefault(r.get("warehouse") or "", []).append(d)
-    out = {}
-    for wh, ds in by_wh.items():
-        if len(ds) >= int(cfg["lead_min_samples"]):
-            m = median(ds)
-            out[wh] = (int(round(min(45, max(14, m)))),
-                       f"median of {len(ds)} recent POs, order → arrival")
-    return out
-
-
-try:
-    from integrations.planning_config import transfer_group_for
-except Exception:  # noqa: BLE001
-    transfer_group_for = None
-
-
-def reorder_suggestions(inv: dict, ledger: list, cfg: "dict | None" = None,
-                        now: "datetime | None" = None, top4: "set | None" = None,
-                        count_items: "dict | None" = None) -> dict:
-    cfg = dict(REORDER_DEFAULTS, **(cfg or {}))
-    now = now or datetime.now()
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    top4 = top4 or {"Plain", "Everything", "Sesame", "Cinnamon Raisin"}
-    leads = lead_times(ledger, now, cfg)
-    mult = int(cfg["line_multiple_cs"]) or 1
-    pallet = int(cfg["pallet_cs"]) or 1
-    by_wh: dict = {}
-    excluded = set()
-    for key, it in inv.items():
-        if (it.get("distributor") or "") not in cfg["distributors"]:
-            continue
-        variety = _variety(it.get("name") or key)
-        if (it.get("category") or "") in cfg["exclude_categories"]:
-            excluded.add(variety)
-            continue
-        forecast_wu = _f(it.get("weekly_usage"))
-        cnt = (count_items or {}).get(key) or {}
-        counts_wu = cnt.get("usage_4w")
-        wu, basis_u = forecast_wu, "forecast"
-        if (cfg["usage_basis"] == "counts" and counts_wu is not None
-                and (cnt.get("usage_4w_windows") or 0) >= int(cfg["counts_min_windows"])
-                and (cnt.get("usage_4w_days") or 0) >= float(cfg["counts_min_days"])):
-            wu, basis_u = float(counts_wu), "counts"
-        if wu <= 0:
-            continue
-        wh = it.get("warehouse") or ""
-        lead, basis = leads.get(wh, (int(cfg["lead_days"]), "30-day default"))
-        safety = int(cfg["safety_days_top4"] if variety in top4 else cfg["safety_days_other"])
-        review = int(cfg["review_days"])
-        d = wu / 7.0
-        th = max(0.0, _f(it.get("quantity")))
-        arrivals = []
-        for o in it.get("on_order") or []:
-            q = _f(o.get("qty"))
-            if q <= 0:
-                continue
-            when = naive_local_dt(o.get("arrival_date") or o.get("eta") or "")
-            if when is None:
-                when = today + timedelta(days=lead)
-            arrivals.append((max(today, when.replace(hour=0, minute=0, second=0,
-                                                     microsecond=0)), q,
-                             o.get("po_number") or ""))
-        arrivals.sort()
-        on_order = sum(q for _, q, _ in arrivals)
-        position = th + on_order
-        rop = d * (lead + safety)
-        out_level = d * (lead + review + safety)
-        # Day-by-day: when does it run out, given the open POs' dates?
-        horizon = lead + review + safety
-        q = th
-        stockout = None
-        ai = 0
-        for day in range(0, horizon + 1):
-            date = today + timedelta(days=day)
-            while ai < len(arrivals) and arrivals[ai][0] <= date:
-                q += arrivals[ai][1]
-                ai += 1
-            if day > 0:
-                q -= d
-            if q < 0 and stockout is None:
-                stockout = date
-        suggest = 0
-        if position < rop:
-            suggest = int(math.ceil((out_level - position) / mult) * mult)
-        new_order_lands = today + timedelta(days=lead)
-        if stockout is not None and stockout < new_order_lands:
-            urgency = "short"          # runs out before anything ordered today
-        elif suggest > 0:
-            urgency = "order"
-        else:
-            urgency = "ok"
-        line = {
-            "item_key": key, "variety": variety, "top4": variety in top4,
-            "theoretical": round(th, 1), "weekly_usage": round(wu, 1),
-            "usage_basis": basis_u, "forecast_weekly_usage": round(forecast_wu, 1),
-            "on_order": round(on_order, 1),
-            "next_arrival": arrivals[0][0].date().isoformat() if arrivals else "",
-            "weeks_cover_now": round(th / d / 7.0, 1),
-            "weeks_cover_with_orders": round(position / d / 7.0, 1),
-            "reorder_point": round(rop, 1), "order_up_to": round(out_level, 1),
-            "stockout_date": stockout.date().isoformat() if stockout else "",
-            "suggest_cs": suggest, "urgency": urgency,
-            "usage_from_counts": counts_wu,
-        }
-        w = by_wh.setdefault(wh, {"warehouse": wh, "distributor": it.get("distributor") or "",
-                                  "lead_days": lead, "lead_basis": basis,
-                                  "new_order_lands": new_order_lands.date().isoformat(),
-                                  "lines": []})
-        w["lines"].append(line)
-
-    warehouses = []
-    for w in by_wh.values():
-        lines = w["lines"]
-        need = [l for l in lines if l["suggest_cs"] > 0]
-        raw = sum(l["suggest_cs"] for l in need)
-        total = raw
-        if raw:
-            total = int(math.ceil(raw / pallet) * pallet)
-            extra = total - raw
-            # Spread the pallet top-up a layer at a time onto the lowest cover.
-            while extra > 0 and need:
-                lowest = min(need, key=lambda l: (l["theoretical"] + l["on_order"]
-                                                   + l["suggest_cs"]) / max(l["weekly_usage"], 0.1))
-                lowest["suggest_cs"] += mult
-                extra -= mult
-        w["suggest_total_cs"] = sum(l["suggest_cs"] for l in lines)
-        w["suggest_pallets"] = round(w["suggest_total_cs"] / pallet, 2)
-        w["short_count"] = sum(1 for l in lines if l["urgency"] == "short")
-        w["order_count"] = sum(1 for l in lines if l["urgency"] == "order")
-        fc = [(l["forecast_weekly_usage"], l["usage_from_counts"]) for l in lines
-              if l["usage_from_counts"] is not None]
-        w["usage_note"] = ""
-        w["counts_basis_lines"] = sum(1 for l in lines if l["usage_basis"] == "counts")
-        if len(fc) >= 3:
-            a, b = sum(x for x, _ in fc), sum(y for _, y in fc)
-            if a > 0 and abs(b - a) / a >= 0.3:
-                w["usage_note"] = (f"Counts over the last ~6 weeks show about {b:.0f} cs/wk "
-                                   f"actually used here vs {a:.0f} cs/wk in the forecast"
-                                   + (" — suggestions use the counts." if
-                                      w["counts_basis_lines"] else
-                                      f" — suggestions may run {'high' if b < a else 'low'}."))
-        w["pool_note"] = ""
-        if transfer_group_for is not None and transfer_group_for(w["warehouse"]):
-            w["pool_note"] = ("Pooled with the other Cheney FL DCs — transfers between "
-                              "them show up as usage here; check the pool before ordering.")
-        rank = {"short": 0, "order": 1, "ok": 2}
-        lines.sort(key=lambda l: (rank[l["urgency"]], l["weeks_cover_with_orders"]))
-        warehouses.append(w)
-    warehouses.sort(key=lambda w: (-w["short_count"], -w["suggest_total_cs"], w["warehouse"]))
-    return {"warehouses": warehouses, "params": cfg,
-            "excluded_varieties": sorted(excluded),
-            "as_of": now.isoformat(timespec="seconds")}
-
-
-__all__ = ["count_checks", "reorder_suggestions", "lead_times",
-           "REORDER_DEFAULTS", "COUNT_CHECK_DEFAULTS"]
+__all__ = ["count_checks", "COUNT_CHECK_DEFAULTS"]
