@@ -30,6 +30,7 @@ from blueprints.admin import admin_bp  # noqa: E402
 from blueprints.email import email_bp  # noqa: E402
 from blueprints.reporting import reporting_bp  # noqa: E402
 from blueprints.planning import planning_bp  # noqa: E402
+from blueprints.activity import activity_bp  # noqa: E402
 app.register_blueprint(health_bp)
 app.register_blueprint(webhooks_bp)
 app.register_blueprint(freight_bp)
@@ -41,6 +42,7 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(email_bp)
 app.register_blueprint(reporting_bp)
 app.register_blueprint(planning_bp)
+app.register_blueprint(activity_bp)
 
 # Session config — 30-day signed cookies. SECRET_KEY should come from Render's
 # environment (otherwise sessions reset on every redeploy when the random
@@ -158,6 +160,40 @@ def _gate_requests():
     # preserving the intended destination.
     nxt = request.full_path if request.query_string else request.path
     return redirect(url_for("login", next=nxt))
+
+
+@app.after_request
+def _record_activity(response):
+    """Action log (core/activity.py): every change request under /api/ --
+    who sent it, what it asked for, what came back. Status labels and dates
+    on arrived POs used to change with no trace anywhere."""
+    try:
+        if (request.method not in ("POST", "PUT", "DELETE")
+                or not request.path.startswith("/api/")
+                or response.status_code == 401):
+            return response
+        if app.testing and not app.config.get("ACTIVITY_LOG"):
+            return response
+        from core.activity import record_request
+        if _user_logged_in():
+            actor = str(session.get("user") or "user")
+        elif getattr(g, "auth_scope", "") == "delivery":
+            actor = "Lineage task (delivery key)"
+        else:
+            ua = (request.headers.get("User-Agent") or "").lower()
+            actor = ("cron / script" if any(t in ua for t in
+                                            ("python", "curl", "httpx", "powershell"))
+                     else "API token")
+        payload = None
+        if response.is_json:
+            payload = response.get_json(silent=True)
+        record_request(endpoint=request.endpoint or "", method=request.method,
+                       path=request.path, status=response.status_code,
+                       actor=actor, body=request.get_json(silent=True),
+                       payload=payload)
+    except Exception:  # noqa: BLE001 -- logging must never fail a request
+        pass
+    return response
 
 
 @app.route("/api/auth/check")

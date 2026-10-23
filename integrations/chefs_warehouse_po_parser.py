@@ -49,12 +49,9 @@ item code on the PO.
 The ``Ship To`` header identifies the DC by CW's internal ID:
 
     200001 -> Dairyland USA Corporation, Bronx, NY      (NY DC)
+    133001 -> The Chefs' Warehouse Midwest, Chicago, IL (CHI DC)
     400001 -> The Chefs' Warehouse Mid-Atlantic,
-              Hanover, MD                               (MD + CHI DCs;
-                                                         CHI POs ship to
-                                                         Hanover and are
-                                                         transferred from
-                                                         there)
+              Hanover, MD                               (MD DC)
     600001 -> The Chefs' Warehouse Florida,
               Opa Locka, FL                             (FLA DC)
 
@@ -116,6 +113,35 @@ CW_SHIP_TO_TO_DC_NAME: dict[str, str] = {
     "400001": "CW Mid-Atlantic",
     "600001": "CW Florida",
 }
+
+# DC tag shown next to the city ("Opa Locka, FL (FLA)"), keyed on ship-to id
+# like the maps above. The tag in the email SUBJECT is typed by the buyer and
+# can be wrong -- PO 1226111 shipped to 600001 / Opa Locka but its subject said
+# "MD", and PO 1113603 shipped to 400001 / Hanover with "CHI" -- so the label
+# is derived from the PDF's Ship To, never copied from the subject.
+CW_SHIP_TO_TO_DC_CODE: dict[str, str] = {
+    "133001": "CHI",
+    "200001": "NY",
+    "400001": "MD",
+    "600001": "FLA",
+}
+CW_WAREHOUSE_TO_DC_CODE: dict[str, str] = {
+    CW_SHIP_TO_TO_WAREHOUSE[k]: v for k, v in CW_SHIP_TO_TO_DC_CODE.items()
+}
+
+
+def cw_dc_code(ship_to_id: str = "", warehouse: str = "",
+               fallback: str = "") -> str:
+    """Canonical DC tag for a CW PO: ship-to id first, then the mapped
+    warehouse, then ``fallback`` (the subject hint) only when neither is known."""
+    sid = (ship_to_id or "").strip()
+    if sid in CW_SHIP_TO_TO_DC_CODE:
+        return CW_SHIP_TO_TO_DC_CODE[sid]
+    wh = (warehouse or "").strip()
+    if wh in CW_WAREHOUSE_TO_DC_CODE:
+        return CW_WAREHOUSE_TO_DC_CODE[wh]
+    return (fallback or "").strip().upper()
+
 
 # Fallback for unknown ship-to IDs -- match on the city extracted from
 # the PDF address block.
@@ -200,7 +226,8 @@ class ChefsWarehousePO:
     ship_to_state: str = ""          # e.g. "MD"
     ship_to_zip: str = ""
     warehouse: str = ""              # canonical "<City>, <ST>"
-    dc_code: str = ""                # subject suffix hint (NY/MD/FLA/CHI), populated by caller
+    dc_code: str = ""                # DC tag (NY/MD/FLA/CHI) -- from Ship To once parsed
+    subject_dc_code: str = ""        # what the email subject said (hint only; can be wrong)
     buyer_id: str = ""
     buyer_name: str = ""             # e.g. "NATALIE LOPEZ"
     total_usd: Optional[float] = None
@@ -302,6 +329,10 @@ def parse_po_text(text: str, dc_code: str = "") -> ChefsWarehousePO:
         po.warehouse = CW_SHIP_TO_TO_WAREHOUSE[po.ship_to_id]
     elif po.ship_to_city in CW_DC_CITY_TO_WAREHOUSE:
         po.warehouse = CW_DC_CITY_TO_WAREHOUSE[po.ship_to_city]
+
+    # The DC tag follows the Ship To too; the subject's tag is kept as a hint.
+    po.subject_dc_code = po.dc_code
+    po.dc_code = cw_dc_code(po.ship_to_id, po.warehouse, fallback=po.dc_code)
 
     # Parse line items. Each item is a 2-line block. CW prints all
     # blocks back-to-back at the end of the PO.
@@ -409,6 +440,8 @@ __all__ = [
     "CW_SHIP_TO_TO_WAREHOUSE",
     "CW_DC_CITY_TO_WAREHOUSE",
     "CW_DESCRIPTION_TO_VARIETY",
+    "CW_SHIP_TO_TO_DC_CODE",
+    "cw_dc_code",
     "parse_po_pdf",
     "parse_po_text",
     "total_cs",

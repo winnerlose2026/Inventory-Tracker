@@ -376,6 +376,17 @@ def api_scan_health():
         except Exception as exc:  # noqa: BLE001
             _log_exc(exc, "scan health production subscriptions")
             production_subscriptions = {"error": "unavailable"}
+        # Pending POs <-> Inventory on-order agreement (blueprints/activity.py).
+        # La Mirada 7135734C sat "In Production" on one tab and already in
+        # on-hand on the other with no signal anywhere.
+        try:
+            from blueprints.activity import po_flow_check
+            _flow = po_flow_check()
+            po_flow = {"ok": _flow["ok"], "issue_count": _flow["issue_count"],
+                       "issues": _flow["issues"], "notes": _flow["notes"]}
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "scan health po flow")
+            po_flow = {"ok": None, "error": "unavailable"}
         scan_age_hours = None
         last_ts = health.get("ts") if health else None
         if last_ts:
@@ -403,6 +414,7 @@ def api_scan_health():
             "sku_count_gap_count": len(sku_gaps),
             "unparsed_reports": load_unparsed_reports(),
             "production_subscriptions": production_subscriptions,
+            "po_flow": po_flow,
         })
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "scan health")

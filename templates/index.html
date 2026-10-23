@@ -278,6 +278,21 @@
   }
   #logout-btn { padding: 6px 12px; font-size: 11px; }
 
+  .act-table td { font-size: 12.5px; padding: 9px 12px; vertical-align: top; }
+  .act-table th { padding: 9px 12px; }
+  .act-table tr.act-row { cursor: pointer; }
+  .act-table tr.act-row:hover td { background: var(--surface2); }
+  .act-table tr.act-detail td { background: var(--surface2); padding: 6px 12px 12px 40px; }
+  .act-table .act-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 2px 18px; font-size: 11.5px; color: var(--muted); }
+  .act-table .po-link { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); text-decoration: underline dotted; cursor: pointer; }
+  .act-pos { color: var(--green); font-weight: 600; }
+  .act-neg { color: var(--red); font-weight: 600; }
+  .flow-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+  .flow-wh { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  .flow-wh.bad { border-color: var(--red); background: rgba(236,80,57,.06); }
+  .flow-issue { border-left: 3px solid var(--red); padding: 6px 10px; margin: 8px 0; font-size: 12.5px; background: rgba(236,80,57,.05); }
+  .flow-note { border-left: 3px solid #B07F0E; padding: 6px 10px; margin: 8px 0; font-size: 12.5px; background: rgba(240,179,35,.08); }
+
   .pager-row {
     padding: 10px 20px;
     border-bottom: 1px solid var(--border);
@@ -743,6 +758,9 @@
       <div class="nav-item" onclick="showPage('report')">
         <span class="nav-icon">📈</span> Report
       </div>
+      <div class="nav-item" id="nav-activity" onclick="showPage('activity')">
+        <span class="nav-icon">🧾</span> Activity Log <span id="nav-activity-flag" class="badge badge-red" style="display:none;font-size:10px;padding:1px 7px;margin-left:4px"></span>
+      </div>
     </nav>
   </aside>
 
@@ -769,6 +787,7 @@
       </div>
 
       <div id="sync-report" style="display:none;margin-bottom:20px"></div>
+      <div id="inv-flow-alert" class="flow-issue" style="display:none;margin:0 0 16px"></div>
       <div class="card-title" style="font-size:22px;margin:28px 0 14px">Warehouse Inventory</div>
       <div id="inventory-container"></div>
 
@@ -803,6 +822,7 @@
           <button class="btn btn-ghost btn-sm active" id="pending-filter-all" onclick="setPendingFilter('all')">All</button>
         </div>
       </div>
+      <div id="pending-flow-alert" class="flow-issue" style="display:none;margin:0 0 16px"></div>
       <!-- In Transit: POs already shipped (ship date passed) and not yet
            arrived -- en route between ship and arrival. Surfaced on its own
            so it's clear what's already moving vs. still to produce/ship. -->
@@ -1205,6 +1225,95 @@
 
 <!-- Distributors page merged into Inventory -->
 
+    <!-- Activity Log -->
+    <div class="page" id="page-activity">
+      <div class="page-header">
+        <div>
+          <h1 style="margin-bottom:6px">Activity Log</h1>
+          <p class="subtitle" style="margin-bottom:0">Every change flowing through, newest first &mdash; counts, PO bookings, arrivals into on-hand, status and date edits, cancels, scans and follow-ups, and who or what made each one. Click a PO number to see its whole story.</p>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-ghost btn-sm" onclick="loadActivity()">&#8635; Refresh</button>
+        </div>
+      </div>
+
+      <div class="card" id="flow-card" style="margin-bottom:16px">
+        <div class="card-header">
+          <span class="card-title">Pending POs &harr; Inventory check</span>
+          <span id="flow-summary" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div id="flow-body" style="padding:12px 20px"></div>
+      </div>
+
+      <div class="card" style="margin-bottom:14px">
+        <div class="filters" style="padding:12px 20px">
+          <div class="filter-group">
+            <label for="act-days">Period</label>
+            <select id="act-days" onchange="loadActivity()" style="width:140px">
+              <option value="1">Last 24 hours</option>
+              <option value="3">Last 3 days</option>
+              <option value="7" selected>Last 7 days</option>
+              <option value="14">Last 14 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="act-warehouse">Warehouse</label>
+            <select id="act-warehouse" onchange="renderActivity()" style="width:190px">
+              <option value="">All warehouses</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="act-category">Type</label>
+            <select id="act-category" onchange="onActivityCategoryChange()" style="width:200px">
+              <option value="">Everything (no daily burn)</option>
+              <option value="action">Edits &amp; automation runs</option>
+              <option value="arrival">PO arrivals into on-hand</option>
+              <option value="po">PO bookings &amp; reversals</option>
+              <option value="count">Counts received</option>
+              <option value="usage">Weekly usage updates</option>
+              <option value="correction">Corrections</option>
+              <option value="burn">Daily usage burn</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="act-po">PO #</label>
+            <input id="act-po" type="search" placeholder="e.g. 7135734C" oninput="renderActivity()" style="width:150px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+          <div class="filter-group" style="flex:1;min-width:180px">
+            <label for="act-q">Search</label>
+            <input id="act-q" type="search" placeholder="variety, email subject, user&hellip;" oninput="renderActivity()" style="padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="pager-row">
+          <div id="act-info">Loading&hellip;</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-ghost btn-sm" id="act-prev" onclick="onActivityPage(-1)">&laquo; Newer</button>
+            <span id="act-page" style="min-width:80px;text-align:center"></span>
+            <button class="btn btn-ghost btn-sm" id="act-next" onclick="onActivityPage(1)">Older &raquo;</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="act-table">
+            <thead><tr>
+              <th style="width:120px">When</th>
+              <th style="width:150px">Type</th>
+              <th style="width:150px">Warehouse</th>
+              <th style="width:120px">PO</th>
+              <th>What happened</th>
+              <th style="width:110px;text-align:right">On-hand &Delta;</th>
+              <th style="width:130px">By</th>
+            </tr></thead>
+            <tbody id="act-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- Usage Log -->
     <div class="page" id="page-usage">
       <div class="page-header">
@@ -1542,7 +1651,7 @@
       </div>
       <div class="form-group full">
         <label>Status</label>
-        <select id="modify-po-status">
+        <select id="modify-po-status" onchange="onModifyStatusChange()">
           <option value="">Auto (computed from dates)</option>
           <option value="open">Open</option>
           <option value="overdue">Overdue</option>
@@ -1550,7 +1659,12 @@
           <option value="in_production">In Production</option>
           <option value="arrived">Arrived</option>
         </select>
-        <div style="font-size:11px;color:var(--muted);margin-top:4px">A manual status wins over the auto 30-day ETA / freight rules. Label only &mdash; it does not move inventory.</div>
+        <div id="modify-po-status-note" style="font-size:11px;color:var(--muted);margin-top:4px">A manual status wins over the auto 30-day ETA / freight rules, and the Inventory tab follows it: Open / Overdue / In Production / In Transit keep the PO <strong>on order</strong> (an already-arrived PO is moved back on order and its cases come out of on-hand). Arrived with an arrival date adds it to on-hand.</div>
+      </div>
+      <div class="form-group full" id="modify-po-arrival-group" style="display:none">
+        <label>Arrival date</label>
+        <input id="modify-po-arrival" type="date" onclick="try{this.showPicker()}catch(e){}">
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">The day the truck actually landed. On-hand gets the cases unless a count taken on/after that day already includes them. Leave blank to only change the label.</div>
       </div>
       <div class="form-group full">
         <label>Ship Date</label>

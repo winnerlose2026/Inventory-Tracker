@@ -73,6 +73,7 @@ function refresh(page) {
   else if (page === 'production') loadProduction();
   else if (page === 'planner') loadProductionGuide();
   else if (page === 'traceability') initTraceability();
+  else if (page === 'activity') loadActivity();
 }
 
 function distributorBadge(name) {
@@ -463,6 +464,7 @@ async function loadInventory() {
   ]);
   window._lotMapByPair = lotMap || {};
   refreshLowStock(groups);
+  refreshFlowAlerts();
 
   // Cache flat items for Edit/Use/Restock modal lookups.
   inventoryCache = [];
@@ -2230,6 +2232,7 @@ function _currentPendingStatus() {
 }
 
 async function loadPendingPOs() {
+  refreshFlowAlerts();
   await ensureWarehouses();
   // Populate warehouse filter dropdown
   const wSel = document.getElementById('pending-filter-warehouse');
@@ -2782,7 +2785,10 @@ async function _postArrivedAdjust(payload) {
   const moved = Number(r.onhand_delta_cs) || 0;
   const recordOnly = (r.changes || []).filter(c => c.record_only).length;
   let msg = `PO ${r.po_number} updated`;
-  if (moved) {
+  if (r.unrolled) {
+    msg = `PO ${r.po_number} hasn't arrived yet \u2014 moved back on order` +
+      (moved ? ` (on-hand ${moved.toFixed(0)} cs)` : ' (on-hand unchanged: a count already covers it)');
+  } else if (moved) {
     msg += ` — on-hand ${moved > 0 ? '+' : ''}${moved.toFixed(0)} cs`;
   } else if (recordOnly) {
     msg += ' — PO record corrected; on-hand left on the count';
@@ -3108,6 +3114,7 @@ function openModifyModal(presetPo) {
       state: g._state || '',
       distributor: g.distributor || '',
       warehouse: g.warehouse || '',
+      rolled: g._source === 'arrived',
     };
     modifyPoOrder.push(g.po_number);
   });
@@ -3177,8 +3184,39 @@ function onModifyPoSelect() {
   if (note) note.textContent = verified
     ? 'Ship date is verified by a freight invoice and is locked.'
     : invArrived
-      ? 'This PO has already arrived \u2014 use Reopen on its row to change it.'
+      ? 'This PO has already arrived \u2014 set a not-arrived status above to move it back on order, or use Reopen on its row.'
       : 'Arrival auto-sets to ship date + this location\u2019s learned transit (Freight > Lead Times; 7 days until it has 2 confirmed deliveries). Leave blank to use the 30-day ETA.';
+  const arrIn = document.getElementById('modify-po-arrival');
+  if (arrIn) arrIn.value = '';
+  onModifyStatusChange();
+}
+
+const _NOT_ARRIVED_STATES = ['open', 'overdue', 'in_transit', 'in_production'];
+
+// Status drives stock now (server: /api/pending/set-status). Show the arrival
+// date only for "Arrived" on an inventory PO that is still on order, and let a
+// rolled PO being moved back on order take a ship date in the same save.
+function onModifyStatusChange() {
+  const po = modifySelectedPo;
+  const info = modifyPoMap[po] || {};
+  const status = (document.getElementById('modify-po-status') || {}).value || '';
+  const isCW = info.source === 'chefs_warehouse';
+  const arrGroup = document.getElementById('modify-po-arrival-group');
+  const arrInput = document.getElementById('modify-po-arrival');
+  const showArrival = !isCW && status === 'arrived' && !info.rolled;
+  if (arrGroup) arrGroup.style.display = showArrival ? '' : 'none';
+  if (arrInput && showArrival && !arrInput.value) {
+    const d = new Date();
+    arrInput.value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  const shipInput = document.getElementById('modify-po-ship');
+  const note = document.getElementById('modify-po-ship-note');
+  const verified = info.ship_date_source === 'freight';
+  if (!isCW && info.rolled && !verified && shipInput) {
+    const unrolling = _NOT_ARRIVED_STATES.indexOf(status) !== -1;
+    shipInput.disabled = !unrolling;
+    if (note && unrolling) note.textContent = 'Saving moves this PO back on order (its cases come out of on-hand unless a count already covers them). Set the ship date if you know it.';
+  }
 }
 
 async function saveModifyPO() {
@@ -3189,12 +3227,28 @@ async function saveModifyPO() {
   const shipInput = document.getElementById('modify-po-ship');
   const newShip = shipInput ? shipInput.value : '';
   const verified = info.ship_date_source === 'freight';
-  const invArrived = (info.source !== 'chefs_warehouse') && (info.state === 'arrived');
+  let invArrived = (info.source !== 'chefs_warehouse') && (info.state === 'arrived');
+  const isCWpo = info.source === 'chefs_warehouse';
   let changed = false;
+  let movedMsg = '';
   try {
-    if ((newStatus || '') !== (info.override || '')) {
-      await api('/api/pending/set-status', 'POST', { po_number: po, status: newStatus });
+    const arrivalEl = document.getElementById('modify-po-arrival');
+    const arrivalDate = (!isCWpo && newStatus === 'arrived' && !info.rolled && arrivalEl) ? (arrivalEl.value || '') : '';
+    const unrolling = !isCWpo && info.rolled && _NOT_ARRIVED_STATES.indexOf(newStatus) !== -1;
+    if ((newStatus || '') !== (info.override || '') || arrivalDate || unrolling) {
+      const body = { po_number: po, status: newStatus };
+      if (arrivalDate) body.arrival_date = arrivalDate;
+      const sr = await api('/api/pending/set-status', 'POST', body);
+      if (sr && sr.ok === false) { toast('Save failed: ' + (sr.error || 'unknown'), 'error'); return; }
       changed = true;
+      const mb = sr && sr.moved_back_on_order;
+      if (mb) {
+        invArrived = false;          // its lines are on order again
+        movedMsg = ` \u2014 moved back on order (${Number(mb.cs).toFixed(0)} cs` +
+          (Number(mb.onhand_removed_cs) ? `, on-hand \u2212${Number(mb.onhand_removed_cs).toFixed(0)} cs)` : ', on-hand unchanged: a count already covers it)');
+      } else if (sr && sr.arrival_stamped_lines) {
+        movedMsg = ` \u2014 arrival ${formatDate(sr.arrival_date)} recorded; on-hand updates now`;
+      }
     }
     if (!verified && !invArrived && (newShip || '') !== (info.ship_date || '')) {
       const isCW = info.source === 'chefs_warehouse';
@@ -3211,7 +3265,7 @@ async function saveModifyPO() {
     toast('Save failed: ' + String(e), 'error');
     return;
   }
-  toast(changed ? `Updated PO ${po}` : `No changes for PO ${po}`);
+  toast(changed ? `Updated PO ${po}${movedMsg}` : `No changes for PO ${po}`);
   closeModal('modify-po-modal');
   await loadPendingPOs();
   loadDashboard();
@@ -4703,3 +4757,255 @@ async function loadProductionGuide() {
     }</tbody></table></div>` : '';
   body.innerHTML = qTbl + bakeTbl + bwTbl;
 }
+
+
+// -------------------------------------------------------------------------
+// Activity Log + Pending POs <-> Inventory flow check
+// (/api/activity, /api/activity/flow-check -- blueprints/activity.py)
+// -------------------------------------------------------------------------
+var activityData = null;
+var activityPage = 0;
+var activityExpanded = new Set();
+var activityLastCategory = '';
+const ACT_PAGE_SIZE = 50;
+const ACT_CATEGORIES = {
+  count:      { label: 'Count',        cls: 'badge-cheney' },
+  po:         { label: 'PO booking',   cls: 'badge-yellow' },
+  arrival:    { label: 'Arrival',      cls: 'badge-green'  },
+  action:     { label: 'Edit / run',   cls: 'badge-violet' },
+  usage:      { label: 'Usage rate',   cls: 'badge-gray'   },
+  correction: { label: 'Correction',   cls: 'badge-red'    },
+  burn:       { label: 'Daily burn',   cls: 'badge-gray'   },
+};
+const FLOW_KIND_TEXT = {
+  open_but_in_on_hand: 'Open on Pending POs, but already in on-hand',
+  qty_mismatch: 'Case counts disagree',
+  arrived_but_on_order: 'Arrived on Pending POs, still on order in Inventory',
+  arrived_future_date: 'In on-hand with an arrival date still ahead',
+  on_order_not_on_pending_tab: 'On order in Inventory, missing from Pending POs',
+  on_order_without_po: 'On order with no PO number',
+};
+
+// Server stamps are naive server-local time; show them in the viewer's time.
+function _actDate(ts, offsetMin) {
+  const m = String(ts || '').match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const utc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) - (Number(offsetMin) || 0) * 60000;
+  return new Date(utc);
+}
+
+function _actWhen(ts, offsetMin) {
+  const d = _actDate(ts, offsetMin);
+  if (!d) return escHtml(ts || '');
+  const mon = d.toLocaleString(undefined, { month: 'short' });
+  const t = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return `<span style="white-space:nowrap">${mon} ${d.getDate()}</span> <span style="color:var(--muted);white-space:nowrap">${t}</span>`;
+}
+
+function _actNum(v) {
+  const n = Number(v) || 0;
+  return (Math.abs(n - Math.round(n)) < 0.05) ? n.toFixed(0) : n.toFixed(1);
+}
+
+async function refreshFlowAlerts() {
+  let flow = null;
+  try { flow = await api('/api/activity/flow-check'); } catch (e) { return; }
+  const n = (flow && flow.issue_count) || 0;
+  const flag = document.getElementById('nav-activity-flag');
+  if (flag) { flag.style.display = n ? '' : 'none'; flag.textContent = n; }
+  const html = n ? `<strong>Pending POs and Inventory disagree on ${n} item${n === 1 ? '' : 's'}.</strong> ` +
+    (flow.issues || []).slice(0, 3).map(i =>
+      `PO <span class="po-link" onclick="openActivityForPo('${escAttr(i.po_number || '')}')">${escHtml(i.po_number || '?')}</span> (${escHtml(i.warehouse || '')}): ${escHtml(FLOW_KIND_TEXT[i.kind] || i.kind)}`).join(' &middot; ') +
+    ` &mdash; <a href="#" onclick="openActivityForPo('');return false">open the Activity Log</a>` : '';
+  ['inv-flow-alert', 'pending-flow-alert'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.style.display = n ? '' : 'none';
+    el.innerHTML = html;
+  });
+}
+
+function openActivityForPo(po) {
+  const poEl = document.getElementById('act-po');
+  if (poEl) poEl.value = po || '';
+  const nav = document.getElementById('nav-activity');
+  if (nav) nav.click();
+}
+
+function renderFlowCheck(flow) {
+  const body = document.getElementById('flow-body');
+  const sum = document.getElementById('flow-summary');
+  if (!body) return;
+  if (!flow || flow.ok === undefined) {
+    body.innerHTML = '<div style="color:var(--muted)">Flow check unavailable.</div>';
+    if (sum) sum.textContent = '';
+    return;
+  }
+  const whs = flow.warehouses || [];
+  const bad = whs.filter(w => !w.ok).length;
+  if (sum) sum.innerHTML = flow.ok
+    ? `<span class="badge badge-green">All ${whs.length} warehouses in sync</span>`
+    : `<span class="badge badge-red">${flow.issue_count} issue${flow.issue_count === 1 ? '' : 's'} &middot; ${bad} warehouse${bad === 1 ? '' : 's'}</span>`;
+  const issues = (flow.issues || []).map(i => `<div class="flow-issue">
+      <strong>${escHtml(FLOW_KIND_TEXT[i.kind] || i.kind)}</strong> &mdash;
+      ${i.po_number ? `PO <span class="po-link" onclick="filterActivityPo('${escAttr(i.po_number)}')">${escHtml(i.po_number)}</span> &middot; ` : ''}${escHtml(i.warehouse || '')}
+      <div style="color:var(--muted);margin-top:2px">${escHtml(i.detail || '')}</div></div>`).join('');
+  const notes = (flow.notes || []).map(i => `<div class="flow-note">
+      PO <span class="po-link" onclick="filterActivityPo('${escAttr(i.po_number || '')}')">${escHtml(i.po_number || '')}</span> &middot; ${escHtml(i.warehouse || '')}
+      <div style="color:var(--muted);margin-top:2px">${escHtml(i.detail || '')}</div></div>`).join('');
+  const grid = whs.map(w => `<div class="flow-wh${w.ok ? '' : ' bad'}">
+      <div style="display:flex;justify-content:space-between;gap:6px"><strong>${escHtml(w.warehouse)}</strong><span>${w.ok ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>'}</span></div>
+      <div style="color:var(--muted)">${escHtml(w.distributor || '')}</div>
+      <div>${w.open_pos} open PO${w.open_pos === 1 ? '' : 's'} &middot; ${_actNum(w.pending_pos_cs)} cs on Pending POs</div>
+      <div${w.ok ? '' : ' style="color:var(--red);font-weight:600"'}>${_actNum(w.inventory_on_order_cs)} cs on order in Inventory</div>
+    </div>`).join('');
+  const cw = (flow.chefs_warehouse || []);
+  const cwLine = cw.length ? `<div style="margin-top:10px;font-size:12px;color:var(--muted)">Chefs Warehouse (Pending POs only &mdash; no inventory feed): ` +
+    cw.map(c => `${escHtml(c.warehouse)} (${escHtml(c.dc_code || '')}) ${c.open_pos} PO${c.open_pos === 1 ? '' : 's'} / ${_actNum(c.open_cs)} cs`).join(' &middot; ') + '</div>' : '';
+  body.innerHTML = issues + notes + `<div class="flow-grid" style="margin-top:${issues || notes ? '10px' : '0'}">${grid}</div>` + cwLine;
+}
+
+function filterActivityPo(po) {
+  const el = document.getElementById('act-po');
+  if (el) el.value = po || '';
+  activityPage = 0;
+  renderActivity();
+}
+
+function onActivityCategoryChange() {
+  const cat = document.getElementById('act-category').value;
+  // The daily burn is only fetched when asked for (it is ~13 rows/warehouse/day).
+  if ((cat === 'burn') !== (activityLastCategory === 'burn')) { loadActivity(); return; }
+  activityLastCategory = cat;
+  activityPage = 0;
+  renderActivity();
+}
+
+async function loadActivity() {
+  const info = document.getElementById('act-info');
+  if (info) info.textContent = 'Loading\u2026';
+  const days = document.getElementById('act-days').value || '7';
+  const cat = document.getElementById('act-category').value || '';
+  activityLastCategory = cat;
+  const qs = new URLSearchParams({ days, limit: '3000' });
+  if (cat === 'burn') qs.set('include_burn', '1');
+  let data = null, flow = null;
+  try {
+    [data, flow] = await Promise.all([
+      api('/api/activity?' + qs.toString()),
+      api('/api/activity/flow-check').catch(() => null),
+    ]);
+  } catch (e) {
+    if (info) info.textContent = 'Could not load the activity log: ' + String(e);
+    return;
+  }
+  activityData = data || { events: [] };
+  activityPage = 0;
+  renderFlowCheck(flow);
+  const sel = document.getElementById('act-warehouse');
+  if (sel) {
+    const cur = sel.value;
+    const whs = new Set();
+    (activityData.events || []).forEach(e => { if (e.warehouse) whs.add(e.warehouse); });
+    ((flow && flow.warehouses) || []).forEach(w => whs.add(w.warehouse));
+    ((flow && flow.chefs_warehouse) || []).forEach(w => whs.add(w.warehouse));
+    sel.innerHTML = '<option value="">All warehouses</option>' +
+      Array.from(whs).sort().map(w => `<option${w === cur ? ' selected' : ''}>${escHtml(w)}</option>`).join('');
+  }
+  renderActivity();
+}
+
+function _activityFiltered() {
+  const evs = (activityData && activityData.events) || [];
+  const wh = (document.getElementById('act-warehouse') || {}).value || '';
+  const cat = (document.getElementById('act-category') || {}).value || '';
+  const po = _normPoKey((document.getElementById('act-po') || {}).value || '');
+  const q = ((document.getElementById('act-q') || {}).value || '').trim().toLowerCase();
+  return evs.filter(e => {
+    if (wh && e.warehouse !== wh) return false;
+    if (cat && e.category !== cat) return false;
+    if (po && _normPoKey(e.po_number || '').indexOf(po) === -1) return false;
+    if (q) {
+      const hay = [e.label, e.warehouse, e.po_number, e.detail, e.actor, e.distributor,
+                   (e.items || []).map(i => i.name).join(' ')].join(' ').toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  });
+}
+
+function onActivityPage(dir) {
+  activityPage = Math.max(0, activityPage + dir);
+  renderActivity();
+}
+
+function toggleActivityRow(key) {
+  if (activityExpanded.has(key)) activityExpanded.delete(key); else activityExpanded.add(key);
+  renderActivity();
+}
+
+function _actItemsHtml(e) {
+  const items = (e.items || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  return `<div class="act-items">` + items.map(i => {
+    let v = '';
+    if (i.from !== undefined && i.to !== undefined && e.category !== 'arrival') {
+      v = `${_actNum(i.from)} \u2192 ${_actNum(i.to)}`;
+    } else if (i.absorbed !== undefined) {
+      v = `${_actNum(i.absorbed)} cs (already counted)`;
+    } else if (i.on_order !== undefined) {
+      v = `on order ${Number(i.on_order) > 0 ? '+' : ''}${_actNum(i.on_order)} cs`;
+    } else {
+      v = `${Number(i.delta) > 0 ? '+' : ''}${_actNum(i.delta)} cs`;
+    }
+    return `<div>${escHtml((i.name || '').replace(/ Bagel 4oz/i, '').replace(/\s*\[.*\]$/, ''))}: <span style="color:var(--text)">${escHtml(v)}</span></div>`;
+  }).join('') + `</div>`;
+}
+
+function renderActivity() {
+  const body = document.getElementById('act-body');
+  if (!body) return;
+  const rows = _activityFiltered();
+  const pages = Math.max(1, Math.ceil(rows.length / ACT_PAGE_SIZE));
+  if (activityPage >= pages) activityPage = pages - 1;
+  const start = activityPage * ACT_PAGE_SIZE;
+  const slice = rows.slice(start, start + ACT_PAGE_SIZE);
+  const off = activityData ? activityData.tz_offset_min : 0;
+  const info = document.getElementById('act-info');
+  if (info) {
+    const total = (activityData && activityData.events || []).length;
+    info.textContent = rows.length
+      ? `Showing ${start + 1}\u2013${start + slice.length} of ${rows.length} event${rows.length === 1 ? '' : 's'}` + (rows.length !== total ? ` (filtered from ${total})` : '')
+      : 'No activity matches these filters.';
+  }
+  const pg = document.getElementById('act-page');
+  if (pg) pg.textContent = `Page ${activityPage + 1} / ${pages}`;
+  const prev = document.getElementById('act-prev'), next = document.getElementById('act-next');
+  if (prev) prev.disabled = activityPage <= 0;
+  if (next) next.disabled = activityPage >= pages - 1;
+
+  body.innerHTML = slice.map((e, idx) => {
+    const key = `${e.ts}|${e.label}|${e.warehouse}|${e.po_number}|${e.source}`;
+    const open = activityExpanded.has(key);
+    const cat = ACT_CATEGORIES[e.category] || { label: e.category, cls: 'badge-gray' };
+    const d = Number(e.delta_cs) || 0;
+    let delta = d ? `<span class="${d > 0 ? 'act-pos' : 'act-neg'}">${d > 0 ? '+' : '\u2212'}${_actNum(Math.abs(d))} cs</span>` : '<span style="color:var(--muted)">\u2014</span>';
+    if (e.on_order_cs) delta += `<div style="font-size:11px;color:var(--muted)">on order ${e.on_order_cs > 0 ? '+' : ''}${_actNum(e.on_order_cs)} cs</div>`;
+    if (e.absorbed_cs) delta += `<div style="font-size:11px;color:var(--muted)">${_actNum(e.absorbed_cs)} cs already counted</div>`;
+    const n = e.item_count || 0;
+    const more = n ? ` <span style="color:var(--muted);font-size:11px">${open ? '\u25be' : '\u25b8'} ${n} SKU${n === 1 ? '' : 's'}</span>` : '';
+    const label = e.failed ? `<span style="color:var(--red)">${escHtml(e.label)}</span>` : escHtml(e.label);
+    const detail = e.detail ? `<div style="color:var(--muted);font-size:11.5px;margin-top:2px">${escHtml(e.detail)}</div>` : '';
+    const po = e.po_number ? `<span class="po-link" onclick="event.stopPropagation();filterActivityPo('${escAttr(e.po_number)}')">${escHtml(e.po_number)}</span>` : '';
+    const row = `<tr class="act-row" onclick="toggleActivityRow('${escAttr(key)}')">
+        <td>${_actWhen(e.ts, off)}</td>
+        <td><span class="badge ${cat.cls}" style="font-size:10px">${escHtml(cat.label)}</span></td>
+        <td>${escHtml(e.warehouse || '')}${e.distributor ? `<div style="font-size:11px;color:var(--muted)">${escHtml(e.distributor)}</div>` : ''}</td>
+        <td>${po}</td>
+        <td><strong style="font-weight:600">${label}</strong>${more}${detail}</td>
+        <td style="text-align:right">${delta}</td>
+        <td style="font-size:12px">${escHtml(e.actor || '')}</td>
+      </tr>`;
+    return row + (open && n ? `<tr class="act-detail"><td colspan="7">${_actItemsHtml(e)}</td></tr>` : '');
+  }).join('') || '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:24px">Nothing here yet.</td></tr>';
+}
+

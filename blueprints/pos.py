@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request
 from blueprints.freight import _freight_ship_date_index
 from core.errors import _log_exc, _safe_err
 from core.util import _norm_po_key, rollover_row_live, absorbed_row_live, absorbed_row_qty
+from core.util import NOT_ARRIVED_STATUSES
 from core.util import with_data_lock
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
@@ -40,12 +41,17 @@ def _cw_po_summary(record: dict) -> dict:
         }
     total_cs = float(record.get("total_cs")
                      or sum(float(L.get("qty") or 0) for L in lines))
+    # Stored records written before the parser fix carry the SUBJECT's tag
+    # (PO 1226111 = Opa Locka shown as "(MD)"); derive it from the ship-to.
+    from integrations.chefs_warehouse_po_parser import cw_dc_code
+    dc = cw_dc_code(record.get("ship_to_id") or "", record.get("warehouse") or "",
+                    fallback=record.get("dc_code") or "")
     return {
         "po_number":    record.get("po_number") or "",
         "po_revision":  record.get("po_revision") or "",
         "distributor":  "Chefs Warehouse",
         "warehouse":    record.get("warehouse") or "",
-        "dc_code":      record.get("dc_code") or "",
+        "dc_code":      dc,
         "ordered_at":   record.get("ordered_at") or "",
         "eta":          record.get("eta") or "",
         "ship_date":    record.get("ship_date") or "",
@@ -247,6 +253,173 @@ def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
     return not receipt_inside_count(row, count_at, _rollover_arrival(row))
 
 
+def _future_iso(raw: str, now: datetime) -> str:
+    """``raw`` as naive-local ISO when it is a date AFTER ``now``, else ''."""
+    from inventory_tracker import _parse_sane_dt
+    dt = _parse_sane_dt(raw or "")
+    return dt.isoformat() if (dt is not None and dt > now) else ""
+
+
+def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
+               keep_dates: bool, include_absorbed: bool = False,
+               ship_iso: "str | None" = None, arrival_iso: "str | None" = None,
+               why: str = "") -> dict:
+    """Move an ARRIVED inventory PO back on order. Mutates ``inv``/``usage``.
+
+    Each live on_order_rollover row of the PO is retired (``reversed``) and a
+    pending on_order entry is re-created for its cases. On-hand drops by the
+    cases only while they are still a separate addend on it
+    (_rollover_still_in_onhand) -- once a count superseded the rollover, the
+    count is what is on the shelf and nothing moves. With
+    ``include_absorbed`` the PO's on_order_absorbed rows (zero-amount: a count
+    "contained" the arrival) come back on order too, again without moving
+    on-hand.
+
+    keep_dates=False is Reopen: the PO returns as Open with no dates.
+    keep_dates=True keeps the PO's ship date and any arrival still in the
+    FUTURE (an operator who says "it ships 10/30" has also said it is not
+    here). ``ship_iso`` / ``arrival_iso`` replace them when given. A ship date
+    with no usable arrival gets ship + the location's learned transit, but only
+    when that lands in the future -- a past arrival would roll the PO straight
+    back in on the next read. With no future arrival the entry carries no
+    trigger at all and waits on order for a ship date.
+
+    Returns {restored_lines, removed_cs, lines: [...], delivery_reopened}.
+    """
+    from integrations import lead_times as LT
+    from integrations.planning_config import transit_days_for
+    now = datetime.now()
+    key_norm = _norm_po_key(po_number)
+    restored = 0
+    removed_cs = 0.0
+    new_rows, lines = [], []
+    model = None
+    for e in usage:
+        absorbed = include_absorbed and absorbed_row_live(e)
+        # Superseded rows were already un-rolled by the revision that replaced
+        # them; un-rolling them again would subtract the cases twice.
+        if not (rollover_row_live(e) or absorbed):
+            continue
+        if _norm_po_key(e.get("po_number") or "") != key_norm:
+            continue
+        ik = e.get("item_key") or ""
+        item = inv.get(ik)
+        qty = absorbed_row_qty(e) if absorbed else abs(float(e.get("amount") or 0))
+        e["reversed"] = True
+        e["reversed_at"] = now_iso
+        if item is None or qty <= 0:
+            continue
+        # Pull the auto-added cases back out of on-hand -- but only while they
+        # are still a separate addend there. If a count has since superseded the
+        # rollover, on-hand already excludes these cases and subtracting would
+        # remove them twice. See _rollover_still_in_onhand.
+        still_in_onhand = (not absorbed) and _rollover_still_in_onhand(e, item)
+        if still_in_onhand:
+            item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
+            removed_cs += qty
+        item["updated"] = now_iso
+        entry = {
+            "qty":          qty,
+            "po_number":    e.get("po_number") or po_number,
+            "po_revision":  e.get("po_revision") or "",
+            "unit":         e.get("unit") or item.get("unit") or "cs",
+            "ordered_at":   e.get("ordered_at") or "",
+            "eta":          "",
+            "ship_date":    "",
+            "arrival_date": "",
+            # Keep the document identity so the next re-scan of the same
+            # email is recognised as a replay, not a newer revision.
+            "source_received_at": e.get("source_received_at") or "",
+            "source_sender":      e.get("source_sender") or "",
+        }
+        if keep_dates:
+            ship = ship_iso if ship_iso is not None else (e.get("ship_date") or "")
+            arr, src = "", ""
+            if arrival_iso:
+                arr, src = _future_iso(arrival_iso, now), "operator"
+            if not arr:
+                arr = _future_iso(e.get("arrival_date") or "", now)
+                # A future arrival on an ARRIVED row can only have been typed
+                # by an operator (/api/pos/arrived/adjust).
+                src = "operator" if (arr and e.get("adjusted_at")) else ""
+            if not arr and ship:
+                if model is None:
+                    try:
+                        from blueprints.freight import current_lead_time_model
+                        model = current_lead_time_model()["model"]
+                    except Exception as exc:  # noqa: BLE001 -- defaults apply
+                        _log_exc(exc, "lead-time model")
+                        model = {}
+                est, tdays, tbasis = LT.estimate_arrival(
+                    ship, item.get("distributor") or "",
+                    item.get("warehouse") or "", model, transit_days_for)
+                arr = _future_iso(est, now)
+                if arr:
+                    src = "ship+transit"
+                    entry["transit_days"] = tdays
+                    entry["transit_basis"] = tbasis
+            entry["ship_date"] = ship
+            entry["arrival_date"] = arr
+            entry["eta"] = arr
+            if src:
+                entry["arrival_source"] = src
+            if ship and e.get("ship_date_source") and ship_iso is None:
+                entry["ship_date_source"] = e["ship_date_source"]
+            entry["unrolled_at"] = now_iso
+        item.setdefault("on_order", []).append(entry)
+        # Audit row (positive = reverses the original -qty restock). When a
+        # count already superseded the rollover nothing moves, so the row
+        # records 0 and says why -- the reversal is metadata-only.
+        label = why or f"Reopened PO {po_number}"
+        new_rows.append({
+            "item_key":   ik,
+            "item_name":  e.get("item_name") or item.get("name") or ik,
+            "amount":     qty if still_in_onhand else 0.0,
+            "unit":       e.get("unit") or item.get("unit") or "",
+            "note":       ((f"{label} -- un-rolled from Arrived")
+                           if still_in_onhand else
+                           (f"{label} -- on-hand left on the "
+                            f"{(item.get('last_count_at') or '')[:10]} count, "
+                            f"which already excludes these {qty:g} cs")),
+            "timestamp":  now_iso,
+            "source":     "reversal",
+            "po_number":  e.get("po_number") or po_number,
+            "warehouse":  item.get("warehouse") or "",
+            "reverses_timestamp": e.get("timestamp") or "",
+        })
+        lines.append({"item_key": ik, "name": item.get("name") or ik,
+                      "warehouse": item.get("warehouse") or "",
+                      "qty": qty, "onhand_delta": -qty if still_in_onhand else 0.0,
+                      "ship_date": entry["ship_date"],
+                      "arrival_date": entry["arrival_date"]})
+        restored += 1
+    delivery_status = None
+    if restored:
+        usage.extend(new_rows)
+        # A Lineage-CONFIRMED delivery would roll the restored lines straight
+        # back on the next read (_delivery_gate -> "delivered"): Reopen
+        # reported "back to pending" and silently did nothing. Reopening the
+        # PO reopens its delivery record too, so the gate HOLDS until a new
+        # confirmation or an operator arrival date.
+        from datetime import timezone as _tz
+        from inventory_tracker import load_po_delivery, save_po_delivery
+        from integrations.po_delivery import norm_po, reopen_delivered
+        try:
+            tracking = load_po_delivery() or {}
+        except Exception as exc:  # noqa: BLE001 -- never block a reopen on it
+            _log_exc(exc, "reopen: po_delivery")
+            tracking = {}
+        trk = tracking.get(norm_po(po_number))
+        if trk and trk.get("status") == "delivered":
+            tracking[norm_po(po_number)] = reopen_delivered(
+                trk, datetime.now(_tz.utc),
+                note=f"{why or 'Reopened from Pending POs'} ({restored} line(s))")
+            delivery_status = tracking[norm_po(po_number)].get("status")
+            save_po_delivery(tracking)
+    return {"restored_lines": restored, "removed_cs": round(removed_cs, 2),
+            "lines": lines, "delivery_reopened": delivery_status}
+
+
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
 @with_data_lock
 def api_pending_reopen():
@@ -294,89 +467,11 @@ def api_pending_reopen():
     )
     inv = load_inventory()
     usage = load_usage()
-    key_norm = _norm_po_key(po_number)
-    restored = 0
-    removed_cs = 0.0
-    new_rows = []
-    for e in usage:
-        # Superseded rows were already un-rolled by the revision that replaced
-        # them; un-rolling them again would subtract the cases twice.
-        if not rollover_row_live(e):
-            continue
-        if _norm_po_key(e.get("po_number") or "") != key_norm:
-            continue
-        ik = e.get("item_key") or ""
-        item = inv.get(ik)
-        qty = abs(float(e.get("amount") or 0))
-        e["reversed"] = True
-        e["reversed_at"] = now_iso
-        if item is None or qty <= 0:
-            continue
-        # Pull the auto-added cases back out of on-hand -- but only while they
-        # are still a separate addend there. If a count has since superseded the
-        # rollover, on-hand already excludes these cases and subtracting would
-        # remove them twice. See _rollover_still_in_onhand.
-        still_in_onhand = _rollover_still_in_onhand(e, item)
-        if still_in_onhand:
-            item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
-            removed_cs += qty
-        item["updated"] = now_iso
-        # Restore the pending on_order entry (no ship date yet -> Open).
-        item.setdefault("on_order", []).append({
-            "qty":          qty,
-            "po_number":    e.get("po_number") or po_number,
-            "po_revision":  e.get("po_revision") or "",
-            "unit":         e.get("unit") or item.get("unit") or "cs",
-            "ordered_at":   e.get("ordered_at") or "",
-            "eta":          "",
-            "ship_date":    "",
-            "arrival_date": "",
-            # Keep the document identity so the next re-scan of the same
-            # email is recognised as a replay, not a newer revision.
-            "source_received_at": e.get("source_received_at") or "",
-            "source_sender":      e.get("source_sender") or "",
-        })
-        # Audit row (positive = reverses the original -qty restock). When a
-        # count already superseded the rollover nothing moves, so the row
-        # records 0 and says why -- the reversal is metadata-only.
-        new_rows.append({
-            "item_key":   ik,
-            "item_name":  e.get("item_name") or item.get("name") or ik,
-            "amount":     qty if still_in_onhand else 0.0,
-            "unit":       e.get("unit") or item.get("unit") or "",
-            "note":       (f"Reopened PO {po_number} -- un-rolled from Arrived"
-                           if still_in_onhand else
-                           f"Reopened PO {po_number} -- on-hand left on the "
-                           f"{(item.get('last_count_at') or '')[:10]} count, "
-                           f"which already excludes these {qty:g} cs"),
-            "timestamp":  now_iso,
-            "source":     "reversal",
-            "reverses_timestamp": e.get("timestamp") or "",
-        })
-        restored += 1
-    delivery_status = None
+    un = _unroll_po(po_number, inv, usage, now_iso=now_iso, keep_dates=False)
+    restored = un["restored_lines"]
+    removed_cs = un["removed_cs"]
+    delivery_status = un["delivery_reopened"]
     if restored:
-        usage.extend(new_rows)
-        # A Lineage-CONFIRMED delivery would roll the restored lines straight
-        # back on the next read (_delivery_gate -> "delivered"): Reopen
-        # reported "back to pending" and silently did nothing. Reopening the
-        # PO reopens its delivery record too, so the gate HOLDS until a new
-        # confirmation or an operator arrival date.
-        from datetime import timezone as _tz
-        from inventory_tracker import load_po_delivery, save_po_delivery
-        from integrations.po_delivery import norm_po, reopen_delivered
-        try:
-            tracking = load_po_delivery() or {}
-        except Exception as exc:  # noqa: BLE001 -- never block a reopen on it
-            _log_exc(exc, "reopen: po_delivery")
-            tracking = {}
-        trk = tracking.get(norm_po(po_number))
-        if trk and trk.get("status") == "delivered":
-            tracking[norm_po(po_number)] = reopen_delivered(
-                trk, datetime.now(_tz.utc),
-                note=f"Reopened from Pending POs ({restored} line(s))")
-            delivery_status = tracking[norm_po(po_number)].get("status")
-            save_po_delivery(tracking)
         save_inventory(inv)
         save_usage(usage)
     return jsonify({
@@ -526,6 +621,51 @@ def api_arrived_po_adjust():
                                               "PO - it may still be pending, "
                                               "or already reopened"}), 404
 
+    # A ship date after today or an arrival still ahead says the truck has
+    # not landed: the PO is not "arrived with different dates", it is on
+    # order. Recording those dates on the rollover rows (the old behaviour)
+    # left the cases in on-hand with nothing on order -- La Mirada 7135734C,
+    # 10/22: ship 10/30, arrival 11/06, 336 cs counted as already there.
+    _now = datetime.now()
+    _future_arrival = bool(arrival_iso and _future_iso(arrival_iso, _now))
+    _future_ship = bool(ship_iso and ship_iso[:10] > _now.date().isoformat())
+    if _future_arrival or _future_ship:
+        if qty_by_key:
+            return jsonify({"ok": False,
+                            "error": "A future ship/arrival date means this PO "
+                                     "has not been received yet, so received "
+                                     "quantities can't be recorded. Save the "
+                                     "date on its own."}), 400
+        un = _unroll_po(po_number, inv, usage, now_iso=now_iso, keep_dates=True,
+                        ship_iso=ship_iso, arrival_iso=arrival_iso,
+                        why=(f"PO {po_number} has not arrived "
+                             f"({'arrival ' + arrival_iso[:10] if _future_arrival else 'ships ' + ship_iso[:10]})"
+                             + (f" ({reason})" if reason else "")))
+        if un["restored_lines"]:
+            if ship_iso is not None:
+                for item in inv.values():
+                    for entry in (item.get("on_order") or []):
+                        if (_norm_po_key(entry.get("po_number") or "") == key_norm
+                                and entry.get("unrolled_at") == now_iso):
+                            entry["ship_date_source"] = ("operator-override"
+                                                         if override_freight else "operator")
+            save_inventory(inv)
+            save_usage(usage)
+        return jsonify({
+            "ok": un["restored_lines"] > 0,
+            "po_number": po_number,
+            "unrolled": True,
+            "arrival_date": arrival_iso,
+            "ship_date": ship_iso,
+            "lines_touched": un["restored_lines"],
+            "onhand_delta_cs": -un["removed_cs"],
+            "delivery_reopened": un["delivery_reopened"],
+            "changes": [dict(l, record_only=False,
+                             note="moved back on order -- not arrived yet")
+                        for l in un["lines"]],
+            "error": None if un["restored_lines"] else "No arrived lines to move",
+        })
+
     unknown = sorted(qty_by_key) and [
         k for k in qty_by_key
         if not any((e.get("item_key") or "") == k for e in rows)
@@ -667,11 +807,28 @@ def api_pending_set_status():
       status in {open, overdue, in_transit, in_production, arrived,
       cancelled}; empty / "auto" clears the override (back to computed).
 
-    Display-only: the override forces the tag shown on the Pending POs tab
-    (winning over the 30-day ETA / freight rules). It does NOT move
-    inventory on-hand.
+    The override forces the tag shown on the Pending POs tab (winning over
+    the 30-day ETA / freight rules), and since 2026-10-23 it also keeps the
+    Inventory tab in step with it:
+
+      * Open / Overdue / In Production / In Transit (NOT_ARRIVED_STATUSES):
+        the PO has not arrived. If it already rolled into on-hand (typically
+        on its automatic 30-day ETA), it is moved back on order -- its ship
+        date and any future arrival kept -- and the cases come back out of
+        on-hand unless a count already superseded them. While it carries no
+        dated arrival, _rollover_on_order will not roll it again.
+        La Mirada 7135734C: rolled 10/22 on the 30-day ETA, marked In
+        Production / ship 10/30, and kept 336 cs in on-hand with nothing on
+        order because this used to be a label only.
+      * Arrived + ``arrival_date``: stamps that arrival on the PO's pending
+        lines (arrival_source="operator"); the next read rolls them into
+        on-hand under the usual count-absorption rule. Without an
+        arrival_date, Arrived stays a label.
     """
-    from inventory_tracker import load_status_overrides, save_status_overrides
+    from inventory_tracker import (
+        load_status_overrides, save_status_overrides,
+        load_inventory, save_inventory, load_usage, save_usage,
+    )
     body = request.json or {}
     po_number = (body.get("po_number") or "").strip()
     status = (body.get("status") or "").strip().lower()
@@ -682,6 +839,11 @@ def api_pending_set_status():
     elif status not in _ALLOWED_PO_STATUSES:
         return jsonify({"ok": False,
                         "error": f"status must be one of {sorted(_ALLOWED_PO_STATUSES)} or empty"}), 400
+    arrival_iso = None
+    if status == "arrived" and body.get("arrival_date"):
+        arrival_iso, err = _parse_iso_date(body["arrival_date"], "arrival_date")
+        if err:
+            return err
     key = _norm_po_key(po_number)
     overrides = load_status_overrides()
     if status:
@@ -689,8 +851,46 @@ def api_pending_set_status():
     else:
         overrides.pop(key, None)
     save_status_overrides(overrides)
-    return jsonify({"ok": True, "po_number": po_number, "key": key,
-                    "status": status or None})
+    out = {"ok": True, "po_number": po_number, "key": key,
+           "status": status or None}
+
+    if status in NOT_ARRIVED_STATUSES:
+        inv = load_inventory()
+        usage = load_usage()
+        label = status.replace("_", " ").title()
+        un = _unroll_po(po_number, inv, usage,
+                        now_iso=datetime.now().isoformat(), keep_dates=True,
+                        include_absorbed=True,
+                        why=f"PO {po_number} set to {label}")
+        if un["restored_lines"]:
+            save_inventory(inv)
+            save_usage(usage)
+            out["moved_back_on_order"] = {
+                "lines": un["restored_lines"],
+                "cs": round(sum(l["qty"] for l in un["lines"]), 2),
+                "onhand_removed_cs": un["removed_cs"],
+                "delivery_reopened": un["delivery_reopened"],
+                "detail": un["lines"],
+            }
+    elif arrival_iso:
+        inv = load_inventory()
+        stamped = 0
+        for item in inv.values():
+            for entry in (item.get("on_order") or []):
+                if _norm_po_key(entry.get("po_number") or "") != key:
+                    continue
+                entry["arrival_date"] = arrival_iso
+                entry["eta"] = arrival_iso
+                entry["arrival_source"] = "operator"
+                entry.pop("rebooked_after_count", None)
+                for k in ("transit_days", "transit_basis"):
+                    entry.pop(k, None)
+                stamped += 1
+        if stamped:
+            save_inventory(inv)
+        out["arrival_stamped_lines"] = stamped
+        out["arrival_date"] = arrival_iso
+    return jsonify(out)
 
 
 @pos_bp.route("/api/chefs-warehouse/pos")

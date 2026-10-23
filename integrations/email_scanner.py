@@ -825,6 +825,7 @@ def _chefs_warehouse_po_to_record(pdf_bytes, msg_id, subject):
         "distributor":  "Chefs Warehouse",
         "warehouse":    po.warehouse or "",
         "dc_code":      po.dc_code or "",
+        "subject_dc_code": po.subject_dc_code or "",
         "ship_to_id":   po.ship_to_id or "",
         "ship_to_name": po.ship_to_name or "",
         "ship_to_city": po.ship_to_city or "",

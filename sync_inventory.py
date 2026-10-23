@@ -1149,6 +1149,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         "old_quantity": old_qty,
         "new_quantity": new_qty,
         "delta": round(new_qty - old_qty, 2),
+        "subject": (evt.source_subject or "")[:80],
     }
     # Surface a weekly-usage refresh (inventory worksheets carry it) so the
     # report shows it even when cases-on-hand didn't move.
@@ -1286,8 +1287,14 @@ def _apply_cw_pos(cw_pos: list,
             arrival_date = existing_rec.get("arrival_date") or ""
             first_ingest = existing_rec.get("ingested_at") or now_iso
 
+        # DC tag from the PDF's Ship To, never the buyer-typed subject tag
+        # (PO 1226111: Opa Locka ship-to, subject "MD").
+        from integrations.chefs_warehouse_po_parser import cw_dc_code
         normalized = {
             **record,
+            "dc_code":      cw_dc_code(record.get("ship_to_id") or "",
+                                       record.get("warehouse") or "",
+                                       fallback=record.get("dc_code") or ""),
             "po_number":    po_num,
             "distributor":  record.get("distributor") or "Chefs Warehouse",
             "ordered_at":   ordered_at,
@@ -1795,6 +1802,11 @@ def _apply_events(events: list,
                     "old_quantity": c.get("old_quantity"),
                     "new_quantity": c.get("new_quantity"),
                     "delta": c.get("delta"),
+                    # Which PO / how many cases on order / which email: the
+                    # Activity Log needs them, and they were being dropped.
+                    **{k: c[k] for k in ("po_number", "po_revision",
+                                         "on_order_delta", "eta", "subject")
+                       if c.get(k) not in (None, "")},
                 }
                 for c in (report.get("changes") or []) if isinstance(c, dict)
             ])

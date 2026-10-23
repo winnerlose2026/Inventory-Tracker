@@ -744,9 +744,11 @@ STATUS_OVERRIDES_FILE = DATA_DIR / "po_status_overrides.json"
 def load_status_overrides() -> dict:
     """Return {normalized_po_key: status} manual Pending-PO status overrides.
 
-    Display-only: forces the tag shown on the Pending POs tab, winning over
-    the date-computed status and any freight inference. Does not touch
-    inventory quantity.
+    Forces the tag shown on the Pending POs tab, winning over the
+    date-computed status and any freight inference. Since 2026-10-23 a
+    not-arrived status (core.util.NOT_ARRIVED_STATUSES) also keeps the PO on
+    order: _rollover_on_order will not roll it on the bare 30-day ETA, and
+    /api/pending/set-status moves an already-rolled PO back on order.
     """
     return _read_json(STATUS_OVERRIDES_FILE, {})
 
@@ -1009,6 +1011,12 @@ def _rollover_on_order(inv: dict) -> bool:
         missed = _counts_that_missed_deliveries(inv, tracking, now) if tracking else {}
     except Exception:  # noqa: BLE001 -- fall back to the plain day rule
         missed = {}
+    try:
+        overrides = load_status_overrides() or {}
+    except Exception:  # noqa: BLE001 -- a bad overrides file must not stop reads
+        overrides = {}
+    from core.util import NOT_ARRIVED_STATUSES, _norm_po_key
+    rolled_pos: set = set()
     for key, item in inv.items():
         pending = item.get("on_order") or []
         if not pending:
@@ -1020,6 +1028,17 @@ def _rollover_on_order(inv: dict) -> bool:
             if gate == "hold":
                 # Sent to Lineage, not yet confirmed delivered: stays pending
                 # whatever its dates say.
+                kept.append(entry)
+                continue
+            if (gate != "delivered"
+                    and not (entry.get("arrival_date") or "").strip()
+                    and overrides.get(_norm_po_key(entry.get("po_number") or ""))
+                    in NOT_ARRIVED_STATUSES):
+                # An operator marked the PO Open / In Production / In Transit /
+                # Overdue and its only trigger is the automatic 30-day ETA -- a
+                # guess. The operator's word beats the guess: it stays on order
+                # until a real date exists (ship date -> arrival, an explicit
+                # arrival, or a Lineage-confirmed delivery).
                 kept.append(entry)
                 continue
             if entry.get("rebooked_after_count") and gate != "delivered":
@@ -1061,6 +1080,7 @@ def _rollover_on_order(inv: dict) -> bool:
             miss = missed.get((entry.get("po_number") or "", key))
             if (count_date and trigger.date().isoformat() <= count_date
                     and miss is None):
+                rolled_pos.add(_norm_po_key(entry.get("po_number") or ""))
                 _PENDING_ROLLOVER_ABSORBED.append({
                     "item_key": key,
                     "item_name": item.get("name", key),
@@ -1078,6 +1098,7 @@ def _rollover_on_order(inv: dict) -> bool:
 
             item["quantity"] = float(item.get("quantity", 0)) + qty
             item["updated"] = now.isoformat()
+            rolled_pos.add(_norm_po_key(entry.get("po_number") or ""))
             _PENDING_ROLLOVER_AUDIT.append({
                 "item_key": key,
                 "item_name": item.get("name", key),
@@ -1100,6 +1121,24 @@ def _rollover_on_order(inv: dict) -> bool:
             })
             changed = True
         item["on_order"] = kept
+    # A pinned not-arrived status on a PO that has now arrived in full (a
+    # dated arrival passed, or Lineage confirmed it) is stale: clear it, or
+    # the Pending POs tab keeps saying "In Production" about stock that is in
+    # on-hand -- the split La Mirada 7135734C showed on 10/22.
+    stale = {po for po in rolled_pos
+             if po and overrides.get(po) in NOT_ARRIVED_STATUSES}
+    if stale:
+        still = {_norm_po_key(o.get("po_number") or "")
+                 for it in inv.values() for o in (it.get("on_order") or [])}
+        stale -= still
+        if stale:
+            try:
+                fresh = load_status_overrides() or {}
+                for po in stale:
+                    fresh.pop(po, None)
+                save_status_overrides(fresh)
+            except Exception:  # noqa: BLE001 -- never block a read on it
+                pass
     return changed
 
 

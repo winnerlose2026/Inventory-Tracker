@@ -15,6 +15,15 @@ def _norm_po_key(s: str) -> str:
     return t.strip().strip(".").strip()
 
 
+# Pending-PO statuses that say "this PO has NOT arrived". An operator choosing
+# one of them on the Pending POs tab is a statement about the stock, not just
+# a label: the PO must be (or stay) on order in the Inventory tab. La Mirada
+# 7135734C (2026-10-22) auto-rolled into on-hand on its 30-day ETA, was then
+# marked In Production / ship 10-30 -- and kept its 336 cs in on-hand with
+# nothing on order, because the status was display-only.
+NOT_ARRIVED_STATUSES = frozenset({"open", "overdue", "in_transit", "in_production"})
+
+
 def row_superseded(e: dict) -> bool:
     """Has a newer copy of this row's PO retired it?
 
