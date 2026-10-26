@@ -133,7 +133,13 @@ def _parse_date_label(label) -> Optional[date]:
 
 
 def _norm(v) -> str:
-    return str(v).strip().lower() if v is not None else ""
+    return " ".join(str(v).split()).lower() if v is not None else ""
+
+
+# The usage column beside each CS OH column. The Chicago rep headed it
+# "WKLY USE" until mid-July 2026, then just "USE" -- both mean the same thing.
+_USE_HEADERS = frozenset({"wkly use", "use", "weekly use", "wkly usage",
+                          "weekly usage", "usage"})
 
 
 def parse_worksheet_xlsx(xlsx_bytes: bytes, *, distributor: str,
@@ -176,7 +182,7 @@ def parse_worksheet_xlsx(xlsx_bytes: bytes, *, distributor: str,
     pairs = []  # (date_or_None, position_idx, cs_col, wk_col, label)
     for c, name in enumerate(header):
         if name == "cs oh":
-            wk_col = c + 1 if (c + 1) < len(header) and header[c + 1] == "wkly use" else None
+            wk_col = c + 1 if (c + 1) < len(header) and header[c + 1] in _USE_HEADERS else None
             label = ""
             if c < len(date_row) and date_row[c] is not None:
                 label = str(date_row[c]).strip()
