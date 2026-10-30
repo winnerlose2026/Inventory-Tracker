@@ -5354,3 +5354,47 @@ function renderPlanCompare(r) {
     ${pools}
     <div style="font-size:12px;color:var(--muted);margin-top:8px">${escHtml(bt.method || '')} Houston&rsquo;s reps figures were placeholders until Tom&rsquo;s 10/13 numbers, so its history understates them.</div>`;
 }
+
+// ---------------------------------------------------------------------------
+// Mobile "card" tables: tag data tables with .mcards and copy each <th> label
+// onto its cells (data-label) so the phone CSS can show every column as a
+// compact labelled card instead of a sideways-scrolling table. Re-runs when
+// the app re-renders a tbody. Desktop layout is unaffected (CSS is <=640px).
+// ---------------------------------------------------------------------------
+(function () {
+  const SEL = '.inv-table, .po-table, #page-production table, #page-freight table, ' +
+              '#page-activity table.act-table, #page-planner table.table, .ins-table';
+  function labelOf(th) {
+    const c = th.cloneNode(true);
+    c.querySelectorAll('.wks-abbr, .sort-ind').forEach(n => n.remove());
+    return (c.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function stamp() {
+    document.querySelectorAll(SEL).forEach(tbl => {
+      if (tbl.closest('.lot-detail-row')) return;
+      const hr = tbl.querySelector(':scope > thead > tr:last-child');
+      if (!hr) return;
+      tbl.classList.add('mcards');
+      const labels = Array.from(hr.children).map(labelOf);
+      tbl.querySelectorAll(':scope > tbody > tr').forEach(tr => {
+        const cells = Array.from(tr.children);
+        if (cells.some(c => c.hasAttribute('colspan'))) return;
+        cells.forEach((td, i) => {
+          if (labels[i] && !td.hasAttribute('data-label')) td.setAttribute('data-label', labels[i]);
+        });
+      });
+    });
+  }
+  let queued = false;
+  function schedule() {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; stamp(); });
+  }
+  function start() {
+    stamp();
+    new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
