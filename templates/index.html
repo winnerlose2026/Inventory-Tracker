@@ -693,60 +693,165 @@
     #toast-sales-container th:nth-child(1), #toast-sales-container td:nth-child(1),
     #toast-sales-container th:nth-child(4), #toast-sales-container td:nth-child(4) { display: none; }
   }
-  /* Phones (<=640px): each table row becomes a compact card. */
+  /* ==== Phones (<=860px): compact 1-2 line rows ====================
+     Every data table row collapses to at most two short lines, like the
+     desktop row: a bold primary cell + status on line 1, the few numbers
+     that matter on line 2 (tiny inline labels). Columns that are noise on
+     a phone are hidden per table below. data-label comes from app.js. */
   @media (max-width: 860px) {
+    /* -- page chrome: less vertical space before the data -- */
+    .page-header .subtitle { display: none; }
+    .page-header h1 { font-size: 24px; margin-bottom: 8px !important; }
+    .page-header .btn-group { flex-direction: row !important; flex-wrap: wrap; gap: 6px; }
+    .page-header .btn-group .btn { width: auto !important; flex: 1 1 calc(33% - 6px); min-height: 34px; padding: 6px 8px; font-size: 12px; }
+    .nav-item { min-height: 34px !important; padding: 6px 6px !important; font-size: 12.5px !important; flex: 1 1 30% !important; }
+    .nav-icon { font-size: 14px !important; }
+    .sidebar-logo { padding: 6px 12px; }
+    .sidebar-logo svg { width: 40px; }
+    .sidebar-logo .wordmark { font-size: 13px; }
+    .card-title[style*="font-size:22px"], .card-title[style*="font-size:20px"] { font-size: 17px !important; }
+    .card-header { padding: 10px 12px; }
+    #inventory-container div[style*="font-size:20px"] { font-size: 17px !important; }
+    #inventory-container div[style*="padding:14px 16px 4px"] { padding: 10px 8px 2px !important; }
+    .filters { display: grid !important; grid-template-columns: 1fr 1fr; gap: 6px 8px !important; padding: 8px 12px !important; }
+    .filters .filter-group { flex: none !important; }
+    .filters .filter-group:has(input[type="search"]), .filters .filter-group:has(input[type="text"]) { grid-column: 1 / -1; }
+    .filters label { font-size: 10px; margin-bottom: 2px; }
+    .filters select, .filters input { padding: 6px 8px !important; font-size: 16px; min-height: 0; }
+
+    /* -- generic row: inline cells that wrap to ~2 lines -- */
     .mcards, .mcards > tbody, .mcards > tfoot { display: block; width: 100% !important; min-width: 0 !important; }
     .mcards > thead, .mcards > colgroup { display: none !important; }
-    .mcards > tbody > tr, .mcards > tfoot > tr {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 8px 10px;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
+    .mcards > tbody > tr {
+      display: flex; flex-wrap: wrap; align-items: baseline;
+      gap: 2px 12px; padding: 7px 10px; border-bottom: 1px solid var(--border);
     }
-    .mcards > tbody > tr > td, .mcards > tfoot > tr > td {
+    .mcards > tbody > tr > td {
       display: block; min-width: 0; padding: 0 !important; border: 0 !important;
-      font-size: 13px; line-height: 1.3; text-align: left !important;
-      white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
-      overflow-wrap: anywhere;
+      font-size: 13px; line-height: 1.35; text-align: left !important;
+      white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
     }
     .mcards > tbody > tr > td[data-label]::before {
-      content: attr(data-label); display: block; margin-bottom: 1px;
-      font-size: 9px; font-weight: 600; letter-spacing: 0; text-transform: uppercase;
-      color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      content: attr(data-label); margin-right: 4px;
+      font-size: 9.5px; font-weight: 600; text-transform: uppercase; color: var(--muted);
     }
-    /* Primary cell (name / PO # / date) spans the whole card, bold, no label */
-    .mcards > tbody > tr > td:first-child { grid-column: 1 / -1; font-size: 14.5px; }
+    .mcards > tbody > tr > td:first-child { flex: 1 1 100%; font-weight: 600; font-size: 14px; }
     .mcards > tbody > tr > td:first-child::before { display: none; }
-    .mcards > tbody > tr > td[colspan] { grid-column: 1 / -1; }
-    /* Long free-text cells (PO items, notes, breakdowns) get the full width */
-    .po-table > tbody > tr > td:nth-child(4),
-    .mcards > tbody > tr > td.mc-wide { grid-column: 1 / -1; }
-    /* PO tables: status + total sit with the PO number up top */
-    .po-table > tbody > tr > td:nth-child(5) { grid-column: span 1; }
-    .po-table > tbody > tr > td:nth-child(10) { grid-column: 1 / -1; }
-    .inv-table > tbody > tr.lot-detail-row, .mcards > tbody > tr.act-detail { display: block; padding: 6px 8px; }
+    .mcards > tbody > tr > td[colspan] { flex: 1 1 100%; white-space: normal !important; overflow: visible !important; }
+    .mcards > tbody > tr > td .badge { font-size: 10.5px; padding: 1px 7px; }
+    .mcards > tfoot { display: none; }
+
+    /* -- two-line grid tables: line 1 = primary + status, line 2 = numbers -- */
+    .inv-table > tbody > tr.sku-row, .po-table > tbody > tr,
+    #prod-tbody > tr, #prod-summary-tbody > tr, #freight-tbody > tr, #act-body > tr.act-row {
+      display: grid; grid-template-columns: repeat(var(--mc, 3), minmax(0, 1fr)); gap: 1px 8px; padding: 7px 10px;
+    }
+    .inv-table > tbody > tr.sku-row > td:first-child,
+    .po-table > tbody > tr > td:first-child { flex: none; }
+    .mcards > tbody > tr > td.mc-hide { display: none !important; }
+
+    /* Inventory (main): Variety · Status / Counted · Theoretical · On order · Weeks */
+    .inv-table.inv-main > tbody > tr.sku-row { --mc: 4; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(1) { grid-row: 1; grid-column: 1 / 4; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(9) { grid-row: 1; grid-column: 4; justify-self: end; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(5),
+    .inv-main > tbody > tr.sku-row > td:nth-child(6),
+    .inv-main > tbody > tr.sku-row > td:nth-child(7) { display: none !important; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(2)::before { content: 'Cnt'; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(3)::before { content: 'Theo'; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(4)::before { display: none; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(2) > span + span { display: none; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(8)::before { content: 'Left'; }
+    .inv-main > tbody > tr.sku-row > td:nth-child(9)::before { display: none; }
+    /* Low-stock alerts: Variety · Status / Qty · On order · Weeks */
+    .inv-table:not(.inv-main) > tbody > tr.sku-row, #low-stock-body .inv-table > tbody > tr { --mc: 4; display: grid; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(1) { grid-row: 1; grid-column: 1 / 4; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(8) { grid-row: 1; grid-column: 4; justify-self: end; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(4),
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(5),
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(6) { display: none !important; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(3)::before { display: none; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(7)::before { content: 'Left'; }
+    .inv-table:not(.inv-main) > tbody > tr > td:nth-child(8)::before { display: none; }
+    /* On-order cell: just the +cases badge (the date lives on Pending POs) */
+    .inv-table > tbody > tr.sku-row > td .badge ~ span { display: none; }
+    .inv-table > tbody > tr.sku-row > td:first-child .badge { display: none; }
+    .mcards > tbody > tr:nth-child(4n+1), .mcards > tbody > tr:nth-child(4n+3) { background: transparent; }
+    /* Lot history rows keep a normal small table */
+    .inv-table > tbody > tr.lot-detail-row { display: block; padding: 4px 6px; }
     .inv-table > tbody > tr.lot-detail-row[style*="display:none"], .inv-table > tbody > tr.lot-detail-row[style*="display: none"] { display: none; }
-    .inv-table > tbody > tr.lot-detail-row > td { padding: 4px !important; overflow-x: auto !important; }
+    .inv-table > tbody > tr.lot-detail-row > td { padding: 4px !important; overflow-x: auto !important; white-space: normal !important; }
     .inv-table > tbody > tr.lot-detail-row td::before { display: none; }
     .lot-detail-row table { width: 100% !important; min-width: 0 !important; }
     .lot-detail-row table thead { display: table-header-group; }
     .lot-detail-row table tr { display: table-row; }
-    .lot-detail-row table td { display: table-cell; }
-    /* Phone chrome: compact tabs, clamped intro text, 2-up button grid */
-    .nav-item { min-height: 40px !important; padding: 8px 8px !important; font-size: 13px !important; flex: 1 1 30% !important; }
-    .nav-icon { font-size: 15px !important; }
-    .sidebar-logo { padding: 6px 12px; }
-    .sidebar-logo svg { width: 44px; }
-    .sidebar-logo .wordmark { font-size: 14px; }
-    .page-header .subtitle { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; font-size: 12.5px; margin-bottom: 10px; }
-    .page-header .btn-group { flex-direction: row !important; flex-wrap: wrap; }
-    .page-header .btn-group .btn { width: auto !important; flex: 1 1 calc(50% - 6px); min-height: 38px; padding: 8px 10px; font-size: 12.5px; }
-    .mcards .badge { white-space: normal; }
-    .mcards > tbody > tr:nth-child(even) { background: rgba(5,23,71,.025); }
-    /* Warehouse card + alert boxes: use the full width */
+    .lot-detail-row table td, .lot-detail-row table th { display: table-cell; white-space: normal; padding: 4px 5px; font-size: 11px; }
+    .lot-detail-row table td:nth-child(3), .lot-detail-row table th:nth-child(3),
+    .lot-detail-row table td:nth-child(5), .lot-detail-row table th:nth-child(5) { display: none; }
+
+    /* Pending POs (all 3 tables): PO # · Warehouse · Status / cs · Ship · Arrival */
+    .po-table > tbody > tr { --mc: 3; }
+    .po-table > tbody > tr > td:nth-child(1) { grid-row: 1; grid-column: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
+    .po-table > tbody > tr > td:nth-child(3) { grid-row: 1; grid-column: 2; font-weight: 600; }
+    .po-table > tbody > tr > td:nth-child(10) { grid-row: 1; grid-column: 3; justify-self: end; white-space: normal !important; text-align: right !important; }
+    .po-table > tbody > tr > td:nth-child(2),
+    .po-table > tbody > tr > td:nth-child(4),
+    .po-table > tbody > tr > td:nth-child(6),
+    .po-table > tbody > tr > td:nth-child(9) { display: none !important; }
+    .po-table > tbody > tr > td:nth-child(3)::before,
+    .po-table > tbody > tr > td:nth-child(5)::before,
+    .po-table > tbody > tr > td:nth-child(10)::before { display: none; }
+    .po-table > tbody > tr > td:nth-child(7)::before { content: 'Ship'; }
+    .po-table > tbody > tr > td:nth-child(8)::before { content: 'Arr'; }
+    .po-table > tbody > tr > td:nth-child(1) div, .po-table > tbody > tr > td:nth-child(8) div,
+    .po-table > tbody > tr > td:nth-child(8) br { display: none; }
+
+    /* Daily Production: Date · Warehouse · Status / cs · PO · Arrival */
+    #prod-tbody > tr { --mc: 3; }
+    #prod-tbody > tr > td:nth-child(1) { grid-row: 1; grid-column: 1; }
+    #prod-tbody > tr > td:nth-child(2) { grid-row: 1; grid-column: 2; font-weight: 600; }
+    #prod-tbody > tr > td:nth-child(9) { grid-row: 1; grid-column: 3; justify-self: end; }
+    #prod-tbody > tr > td:nth-child(3), #prod-tbody > tr > td:nth-child(5),
+    #prod-tbody > tr > td:nth-child(7), #prod-tbody > tr > td:nth-child(10) { display: none !important; }
+    #prod-tbody > tr > td:nth-child(2)::before, #prod-tbody > tr > td:nth-child(6)::before,
+    #prod-tbody > tr > td:nth-child(9)::before { display: none; }
+    #prod-tbody > tr > td:nth-child(4)::before { content: 'PO'; }
+    #prod-tbody > tr > td:nth-child(8)::before { content: 'Arr'; }
+    /* Production period summary: Period · Range · Total cs (one line) */
+    #prod-summary-tbody > tr { --mc: 3; }
+    #prod-summary-tbody > tr > td:nth-child(n+4) { display: none !important; }
+    #prod-summary-tbody > tr > td::before { display: none; }
+
+    /* Freight: Ship date · Destination · Total / Cases · $/case · PO */
+    #freight-tbody > tr { --mc: 3; }
+    #freight-tbody > tr > td:nth-child(1) { grid-row: 1; grid-column: 1; }
+    #freight-tbody > tr > td:nth-child(3) { grid-row: 1; grid-column: 2; font-weight: 600; }
+    #freight-tbody > tr > td:nth-child(8) { grid-row: 1; grid-column: 3; justify-self: end; font-weight: 600; }
+    #freight-tbody > tr > td:nth-child(2), #freight-tbody > tr > td:nth-child(4),
+    #freight-tbody > tr > td:nth-child(6), #freight-tbody > tr > td:nth-child(9),
+    #freight-tbody > tr > td:nth-child(11) { display: none !important; }
+    #freight-tbody > tr > td:nth-child(3)::before, #freight-tbody > tr > td:nth-child(8)::before { display: none; }
+    #freight-tbody > tr > td:nth-child(5)::before { content: 'PO'; }
+
+    /* Activity log: Type · Warehouse · Δ / What happened (1 line) · When */
+    #act-body > tr.act-row { --mc: 3; cursor: pointer; }
+    #act-body > tr.act-row > td:nth-child(2) { grid-row: 1; grid-column: 1; }
+    #act-body > tr.act-row > td:nth-child(3) { grid-row: 1; grid-column: 2; font-weight: 600; }
+    #act-body > tr.act-row > td:nth-child(6) { grid-row: 1; grid-column: 3; justify-self: end; font-weight: 600; }
+    #act-body > tr.act-row > td:nth-child(5) { grid-row: 2; grid-column: 1 / 3; }
+    #act-body > tr.act-row > td:nth-child(1) { grid-row: 2; grid-column: 3; justify-self: end; color: var(--muted); font-size: 11.5px; font-weight: 400; }
+    #act-body > tr.act-row > td:nth-child(4), #act-body > tr.act-row > td:nth-child(7) { display: none !important; }
+    #act-body > tr.act-row > td::before { display: none; }
+    #act-body > tr.act-row > td * { white-space: nowrap; }
+    #act-body > tr.act-row > td:nth-child(5) div:not(:first-child) { display: none; }
+    #act-body > tr.act-detail { display: block; padding: 4px 10px 10px; }
+    #act-body > tr.act-detail > td { white-space: normal !important; }
+    #act-body .act-items { grid-template-columns: 1fr 1fr !important; }
+
     .card > div:has(> .mcards) { overflow-x: visible; }
     #inv-actions > select { min-width: 0 !important; }
+    #low-stock-body span[style*="font-size:18px"] { font-size: 15px !important; }
+    #low-stock-body div[style*="padding:12px 16px"] { padding: 8px 12px !important; }
   }
 </style>
 </head>
