@@ -1,6 +1,6 @@
 # Add Poppy Seed variety — changes
 
-Closes the last remaining gap from `CHANGES_usf_po_pdf.md`: the USF parser
+Closes the last remaining gap from `usf_po_pdf.md`: the USF parser
 already maps item #1152 to "Poppy Seed", but there was no Poppy Seed SKU in
 the seed list, so restock events for 1152 would land as unmatched. Adding
 the variety populates 8 new SKUs (one per DC) and puts the total at 96.

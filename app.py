@@ -17,7 +17,7 @@ from inventory_tracker import (
 
 app = Flask(__name__)
 
-# Blueprints (incremental refactor of this monolith — see REFACTOR_PLAN.md).
+# Blueprints (incremental refactor of this monolith — see docs/REFACTOR_PLAN.md).
 # Imported after `app` exists; blueprint modules must not import this module.
 from blueprints.health import health_bp  # noqa: E402
 from blueprints.webhooks import webhooks_bp  # noqa: E402
@@ -116,7 +116,7 @@ def _cors_preflight(_any):
 # (which authenticates via its own clientState, not our token).
 # ---------------------------------------------------------------------------
 
-# Shared helpers live in core/ now (incremental refactor — see REFACTOR_PLAN.md)
+# Shared helpers live in core/ now (incremental refactor — see docs/REFACTOR_PLAN.md)
 # so blueprints can import them without importing this module.
 from core.auth import (  # noqa: E402
     _user_logged_in, _has_valid_api_token, _is_authenticated, _OPEN_ENDPOINTS,

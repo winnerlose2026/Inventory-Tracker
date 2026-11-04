@@ -62,7 +62,7 @@ def _book(sync, po, days_ahead=20):
 
 def test_api_reads_require_a_token_and_header_only():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync, c = _setup(Path(td))
         assert c.get("/api/pos/ledger").status_code == 401
         assert c.get(f"/api/pos/ledger?token={TOKEN}").status_code == 401
@@ -76,7 +76,7 @@ def test_api_reads_require_a_token_and_header_only():
 
 def test_tz_aware_ship_date_does_not_break_every_read():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync, c = _setup(Path(td))
         _book(sync, "9999991O")
         H = {"X-Inventory-Token": TOKEN}
@@ -101,7 +101,7 @@ def test_tz_aware_ship_date_does_not_break_every_read():
 
 def test_admin_po_order_date_accepts_z_and_marks_operator():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync, c = _setup(Path(td))
         _book(sync, "9999992O")
         H = {"X-Inventory-Token": TOKEN}

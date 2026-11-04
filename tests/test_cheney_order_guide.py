@@ -17,7 +17,7 @@ from integrations.cheney_dcs import (  # noqa: E402
     normalize_dc_code, warehouse_from_dc_code, is_known_dc, store_from_account,
 )
 
-FIX = Path(__file__).parent / "tests" / "fixtures" / "cheney"
+FIX = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "cheney"
 ALTAMONTE = FIX / "OrderGuide-20260803-113324_0060458212.excerpt.csv"
 CHAPEL_HILL = FIX / "OrderGuide-20260803-113324_0060415887.csv"
 

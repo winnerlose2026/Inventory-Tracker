@@ -19,7 +19,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 TOKEN = "test-token-123"
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 
 
 class _Resp:

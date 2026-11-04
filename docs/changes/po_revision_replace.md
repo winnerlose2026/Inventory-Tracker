@@ -1,6 +1,6 @@
 # PO revision-replace semantics — changes
 
-Closes the open follow-up from `CHANGES_usf_po_pdf.md`: a later revision
+Closes the open follow-up from `usf_po_pdf.md`: a later revision
 of the same USF PO now fully supersedes earlier restock events instead
 of stacking on top of them.
 

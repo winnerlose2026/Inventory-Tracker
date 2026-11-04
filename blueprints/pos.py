@@ -1,7 +1,7 @@
 """Purchase-order lifecycle blueprint — on-order ship-date edits, the Pending
 POs status workflow (reopen / status-overrides / set-status), Chefs Warehouse
 PO ingest + ship-date + cancel, and the arrived-POs view. Extracted from
-app.py (refactor — see REFACTOR_PLAN.md). Shared helpers come from core/."""
+app.py (refactor — see docs/REFACTOR_PLAN.md). Shared helpers come from core/."""
 from datetime import datetime
 
 from flask import Blueprint, jsonify, request

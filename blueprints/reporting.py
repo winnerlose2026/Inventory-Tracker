@@ -2,7 +2,7 @@
 PLH (productivity vs labor-hours), bakery sales, the forecast endpoints
 (decrement-daily / backfill-historical / true-up), the summary report +
 report-status pages, and the xlsx export. Extracted from app.py (refactor —
-see REFACTOR_PLAN.md). Shared helpers come from core/."""
+see docs/REFACTOR_PLAN.md). Shared helpers come from core/."""
 import io
 import time as _time
 from datetime import datetime, timedelta

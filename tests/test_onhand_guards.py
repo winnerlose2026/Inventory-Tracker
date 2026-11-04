@@ -64,7 +64,7 @@ KEY_PLAIN_OCALA = "plain bagel 4oz [cb - ocala]"
 def test_mfg_code_as_on_hand_is_refused():
     """The exact Punta Gorda write: Egg on-hand 14 -> 1184 (Egg's own code)."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -86,7 +86,7 @@ def test_mfg_code_as_on_hand_is_refused():
 def test_every_mfg_code_is_refused_as_on_hand():
     from integrations.hh_mfg_codes import HH_MFG_CODE_TO_VARIETY
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         for code in sorted(HH_MFG_CODE_TO_VARIETY):
@@ -109,7 +109,7 @@ def test_plausible_counts_near_the_code_range_still_apply():
     for probe in (1, 60, 417, 1149, 1190):
         assert str(probe) not in codes, probe
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         for qty in (1, 60, 417, 1149, 1190):
@@ -124,7 +124,7 @@ def test_plausible_counts_near_the_code_range_still_apply():
 def test_ocr_cannot_overwrite_a_cell_grid_count_of_the_same_date():
     """The incident, reproduced: both writes carry count_date 2026-08-01."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -149,7 +149,7 @@ def test_ocr_cannot_overwrite_a_cell_grid_count_of_the_same_date():
 def test_cell_grid_does_overwrite_an_earlier_ocr_count_of_the_same_date():
     """Precedence runs the other way too -- the trusted source repairs it."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -166,7 +166,7 @@ def test_cell_grid_does_overwrite_an_earlier_ocr_count_of_the_same_date():
 def test_manual_correction_outranks_everything():
     """A human fixing a number must always land."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -183,7 +183,7 @@ def test_manual_correction_outranks_everything():
 
 def test_older_count_date_still_loses():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -199,7 +199,7 @@ def test_same_day_timestamps_now_order_by_full_count_date():
     """Two counts on one calendar day, distinguished only below the day.
     The old `count_date[:10]` comparison treated these as equal."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -216,7 +216,7 @@ def test_same_day_timestamps_now_order_by_full_count_date():
 
 def test_equal_rank_and_date_falls_back_to_email_received_time():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -234,7 +234,7 @@ def test_equal_rank_and_date_falls_back_to_email_received_time():
 def test_first_ever_count_always_lands():
     """No incumbent date/rank -> nothing to compare, so it must apply."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         sync._apply_events(
@@ -291,7 +291,7 @@ def test_scan_path_carries_parser_provenance_so_cellgrid_outranks_ocr():
 def test_cellgrid_rescan_of_the_same_count_date_is_not_self_skipped():
     """Rescanning the same workbook must be a clean no-op, not a rank skip."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
         from integrations.email_scanner import EmailEvent

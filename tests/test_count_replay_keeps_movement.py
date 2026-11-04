@@ -73,7 +73,7 @@ def _burn(it, amount, day):
 
 def test_replaying_the_same_count_keeps_the_burn():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         d0 = (_TODAY - timedelta(days=2)).isoformat()
@@ -95,7 +95,7 @@ def test_replaying_the_same_count_keeps_the_burn():
 
 def test_replay_still_refreshes_weekly_usage():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         d0 = (_TODAY - timedelta(days=2)).isoformat()
@@ -112,7 +112,7 @@ def test_replay_still_refreshes_weekly_usage():
 def test_a_new_count_nets_out_burns_dated_after_it():
     """Count taken Monday, applied Wednesday: Tue + Wed burns stay deducted."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         d0 = (_TODAY - timedelta(days=9)).isoformat()
@@ -131,7 +131,7 @@ def test_a_new_count_nets_out_burns_dated_after_it():
 
 def test_manual_use_after_the_count_survives_a_replay():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         d0 = (_TODAY - timedelta(days=2)).isoformat()

@@ -101,7 +101,7 @@ def _on_hand(qty, variety, warehouse, count_date, distributor="US Foods"):
 
 def test_the_alcoa_incident_the_delivery_survives_a_rescan():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it = _setup(Path(td))
         # July 27 count of 20 cs lands first.
         it.save_usage([])
@@ -133,7 +133,7 @@ def test_the_alcoa_incident_the_delivery_survives_a_rescan():
 def test_a_count_taken_after_arrival_still_wins_outright():
     """La Mirada / Chicago case: don't double-count an absorbed delivery."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it = _setup(Path(td))
         it.save_usage([_roll(KEY, 8, "2026-07-30T00:00:00")])
         inv = it._load(it.INVENTORY_FILE)
@@ -148,7 +148,7 @@ def test_a_count_taken_after_arrival_still_wins_outright():
 
 def test_preserved_receipt_is_reported():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it = _setup(Path(td))
         it.save_usage([_roll(KEY, 8, "2026-08-03T00:00:00")])
         r = sync._apply_events([_on_hand(20, "Plain", "Alcoa, TN", "2026-07-27")],

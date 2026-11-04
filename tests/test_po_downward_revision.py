@@ -97,7 +97,7 @@ def _pending(it):
 
 def test_lower_numbered_correction_replaces_the_stale_higher_revision():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -121,7 +121,7 @@ def test_lower_numbered_correction_replaces_the_stale_higher_revision():
 def test_both_documents_in_one_batch_resolve_to_the_correction():
     """A wide-lookback backfill re-reads both copies in a single scan."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -135,7 +135,7 @@ def test_both_documents_in_one_batch_resolve_to_the_correction():
 
 def test_replaying_the_correction_is_idempotent():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -149,7 +149,7 @@ def test_replaying_the_correction_is_idempotent():
 def test_internal_forward_of_the_stale_copy_cannot_undo_the_correction():
     """The protection the revision number used to provide, via the sender."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 

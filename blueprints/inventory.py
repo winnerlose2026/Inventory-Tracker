@@ -1,6 +1,6 @@
 """Inventory blueprint — SKU CRUD (list / add / update / remove), use &
 restock, the usage log + reversal, and the warehouses / distributors
-reference views. Extracted from app.py (refactor — see REFACTOR_PLAN.md)."""
+reference views. Extracted from app.py (refactor — see docs/REFACTOR_PLAN.md)."""
 from flask import Blueprint, jsonify, request
 from core.util import with_data_lock
 

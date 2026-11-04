@@ -79,7 +79,7 @@ def _pending(it):
 
 def test_reparse_with_a_newly_resolved_sku_reapplies():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
 
@@ -98,7 +98,7 @@ def test_reparse_with_a_newly_resolved_sku_reapplies():
 
 def test_reparse_does_not_duplicate_the_lines_it_already_had():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
 
@@ -114,7 +114,7 @@ def test_reparse_does_not_duplicate_the_lines_it_already_had():
 
 def test_identical_replay_that_gains_nothing_is_still_a_no_op():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
 

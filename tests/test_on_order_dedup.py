@@ -49,7 +49,7 @@ def _seed(inventory_tracker) -> dict:
 def test_apply_path_dedupes_duplicate_lines_in_same_batch():
     """Posting the same PO line twice in one batch should book it once."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -83,7 +83,7 @@ def test_apply_path_dedupes_duplicate_lines_in_same_batch():
 def test_load_path_cleans_up_existing_duplicates():
     """Pre-existing duplicate entries should be collapsed on next load."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -108,7 +108,7 @@ def test_load_path_cleans_up_existing_duplicates():
 def test_load_path_keeps_distinct_qty_lines_under_same_po():
     """Same PO with two genuinely different qtys is two separate lines."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -136,7 +136,7 @@ def test_load_path_keeps_distinct_qty_lines_under_same_po():
 def test_load_path_is_idempotent():
     """Loading twice in a row produces no further changes."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -165,7 +165,7 @@ def test_rebase_ordered_at_rolls_old_pos_into_quantity():
     """A backlogged USF PO dated >30 days ago in source_subject should
     be rebased AND rolled into quantity on next load."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -191,7 +191,7 @@ def test_rebase_keeps_recent_po_pending_with_corrected_dates():
     """A USF PO dated within 30 days should stay pending, but with
     ordered_at rebased to the actual PO date and eta = +lead days."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -226,7 +226,7 @@ def test_collapse_keeps_highest_revision_for_same_po():
     """Two pending entries for the same SKU + same po_number but
     different po_revision should collapse to the highest revision."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -253,7 +253,7 @@ def test_collapse_preserves_legitimate_two_line_pos():
     quantities is a real two-line PO (or legit duplicate line item)
     and must be preserved -- the collapse only fires across revisions."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -282,7 +282,7 @@ def test_ship_date_arrival_supersedes_30day_eta():
     INSTEAD of the original 30-day-from-ordered_at eta."""
     from datetime import datetime, timedelta
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -313,7 +313,7 @@ def test_ship_date_not_double_rolled():
     from on_order, so the 30-day rule cannot re-promote it."""
     from datetime import datetime, timedelta
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -344,7 +344,7 @@ def test_no_ship_date_falls_back_to_30day_eta():
     (original behavior is preserved)."""
     from datetime import datetime, timedelta
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -368,7 +368,7 @@ def test_future_arrival_keeps_entry_pending():
     must stay pending until that arrival date."""
     from datetime import datetime, timedelta
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -396,7 +396,7 @@ def test_reprint_supersedes_numeric_revision():
     """USF's 'REPRINT' token must be treated as newer than any
     numeric revision when collapsing same-(item, po) duplicates."""
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, _ = _setup_temp_inventory(Path(td))
         _seed(it)
 
@@ -432,7 +432,7 @@ def test_apply_path_supersedes_numeric_with_reprint():
     from integrations.base import SyncItem
     from integrations.email_scanner import EmailEvent
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup_temp_inventory(Path(td))
         _seed(it)
 

@@ -88,7 +88,7 @@ April 2026):
 ## Follow-ups (not in this change)
 
 - ~~**Add a Poppy Seed SKU** to `seed_bagels.py`.~~ **Done** — see
-  `CHANGES_poppy_seed_sku.md`. Total seeded SKUs went from 88 → 96.
+  `poppy_seed_sku.md`. Total seeded SKUs went from 88 → 96.
 - **Fill in the remaining DC addresses** in the USF account reference
   memory (Zebulon NC, La Mirada CA, Chicago IL, Alcoa TN) as POs for
   those DCs come in.

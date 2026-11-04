@@ -1,6 +1,6 @@
 """Freight blueprint — Lineage freight invoices: list, ingest, the MS365 scan,
 the PO->ship-date index, and lead-time metrics. Extracted from app.py
-(refactor — see REFACTOR_PLAN.md). Shared helpers come from core/.
+(refactor — see docs/REFACTOR_PLAN.md). Shared helpers come from core/.
 """
 from datetime import datetime, timedelta
 

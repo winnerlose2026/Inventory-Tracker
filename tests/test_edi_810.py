@@ -75,7 +75,7 @@ def test_multiple_invoices_and_helpers():
 from pathlib import Path  # noqa: E402
 from integrations.edi_810 import summarize, _money  # noqa: E402
 
-FIX = Path(__file__).parent / "tests" / "fixtures" / "cheney"
+FIX = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "cheney"
 INVOICE = FIX / "CheneyInvoices_9100257242_20260803012916_301220260803-012919-470.EDI"
 CREDIT = FIX / "CheneyInvoices_9800024285_20260803012916_300620260803-012919-238.EDI"
 

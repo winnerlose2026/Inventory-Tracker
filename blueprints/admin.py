@@ -1,6 +1,6 @@
 """Admin / maintenance blueprint — PO admin ops (set order-date, remove PO,
 uncancel PO) and the sync / seed / migrate-units maintenance endpoints.
-Extracted from app.py (refactor — see REFACTOR_PLAN.md)."""
+Extracted from app.py (refactor — see docs/REFACTOR_PLAN.md)."""
 from datetime import datetime, timedelta
 
 from flask import Blueprint, jsonify, request

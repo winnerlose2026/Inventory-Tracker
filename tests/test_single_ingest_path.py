@@ -29,7 +29,7 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 _TODAY = datetime.now(timezone.utc).date()
 
 

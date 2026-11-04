@@ -14,7 +14,7 @@ Regression cover for the 2026-08-03 incident, in which this path overwrote all
     1171, 1152, 1151, 1157, 1156) into Punta Gorda's quantities.
 """
 import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 import cheney_stock_ocr as C
 from integrations.hh_mfg_codes import CHENEY_ITEM_NO_TO_MFG, HH_MFG_CODE_TO_VARIETY
 

@@ -136,7 +136,7 @@ Item Material/Description Brand Pack Size Quantity UM Unit Price         Net Amo
 
 def test_same_document_in_both_mailboxes_is_still_counted_once():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         rcv, od = _iso(1), (_TODAY - timedelta(days=1)).isoformat()
@@ -158,7 +158,7 @@ def test_same_document_in_both_mailboxes_is_still_counted_once():
 
 def test_rescanning_an_arrived_po_is_a_no_op():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         # Old enough that ordered_at + 30 and received + 30 are both past:
@@ -190,7 +190,7 @@ def test_rescanning_an_arrived_po_is_a_no_op():
 
 def test_recut_po_with_old_order_date_stays_pending():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         # PO dated 49 days ago, re-issued (received) yesterday.
@@ -215,7 +215,7 @@ def test_recut_po_with_old_order_date_stays_pending():
 
 def test_backlogged_scan_of_an_old_email_still_rolls_over():
     with TemporaryDirectory() as td:
-        sys.path.insert(0, str(Path(__file__).parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         it, sync = _setup(Path(td))
         _seed(it)
         # Genuinely old email: received the day it was ordered, 45 days ago.

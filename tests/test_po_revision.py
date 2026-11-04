@@ -171,7 +171,7 @@ def test_houston_reprint_then_revision_books_1120_not_1128(tmp_path):
     rev 0000003 (Plain 168) at 19:05. Ordering by received time must leave
     Plain at 168, i.e. the PO totals its true 1120 cs."""
     import sys, pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
     import test_on_order_dedup as T
     from integrations.base import SyncItem
     from integrations.email_scanner import EmailEvent
@@ -212,7 +212,7 @@ def test_replaying_the_stale_reprint_afterwards_is_ignored(tmp_path):
     appended as a SECOND pending row instead of being skipped.
     """
     import sys, pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
     import test_on_order_dedup as T
     from integrations.base import SyncItem
     from integrations.email_scanner import EmailEvent
@@ -246,7 +246,7 @@ def test_two_copies_in_one_batch_keep_the_newer_even_when_qty_is_lower(tmp_path)
     1128 cs against a 1120 cs PO. The newest document must win outright.
     """
     import sys, pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
     import test_on_order_dedup as T
     from integrations.base import SyncItem
     from integrations.email_scanner import EmailEvent

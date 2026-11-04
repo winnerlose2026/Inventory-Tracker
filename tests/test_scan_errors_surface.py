@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
 import inventory_tracker as it
