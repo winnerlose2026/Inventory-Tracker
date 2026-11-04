@@ -123,6 +123,17 @@ def _run_production_scan() -> None:
           payload={"lookback_days": 14, "max_messages": 200})
 
 
+def _run_delivery_sync() -> None:
+    """Re-read the Lineage "Quote and Schedule" threads so a delivery
+    confirmation reaches the Pending POs tab (and on-hand) within ~20 minutes
+    of landing, instead of at the cloud task's next 9:22 / 3:22 run. The sync
+    only reads mail and applies plain confirmations -- it never sends a
+    follow-up (that stays with the task's send-followups call). 60-day
+    lookback so no open thread drops out of the cache between task runs."""
+    _post("/api/pos/delivery/sync-threads", timeout=170,
+          payload={"lookback_days": 60})
+
+
 def start_scheduler() -> BackgroundScheduler | None:
     """Start the background scheduler once. Idempotent within a process; a
     no-op when INPROCESS_SCHEDULER is turned off."""
@@ -163,11 +174,21 @@ def start_scheduler() -> BackgroundScheduler | None:
         coalesce=True,
         misfire_grace_time=3600,
     )
+    # Lineage delivery confirmations — every 20 min, 6am-11pm ET (10-03 UTC).
+    sched.add_job(
+        _run_delivery_sync,
+        CronTrigger(minute="7,27,47", hour="0-3,10-23", timezone=UTC),
+        id="delivery-sync-20m",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
+    )
     sched.start()
     _scheduler = sched
     log.info(
         "in-process scheduler started: forecast-decrement 05:05 UTC, "
-        "graph-renew 09:00 UTC, production-scan 23:30 UTC (base=%s)",
+        "graph-renew 09:00 UTC, production-scan 23:30 UTC, "
+        "delivery-sync every 20 min 10:00-03:59 UTC (base=%s)",
         _self_base_url(),
     )
     return sched

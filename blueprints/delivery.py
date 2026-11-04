@@ -407,8 +407,25 @@ def api_delivery_sync_threads():
                                       "errors": list(errors),
                                       "messages": cached_msgs,
                                       "threads": cache_threads})
+            # Plain confirmations ("This shows delivered 0900AM/22nd") are
+            # applied right here, so the Pending tab moves as soon as the
+            # mail is read -- not at the task's next 9:22 / 3:22 run.
+            try:
+                confirmed = _apply_server_confirmations(dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 -- never fail the sync
+                _log_exc(exc, "delivery-sync-threads confirm")
+                confirmed = [{"applied": False, "reason": _safe_err(exc)}]
+            if confirmed and not dry_run:
+                # the task reads open_pos off this response: show it the new state
+                fresh = load_po_delivery()
+                for t in threads:
+                    for op in t["open_pos"]:
+                        rk = norm_po(op["po_number"])
+                        if rk in fresh:
+                            op["tracking"] = summary(fresh[rk], now)
             threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
             return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
+                            "confirmed_by_server": confirmed,
                             "threads": threads, "registered": registered,
                             "closed": [tracking[k].get("po_number") or k for k in closed
                                        if tracking[k].get("closed_reason")],
@@ -488,6 +505,159 @@ def _verify_evidence(ev: dict, po_key: str, cache: dict, tracked: bool = True) -
     return {**ev, "evidence": evid}, None
 
 
+def _apply_events(events: list, limited: bool = False, dry_run: bool = False) -> dict:
+    """Verify + apply delivery events (the events route, and the server's own
+    confirmation reader). Caller holds the data lock."""
+    from inventory_tracker import (
+        load_po_delivery, load_po_delivery_threads, save_po_delivery,
+    )
+    from integrations.po_delivery import apply_event, norm_po, summary
+    tracking = load_po_delivery()
+    ledger = _ledger_by_po()
+    cache = load_po_delivery_threads() or {}
+    now = _now()
+    results, touched = [], []
+    for ev in events:
+        ev = dict(ev) if isinstance(ev, dict) else {}
+        key = norm_po(ev.get("po_number") or "")
+        lr = ledger.get(key)
+        if lr is None and key not in tracking:
+            results.append({"po_number": ev.get("po_number"), "applied": False,
+                            "reason": "PO not in the tracker"})
+            continue
+        kind = str(ev.get("event") or "").strip().lower()
+        if limited:
+            ev.pop("force", None)
+            if kind not in ("scheduled", "rescheduled", "picked_up", "delivered"):
+                results.append({"po_number": ev.get("po_number"), "applied": False,
+                                "reason": f"'{kind}' isn't allowed with the delivery key"})
+                continue
+        if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
+            ev, why = _verify_evidence(ev, key, cache, tracked=key in tracking)
+            if why:
+                results.append({"po_number": ev.get("po_number"), "applied": False,
+                                "reason": why})
+                continue
+        rec, change, err = apply_event(tracking.get(key), ev, now)
+        if err:
+            results.append({"po_number": ev.get("po_number"), "applied": False,
+                            "reason": err})
+            continue
+        if change is None:
+            results.append({"po_number": ev.get("po_number"), "applied": False,
+                            "reason": "no change (already recorded)"})
+            continue
+        tracking[key] = rec
+        touched.append(key)
+        results.append({"po_number": rec["po_number"], "applied": True,
+                        "change": change, "tracking": summary(rec, now),
+                        "ledger_status_before": (lr or {}).get("status", "")})
+    inventory = {}
+    rederived = None
+    if touched and not dry_run:
+        save_po_delivery(tracking)
+        for key in dict.fromkeys(touched):
+            inventory[key] = _apply_to_inventory(key, tracking[key])
+        if any(tracking[k].get("status") == "delivered" for k in touched):
+            # A new confirmed delivery is a new lead-time sample: re-estimate
+            # the arrivals still derived from a ship date.
+            try:
+                from blueprints.freight import rederive_estimated_arrivals
+                rederived = rederive_estimated_arrivals(dry_run=False)
+            except Exception as exc:  # noqa: BLE001 -- never fail the event
+                _log_exc(exc, "delivery-events rederive")
+        after = _ledger_by_po()
+        for r in results:
+            if r.get("applied"):
+                k = norm_po(r["po_number"])
+                r["inventory"] = inventory.get(k, {})
+                r["ledger_status_after"] = (after.get(k) or {}).get("status", "")
+    out = {"ok": True, "dry_run": dry_run, "results": results}
+    if rederived is not None:
+        out["arrivals_rederived"] = {k: rederived.get(k)
+                                     for k in ("pos_changed", "changes")}
+    return out
+
+
+def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> list:
+    """Delivery events the server can read off the synced threads by itself:
+    one per held PO, from the oldest plain confirmation (Lineage or the DC,
+    after the PO was sent) that names that PO -- on its line, in the message,
+    or by answering an H&H message that asked about it alone. Each is then
+    verified and applied exactly like one the task posts."""
+    from integrations.po_delivery import (
+        HOLD_STATUSES, apply_event, confirmation_lines, delivered_at_from,
+        dock_zone, names_po, own_text, parse_dt, sender_may_report,
+    )
+    threads = cache.get("threads") or {}
+    by_conv: dict = {}
+    for mid, m in (cache.get("messages") or {}).items():
+        by_conv.setdefault(m.get("conversation_id") or "", []).append({**m, "_id": mid})
+    events = []
+    for key, rec in tracking.items():
+        if rec.get("status") not in HOLD_STATUSES or rec.get("closed_reason"):
+            continue
+        req = parse_dt(rec.get("requested_at") or "")
+        lr = ledger.get(key) or {}
+        zone = dock_zone((rec.get("request") or {}).get("address", ""),
+                         lr.get("warehouse", ""))
+        cands = []
+        for conv, th in threads.items():
+            pos = list(dict.fromkeys(th.get("po_numbers") or []))
+            if key not in pos:
+                continue
+            for m in by_conv.get(conv, []):
+                sent = parse_dt(m.get("sent") or "")
+                if (sent is None or not sender_may_report(m.get("from") or "")
+                        or (req and sent < req)):
+                    continue
+                own = own_text(m.get("text") or "")
+                named = [p for p in pos if names_po(own, p)]
+                for line, _kind in confirmation_lines(m.get("text") or ""):
+                    on_line = [p for p in pos if names_po(line, p)]
+                    if on_line:
+                        ok = on_line == [key]
+                    elif named:
+                        ok = named == [key]
+                    else:
+                        ok = len(pos) == 1 or _answers_only(m, key, pos, cache)
+                    if not ok:
+                        continue
+                    at = delivered_at_from(line, m.get("sent") or "", zone,
+                                           rec.get("delivery_appt") or "")
+                    if at is None:
+                        continue
+                    cands.append((sent, not at[1], {
+                        "po_number": rec.get("po_number") or key, "event": "delivered",
+                        "delivered_at": at[0], "time_known": at[1], "source": "server",
+                        "evidence": {"message_id": m["_id"], "sender": m.get("from"),
+                                     "sent": m.get("sent"), "quote": line}}))
+        # oldest message first; within it, a line with a time before one without
+        for _sent, _no_time, ev in sorted(cands, key=lambda c: (c[0], c[1])):
+            ev2, why = _verify_evidence(ev, key, cache)
+            if why:
+                continue
+            _rec, change, err = apply_event(rec, ev2, now)
+            if not err and change:
+                events.append(ev)
+                break
+    return events
+
+
+def _apply_server_confirmations(dry_run: bool = False) -> list:
+    """Read + apply the plain confirmations now in the thread cache.
+    Caller holds the data lock. Returns the applied results."""
+    from inventory_tracker import load_po_delivery, load_po_delivery_threads
+    events = _server_confirmations(load_po_delivery(), _ledger_by_po(),
+                                   load_po_delivery_threads() or {}, _now())
+    if not events:
+        return []
+    out = _apply_events(events, dry_run=dry_run)
+    return [{k: r.get(k) for k in ("po_number", "applied", "reason", "change",
+                                   "ledger_status_after")}
+            for r in out.get("results") or []]
+
+
 @delivery_bp.route("/api/pos/delivery/events", methods=["POST"])
 @with_data_lock
 def api_delivery_events():
@@ -495,81 +665,13 @@ def api_delivery_events():
     delivery_appt?, pickup_at?, delivered_at?, confirmation_no?, evidence:
     {message_id, sender, sent, quote}}], dry_run}. Dates are ISO with the
     receiving dock's UTC offset. Each result says what moved, or why not."""
-    from inventory_tracker import (
-        load_po_delivery, load_po_delivery_threads, save_po_delivery,
-    )
-    from integrations.po_delivery import apply_event, norm_po, summary
     try:
         body = request.get_json(silent=True) or {}
         dry_run = bool(body.get("dry_run", False))
         events = body.get("events") or []
         if not isinstance(events, list):
             return jsonify({"ok": False, "error": "events must be a list"}), 400
-        tracking = load_po_delivery()
-        ledger = _ledger_by_po()
-        cache = load_po_delivery_threads() or {}
-        limited = _scope() == "delivery"
-        now = _now()
-        results, touched = [], []
-        for ev in events:
-            ev = dict(ev) if isinstance(ev, dict) else {}
-            key = norm_po(ev.get("po_number") or "")
-            lr = ledger.get(key)
-            if lr is None and key not in tracking:
-                results.append({"po_number": ev.get("po_number"), "applied": False,
-                                "reason": "PO not in the tracker"})
-                continue
-            kind = str(ev.get("event") or "").strip().lower()
-            if limited:
-                ev.pop("force", None)
-                if kind not in ("scheduled", "rescheduled", "picked_up", "delivered"):
-                    results.append({"po_number": ev.get("po_number"), "applied": False,
-                                    "reason": f"'{kind}' isn't allowed with the delivery key"})
-                    continue
-            if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
-                ev, why = _verify_evidence(ev, key, cache, tracked=key in tracking)
-                if why:
-                    results.append({"po_number": ev.get("po_number"), "applied": False,
-                                    "reason": why})
-                    continue
-            rec, change, err = apply_event(tracking.get(key), ev, now)
-            if err:
-                results.append({"po_number": ev.get("po_number"), "applied": False,
-                                "reason": err})
-                continue
-            if change is None:
-                results.append({"po_number": ev.get("po_number"), "applied": False,
-                                "reason": "no change (already recorded)"})
-                continue
-            tracking[key] = rec
-            touched.append(key)
-            results.append({"po_number": rec["po_number"], "applied": True,
-                            "change": change, "tracking": summary(rec, now),
-                            "ledger_status_before": (lr or {}).get("status", "")})
-        inventory = {}
-        rederived = None
-        if touched and not dry_run:
-            save_po_delivery(tracking)
-            for key in dict.fromkeys(touched):
-                inventory[key] = _apply_to_inventory(key, tracking[key])
-            if any(tracking[k].get("status") == "delivered" for k in touched):
-                # A new confirmed delivery is a new lead-time sample: re-estimate
-                # the arrivals still derived from a ship date.
-                try:
-                    from blueprints.freight import rederive_estimated_arrivals
-                    rederived = rederive_estimated_arrivals(dry_run=False)
-                except Exception as exc:  # noqa: BLE001 -- never fail the event
-                    _log_exc(exc, "delivery-events rederive")
-            after = _ledger_by_po()
-            for r in results:
-                if r.get("applied"):
-                    k = norm_po(r["po_number"])
-                    r["inventory"] = inventory.get(k, {})
-                    r["ledger_status_after"] = (after.get(k) or {}).get("status", "")
-        out = {"ok": True, "dry_run": dry_run, "results": results}
-        if rederived is not None:
-            out["arrivals_rederived"] = {k: rederived.get(k)
-                                         for k in ("pos_changed", "changes")}
+        out = _apply_events(events, limited=_scope() == "delivery", dry_run=dry_run)
         return jsonify(out)
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-events")

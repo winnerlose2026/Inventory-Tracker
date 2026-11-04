@@ -424,6 +424,8 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     new = {k: rec.get(k, "") for k in old}
     entry = {"event": kind, "at": now.isoformat(), **{k: new[k] for k in new
              if new[k] != old[k]}, "evidence": evid}
+    if ev.get("source"):
+        entry["source"] = str(ev["source"])[:40]     # "server" = read by the app itself
     if new == old and kind != "requested":
         return rec, None, None                      # replay: nothing new
     if kind == "requested" and rec["events"]:
@@ -666,3 +668,157 @@ def summary(rec: dict, now: datetime) -> dict:
         "thread_subject": (rec.get("thread") or {}).get("subject", ""),
         "destination": (rec.get("request") or {}).get("address", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Reading a delivery confirmation on the SERVER (no scheduled task needed)
+# ---------------------------------------------------------------------------
+# Until 11/4 only the twice-a-weekday cloud task read Lineage's replies, so a
+# confirmation that landed at 10:30 AM sat until 3:22 PM (a Friday-evening
+# one until Monday), and one the task misread never landed at all: 7728445G
+# (Zebulon) showed "Awaiting delivery confirmation" for two days after
+# Belinda's 11/2 detention notice gave its arrival and departure times, and
+# the server kept asking her about it. The server now reads the plain,
+# unambiguous confirmations itself every time it syncs the threads (every
+# 20 minutes, scheduler.py). Anything hedged, partial or about several POs
+# at once is left for the task / a person -- a wrong "delivered" releases a
+# PO into on-hand, a missed one only waits for the next read.
+
+_CONFIRM = re.compile(r"\bdelivered\b", re.I)
+# Words that make a "delivered" line a question, a plan or a problem.
+_HEDGE = re.compile(
+    r"n't\b|\?|\b(?:not|never|no|if|whether|confirm|confirming|can|could|would|"
+    r"please|will|to\s+be|waiting|pending|yet|missed|reschedul\w*|attempt\w*|"
+    r"expected|should|eta|when|once|until|before|tomorrow|tonight)\b", re.I)
+# Words that put the whole message beyond a plain confirmation.
+_PROBLEM = re.compile(
+    r"\b(?:partial\w*|short\w*|damag\w*|refus\w*|reject\w*|overage|missing|"
+    r"not\s+delivered|undeliver\w*|returned|claim)\b", re.I)
+_ARRIVAL = re.compile(r"^\s*Arrival\s+Time\s*:\s*(\S.*?)\s*$", re.I | re.M)
+_DEPARTURE = re.compile(r"^\s*Departure\s+Time\s*:\s*\S", re.I | re.M)
+_SENTENCE = re.compile(r"[^\n.!?]+(?:[.!](?!\d)|$)", re.M)
+
+_STATE_ZONES = {
+    **{s: "America/New_York" for s in ("NY", "NJ", "CT", "MA", "PA", "MD", "DE",
+                                        "DC", "VA", "NC", "SC", "GA", "FL", "OH",
+                                        "MI", "IN")},
+    **{s: "America/Chicago" for s in ("IL", "TX", "TN", "WI", "MN", "MO", "AL",
+                                       "MS", "LA", "AR", "OK", "KS", "IA")},
+    **{s: "America/Denver" for s in ("CO", "UT", "NM", "AZ")},
+    **{s: "America/Los_Angeles" for s in ("CA", "WA", "OR", "NV")},
+}
+
+
+def dock_zone(*places: str) -> str:
+    """IANA zone of the receiving dock from an address or a "City, ST"
+    warehouse label; Eastern when nothing says."""
+    for p in places:
+        for st in re.findall(r"\b([A-Z]{2})\b\.?\s*(?:\d{5})?\s*$|,\s*([A-Z]{2})\b",
+                             str(p or "")):
+            for s in st:
+                if s in _STATE_ZONES:
+                    return _STATE_ZONES[s]
+    return "America/New_York"
+
+
+def _clock(quote: str) -> Optional[tuple]:
+    """(hour, minute) a confirmation line states, or None. "0800AM", "543AM",
+    "8:00 AM", "1556PM", "1225" (24-hour, only next to a date)."""
+    rest = _DATE_TOKEN.sub(" ", quote or "")
+    m = re.search(r"\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?(?![a-z])", rest, re.I) \
+        or re.search(r"\b(\d{1,4})\s*(a\.?m\.?|p\.?m\.?)(?![a-z])", rest, re.I)
+    if m and ":" in m.group(0):
+        h, mi, ap = int(m.group(1)), int(m.group(2)), (m.group(3) or "")
+    elif m:
+        digits, ap = m.group(1), m.group(2)
+        h, mi = (int(digits), 0) if len(digits) <= 2 else (int(digits[:-2]), int(digits[-2:]))
+    else:
+        mm = _MILITARY_TIME.search(rest) if _DATE_TOKEN.search(quote or "") else None
+        if not mm:
+            return None
+        h, mi, ap = int(mm.group(0)[:2]), int(mm.group(0)[2:]), ""
+    ap = ap.lower().replace(".", "")
+    if ap == "pm" and h < 12:
+        h += 12
+    elif ap == "am" and h == 12:
+        h = 0
+    return (h, mi) if 0 <= h <= 23 and 0 <= mi <= 59 else None
+
+
+def _day(quote: str, sent_local: datetime) -> Optional[datetime]:
+    """The (naive) calendar day a line states, resolved against the day the
+    message was sent: "2nd" -> this month or last; "11/2" -> this year or last.
+    Never later than the send day."""
+    qd = quote_dates(quote)
+    if not qd:
+        return None
+    mo, d = qd[0]
+    y = sent_local.year
+    if mo is None:
+        mo = sent_local.month
+        if d > sent_local.day:
+            mo -= 1
+            if mo == 0:
+                mo, y = 12, y - 1
+    try:
+        day = datetime(y, mo, d)
+    except ValueError:
+        return None
+    if day.date() > sent_local.date():
+        try:
+            day = datetime(y - 1, mo, d)
+        except ValueError:
+            return None
+    return day
+
+
+def confirmation_lines(text: str) -> list:
+    """Plain delivery confirmations in a message's own words, as (line, kind):
+    "delivered" for "This shows delivered 0900AM/22nd" / "7236706H-delivered"
+    / "This load delivered 11/2"; "arrival" for a detention notice's
+    "Arrival Time: 543AM/2nd" (it only exists once the truck unloaded, and
+    only counts next to a Departure time). Empty when the message hedges or
+    reports a problem anywhere."""
+    own = own_text(text or "")
+    if _PROBLEM.search(own):
+        return []
+    out = []
+    for raw in _SENTENCE.findall(own):
+        line = raw.strip().strip(".!").strip()
+        if not line or not _CONFIRM.search(line):
+            continue
+        if _HEDGE.search(line):
+            return []            # one hedged "delivered" line: leave it to a reader
+        out.append((line, "delivered"))
+    if _DEPARTURE.search(own):
+        for m in _ARRIVAL.finditer(own):
+            line = m.group(0).strip()
+            if quote_dates(line):
+                out.append((line, "arrival"))
+    return out
+
+
+def delivered_at_from(line: str, sent: str, zone: str,
+                      appt: str = "") -> Optional[tuple]:
+    """(delivered_at ISO, time_known) for a confirmation line, or None.
+    A stated day (+ time when given, in the dock's zone); no day -> the
+    appointment's day, if the appointment had passed when the line was sent."""
+    from zoneinfo import ZoneInfo
+    sent_dt = parse_dt(sent)
+    if sent_dt is None:
+        return None
+    tz = ZoneInfo(zone)
+    sent_local = sent_dt.astimezone(tz)
+    day = _day(line, sent_local)
+    if day is None:
+        a = parse_dt(appt)
+        if a is None or a > sent_dt:
+            return None
+        return a.astimezone(tz).strftime("%Y-%m-%d"), False
+    clk = _clock(line)
+    if clk is None:
+        return day.strftime("%Y-%m-%d"), False
+    local = day.replace(hour=clk[0], minute=clk[1]).replace(tzinfo=tz)
+    if local > sent_local + DELIVERED_FUTURE_SLACK:
+        return None
+    return local.isoformat(timespec="seconds"), True
