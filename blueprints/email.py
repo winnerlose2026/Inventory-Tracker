@@ -488,6 +488,11 @@ def api_email_send():
                                                    #   EMAIL_SEND_ALLOWED_FROM
           "reply_to_message_id": "<graph id>",     # optional; reply in-thread
           "save_to_sent_items": true,              # optional, default true
+          "inline_images": [                       # optional; new mail only.
+            {"cid": "hh-logo", "name": "logo.png", # <img src="cid:hh-logo">
+             "content_type": "image/png",          # png / jpeg / gif only
+             "content_b64": "<base64>"}            # max 24 images, 3 MB total
+          ],
           "dry_run": false                         # optional; build, don't send
         }
 
@@ -541,6 +546,37 @@ def api_email_send():
         else:
             content_type, content = "Text", (body.get("body") or "")
 
+        # Inline images (Graph fileAttachment, isInline + contentId) so a
+        # branded HTML mail can show its logo / brand-font headings in Outlook,
+        # which blocks remote images and data: URIs. Images only, size-capped.
+        inline = body.get("inline_images") or []
+        if not isinstance(inline, list) or len(inline) > 24:
+            return jsonify({"ok": False, "error": "inline_images must be a list of at most 24 images"}), 400
+        import base64 as _b64
+        import re as _re2
+        attachments, total = [], 0
+        for i, img in enumerate(inline):
+            if not isinstance(img, dict):
+                return jsonify({"ok": False, "error": f"inline_images[{i}] must be an object"}), 400
+            cid = str(img.get("cid") or "").strip()
+            ctype = str(img.get("content_type") or "").strip().lower()
+            b64 = str(img.get("content_b64") or "")
+            name = str(img.get("name") or cid or f"image{i}").strip()[:100]
+            if not _re2.fullmatch(r"[A-Za-z0-9._-]{1,64}", cid):
+                return jsonify({"ok": False, "error": f"inline_images[{i}].cid must be 1-64 of A-Z a-z 0-9 . _ -"}), 400
+            if ctype not in ("image/png", "image/jpeg", "image/gif"):
+                return jsonify({"ok": False, "error": f"inline_images[{i}].content_type must be image/png, image/jpeg or image/gif"}), 400
+            try:
+                raw = _b64.b64decode(b64, validate=True)
+            except Exception:  # noqa: BLE001
+                return jsonify({"ok": False, "error": f"inline_images[{i}].content_b64 is not valid base64"}), 400
+            total += len(raw)
+            attachments.append({"@odata.type": "#microsoft.graph.fileAttachment",
+                                "name": name, "contentType": ctype,
+                                "contentBytes": b64, "contentId": cid, "isInline": True})
+        if total > 3 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "inline_images exceed 3 MB in total"}), 400
+
         dry_run = bool(body.get("dry_run", False))
         save_to_sent = bool(body.get("save_to_sent_items", True))
         reply_to = (body.get("reply_to_message_id") or "").strip()
@@ -567,7 +603,7 @@ def api_email_send():
         if dry_run:
             return jsonify({"ok": True, "sent": False, "dry_run": True,
                             "from": sender, "from_overridden": from_overridden,
-                            "to": to, "cc": cc,
+                            "to": to, "cc": cc, "inline_images": len(attachments),
                             "subject": subject, "threaded": bool(reply_to)})
 
         client = EmailInboxClient()
@@ -612,6 +648,8 @@ def api_email_send():
                            "toRecipients": _recips(to)}
                 if cc:
                     message["ccRecipients"] = _recips(cc)
+                if attachments:
+                    message["attachments"] = attachments
                 _graph("POST", f"{GRAPH_BASE}/users/{uq(sender)}/sendMail",
                        {"message": message, "saveToSentItems": save_to_sent})
         except urllib.error.HTTPError as exc:
@@ -625,7 +663,7 @@ def api_email_send():
 
         return jsonify({"ok": True, "sent": True, "dry_run": False,
                         "from": sender, "from_overridden": from_overridden,
-                        "to": to, "cc": cc,
+                        "to": to, "cc": cc, "inline_images": len(attachments),
                         "subject": subject, "threaded": bool(reply_to)})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": _safe_err(exc),

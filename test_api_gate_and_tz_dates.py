@@ -105,9 +105,13 @@ def test_admin_po_order_date_accepts_z_and_marks_operator():
         it, sync, c = _setup(Path(td))
         _book(sync, "9999992O")
         H = {"X-Inventory-Token": TOKEN}
+        # Relative date: a fixed 2026-10-01 + lead days put the recomputed ETA
+        # in the past once the calendar passed it, so the PO rolled to arrived
+        # and the on_order lookup below found nothing (test went red 2026-11).
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z")
         r = c.post("/api/admin/po-order-date",
                    json={"po_number": "9999992O",
-                         "order_date": "2026-10-01T00:00:00Z"}, headers=H)
+                         "order_date": recent}, headers=H)
         assert r.status_code == 200
         entry = next(p for i in it.load_inventory().values()
                      for p in (i.get("on_order") or []) if p.get("po_number") == "9999992O")
