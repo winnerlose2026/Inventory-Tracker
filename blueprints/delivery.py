@@ -441,9 +441,13 @@ def api_delivery_sync_threads():
 def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> bool:
     """Is ``msg`` a reply to an H&H message that asked about ``po_key`` and no
     other PO on the thread? (JD's follow-up "- PO 1209157 (...): can you
-    confirm it delivered" -> Lineage: "This shows delivered.")"""
+    confirm it delivered" -> Lineage: "This shows delivered.")
+
+    Also true when that H&H message asked about several POs, ``po_key``
+    among them, and the reply says it speaks for all of them ("Both shows
+    delivered today" -- 5-Orders thread, 11/5)."""
     from integrations.po_delivery import (INTERNAL_TEST_PREFIX, is_hh, names_po,
-                                          own_text, parse_dt)
+                                          own_text, parse_dt, speaks_for_all)
     sent = parse_dt(msg.get("sent") or "")
     conv = msg.get("conversation_id") or ""
     prev = None
@@ -460,7 +464,10 @@ def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> b
     if prev is None:
         return False
     text = own_text(prev[1].get("text") or "")
-    return [p for p in dict.fromkeys(pos_on_thread) if names_po(text, p)] == [po_key]
+    asked = [p for p in dict.fromkeys(pos_on_thread) if names_po(text, p)]
+    if asked == [po_key]:
+        return True
+    return len(asked) > 1 and po_key in asked and speaks_for_all(msg.get("text") or "")
 
 
 def _verify_evidence(ev: dict, po_key: str, cache: dict, tracked: bool = True) -> tuple:
@@ -789,7 +796,9 @@ def api_delivery_send_followups():
     wording (ASK_TEXT), and the thread (the NEWEST Quote and Schedule thread
     listing the PO, from the last sync). Guards: the sync must be fresh
     (SYNC_FRESH_FOR) and complete; a PO someone wrote about on ANY cached
-    thread in the last THREAD_QUIET_FOR is held back (po_delivery.quiet_pos);
+    thread in the last THREAD_QUIET_FOR is held back (po_delivery.quiet_pos),
+    and so is one Lineage / the dock already replied about since our last ask
+    (po_delivery.answered_since_chase -- auto-replies don't count);
     a canceled PO, or one the ledger no longer has, is never chased; at most
     MAX_FOLLOWUP_EMAILS.
 
@@ -805,8 +814,8 @@ def api_delivery_send_followups():
     )
     from integrations.po_delivery import (
         FOLLOWUP_CC, FOLLOWUP_FROM, FOLLOWUP_TO, MAX_FOLLOWUP_EMAILS,
-        SYNC_FRESH_FOR, chase_due, followup_body, parse_dt, quiet_pos,
-        record_chase, reply_subject,
+        SYNC_FRESH_FOR, answered_since_chase, chase_due, followup_body, parse_dt,
+        quiet_pos, record_chase, reply_subject,
     )
     try:
         body = request.get_json(silent=True) or {}
@@ -861,6 +870,15 @@ def api_delivery_send_followups():
                     "warehouse": (lr or {}).get("warehouse", ""),
                     "delivery_appt": rec.get("delivery_appt") or ""}
             why = next((q[key] for q in quiet_by_conv.values() if key in q), None)
+            if not why:
+                # Lineage already answered our last ask (on any thread naming
+                # the PO): read that reply, don't send the same ask again.
+                why = next((a for c, t in threads.items()
+                            if key in (t.get("po_numbers") or [])
+                            for a in [answered_since_chase(
+                                rec, by_conv.get(c, []),
+                                list(dict.fromkeys(t.get("po_numbers") or [])), now)]
+                            if a), None)
             if why:
                 held_by_conv.setdefault(conv, {})[item["po_number"]] = why
                 continue

@@ -70,6 +70,7 @@ FOLLOWUP_CC = ("Isaiah@hhbagels.com", "Gabo@hhbagels.com")
 THREAD_QUIET_FOR = timedelta(hours=4)    # someone wrote on the thread just now: wait
 SYNC_FRESH_FOR = timedelta(minutes=45)   # follow-ups only off a just-read mailbox
 MAX_FOLLOWUP_EMAILS = 10                 # per call
+ANSWERED_HOLD_FOR = timedelta(hours=48)  # Lineage replied since our last ask: don't re-ask
 ASK_TEXT = {
     "schedule": ("could you send the pickup date and the delivery appointment "
                  "(date and time)? If it has already delivered, please confirm "
@@ -605,6 +606,65 @@ def followup_body(items: list) -> str:
 INTERNAL_TEST_PREFIX = "TEST (internal"   # H&H-only test replies: never "activity"
 
 
+# Out-of-office / auto-replies are never an answer and never "activity"
+# (Belinda's 11/6 OOO landed seconds after a chase she had already answered).
+_AUTO_REPLY_SUBJECT = re.compile(
+    r"^\s*(?:automatic\s+reply|auto(?:matic)?[- ]?reply|out\s+of\s+(?:the\s+)?office)\b",
+    re.I)
+_AUTO_REPLY_TEXT = re.compile(
+    r"\b(?:out\s+of\s+(?:the\s+)?office|I\s+will\s+(?:be\s+)?return(?:ing)?|"
+    r"I\s+am\s+(?:currently\s+)?away|on\s+vacation|limited\s+access\s+to\s+(?:my\s+)?e-?mail)\b",
+    re.I)
+
+
+def is_auto_reply(msg: dict) -> bool:
+    """An automatic / out-of-office reply (by subject, or a short body that
+    reads like one)."""
+    if _AUTO_REPLY_SUBJECT.search(msg.get("subject") or ""):
+        return True
+    own = own_text(msg.get("text") or "").strip()
+    return len(own) < 600 and bool(_AUTO_REPLY_TEXT.search(own))
+
+
+# A reply naming no PO that answers an H&H message about SEVERAL POs speaks for
+# all of them only when it says so: "Both shows delivered today" (Belinda,
+# 11/5, 5-Orders thread, answering the chase for 014511767346 + 054511767347).
+_COLLECTIVE = re.compile(r"\b(?:both|all|each|every|these|those|they)\b", re.I)
+
+
+def speaks_for_all(text: str) -> bool:
+    return bool(_COLLECTIVE.search(own_text(text or "")))
+
+
+def answered_since_chase(rec: dict, messages: list, po_numbers: list,
+                         now: datetime) -> Optional[str]:
+    """Did Lineage / the dock reply on this thread AFTER our last follow-up
+    about this PO (and within ANSWERED_HOLD_FOR)? Then the ball is in our
+    court -- the reply needs reading, not another ask. Returns the hold
+    reason, or None. A reply naming other POs only doesn't count; one naming
+    none counts for every PO on the thread. Auto-replies never count.
+
+    Before this, a reply the server couldn't read ("Both shows delivered
+    today") was invisible to the chase rule, so the next run asked again."""
+    last = _last_chase(rec)
+    if last is None:
+        return None
+    key = norm_po(rec.get("po_number") or "")
+    pos = [norm_po(p) for p in po_numbers]
+    for m in sorted(messages, key=lambda m: m.get("sent") or "", reverse=True):
+        sent = parse_dt(m.get("sent") or "")
+        if sent is None or sent <= last or now - sent >= ANSWERED_HOLD_FOR:
+            continue
+        if not sender_may_report(m.get("from") or "") or is_auto_reply(m):
+            continue
+        named = [p for p in pos if names_po(own_text(m.get("text") or ""), p)]
+        if named and key not in named:
+            continue
+        return (f"{m.get('from')} replied {sent.strftime('%m/%d %H:%M')} UTC after the "
+                "last follow-up -- that reply needs reading, not another ask")
+    return None
+
+
 def quiet_pos(messages: list, po_numbers: list, now: datetime) -> dict:
     """POs on a thread that someone wrote about within THREAD_QUIET_FOR ->
     {po_key: reason}. A message that names some of the thread's POs quiets
@@ -617,7 +677,7 @@ def quiet_pos(messages: list, po_numbers: list, now: datetime) -> dict:
         if not sent or now - sent >= THREAD_QUIET_FOR:
             continue
         text = m.get("text") or ""
-        if text.lstrip().startswith(INTERNAL_TEST_PREFIX):
+        if text.lstrip().startswith(INTERNAL_TEST_PREFIX) or is_auto_reply(m):
             continue
         up = text.upper()
         named = [p for p in po_numbers
@@ -751,6 +811,12 @@ def _day(quote: str, sent_local: datetime) -> Optional[datetime]:
     Never later than the send day."""
     qd = quote_dates(quote)
     if not qd:
+        # "delivered today" / "delivered yesterday": relative to the send day
+        if re.search(r"\btoday\b", quote or "", re.I):
+            return datetime(sent_local.year, sent_local.month, sent_local.day)
+        if re.search(r"\byesterday\b", quote or "", re.I):
+            return (datetime(sent_local.year, sent_local.month, sent_local.day)
+                    - timedelta(days=1))
         return None
     mo, d = qd[0]
     y = sent_local.year

@@ -624,3 +624,39 @@ def test_appt_label_reads_the_zone_off_the_offset():
     assert not D.quote_in_text("Appointment: 10/19/2026 8:00 AM ... Delivery moved",
                                ROJEAN_1015), "pieces must appear in order"
     assert not D.quote_in_text("...", ROJEAN_1015)
+
+
+def test_no_second_ask_after_lineage_answered_the_first(monkeypatch):
+    """11/6: Belinda had answered the 11/5 chase ("Both shows delivered
+    today"); the server couldn't read it and asked again. A reply after our
+    last ask holds the next one (for ANSWERED_HOLD_FOR); an auto-reply or a
+    reply about a different PO doesn't."""
+    rec, _, _ = D.apply_event(None, _requested(sent="2026-10-12T19:16:29Z"), NOW)
+    rec["status"] = "scheduled"
+    rec["delivery_appt"] = "2026-10-14T08:00:00-05:00"
+    rec = D.record_chase(rec, "confirm_delivery", NOW - timedelta(hours=20), "m1")
+    assert D.chase_due(rec, NOW) == "confirm_delivery"
+
+    def run(text, h=19, sender=BELINDA, subject="RE: Quote and Schedule - 2 Orders"):
+        msgs = {"<ans@x>": {"from": sender, "conversation_id": "conv1", "text": text,
+                            "subject": subject,
+                            "sent": (NOW - timedelta(hours=h)).isoformat()}}
+        c, store = _routes(monkeypatch, _inv(), {"393072B2": dict(rec)},
+                           synced=_synced(msgs, pos=("393072B2", "014511763291"), base=False))
+        return c.post("/api/pos/delivery/send-followups", json={},
+                      headers={"X-Inventory-Token": "dtok"}).get_json(), store
+
+    out, store = run("Both shows delivered today")
+    assert out["sent"] == 0 and store["sent"] == []
+    assert "needs reading" in out["emails"][0]["held_back"]["393072B2"]
+    # an out-of-office is not an answer
+    out, store = run("I will be out of the office Friday and return Monday.",
+                     subject="Automatic reply: Quote and Schedule - 2 Orders")
+    assert out["sent"] == 1
+    # a reply naming only another PO is not an answer about this one
+    out, _ = run("014511763291 delivered 10/15")
+    assert out["sent"] == 1
+    # a reply from before our last ask doesn't hold the next one
+    for h in (21, 49):
+        out, _ = run("Both shows delivered today", h=h)
+        assert out["sent"] == 1, h
