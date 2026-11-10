@@ -266,10 +266,19 @@ def test_delivery_inside_a_later_count_is_absorbed_not_added(monkeypatch):
     assert item["quantity"] == 72.0 and item["on_order"] == []
 
 
-def test_an_operators_explicit_arrival_overrides_the_hold(monkeypatch):
+def test_an_operators_expected_arrival_does_not_override_the_hold(monkeypatch):
+    # JD 2026-11-10: a tracked PO counts only once arrival is confirmed.
     rec, _, _ = D.apply_event(None, _requested(), NOW)
     item = _roll(monkeypatch, _inv(eta="2026-10-14T00:00:00", source="operator"),
                  {"393072B2": rec})
+    assert item["quantity"] == 72.0 and len(item["on_order"]) == 1
+
+
+def test_an_operator_marking_it_arrived_overrides_the_hold(monkeypatch):
+    rec, _, _ = D.apply_event(None, _requested(), NOW)
+    inv = _inv(eta="2026-10-14T00:00:00", source="operator")
+    inv[KEY]["on_order"][0]["arrival_confirmed"] = True
+    item = _roll(monkeypatch, inv, {"393072B2": rec})
     assert item["quantity"] == 296.0
 
 

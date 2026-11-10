@@ -120,8 +120,9 @@ def _apply_to_inventory(po_key: str, rec: dict) -> dict:
         for e in (item.get("on_order") or []):
             if norm_po(e.get("po_number") or "") != po_key:
                 continue
-            if (e.get("arrival_source") or "") == "operator":
-                continue          # a human's explicit arrival wins
+            if ((e.get("arrival_source") or "") == "operator"
+                    and e.get("arrival_confirmed")):
+                continue          # a human marked it Arrived: that wins
             before = dict(e)
             if st == "scheduled" and rec.get("delivery_appt"):
                 local = wall_time(rec["delivery_appt"])

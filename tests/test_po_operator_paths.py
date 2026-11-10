@@ -288,3 +288,31 @@ def test_reopened_confirmation_cannot_be_reposted_from_the_same_message():
                                    sent="2026-10-22T14:00:00Z"))
     rec2, change, err = apply_event(rec, newer, now)
     assert err is None and rec2["status"] == "delivered"
+
+
+def test_operator_expected_arrival_does_not_release_lineage_hold(env):
+    """La Mirada 7135734C (2026-11-06): an expected arrival typed on the Pending
+    tab passed while Lineage still had the PO awaiting delivery, and 336 cs
+    rolled into on-hand. A tracked PO counts only on confirmation."""
+    it, sync, c = env
+    PO = "7300002C"
+    _book(sync, PO, order_day=_day(-40))
+    it.save_po_delivery({PO: {"po_number": PO, "status": "scheduled",
+                              "delivery_appt": f"{_day(-2)}T08:00:00-08:00"}})
+    c.post("/api/on-order/ship-date", json={"po_number": PO, "ship_date": _day(-8),
+                                            "arrival_date": _day(-1)}, headers=H)
+    inv = it.load_inventory()
+    assert [e["po_number"] for e in inv[KEY]["on_order"]] == [PO]
+    assert it._delivery_gate(inv[KEY]["on_order"][0], it.load_po_delivery()) == ("hold", None)
+
+
+def test_operator_marked_arrived_releases_lineage_hold(env):
+    it, sync, c = env
+    PO = "7300003C"
+    _book(sync, PO, order_day=_day(-40))
+    it.save_po_delivery({PO: {"po_number": PO, "status": "scheduled",
+                              "delivery_appt": f"{_day(-2)}T08:00:00-08:00"}})
+    r = c.post("/api/pending/set-status", json={"po_number": PO, "status": "arrived",
+                                                "arrival_date": _day(-1)}, headers=H).get_json()
+    assert r["arrival_stamped_lines"] == 1
+    assert it.load_inventory()[KEY]["on_order"] == []

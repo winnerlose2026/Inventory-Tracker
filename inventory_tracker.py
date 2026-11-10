@@ -793,10 +793,20 @@ def _delivery_gate(entry: dict, tracking: dict):
     delivered -- it stays in Pending POs even after its appointment passes
     (JD 2026-10-15: arrival is confirmation-driven). Returns ("delivered",
     dt) once confirmed, so the entry rolls over dated to the actual delivery.
-    ("none", None) when untracked or when an operator typed an explicit
-    arrival on the Pending tab (arrival_source="operator"), which wins.
+    ("none", None) when untracked, or when an operator marked the PO
+    Arrived with a date on the Pending tab (arrival_confirmed), which wins.
+
+    An operator's EXPECTED arrival date (ship-date editor, a future arrival
+    carried through an un-roll) is an estimate, not a receipt, and does NOT
+    release a tracked PO (JD 2026-11-10: "shouldn't be counted in inventory
+    until we get the arrival confirmation"). La Mirada 7135734C: an 11/6
+    estimate typed on 10/23 rolled 336 cs into on-hand on 11/6 while Lineage
+    still had it awaiting delivery -- it had not even left on the truck.
     """
-    if not tracking or (entry.get("arrival_source") or "") == "operator":
+    if not tracking:
+        return "none", None
+    if ((entry.get("arrival_source") or "") == "operator"
+            and entry.get("arrival_confirmed")):
         return "none", None
     from integrations.po_delivery import HOLD_STATUSES, norm_po
     rec = tracking.get(norm_po(entry.get("po_number") or ""))

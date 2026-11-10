@@ -215,6 +215,9 @@ def api_on_order_ship_date():
                 # reads eta off the on_order entry for the Pending POs tab.
                 entry["eta"] = arrival_iso
                 entry["arrival_source"] = "operator"
+            # A date typed here is an expectation, never a receipt: it must
+            # not keep (or grant) the Arrived release of the Lineage hold.
+            entry.pop("arrival_confirmed", None)
             updated += 1
             if item.get("name") not in touched_items:
                 touched_items.append(item.get("name") or key)
@@ -882,6 +885,9 @@ def api_pending_set_status():
                 entry["arrival_date"] = arrival_iso
                 entry["eta"] = arrival_iso
                 entry["arrival_source"] = "operator"
+                # The operator says it IS here: the one operator date that
+                # releases a Lineage-tracked PO (_delivery_gate).
+                entry["arrival_confirmed"] = True
                 entry.pop("rebooked_after_count", None)
                 for k in ("transit_days", "transit_basis"):
                     entry.pop(k, None)

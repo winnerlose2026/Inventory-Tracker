@@ -29,8 +29,9 @@ ARRIVAL IS CONFIRMATION-DRIVEN (JD, 2026-10-15): while a PO is tracked here
 and not yet confirmed delivered, the inventory rollover HOLDS it in Pending
 POs even after its appointment passes; it lands in on-hand only when Lineage
 (or the receiving DC) confirms delivery, dated to the actual delivery time.
-An operator who types an explicit arrival on the Pending tab overrides the
-hold (arrival_source="operator").
+Only an operator marking the PO Arrived (with a date) on the Pending tab
+overrides the hold (arrival_confirmed); an expected arrival date typed there
+is an estimate and the PO stays held until Lineage / the DC confirms.
 """
 
 from __future__ import annotations
