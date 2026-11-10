@@ -408,6 +408,13 @@ def api_delivery_sync_threads():
                                       "errors": list(errors),
                                       "messages": cached_msgs,
                                       "threads": cache_threads})
+            # Firm appointment changes ("scheduled for 11/11 at 8:30 AM") too,
+            # from Lineage or the DC, on any thread about the PO (JD 11/10).
+            try:
+                rescheduled = _apply_server_schedules(dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 -- never fail the sync
+                _log_exc(exc, "delivery-sync-threads schedule")
+                rescheduled = [{"applied": False, "reason": _safe_err(exc)}]
             # Plain confirmations ("This shows delivered 0900AM/22nd") are
             # applied right here, so the Pending tab moves as soon as the
             # mail is read -- not at the task's next 9:22 / 3:22 run.
@@ -416,7 +423,7 @@ def api_delivery_sync_threads():
             except Exception as exc:  # noqa: BLE001 -- never fail the sync
                 _log_exc(exc, "delivery-sync-threads confirm")
                 confirmed = [{"applied": False, "reason": _safe_err(exc)}]
-            if confirmed and not dry_run:
+            if (confirmed or rescheduled) and not dry_run:
                 # the task reads open_pos off this response: show it the new state
                 fresh = load_po_delivery()
                 for t in threads:
@@ -427,6 +434,7 @@ def api_delivery_sync_threads():
             threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
             return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
                             "confirmed_by_server": confirmed,
+                            "rescheduled_by_server": rescheduled,
                             "threads": threads, "registered": registered,
                             "closed": [tracking[k].get("po_number") or k for k in closed
                                        if tracking[k].get("closed_reason")],
@@ -650,6 +658,86 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                 events.append(ev)
                 break
     return events
+
+
+def _server_schedules(tracking: dict, ledger: dict, cache: dict, now) -> list:
+    """Appointment changes the server can read off the synced threads by
+    itself (po_delivery.appointment_lines): firm "scheduled for 11/11 at 8:30
+    AM" statements from Lineage or the receiving DC, on any thread about the
+    PO -- Quote and Schedule or a one-off delivery thread. Messages are taken
+    oldest first so the latest firm date wins; each event is verified and
+    applied exactly like one the task posts (stale / implausible refused)."""
+    from integrations.po_delivery import (
+        HOLD_STATUSES, apply_event, appointment_from, appointment_lines,
+        dock_zone, is_auto_reply, names_po, own_text, parse_dt, sender_may_report,
+    )
+    threads = cache.get("threads") or {}
+    by_conv: dict = {}
+    for mid, m in (cache.get("messages") or {}).items():
+        by_conv.setdefault(m.get("conversation_id") or "", []).append({**m, "_id": mid})
+    events = []
+    for key, rec in tracking.items():
+        if rec.get("status") not in HOLD_STATUSES or rec.get("closed_reason"):
+            continue
+        req = parse_dt(rec.get("requested_at") or "")
+        lr = ledger.get(key) or {}
+        zone = dock_zone((rec.get("request") or {}).get("address", ""),
+                         lr.get("warehouse", ""))
+        cands = []
+        for conv, th in threads.items():
+            pos = list(dict.fromkeys(th.get("po_numbers") or []))
+            if key not in pos:
+                continue
+            for m in by_conv.get(conv, []):
+                sent = parse_dt(m.get("sent") or "")
+                if (sent is None or not sender_may_report(m.get("from") or "")
+                        or (req and sent < req) or is_auto_reply(m)):
+                    continue
+                own = own_text(m.get("text") or "")
+                named = [p for p in pos if names_po(own, p)]
+                for line in appointment_lines(m.get("text") or ""):
+                    on_line = [p for p in pos if names_po(line, p)]
+                    if on_line:
+                        ok = on_line == [key]
+                    elif named:
+                        ok = named == [key]
+                    else:
+                        ok = len(pos) == 1 or _answers_only(m, key, pos, cache)
+                    if ok:
+                        cands.append((sent, m, line))
+        work = rec
+        for _sent, m, line in sorted(cands, key=lambda c: c[0]):
+            appt = appointment_from(line, m.get("sent") or "", zone,
+                                    work.get("delivery_appt") or "")
+            if appt is None:
+                continue
+            ev = {"po_number": rec.get("po_number") or key,
+                  "event": "rescheduled" if work.get("delivery_appt") else "scheduled",
+                  "delivery_appt": appt, "source": "server",
+                  "evidence": {"message_id": m["_id"], "sender": m.get("from"),
+                               "sent": m.get("sent"), "quote": line}}
+            ev2, why = _verify_evidence(ev, key, cache, tracked=True)
+            if why:
+                continue
+            nxt, change, err = apply_event(work, ev2, now)
+            if err or not change:
+                continue
+            work = nxt
+            events.append(ev)
+    return events
+
+
+def _apply_server_schedules(dry_run: bool = False) -> list:
+    """Read + apply the firm appointment changes now in the thread cache.
+    Caller holds the data lock. Returns the applied results."""
+    from inventory_tracker import load_po_delivery, load_po_delivery_threads
+    events = _server_schedules(load_po_delivery(), _ledger_by_po(),
+                               load_po_delivery_threads() or {}, _now())
+    if not events:
+        return []
+    out = _apply_events(events, dry_run=dry_run)
+    return [{k: r.get(k) for k in ("po_number", "applied", "reason", "change")}
+            for r in out.get("results") or []]
 
 
 def _apply_server_confirmations(dry_run: bool = False) -> list:

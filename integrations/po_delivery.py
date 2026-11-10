@@ -889,3 +889,93 @@ def delivered_at_from(line: str, sent: str, zone: str,
     if local > sent_local + DELIVERED_FUTURE_SLACK:
         return None
     return local.isoformat(timespec="seconds"), True
+
+
+# ---------------------------------------------------------------------------
+# Appointment changes the server reads itself (2026-11-10)
+# ---------------------------------------------------------------------------
+# JD: "I want these updated arrival dates to automatically get updated in the
+# dashboard as they are sent." Miss that prompted it: Cheney's Marbel Fox wrote
+# "We show this PO scheduled for 11/11 at 8:30 AM" on a one-off
+# "PO 064511780513 - Delivery appointment help" thread; the Pending tab kept
+# Lineage's earlier 11/18 because only the twice-daily task read schedules,
+# and it only reads the Quote and Schedule threads. Like confirmation_lines,
+# only FIRM statements are read: a request, a question or a conditional
+# ("if you are able ... otherwise 11/18") is left for a person -- a wrong
+# appointment date is cosmetic (the PO stays held either way), a guessed one
+# from a conditional is not worth showing.
+
+_APPT_CUE = re.compile(
+    r"\b(?:scheduled|rescheduled|appointment|appt|moved\s+to|pushed\s+to|"
+    r"set\s+for|booked|will\s+(?:now\s+)?deliver|delivering|deliver(?:s|y)?\s+(?:on|for))\b",
+    re.I)
+_APPT_HEDGE = re.compile(
+    r"\?|n't\b|\b(?:if|unless|otherwise|whether|request\w*|ask\w*|can|could|"
+    r"would|please|try\w*|hop\w*|possible|possibly|tentative\w*|pending|maybe|"
+    r"not|no|need\w*|want\w*|prefer\w*|instead\s+of|was\s+given|received|"
+    r"capacity|delivered|picked)\b", re.I)
+
+
+def appointment_lines(text: str) -> list:
+    """Firm delivery-appointment statements in a message's own words:
+    "We show this PO scheduled for 11/11 at 8:30 AM", "Appointment: 10/19/2026
+    8:00 AM", "Delivery moved to 0830AM/18th". Each line must state a day.
+    A hedged / conditional / requesting line is skipped, and a message whose
+    firm lines disagree on the day is skipped whole (ambiguous)."""
+    own = own_text(text or "")
+    if _PROBLEM.search(own):
+        return []
+    out = []
+    for raw in re.split(r"[\n]|(?<=[.!?])\s+(?=[A-Z])", own):
+        line = raw.strip().strip(".!").strip()
+        if not line or len(line) > 220:
+            continue
+        if not (_APPT_CUE.search(line) and quote_dates(line)):
+            continue
+        if _APPT_HEDGE.search(line):
+            continue
+        out.append(line)
+    days = {quote_dates(l)[0] for l in out}
+    return out if len(days) == 1 else []
+
+
+def appointment_from(line: str, sent: str, zone: str,
+                     current_appt: str = "") -> Optional[str]:
+    """ISO appointment (dock zone offset) for an appointment line, or None.
+    The day is resolved FORWARD from the send day ("18th" sent 11/9 -> 11/18;
+    "1/4" sent 12/28 -> next January). With no time stated, the current
+    appointment's time is kept; with neither, nothing is read."""
+    from zoneinfo import ZoneInfo
+    sent_dt = parse_dt(sent)
+    if sent_dt is None:
+        return None
+    tz = ZoneInfo(zone)
+    s = sent_dt.astimezone(tz)
+    qd = quote_dates(line)
+    if not qd:
+        return None
+    mo, d = qd[0]
+    y = s.year
+    if mo is None:
+        mo = s.month
+        if d < s.day:
+            mo += 1
+            if mo == 13:
+                mo, y = 1, y + 1
+    elif (mo, d) < (s.month, s.day) and (s.month - mo) % 12 > 2:
+        y += 1                       # "1/4" written in late December
+    try:
+        day = datetime(y, mo, d)
+    except ValueError:
+        return None
+    clk = _clock(line)
+    if clk is None:
+        cur = parse_dt(current_appt)
+        if cur is None:
+            return None
+        cur = cur.astimezone(tz)
+        clk = (cur.hour, cur.minute)
+    local = day.replace(hour=clk[0], minute=clk[1]).replace(tzinfo=tz)
+    if local < s - timedelta(days=1):
+        return None                  # a past day isn't a new appointment
+    return local.isoformat(timespec="seconds")

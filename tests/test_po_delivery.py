@@ -415,7 +415,12 @@ def test_sync_threads_registers_open_pos_and_returns_jds_reply_id(monkeypatch):
     assert [p["po_number"] for p in t["open_pos"]] == ["393072B2"]
     assert t["open_pos"][0]["destination"].startswith("US Foods, 13400 Hollister")
     assert t["messages"][-1]["text"] == "This order is all set"
-    assert store["tracking"]["393072B2"]["status"] == "requested"
+    # The cache already held Rojean's 10/15 "Appointment: 10/19/2026 8:00 AM
+    # ... PO # 393072B2": the server reads firm appointments itself (11/10).
+    rec = store["tracking"]["393072B2"]
+    assert rec["status"] == "scheduled"
+    assert rec["delivery_appt"] == "2026-10-19T08:00:00-05:00"     # Houston dock
+    assert [g["po_number"] for g in out["rescheduled_by_server"] if g["applied"]] == ["393072B2"]
     # what it read is cached for the quote check and the follow-ups
     th = store["threads"]["threads"]["conv1"]
     assert th["po_numbers"] == ["393072B2", "014511763291"]
