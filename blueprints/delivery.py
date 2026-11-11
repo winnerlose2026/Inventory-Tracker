@@ -171,7 +171,16 @@ def api_delivery_list():
                         "total_cs": (lr or {}).get("total_cs", 0),
                         "thread": rec.get("thread") or {}})
         out.sort(key=lambda r: (r["status"], r["delivery_appt"] or r["requested_at"]))
-        return jsonify({"ok": True, "count": len(out), "pos": out})
+        try:
+            from inventory_tracker import load_po_delivery_labels
+            lab = load_po_delivery_labels() or {}
+            labels_status = {k: lab.get(k) for k in ("updated_at", "last_wanted",
+                                                     "last_patched", "last_errors")}
+            labels_status["labeled_messages"] = len(lab.get("labeled") or {})
+        except Exception:  # noqa: BLE001
+            labels_status = {}
+        return jsonify({"ok": True, "count": len(out), "pos": out,
+                        "mailbox_labels": labels_status})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-list")
         return jsonify({"ok": False, "error": _safe_err(exc), "pos": []}), 200
@@ -611,7 +620,10 @@ def _run_labeling(labels: dict, msgs: dict) -> None:
         labeled, patched, errors = _label_mailbox(labels, msgs, labeled, _now())
         with data_lock():
             save_po_delivery_labels({"updated_at": _now().isoformat(), "labeled": labeled,
+                                     "last_wanted": len(labels),
                                      "last_patched": patched, "last_errors": errors})
+        print(f"[delivery-labels] wanted={len(labels)} patched={patched} "
+              f"errors={errors[:3]}", flush=True)
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-label-mailbox")
 
@@ -620,9 +632,12 @@ def _start_labeling(labels: dict, msgs: dict) -> None:
     """Label off the request thread (Graph calls never hold the data lock or
     slow the sync's reply). Off in tests and where MS365 isn't set up."""
     import threading
-    if (not labels or os.environ.get("PYTEST_CURRENT_TEST")
-            or not os.environ.get("MS365_USER")
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if (not labels or not os.environ.get("MS365_USER")
             or os.environ.get("DELIVERY_LABELS", "1") == "0"):
+        print(f"[delivery-labels] skipped: labels={len(labels)} "
+              f"ms365_user={'set' if os.environ.get('MS365_USER') else 'unset'}", flush=True)
         return
     threading.Thread(target=_run_labeling, args=(labels, dict(msgs)), daemon=True).start()
 
