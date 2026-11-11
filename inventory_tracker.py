@@ -786,6 +786,19 @@ def save_po_delivery_threads(data: dict):
     _write_json(PO_DELIVERY_THREADS_FILE, data)
 
 
+PO_DELIVERY_LABELS_FILE = DATA_DIR / "po_delivery_labels.json"
+
+
+def load_po_delivery_labels() -> dict:
+    """Outlook PO labels already put on Quote and Schedule messages in JD's
+    mailbox: {labeled: {internetMessageId: [labels]}} (each added once)."""
+    return _read_json(PO_DELIVERY_LABELS_FILE, {})
+
+
+def save_po_delivery_labels(data: dict):
+    _write_json(PO_DELIVERY_LABELS_FILE, data)
+
+
 def _delivery_gate(entry: dict, tracking: dict):
     """How Lineage tracking changes one pending entry's rollover.
 

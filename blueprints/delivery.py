@@ -208,7 +208,7 @@ def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
         url = (f"{GRAPH_BASE}/users/{urllib.parse.quote(user)}/messages?"
                f"$search={search}&$top=100&$select=id,subject,conversationId,"
                "sentDateTime,from,toRecipients,ccRecipients,internetMessageId,"
-               "uniqueBody")
+               "uniqueBody,categories")
         pages = 0
         while url and pages < 6:
             pages += 1
@@ -238,6 +238,7 @@ def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
                     "from": addr(m.get("from")),
                     "to": [addr(r) for r in m.get("toRecipients") or []],
                     "cc": [addr(r) for r in m.get("ccRecipients") or []],
+                    "categories": list(m.get("categories") or []),
                     # full text: a long request lists every PO block
                     "text": clean_body(((m.get("uniqueBody") or {}).get("content") or ""),
                                        limit=20000),
@@ -298,8 +299,9 @@ def api_delivery_sync_threads():
                 for m in ms:
                     if m["message_id"]:
                         cached_msgs[m["message_id"]] = {
-                            k: m[k] for k in ("from", "sent", "conversation_id",
-                                              "subject", "text", "graph_id", "mailbox")}
+                            k: m.get(k) for k in ("from", "sent", "conversation_id",
+                                                  "subject", "text", "graph_id", "mailbox",
+                                                  "categories")}
                 requested = []
                 for m in ms:
                     if not is_hh(m["from"]):
@@ -384,8 +386,9 @@ def api_delivery_sync_threads():
                 for m in ms:
                     if m["message_id"]:
                         cached_msgs[m["message_id"]] = {
-                            k: m[k] for k in ("from", "sent", "conversation_id",
-                                              "subject", "text", "graph_id", "mailbox")}
+                            k: m.get(k) for k in ("from", "sent", "conversation_id",
+                                                  "subject", "text", "graph_id", "mailbox",
+                                                  "categories")}
                 cache_threads[conv] = {
                     "conversation_id": conv, "subject": ms[0]["subject"],
                     "reply_to_graph_id": "", "reply_subject": ms[-1]["subject"],
@@ -403,11 +406,22 @@ def api_delivery_sync_threads():
             # A partial read is still cached (its messages are real, so quotes can
             # be checked against them) but marked, and send-followups won't chase
             # off it: a reply in the mailbox we couldn't read might answer the ask.
-            save_po_delivery_threads({"synced_at": now.isoformat(),
-                                      "lookback_days": lookback,
-                                      "errors": list(errors),
-                                      "messages": cached_msgs,
-                                      "threads": cache_threads})
+            new_cache = {"synced_at": now.isoformat(), "lookback_days": lookback,
+                         "errors": list(errors), "messages": cached_msgs,
+                         "threads": cache_threads}
+            # Which PO(s) each message is about (mailbox labels) and the
+            # Lineage / DC dates no PO could be matched to (Pending tab).
+            try:
+                labels, unmatched = _message_plan(new_cache, tracking, ledger)
+            except Exception as exc:  # noqa: BLE001 -- never fail the sync
+                _log_exc(exc, "delivery-sync-threads plan")
+                labels, unmatched = {}, {}
+            for conv, notes in unmatched.items():
+                if conv in cache_threads:
+                    cache_threads[conv]["unmatched"] = notes
+            save_po_delivery_threads(new_cache)
+            if not dry_run:
+                _start_labeling(labels, cached_msgs)
             # Firm appointment changes ("scheduled for 11/11 at 8:30 AM") too,
             # from Lineage or the DC, on any thread about the PO (JD 11/10).
             try:
@@ -455,11 +469,12 @@ def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> b
     Also true when that H&H message asked about several POs, ``po_key``
     among them, and the reply says it speaks for all of them ("Both shows
     delivered today" -- 5-Orders thread, 11/5)."""
-    from integrations.po_delivery import (INTERNAL_TEST_PREFIX, is_hh, names_po,
-                                          own_text, parse_dt, speaks_for_all)
+    from integrations.po_delivery import (INTERNAL_TEST_PREFIX, is_ack, is_hh,
+                                          names_po, own_text, parse_dt,
+                                          speaks_for_all)
     sent = parse_dt(msg.get("sent") or "")
     conv = msg.get("conversation_id") or ""
-    prev = None
+    earlier = []
     for m in (cache.get("messages") or {}).values():
         if m.get("conversation_id") != conv or not is_hh(m.get("from") or ""):
             continue
@@ -468,8 +483,17 @@ def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> b
         t = parse_dt(m.get("sent") or "")
         if t is None or sent is None or t >= sent:
             continue
-        if prev is None or t > prev[0]:
-            prev = (t, m)
+        earlier.append((t, m))
+    # The H&H message being answered: the latest one, passing over a bare
+    # "Thanks so much" that names no PO (JD 11/11: a thank-you between the
+    # ask and Lineage's answer used to make the answer unattributable).
+    prev = None
+    for t, m in sorted(earlier, key=lambda x: x[0], reverse=True):
+        own_m = own_text(m.get("text") or "")
+        if is_ack(own_m) and not any(names_po(own_m, p) for p in pos_on_thread):
+            continue
+        prev = (t, m)
+        break
     if prev is None:
         return False
     text = own_text(prev[1].get("text") or "")
@@ -477,6 +501,130 @@ def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> b
     if asked == [po_key]:
         return True
     return len(asked) > 1 and po_key in asked and speaks_for_all(msg.get("text") or "")
+
+
+def _message_pos(msg: dict, pos: list, cache: dict) -> list:
+    """The PO(s) on the thread a message is about: the ones it names; else,
+    from Lineage / the DC, the only PO on the thread or the PO(s) the H&H
+    message it answers asked about. An H&H message is about what it names."""
+    from integrations.po_delivery import is_hh, names_po, own_text
+    own = own_text(msg.get("text") or "")
+    named = [p for p in pos if names_po(own, p)]
+    if named or is_hh(msg.get("from") or ""):
+        return named
+    if len(pos) == 1:
+        return list(pos)
+    return [p for p in pos if _answers_only(msg, p, pos, cache)]
+
+
+def _message_plan(cache: dict, tracking: dict, ledger: dict) -> tuple:
+    """({message_id: [labels]}, {conversation_id: [unmatched date notes]}).
+    A Lineage / DC message with a delivery date that can't be tied to a PO on
+    a multi-PO thread gets NEEDS_REVIEW_LABEL and an unmatched note."""
+    from integrations.po_delivery import (NEEDS_REVIEW_LABEL, date_lines, is_auto_reply,
+                                          po_label, sender_may_report, short_place)
+    threads = cache.get("threads") or {}
+    labels, unmatched = {}, {}
+
+    def label(p):
+        trk, lr = tracking.get(p) or {}, ledger.get(p) or {}
+        return po_label(trk.get("po_number") or lr.get("po_number") or p,
+                        lr.get("distributor", ""),
+                        short_place(lr.get("warehouse", ""),
+                                    (trk.get("request") or {}).get("address", "")))
+
+    for mid, m in (cache.get("messages") or {}).items():
+        conv = m.get("conversation_id") or ""
+        th = threads.get(conv)
+        if not th:
+            continue
+        pos = list(dict.fromkeys(th.get("po_numbers") or []))
+        if not pos:
+            continue
+        msg = {**m, "_id": mid}
+        about = _message_pos(msg, pos, cache)
+        if about:
+            labels[mid] = [label(p) for p in about]
+            continue
+        if not sender_may_report(m.get("from") or "") or is_auto_reply(m):
+            continue
+        dl = date_lines(m.get("text") or "")
+        if dl:
+            labels[mid] = [NEEDS_REVIEW_LABEL]
+            unmatched.setdefault(conv, []).append({
+                "message_id": mid, "sender": m.get("from") or "",
+                "sent": m.get("sent") or "", "quote": dl[0],
+                "subject": m.get("subject") or ""})
+    return labels, unmatched
+
+
+LABEL_DAYS = 30          # only messages this recent get labeled
+LABEL_CAP = 60           # Graph PATCHes per sync (the rest go next sync)
+
+
+def _label_mailbox(labels: dict, msgs: dict, labeled: dict, now, call_for=None) -> tuple:
+    """Add each message's PO labels to its Outlook categories in JD's mailbox.
+    A label is added once per message: if JD removes it, it stays removed.
+    Existing categories are kept. Returns (labeled, patched, errors)."""
+    from integrations.po_delivery import parse_dt
+    call_for = call_for or _graph_call
+    cutoff = now - timedelta(days=LABEL_DAYS)
+    patched, errors, calls = 0, [], {}
+    for mid, want in labels.items():
+        m = msgs.get(mid) or {}
+        box = (m.get("mailbox") or "").strip()
+        if not (box.lower().startswith("jd@") and m.get("graph_id")):
+            continue
+        sent = parse_dt(m.get("sent") or "")
+        if sent is None or sent < cutoff:
+            continue
+        prior = set(labeled.get(mid) or [])
+        new = [x for x in want if x not in prior]
+        if not new:
+            continue
+        if patched >= LABEL_CAP:
+            break
+        existing = list(m.get("categories") or [])
+        cats = list(dict.fromkeys(existing + new))
+        try:
+            if cats != existing:
+                if box not in calls:
+                    calls[box] = call_for(box)
+                call, url = calls[box]
+                call("PATCH", f"{url}/{urllib.parse.quote(m['graph_id'])}",
+                     {"categories": cats})
+                patched += 1
+            labeled[mid] = sorted(prior | set(new))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{mid}: {_safe_err(exc)}")
+            if len(errors) >= 3:
+                break
+    keep = set(msgs)
+    return {k: v for k, v in labeled.items() if k in keep}, patched, errors
+
+
+def _run_labeling(labels: dict, msgs: dict) -> None:
+    from inventory_tracker import (data_lock, load_po_delivery_labels,
+                                   save_po_delivery_labels)
+    try:
+        labeled = dict((load_po_delivery_labels() or {}).get("labeled") or {})
+        labeled, patched, errors = _label_mailbox(labels, msgs, labeled, _now())
+        with data_lock():
+            save_po_delivery_labels({"updated_at": _now().isoformat(), "labeled": labeled,
+                                     "last_patched": patched, "last_errors": errors})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "delivery-label-mailbox")
+
+
+def _start_labeling(labels: dict, msgs: dict) -> None:
+    """Label off the request thread (Graph calls never hold the data lock or
+    slow the sync's reply). Off in tests and where MS365 isn't set up."""
+    import threading
+    if (not labels or os.environ.get("PYTEST_CURRENT_TEST")
+            or not os.environ.get("MS365_USER")
+            or os.environ.get("DELIVERY_LABELS", "1") == "0"):
+        return
+    threading.Thread(target=_run_labeling, args=(labels, dict(msgs)), daemon=True).start()
 
 
 def _verify_evidence(ev: dict, po_key: str, cache: dict, tracked: bool = True) -> tuple:

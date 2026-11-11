@@ -25,6 +25,35 @@ _ALLOWED_PO_STATUSES = {
 }
 
 
+def _unmatched_by_po(cache: dict) -> dict:
+    """{po_key: [notes]}: Lineage / DC dates on a thread that no PO could be
+    matched to, listed under every PO on that thread."""
+    out: dict = {}
+    for th in (cache.get("threads") or {}).values():
+        for note in th.get("unmatched") or []:
+            for p in dict.fromkeys(th.get("po_numbers") or []):
+                out.setdefault(p, []).append(note)
+    return out
+
+
+def _unmatched_for(trk: dict, notes: list, now) -> list:
+    """The notes still worth showing for a held PO: from the last 14 days and
+    newer than the last thing the tracker recorded for it."""
+    from datetime import timedelta
+    from integrations import po_delivery as _pd
+    if trk.get("status") not in _pd.HOLD_STATUSES:
+        return []
+    last = _pd.parse_dt(((trk.get("events") or [{}])[-1].get("evidence") or {}).get("sent")
+                        or "")
+    out = []
+    for n in notes:
+        sent = _pd.parse_dt(n.get("sent") or "")
+        if sent is None or sent < now - timedelta(days=14) or (last and sent <= last):
+            continue
+        out.append({k: n.get(k, "") for k in ("sender", "sent", "quote", "subject")})
+    return out
+
+
 def _cw_po_summary(record: dict) -> dict:
     """Shape a stored CW PO record into the same group dict the
     Pending POs frontend uses for on_order groups (so the merge in
@@ -1339,6 +1368,11 @@ def build_po_ledger() -> list:
         tracking = load_po_delivery() or {}
     except Exception:  # noqa: BLE001 -- tracking is an overlay; never fatal
         tracking = {}
+    try:
+        from inventory_tracker import load_po_delivery_threads
+        _unmatched = _unmatched_by_po(load_po_delivery_threads() or {})
+    except Exception:  # noqa: BLE001 -- an overlay too
+        _unmatched = {}
     overrides = load_status_overrides() or {}
     freight_idx = _freight_ship_date_index()
     recs: dict = {}
@@ -1502,6 +1536,8 @@ def build_po_ledger() -> list:
         if trk and trk.get("status") != "released":
             from datetime import timezone as _tz
             dsum = _pd.summary(trk, datetime.now(_tz.utc))
+            dsum["unmatched"] = _unmatched_for(trk, _unmatched.get(_pd.norm_po(po)) or [],
+                                               datetime.now(_tz.utc))
             r["delivery"] = dsum
             if dsum["status"] == "scheduled" and dsum["delivery_appt_local"]:
                 r["arrival_date"] = dsum["delivery_appt_local"]

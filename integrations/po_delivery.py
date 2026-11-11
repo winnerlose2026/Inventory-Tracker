@@ -600,8 +600,82 @@ def followup_body(items: list) -> str:
         ask = ASK_TEXT[it["ask"]].format(appt=appt_label(it.get("delivery_appt") or ""))
         lines.append(f"- PO {it['po_number']}{f' ({where})' if where else ''}: {ask}")
     return ("Hi team,\n\n" + "\n".join(lines) +
-            "\n\nIf any delivery date changes, please let us know on this thread.\n\n"
-            + SIGNATURE)
+            "\n\nIf any delivery date changes, please let us know on this thread.\n"
+            + PO_REPLY_ASK + "\n\n" + SIGNATURE)
+
+
+# JD 11/11: on a thread about several POs, "This order is set for delivery at
+# 11/13 @0900AM" doesn't say which order -- ask for the PO # on every chase.
+PO_REPLY_ASK = ("Please include the PO # in your reply so we can match each "
+                "date to the right order.")
+
+
+# ---------------------------------------------------------------------------
+# Mailbox labels (JD 11/11): an Outlook category per message naming the PO(s)
+# it is about -- "PO 7135734C \u00b7 USF La Mirada" -- so the multi-PO Quote and
+# Schedule threads can be read and filtered by order. The subject is never
+# changed: a new subject starts a new Exchange conversation, splitting the
+# thread for everyone on it and hiding the fork from the sync.
+# ---------------------------------------------------------------------------
+
+NEEDS_REVIEW_LABEL = "PO ? - needs review"
+_DIST_SHORT = (("us foods", "USF"), ("usf", "USF"), ("cheney", "Cheney"),
+               ("chef", "CW"))
+_STATE_ZIP = re.compile(r"^[A-Z]{2}\.?(?:\s+\d{5}(?:-\d{4})?)?$")
+
+
+def short_place(warehouse: str = "", address: str = "") -> str:
+    """'La Mirada, CA' -> 'La Mirada'; else the city out of an address
+    ('US Foods, 15155 Northam Street, La Mirada, CA 90638' -> 'La Mirada',
+    '..., Ocala FL 34475' -> 'Ocala')."""
+    w = (warehouse or "").split(",")[0].strip()
+    if w:
+        return w
+    parts = [p.strip() for p in (address or "").split(",") if p.strip()]
+    for i in range(len(parts) - 1, 0, -1):
+        if _STATE_ZIP.match(parts[i].upper()):
+            return parts[i - 1]
+        m = re.match(r"^(.*?[A-Za-z])\s+[A-Z]{2}\.?\s+\d{5}", parts[i])
+        if m and not re.search(r"\d", m.group(1)):
+            return m.group(1).strip()
+    return ""
+
+
+def po_label(po_number: str, distributor: str = "", place: str = "") -> str:
+    d = (distributor or "").lower()
+    short = next((s for k, s in _DIST_SHORT if k in d), "")
+    where = " ".join(x for x in (short, place) if x)
+    return f"PO {po_number} \u00b7 {where}" if where else f"PO {po_number}"
+
+
+_DATE_CUE = re.compile(
+    r"\b(?:deliver\w*|pick(?:ed)?\s*-?up|arriv\w*|appointment|appt|scheduled|"
+    r"rescheduled|set\s+for|booked|ETA)\b", re.I)
+
+
+def date_lines(text: str) -> list:
+    """Lines in a message's own words that put a date on a delivery / pickup /
+    appointment -- firm or not ("This order is set for delivery at 11/13
+    @0900AM", "This was picked up 11/03"). Used to flag a Lineage message
+    that carries a date but names no PO, for a person to match."""
+    out = []
+    for raw in re.split(r"[\n]|(?<=[.!?])\s+(?=[A-Z])", own_text(text or "")):
+        line = raw.strip().strip(".!").strip()
+        if line and len(line) <= 220 and _DATE_CUE.search(line) and quote_dates(line):
+            out.append(line)
+    return out
+
+
+_REQUEST = re.compile(
+    r"\?|\b(?:please|pls|need|send|confirm|update|advise|let\s+(?:us|me)\s+know|"
+    r"can\s+you|could\s+you|when|where|status|eta|escalat\w*)\b", re.I)
+
+
+def is_ack(text: str) -> bool:
+    """A short H&H note that asks nothing ("Thanks so much for getting us the
+    info") -- not the message a following Lineage reply is answering."""
+    own = own_text(text or "").strip()
+    return len(own) < 400 and not _REQUEST.search(own)
 
 
 INTERNAL_TEST_PREFIX = "TEST (internal"   # H&H-only test replies: never "activity"

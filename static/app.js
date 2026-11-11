@@ -2862,6 +2862,22 @@ function _deliveryTime(iso) {
 function _deliveryNoteHtml(g) {
   const d = g && g.delivery;
   if (!d || !d.status) return '';
+  return _deliveryStatusHtml(d) + _unmatchedDateHtml(d);
+}
+
+// A Lineage / DC date on this PO's thread that named no PO (JD 11/11): show
+// it so someone matches it to the right order instead of it being missed.
+function _unmatchedDateHtml(d) {
+  const notes = (d && d.unmatched) || [];
+  return notes.map(n => {
+    const who = String(n.sender || '').split('@')[0];
+    const when = n.sent ? formatDate(String(n.sent).slice(0, 10)) : '';
+    const tip = escAttr(`"${n.quote}" — ${n.sender || ''}${n.subject ? ' · ' + n.subject : ''}. No PO # in the reply; labeled "PO ? - needs review" in Outlook.`);
+    return `<div title="${tip}" style="font-size:11px;white-space:normal;line-height:1.3;cursor:help;color:#9A6B00;font-weight:600">&#9888; Date with no PO #: &ldquo;${escHtml(n.quote)}&rdquo; (${escHtml(who)}${when ? ', ' + when : ''}) &middot; which order?</div>`;
+  }).join('');
+}
+
+function _deliveryStatusHtml(d) {
   const q = (d.last_event && d.last_event.quote) ? d.last_event.quote : '';
   const who = (d.last_event && d.last_event.sender) ? d.last_event.sender : '';
   const tip = escAttr(q ? `"${q}" (${who})` : `${d.carrier || 'Lineage'} delivery tracking`);
