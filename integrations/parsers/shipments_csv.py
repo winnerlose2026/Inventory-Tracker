@@ -65,6 +65,16 @@ def parse_shipments_csv(distributor: str, filename: str,
                 )
             continue
 
+        if not str(po_number or "").strip():
+            # A shipment row with no PO number used to be booked under a
+            # synthesised "SFTP-<file>-<row>" PO: a pending order nobody
+            # placed, which rolled into on-hand 30 days later and could never
+            # be matched to a real PO, a revision or a delivery. Refuse it.
+            errors.append(
+                f"row {idx}: no PO number ({variety} {qty:g} for {warehouse}) "
+                f"-- skipped; a shipment line cannot be booked without its PO")
+            continue
+
         cs = opt_int(_resolve(row, "case_size"))
         unit_raw = _resolve(row, "unit") or "cs"
         qty_norm, unit_norm = normalize_to_cases(qty, unit_raw, cs)
@@ -91,7 +101,7 @@ def parse_shipments_csv(distributor: str, filename: str,
             "item": item,
             "source_message_id": f"sftp:{filename}#{idx}",
             "source_subject": f"SFTP shipment history: {filename}",
-            "po_number": po_number or f"SFTP-{filename}-{idx}",
+            "po_number": str(po_number).strip(),
             "po_revision": po_revision or "",
         })
 

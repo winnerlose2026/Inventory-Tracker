@@ -57,6 +57,8 @@ import json
 import os
 import socket
 import ssl
+import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -94,6 +96,9 @@ class IngestReport:
     files_failed: int = 0
     server_reports: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Files left for the next run because they may still be uploading.
+    files_deferred: int = 0
+    deferred: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -236,16 +241,76 @@ def _ensure_dir(ftp: ftplib.FTP_TLS, path: str) -> None:
 
 
 def _move_to_processed(ftp: ftplib.FTP_TLS, src_path: str,
-                       processed_dir: str, name: str) -> None:
-    _ensure_dir(ftp, processed_dir)
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    dest = f"{processed_dir}/{stamp}_{name}"
+                       processed_dir: str, name: str) -> bool:
+    """File a handled drop away. Returns False when the server refused --
+    the caller must REPORT that (it used to be swallowed: the drop then grew
+    without bound and, for the Cheney bridge which keeps no cursor, every
+    run re-read and re-posted the same files)."""
     try:
+        _ensure_dir(ftp, processed_dir)
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        dest = f"{processed_dir}/{stamp}_{name}"
         ftp.rename(src_path, dest)
-    except ftplib.error_perm:
-        # If rename fails (cross-device or perms), fall back to leaving
-        # in place — the cursor still prevents re-ingestion.
-        pass
+        return True
+    except ftplib.all_errors as exc:
+        print(f"[sftp_inbox] could not move {src_path} to {processed_dir}/: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Is a file finished uploading?
+# ---------------------------------------------------------------------------
+MIN_FILE_AGE_SECONDS = 120
+SETTLE_SECONDS = 5
+
+
+def parse_mtime(raw: str) -> Optional[datetime]:
+    """FTP MDTM / MLSD "modify" fact ("YYYYMMDDHHMMSS[.sss]", UTC) -> naive
+    UTC datetime, or None."""
+    digits = "".join(ch for ch in str(raw or "").split(".")[0] if ch.isdigit())
+    if len(digits) < 14:
+        return None
+    try:
+        return datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
+def unstable_reason(name: str, first: dict, second: dict, now: datetime,
+                    min_age_s: float = MIN_FILE_AGE_SECONDS) -> str:
+    """Why ``name`` must be left for the next run, or "" when it is safe.
+
+    ``first`` / ``second`` are {name: (size, mtime datetime | None)} from two
+    listings a few seconds apart; ``now`` is naive UTC. A file still being
+    uploaded was read half-written: its size changes between the listings, or
+    its modification time is under ``min_age_s`` old. A file with no readable
+    mtime is judged on size alone."""
+    if name not in second:
+        return "gone from the second listing"
+    s1, _m1 = first[name]
+    s2, m2 = second[name]
+    if s1 is not None and s2 is not None and s1 != s2:
+        return f"size changed between listings ({s1} -> {s2} bytes)"
+    if m2 is not None and (now - m2).total_seconds() < min_age_s:
+        return (f"modified {max(0, int((now - m2).total_seconds()))} s ago "
+                f"(< {int(min_age_s)} s) -- may still be uploading")
+    return ""
+
+
+def _settle_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SFTP_SETTLE_SECONDS", SETTLE_SECONDS)))
+    except ValueError:
+        return float(SETTLE_SECONDS)
+
+
+def _min_age_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SFTP_MIN_FILE_AGE_SECONDS",
+                                             MIN_FILE_AGE_SECONDS)))
+    except ValueError:
+        return float(MIN_FILE_AGE_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -377,12 +442,29 @@ def pull_account(account: str, distributor: str, *,
     try:
         files = _list_incoming(ftp, incoming)
         report.files_seen = len(files)
+        # A second listing a few seconds later: a file whose size moved, or
+        # that was modified under two minutes ago, is still being uploaded.
+        first = {rf.name: (rf.size, parse_mtime(rf.mtime)) for rf in files}
+        settle = _settle_seconds()
+        if files and settle:
+            time.sleep(settle)
+            second = {rf.name: (rf.size, parse_mtime(rf.mtime))
+                      for rf in _list_incoming(ftp, incoming)}
+        else:
+            second = first
+        now_utc = datetime.utcnow()
+        min_age = _min_age_seconds()
 
         new_fingerprints: list[str] = []
         for rf in files:
             fp = _fingerprint(rf)
             if fp in seen_set:
                 report.files_skipped += 1
+                continue
+            why = unstable_reason(rf.name, first, second, now_utc, min_age)
+            if why:
+                report.files_deferred += 1
+                report.deferred.append(f"{rf.name}: {why}")
                 continue
 
             kind = classify(rf.name)
@@ -427,8 +509,13 @@ def pull_account(account: str, distributor: str, *,
             if ok:
                 report.files_ingested += 1
                 if not dry_run:
-                    _move_to_processed(ftp, f"{incoming}/{rf.name}",
-                                       processed, rf.name)
+                    if not _move_to_processed(ftp, f"{incoming}/{rf.name}",
+                                              processed, rf.name):
+                        # Ingested (the cursor stops a re-ingest) but still
+                        # sitting in the drop: say so.
+                        report.errors.append(
+                            f"{rf.name}: ingested, but could not be moved to "
+                            f"{processed}/ -- it stays in {incoming}/")
                 new_fingerprints.append(fp)
             else:
                 report.files_failed += 1
