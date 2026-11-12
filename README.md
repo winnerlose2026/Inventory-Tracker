@@ -13,14 +13,15 @@ Current version: see [`VERSION`](VERSION) and [`CHANGELOG.md`](CHANGELOG.md).
 | Path | What's there |
 |---|---|
 | `app.py` | Flask app entry point; registers the blueprints |
-| `blueprints/` | Route modules (inventory, POs, production, planning, email, delivery, freight, reporting, admin, health, webhooks) |
+| `blueprints/` | Route modules (inventory, POs, production, planning, email, delivery, freight, reporting, admin, ops (backups, feed health, watchdog), health, webhooks) |
 | `core/` | Shared helpers: auth, caching, HTTP, errors, activity log |
 | `integrations/` | Distributor parsers (USF, Cheney, Chefs Warehouse), email scanner, Lineage, Toast, planner and demand model |
 | `scripts/` | Cron and one-off ingest scripts; `safe_push.py` pre-push validator |
 | `templates/`, `static/` | Web UI |
 | `shopify/` | Shopify-embedded widget |
 | `tests/` | Pytest suite and fixtures |
-| `docs/` | Refactor plan, distributor email drafts, past change notes and handoffs |
+| `docs/` | `OPERATIONS.md` (jobs, env vars, alerts, restore), refactor plan, distributor email drafts, past change notes and handoffs |
+| `CLAUDE.md` | How to make a change: the dev flow and the rules |
 | `render.yaml` | Render blueprint (web service + 6h mailbox-scan cron) |
 
 ## Run locally
@@ -40,10 +41,15 @@ python -m pytest -q
 
 ## Deploying
 
-`main` is production. CI (`.github/workflows/ci.yml`) runs the integrity gate
-and the full test suite on every push, then calls the Render deploy hook.
-Before pushing, run `python scripts/safe_push.py` — it catches truncated or
-NUL-padded files from Dropbox sync.
+`main` is production. Work in a fresh clone on a branch (never the Dropbox
+copy) and run `python -m pytest -q` and `python scripts/safe_push.py` before
+every push -- see [`CLAUDE.md`](CLAUDE.md). CI
+(`.github/workflows/ci.yml`) runs the integrity gate and the full suite on
+every push, then calls the Render deploy hook, waits for `/healthz` to report
+the new commit, checks `/readyz`, and only then deploys the scan cron.
+
+Is it healthy? `GET /api/feeds/health`. How it runs, what each alert means
+and how to restore from a backup: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 Releases are tagged `vX.Y.Z`; bump `VERSION` and add a `CHANGELOG.md` entry
 with each one.

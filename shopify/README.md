@@ -31,13 +31,16 @@ Set environment variables from `.env.example`:
   ALLOWED_ORIGINS=https://your-store.myshopify.com,https://your-store.com
   ```
   Leave unset in local dev. Set to `*` only for quick testing.
-- `INVENTORY_API_TOKEN` — required for write-mode. Generate a long random
-  string (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
-  and set it on the backend. While unset, the write endpoints
-  (`/api/use`, `/api/restock`, `/api/sync`, `/api/inventory` POST/PUT/DELETE)
-  are open to anyone who knows the URL. When set, they require an
-  `X-Inventory-Token: <value>` header — the widget sends this automatically
-  once an admin clicks "Set admin key" and pastes the token.
+- `INVENTORY_API_TOKEN` — the backend's master key. **Every `/api/*`
+  request needs a login session or a key, reads included**: without one the
+  backend answers `401` to `GET /api/distributors` and `GET /api/report`
+  just as it does to a write. Generate it with
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`, set it on
+  the backend, and keep it there: it is for server-side jobs only.
+- `INVENTORY_API_TOKENS` — named, limited keys for anything outside the
+  backend, e.g. `shopify-view:<long random string>:read`. A `read` key can
+  load the tables and nothing else. This is the only kind of key that may
+  be typed into the widget.
 - Cheney / US Foods creds (if you've been issued them).
 - Microsoft 365 creds (`MS365_*`) if you want the email scanner to run.
 
@@ -69,11 +72,14 @@ size (60 = 5 dozen) and weekly usage populated.
    set `REFRESH_MS` to auto-refresh the page (e.g. `60000` for every
    minute).
 7. Save the page. Preview it from the admin.
-8. (Write-mode) On the rendered page, click **Set admin key** in the
-   widget header and paste the value of `INVENTORY_API_TOKEN` from step 1.
-   The key is stored in your browser only (`localStorage`). You'll then
-   see per-row **Use** / **Restock** buttons and a **Sync now** action.
-   Click **Clear admin key** to drop back to read-only on that device.
+8. On the rendered page, click **Set admin key** in the widget header and
+   paste the **read-only** key from `INVENTORY_API_TOKENS` (step 1). The
+   tables load once a key is set; without one every request is refused.
+   The key is stored in that browser only (`localStorage`). **Never paste
+   the master `INVENTORY_API_TOKEN` into a storefront page**: anything
+   running on the storefront domain (theme code, apps, a browser extension)
+   can read `localStorage`, and that key can change and delete stock data.
+   Use, Restock and Sync are done in the Inventory Tracker itself, signed in.
 
 Alternative: paste the widget into a custom **theme section**
 (`sections/bagel-inventory.liquid`) and drop it onto any template in the
@@ -89,22 +95,18 @@ widget renders on failure.
 
 ## Security notes
 
-By default the widget loads in read-only mode (`GET /api/distributors`
-and `GET /api/report` only). Admins unlock write mode by clicking
-**Set admin key** and pasting the backend's `INVENTORY_API_TOKEN`; all
-writes then carry `X-Inventory-Token` and are gated server-side by
-`app.py`.
-
-Recommended posture:
-
-- **Always set `INVENTORY_API_TOKEN` in production.** Without it, the
-  write endpoints are open to anyone who can reach the backend URL.
-- Treat the token like a password. Rotate if staff turnover occurs —
-  the widget's "Clear admin key" only clears the local browser; rotating
-  the env var revokes it everywhere.
-- Optional defence in depth: put the backend behind Cloudflare Access or
-  a reverse-proxy with basic auth so the URL itself isn't reachable.
-
-The token is stored in the Shopify domain's `localStorage`, which is
-isolated per-browser and per-domain. It is never written to Shopify
-itself.
+- **Nothing is open.** Reads and writes both need a key or a signed-in
+  session; the only unauthenticated endpoints are `/healthz`, `/readyz`
+  and the login page. If the widget shows data, it is because a key is
+  stored in that browser.
+- **Only a `read`-scope key belongs in the widget.** It is stored in the
+  Shopify domain's `localStorage`, which every script on that domain can
+  read. The master `INVENTORY_API_TOKEN` (and any `full` key) must never
+  be pasted into a storefront page, a theme file or a Liquid template.
+  With a `read` key the widget's Use / Restock / Sync buttons answer
+  `403`; make those changes in the app.
+- Rotate a widget key by changing its entry in `INVENTORY_API_TOKENS` on
+  the backend; "Clear admin key" only clears one browser.
+- Set `ALLOWED_ORIGINS` to the exact storefront origins, never `*`.
+- Optional defence in depth: put the page behind Shopify's password or a
+  staff-only template so the widget is not on a public URL at all.
