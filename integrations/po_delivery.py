@@ -916,7 +916,19 @@ _HEDGE = re.compile(
 # Words that put the whole message beyond a plain confirmation.
 _PROBLEM = re.compile(
     r"\b(?:partial\w*|short\w*|damag\w*|refus\w*|reject\w*|overage|missing|"
-    r"not\s+delivered|undeliver\w*|returned|claim)\b", re.I)
+    r"not\s+delivered|undeliver\w*|returned|claim|wrong|remaining|left\s+on)\b",
+    re.I)
+# A "delivered" that is not a delivery to the receiving dock, or not all of it
+# (2026-11 review: any unhedged "delivered" sentence released the WHOLE PO):
+#   "delivered to our terminal / the cross-dock / the carrier / a driver"
+#   "delivered 18 of 20 pallets", "only 18 pallets delivered",
+#   "delivered, but ..."
+_NOT_FULL = re.compile(
+    r"\bdelivered\s+to\s+(?:our|the|a)\s+(?:terminal|cross.?dock|carrier|driver)\b|"
+    r"\b\d+\s+of\s+\d+\b|\bonly\b|\bbut\b", re.I)
+# Not a delivery at all yet -- and it holds back the rest of the message the
+# way a hedged "delivered" line does.
+_NOT_YET = re.compile(r"\bout\s+for\s+delivery\b", re.I)
 _ARRIVAL = re.compile(r"^\s*Arrival\s+Time\s*:\s*(\S.*?)\s*$", re.I | re.M)
 _DEPARTURE = re.compile(r"^\s*Departure\s+Time\s*:\s*\S", re.I | re.M)
 _SENTENCE = re.compile(r"[^\n.!?]+(?:[.!](?!\d)|$)", re.M)
@@ -1032,9 +1044,9 @@ def confirmation_lines(text: str) -> list:
     scoped_hedge = False
     for raw in _SENTENCE.findall(own):
         line = raw.strip().strip(".!").strip()
-        if not line or not _CONFIRM.search(line):
+        if not line or not (_CONFIRM.search(line) or _NOT_YET.search(line)):
             continue
-        if _HEDGE.search(line):
+        if _HEDGE.search(line) or _NOT_FULL.search(line) or _NOT_YET.search(line):
             if _PO_LED.match(line):
                 scoped_hedge = True   # that PO is left to a reader; the rest stand
                 continue
