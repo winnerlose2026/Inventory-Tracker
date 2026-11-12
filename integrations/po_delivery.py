@@ -494,6 +494,44 @@ def _last_chase(rec: dict) -> Optional[datetime]:
     return max(ts) if ts else None
 
 
+# Follow-ups used to repeat every 16 h for as long as the PO stayed held --
+# for weeks, to the same three people. After this many asks, or this long
+# since the first unanswered one, the emails stop and a person takes over.
+MAX_CHASES = 6
+MAX_CHASE_DAYS = 21
+_CHASE_RESET_EVENTS = ("scheduled", "rescheduled", "reopened")
+
+
+def chase_exhausted(rec: dict, now: datetime) -> str:
+    """Why automatic follow-ups on this PO have stopped, or "".
+
+    Counts the asks sent since Lineage last moved the PO (a schedule /
+    reschedule, or an operator reopen): MAX_CHASES of them, or
+    MAX_CHASE_DAYS since the first, is enough -- another email will not
+    help; someone has to call."""
+    if rec.get("status") not in HOLD_STATUSES:
+        return ""
+    base = max([t for t in (parse_dt(e.get("at") or "")
+                            for e in rec.get("events") or []
+                            if e.get("event") in _CHASE_RESET_EVENTS) if t],
+               default=None)
+    ts = sorted(t for t in (parse_dt(c.get("at") or "")
+                            for c in rec.get("chases") or []
+                            if c.get("ask") in ("schedule", "confirm_delivery"))
+                if t and (base is None or t >= base))
+    if len(ts) >= MAX_CHASES:
+        return (f"{len(ts)} follow-ups sent since "
+                f"{ts[0].strftime('%Y-%m-%d')} with no answer")
+    if ts and now - ts[0] >= timedelta(days=MAX_CHASE_DAYS):
+        return (f"following up since {ts[0].strftime('%Y-%m-%d')} "
+                f"({len(ts)} sent) with no answer")
+    return ""
+
+
+def needs_human(rec: dict, now: datetime) -> bool:
+    return bool(chase_exhausted(rec, now))
+
+
 def chase_due(rec: dict, now: datetime) -> Optional[str]:
     """'schedule' | 'confirm_delivery' | None for one PO record.
 
@@ -501,11 +539,14 @@ def chase_due(rec: dict, now: datetime) -> Optional[str]:
                         delivery appointment.
     confirm_delivery -- the appointment passed 3+ hours ago and nobody has
                         confirmed it delivered.
-    Never twice within REPEAT_ASK_AFTER.
+    Never twice within REPEAT_ASK_AFTER, and never once the follow-ups are
+    exhausted (chase_exhausted -> needs_human).
     """
     st = rec.get("status")
     last = _last_chase(rec)
     if last and now - last < REPEAT_ASK_AFTER:
+        return None
+    if chase_exhausted(rec, now):
         return None
     if st == "requested":
         since = max([t for t in (parse_dt(rec.get("requested_at") or ""), last) if t],
@@ -837,6 +878,10 @@ def summary(rec: dict, now: datetime) -> dict:
         "confirmation_no": rec.get("confirmation_no") or "",
         "awaiting_confirmation": awaiting_confirmation(rec, now),
         "chase_due": chase_due(rec, now),
+        # Follow-ups exhausted (MAX_CHASES / MAX_CHASE_DAYS): no more emails
+        # go out; a person has to call Lineage or the DC.
+        "needs_human": needs_human(rec, now),
+        "needs_human_reason": chase_exhausted(rec, now),
         "last_chased_at": lc.isoformat() if lc else "",
         "chase_count": len(rec.get("chases") or []),
         "last_event": {"event": last.get("event", ""),

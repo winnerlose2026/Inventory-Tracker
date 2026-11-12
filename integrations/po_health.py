@@ -342,13 +342,162 @@ def _check_hold_integrity(now: datetime) -> dict:
 
 
 
+TRACKED_DISTRIBUTORS = ("us foods", "usf", "cheney", "chefs", "chef's")
+UNTRACKED_LOOKBACK_DAYS = 60
+ARRIVED_UNCONFIRMED_DAYS = 30
+
+
+def _is_tracked_distributor(*texts) -> bool:
+    blob = " ".join(str(t or "") for t in texts).lower()
+    return any(d in blob for d in TRACKED_DISTRIBUTORS)
+
+
+def _recent(raw, now: datetime, days: int) -> bool:
+    dt = _parse(str(raw or "")[:25]) or _parse(str(raw or "")[:10])
+    return dt is not None and now - dt <= timedelta(days=days)
+
+
+def untracked_pos(now: datetime) -> dict:
+    """{po_key: {"po_number", "seen": [where...]}} -- PO numbers that exist
+    somewhere real (a Quote and Schedule request to Lineage, a Lineage freight
+    invoice, a Daily Production sheet) for a distributor the tracker books,
+    but that the PO ledger has never heard of. The lost-PO detector: an
+    emailed PO that failed to parse leaves no other trace."""
+    import inventory_tracker as it
+    from blueprints.pos import build_po_ledger
+    from core.util import _norm_po_key
+    known = {_norm_po_key(r.get("po_number") or "") for r in build_po_ledger()}
+    try:
+        known |= {_norm_po_key(k) for k in (it.load_canceled_pos() or {})}
+    except Exception:  # noqa: BLE001
+        pass
+    out: dict = {}
+
+    def _add(po, where):
+        key = _norm_po_key(po)
+        if not key or key in known or not any(ch.isdigit() for ch in key):
+            return
+        out.setdefault(key, {"po_number": str(po).strip(), "seen": []})["seen"].append(where)
+
+    try:
+        cache = it.load_po_delivery_threads() or {}
+    except Exception:  # noqa: BLE001 -- a mailbox mirror; skip it
+        cache = {}
+    for u in cache.get("not_in_tracker") or []:
+        if (_is_tracked_distributor(u.get("address"))
+                and _recent(u.get("request_sent"), now, UNTRACKED_LOOKBACK_DAYS)):
+            _add(u.get("po_number"),
+                 f"sent to Lineage {str(u.get('request_sent') or '')[:10]} "
+                 f"({u.get('subject') or 'Quote and Schedule'}; "
+                 f"{u.get('quantity') or '?'} to {u.get('address') or '?'})")
+    try:
+        invoices = it.load_freight_invoices() or []
+    except Exception:  # noqa: BLE001
+        invoices = []
+    for f in invoices:
+        if (_is_tracked_distributor(f.get("distributor"), f.get("consignee_name"))
+                and _recent(f.get("ship_date") or f.get("invoice_date"), now,
+                            UNTRACKED_LOOKBACK_DAYS)):
+            _add(f.get("po_number"),
+                 f"Lineage freight invoice {f.get('invoice_number') or '?'} "
+                 f"shipped {str(f.get('ship_date') or '')[:10] or '?'} to "
+                 f"{f.get('dest_dc') or f.get('consignee_name') or '?'}")
+    try:
+        production = it._read_json(it.PRODUCTION_FILE, [])       # read-only
+    except Exception:  # noqa: BLE001
+        production = []
+    recs = production.get("records") if isinstance(production, dict) else production
+    for r in recs or []:
+        if not isinstance(r, dict) or r.get("parse_error"):
+            continue
+        if (_is_tracked_distributor(r.get("distributor"))
+                and _recent(r.get("production_date"), now, UNTRACKED_LOOKBACK_DAYS)):
+            _add(r.get("po_number"),
+                 f"Daily Production {str(r.get('production_date') or '')[:10]} "
+                 f"({r.get('total_cases') or '?'} cs for {r.get('warehouse') or '?'})")
+    return out
+
+
+def _check_untracked(now: datetime) -> dict:
+    fh = _fh()
+    found = untracked_pos(now)
+    keep = set()
+    for key, u in found.items():
+        k = f"po-untracked:{key}"
+        keep.add(k)
+        fh.raise_issue(
+            k, f"PO {u['po_number']} is NOT in the tracker but was "
+               + "; ".join(u["seen"][:3])
+               + ". Its PO email was probably never received or did not parse -- "
+                 "find the PO and enter it, or the stock it delivers will never "
+                 "be counted as on order.", "error")
+    fh.clear_issues_with_prefix("po-untracked:", keep=keep)
+    return {"untracked": sorted(found)}
+
+
+def _check_arrived_unconfirmed(now: datetime) -> dict:
+    """po-arrived-unconfirmed:<po>: requested from Lineage in the last 30
+    days, never confirmed delivered, yet the ledger already says arrived (it
+    rolled in on a date, or was marked / absorbed by hand)."""
+    import inventory_tracker as it
+    fh = _fh()
+    try:
+        cache = it.load_po_delivery_threads() or {}
+    except Exception:  # noqa: BLE001
+        cache = {}
+    keep = set()
+    for u in cache.get("requested_but_arrived") or []:
+        if not _recent(u.get("request_sent"), now, ARRIVED_UNCONFIRMED_DAYS):
+            continue
+        k = f"po-arrived-unconfirmed:{u.get('po_number')}"
+        keep.add(k)
+        fh.raise_issue(
+            k, f"PO {u.get('po_number')} was sent to Lineage "
+               f"{str(u.get('request_sent') or '')[:10]} and never confirmed "
+               f"delivered, but the tracker already shows it ARRIVED "
+               f"({u.get('arrival_kind') or 'by date'} "
+               f"{str(u.get('arrival_date') or '')[:10]}). If it has not really "
+               "arrived, Reopen it on the Pending POs tab.", "warn")
+    fh.clear_issues_with_prefix("po-arrived-unconfirmed:", keep=keep)
+    return {"arrived_unconfirmed": sorted(k.split(":", 1)[1] for k in keep)}
+
+
+def _check_chase(now: datetime) -> dict:
+    """po-chase:<po>: automatic follow-ups are exhausted -- a person calls."""
+    import inventory_tracker as it
+    from blueprints.delivery import _is_open, _ledger_by_po
+    from integrations.po_delivery import chase_exhausted
+    fh = _fh()
+    tracking = it.load_po_delivery() or {}
+    ledger = _ledger_by_po()
+    keep = set()
+    for key, rec in tracking.items():
+        if not _is_open(ledger.get(key), rec):
+            continue
+        why = chase_exhausted(rec, now)
+        if not why:
+            continue
+        k = f"po-chase:{rec.get('po_number') or key}"
+        keep.add(k)
+        lr = ledger.get(key) or {}
+        fh.raise_issue(
+            k, f"PO {rec.get('po_number') or key} ({lr.get('distributor') or '?'} "
+               f"{lr.get('warehouse') or ''}): {why}. Automatic follow-ups to "
+               "Lineage have STOPPED -- call Lineage or the DC, then mark it "
+               "Arrived (with the date) or Reopen / remove it.", "warn")
+    fh.clear_issues_with_prefix("po-chase:", keep=keep)
+    return {"needs_human": sorted(k.split(":", 1)[1] for k in keep)}
+
+
 def _check_parse_issues(now: datetime) -> dict:
     _age_out("po-total:", 48, now)
     return {}
 
 
 CHECKS = [("parse", _check_parse_issues), ("stuck", _check_stuck),
-          ("hold", _check_hold_integrity)]
+          ("hold", _check_hold_integrity), ("untracked", _check_untracked),
+          ("arrived_unconfirmed", _check_arrived_unconfirmed),
+          ("chase", _check_chase)]
 
 
 def run_checks() -> dict:
