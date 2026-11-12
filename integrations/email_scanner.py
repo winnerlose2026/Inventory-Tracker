@@ -150,6 +150,28 @@ _EXCLUDED_WELL_KNOWN_FOLDERS = ("sentitems", "drafts", "deleteditems",
 _REQUIRED_EXCLUDED_FOLDERS = ("sentitems", "drafts", "deleteditems")
 
 
+# _graph_get retry policy (see EmailInboxClient._graph_get).
+_GRAPH_GET_RETRIES = 3
+_GRAPH_RETRY_AFTER_CAP_S = 20.0
+_GRAPH_RETRY_BUDGET_S = 60.0
+
+
+def _sleep(seconds: float) -> None:   # module-level so tests can stub it
+    import time as _time
+    _time.sleep(seconds)
+
+
+def _retry_after_seconds(headers) -> Optional[float]:
+    """Seconds Graph asked us to wait (Retry-After), capped; None if absent."""
+    try:
+        raw = (headers.get("Retry-After") if headers is not None else None)
+        if raw is None or str(raw).strip() == "":
+            return None
+        return max(0.0, min(float(str(raw).strip()), _GRAPH_RETRY_AFTER_CAP_S))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 # Listing pages per mailbox per scan (x $top<=50 ~= 4000 messages screened).
 _MAX_LIST_PAGES = 80
 
@@ -1701,16 +1723,49 @@ class EmailInboxClient:
         return token
 
     def _graph_get(self, url, token, accept="application/json"):
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": accept},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read(), resp.headers
-        except urllib.error.HTTPError as exc:
-            raise _graph_error("GET", url, exc) from exc
+        """GET a Graph URL, retrying a throttle or a transient failure.
+
+        Up to _GRAPH_GET_RETRIES retries on 429 / 5xx / a network error or
+        timeout, waiting Retry-After when Graph sends it (capped) and 1-2-4 s
+        otherwise. One 503 on a message download used to cost that message
+        for the whole scan -- and with nothing queued, for good if it was at
+        the edge of the window. Retrying is bounded per client by
+        _GRAPH_RETRY_BUDGET_S so a Graph outage cannot run the scan past the
+        gunicorn worker timeout: once the budget is spent, calls fail fast.
+        """
+        import time as _time
+        attempt = 0
+        while True:
+            attempt += 1
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Accept": accept},
+                method="GET",
+            )
+            started = _time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read(), resp.headers
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                delay = _retry_after_seconds(exc.headers) if retryable else None
+                err = _graph_error("GET", url, exc)
+                cause = exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                retryable, delay = True, None
+                err = RuntimeError(
+                    f"Microsoft Graph GET {url.split('?', 1)[0]} failed "
+                    f"({type(exc).__name__})")
+                cause = exc
+            spent = getattr(self, "_retry_spent_s", 0.0) + (_time.monotonic() - started)
+            if delay is None:
+                delay = float(2 ** (attempt - 1))
+            if (not retryable or attempt > _GRAPH_GET_RETRIES
+                    or spent + delay > _GRAPH_RETRY_BUDGET_S):
+                self._retry_spent_s = spent
+                raise err from cause
+            self._retry_spent_s = spent + delay
+            _sleep(delay)
 
     def _graph_patch(self, url, token, body):
         req = urllib.request.Request(
@@ -1909,6 +1964,33 @@ class EmailInboxClient:
                                .get("address") or "")
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
+                except Exception as exc:  # noqa: BLE001
+                    # Retries are spent. Not a parser gap -- but the message
+                    # was NOT read, so queue it: if it never downloads, it
+                    # must not simply age out of the window unseen.
+                    _log_scan_exc(exc, f"ms365 fetch {upn}")
+                    _fid = m.get("internetMessageId") or mid
+                    _fsubj = m.get("subject") or ""
+                    result.errors.append(
+                        f"fetch failed: {upn}:{_fsubj[:80]!r} from "
+                        f"{_graph_from or '?'} could not be downloaded -- "
+                        "see server log")
+                    result.unparsed.append({
+                        "kind": "fetch", "reason": "fetch failed", "id": _fid,
+                        "mailbox": upn, "sender": _graph_from,
+                        "subject": _fsubj, "filenames": [],
+                        "received": m.get("receivedDateTime") or "", "sent": "",
+                    })
+                    result.issues.append({
+                        "key": f"fetch-failed:{_fid}",
+                        "message": (f"{_fsubj[:120]!r} from {_graph_from or '?'} "
+                                    f"({upn}) could not be downloaded from "
+                                    "Microsoft Graph after retries -- it has "
+                                    "not been read"),
+                        "severity": "error",
+                    })
+                    continue
+                try:
                     msg = email.message_from_bytes(mime_bytes)
                     events, errs, cw_pos = parse_message_with_errors(
                         msg, sender_address=_graph_from or None,

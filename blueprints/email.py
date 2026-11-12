@@ -313,8 +313,11 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
                 # prune re-judges every entry as a weekly REPORT (and retires
                 # it when the sender's warehouse has counted since), which
                 # says nothing about whether a dropped PO was ever booked.
-                _unparsed_po = [u for u in _unparsed if u.get("kind") == "po"]
-                _unparsed_rep = [u for u in _unparsed if u.get("kind") != "po"]
+                # (Same for messages that could not be downloaded.)
+                _unparsed_po = [u for u in _unparsed
+                                if u.get("kind") in _NON_REPORT_QUEUE_KINDS]
+                _unparsed_rep = [u for u in _unparsed
+                                 if u.get("kind") not in _NON_REPORT_QUEUE_KINDS]
                 # Local file writes only (no network I/O) -> under data_lock.
                 with data_lock():
                     if _unparsed_rep:
@@ -326,6 +329,9 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
                     # after this scan's events are applied, so a report
                     # ingested just now clears its own earlier failures.
                     prune_unparsed_reports()
+                    _retire_non_report_entries(
+                        {u.get("id") for u in _unparsed_po},
+                        full_clean=_scan_was_full_and_clean(report, lookback_days))
                     if _unparsed_po:
                         record_unparsed_reports(_unparsed_po)
                     save_scan_health({
@@ -390,16 +396,42 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
             "new_failures": new_failures}
 
 
+# Unparsed-queue entries that are not weekly reports (a dropped PO, a message
+# that would not download). prune_unparsed_reports knows nothing about them.
+_NON_REPORT_QUEUE_KINDS = ("po", "fetch")
+
+
+def _scan_was_full_and_clean(report: dict, lookback_days: int) -> bool:
+    """Did this scan read the whole default window of every mailbox? Only then
+    does "not reported again" mean "resolved"."""
+    if report.get("mailbox_failures") or report.get("status") not in ("ok", "partial"):
+        return False
+    if lookback_days < DEFAULT_SCAN_LOOKBACK_DAYS:
+        return False
+    return not report.get("truncated")
+
+
+def _retire_non_report_entries(current_ids: set, *, full_clean: bool) -> None:
+    """Drop stored PO / fetch-failure queue entries that a full, clean scan no
+    longer reports (the PO now parses, the message downloaded, or it left the
+    window). Caller holds data_lock."""
+    if not full_clean:
+        return
+    import inventory_tracker as _it
+    entries = _it.load_unparsed_reports()
+    kept = [e for e in entries
+            if e.get("kind") not in _NON_REPORT_QUEUE_KINDS
+            or e.get("id") in current_ids]
+    if len(kept) != len(entries):
+        _it._write_json(_it.UNPARSED_REPORTS_FILE, kept)
+
+
 def _clear_resolved_scan_issues(report: dict, issues: list, lookback_days: int) -> None:
     """Close scan-derived issues that a FULL, clean scan no longer reports
     (the parser learned the code, the message was fixed or aged out). Skipped
     when a mailbox failed or the window was narrower than the default -- an
     issue the scan could not have re-seen is not resolved."""
-    if report.get("mailbox_failures") or report.get("status") not in ("ok", "partial"):
-        return
-    if lookback_days < DEFAULT_SCAN_LOOKBACK_DAYS:
-        return
-    if report.get("truncated"):
+    if not _scan_was_full_and_clean(report, lookback_days):
         return
     try:
         from core import feed_health

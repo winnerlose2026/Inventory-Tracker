@@ -463,19 +463,31 @@ def _run_server_mode(args) -> int:
     payload = {"dry_run": bool(args.dry_run),
                "lookback_days": int(args.server_lookback_days),
                "max_messages": int(args.server_max_messages)}
+    #    A dead connection or a gateway error (status 0 / 502 / 503 / 504 --
+    #    a deploy in progress, a cold instance, a worker recycled mid-scan)
+    #    is retried twice after 60 s: the apply path is idempotent, and
+    #    skipping the slot means a 6-hour hole.
     status, body = 0, None
-    for attempt in range(1, 5):
+    busy_tries = net_tries = 0
+    while True:
         try:
             status, body = _post_json(f"{app_url}/api/email/scan", token,
                                       payload, timeout=600)
         except Exception as exc:  # noqa: BLE001 -- network / timeout
-            print(f"ERROR: /api/email/scan attempt {attempt}: "
+            print(f"ERROR: /api/email/scan: "
                   f"{_redact(str(exc), [token])}", file=sys.stderr)
             status, body = 0, None
-        if status == 409 and attempt < 4:
+        if status == 409 and busy_tries < 3:
+            busy_tries += 1
             print(f"email scan busy (409), retrying in 90s "
-                  f"(attempt {attempt}/4)", file=sys.stderr)
+                  f"(attempt {busy_tries}/3)", file=sys.stderr)
             time.sleep(90)
+            continue
+        if status in (0, 502, 503, 504) and net_tries < 2:
+            net_tries += 1
+            print(f"email scan got HTTP {status}, retrying in 60s "
+                  f"(retry {net_tries}/2)", file=sys.stderr)
+            time.sleep(60)
             continue
         break
     rc = 0
