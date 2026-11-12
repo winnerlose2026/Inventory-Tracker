@@ -147,3 +147,47 @@ def api_backup_offsite_ack():
                        still_on_disk=known)
     feed_health.clear_issue("feed-stale:backup-offsite")
     return jsonify({"ok": True, "name": name, "known": known})
+
+
+# ---------------------------------------------------------------------------
+# Feed health + watchdog
+# ---------------------------------------------------------------------------
+
+@ops_bp.route("/api/feeds/health")
+def api_feeds_health():
+    """Is every feed running, and is anything waiting for a person?
+
+    {"ok", "generated_at",
+     "feeds": {name: {"ok", "last_ok", "last_attempt", "detail", "stale",
+                      "max_age_hours"}},
+     "issues": [{"key", "message", "severity", "first_seen", "last_seen"}]}
+
+    `stale` = no successful run within the feed's allowed age
+    (integrations/watchdog.py FEED_MAX_AGE_HOURS). Read-only; the page banner
+    and the off-box tasks poll it."""
+    from integrations import watchdog
+    try:
+        return jsonify(watchdog.feeds_view())
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "generated_at": "", "feeds": {},
+                        "issues": [{"key": "feeds-health-unavailable",
+                                    "message": "Feed health could not be read: "
+                                               + _safe_err(exc),
+                                    "severity": "error", "first_seen": "",
+                                    "last_seen": ""}]}), 500
+
+
+@ops_bp.route("/api/watchdog/run", methods=["POST"])
+def api_watchdog_run():
+    """Run the watchdog now (the scheduler calls this hourly at :40).
+
+    Body (all optional): {"books": bool, "digest": bool, "send": bool}.
+    books / digest default to the hour of day (07:xx / 13:xx UTC); send=false
+    evaluates and records issues without emailing."""
+    from integrations import watchdog
+    body = request.get_json(silent=True) or {}
+    res = watchdog.run(
+        books=body["books"] if isinstance(body.get("books"), bool) else None,
+        digest=body["digest"] if isinstance(body.get("digest"), bool) else None,
+        send=body.get("send", True) is not False)
+    return jsonify(res)
