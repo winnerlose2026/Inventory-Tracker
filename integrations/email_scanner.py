@@ -62,7 +62,11 @@ Configuration
                         Mail.Read application permission granted admin consent.
                         May be a comma-separated list to scan multiple
                         mailboxes, e.g. "ops@foo.com,orders@foo.com".
-  MS365_FOLDER          default "Inbox"
+  MS365_FOLDER          default "Inbox". Left at the default, EVERY folder is
+                        scanned except Sent Items, Drafts, Deleted Items, Junk
+                        Email and Outbox; set to another folder name to scan
+                        just that folder.
+  MS365_SCAN_ALL_FOLDERS  "off" to scan only MS365_FOLDER (default on)
   MS365_FILTER          optional Graph $filter, e.g.
                         "isRead eq false and receivedDateTime ge 2025-01-01T00:00:00Z"
   MS365_MARK_READ       "1" to mark processed messages as read
@@ -137,6 +141,24 @@ DOMAIN_TO_DISTRIBUTOR = {
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_TOKEN_URL_FMT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
+
+
+# Well-known Graph folder names the all-folder scan leaves out, and the ones
+# whose ids must resolve before it will scan anything but the Inbox.
+_EXCLUDED_WELL_KNOWN_FOLDERS = ("sentitems", "drafts", "deleteditems",
+                                "junkemail", "outbox")
+_REQUIRED_EXCLUDED_FOLDERS = ("sentitems", "drafts", "deleteditems")
+
+
+def _scan_all_folders_enabled() -> bool:
+    """All-folder scanning: on unless MS365_SCAN_ALL_FOLDERS is off, or
+    MS365_FOLDER names a folder other than the default Inbox (an explicit
+    single-folder override)."""
+    if os.environ.get("MS365_SCAN_ALL_FOLDERS", "on").strip().lower() in (
+            "off", "0", "false", "no"):
+        return False
+    folder = (os.environ.get("MS365_FOLDER") or "").strip()
+    return folder == "" or folder.lower() == "inbox"
 
 
 def _graph_error(verb: str, url: str, exc: "urllib.error.HTTPError") -> RuntimeError:
@@ -1672,7 +1694,15 @@ class EmailInboxClient:
                 "MS365_USER is empty. Set it to a mailbox UPN, or a comma-"
                 "separated list of UPNs to scan multiple mailboxes."
             )
-        folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
+        # Default: every folder except Sent Items / Drafts / Deleted Items /
+        # Junk / Outbox (folder=None) -- an Outlook rule or a drag into a
+        # subfolder used to hide a report or PO from the scan for good.
+        # MS365_FOLDER set to anything but "Inbox" is an explicit override and
+        # scans that one folder, as before; MS365_SCAN_ALL_FOLDERS=off
+        # restores Inbox-only.
+        folder = (None if _scan_all_folders_enabled()
+                  else urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox")
+                                          or "Inbox"))
         mark_read = os.environ.get("MS365_MARK_READ") == "1"
         # Default: no $filter at all, so both read and unread messages are
         # returned (bounded by max_messages and $orderby desc). Set
@@ -1694,13 +1724,72 @@ class EmailInboxClient:
                 result.errors.append(f"{MAILBOX_FAILURE_PREFIX}ms365 {upn} -- "
                                      "see server log")
 
+    def _excluded_folder_ids(self, user, token):
+        """(excluded ids, junk ids) for one mailbox, resolved from Graph's
+        well-known folder names, including their subfolders.
+
+        Sent Items, Drafts and Deleted Items MUST resolve -- scanning our own
+        sent mail would apply JD's outgoing CSVs -- so a failure there raises
+        and the caller falls back to Inbox-only. Junk and Outbox are optional.
+        Junk is excluded on purpose: it is where spoofed "from a rep" mail
+        lands; a known sender's message found there is flagged, not applied.
+        """
+        def _one(name):
+            raw, _ = self._graph_get(
+                f"{GRAPH_BASE}/users/{user}/mailFolders/{name}"
+                "?$select=id,childFolderCount", token)
+            return json.loads(raw.decode("utf-8"))
+
+        def _children(fid, depth=0):
+            out = set()
+            if depth >= 3:
+                return out
+            raw, _ = self._graph_get(
+                f"{GRAPH_BASE}/users/{user}/mailFolders/{urllib.parse.quote(fid)}"
+                "/childFolders?$select=id,childFolderCount&$top=200", token)
+            for c in json.loads(raw.decode("utf-8")).get("value", []):
+                if c.get("id"):
+                    out.add(c["id"])
+                    if int(c.get("childFolderCount") or 0) > 0:
+                        out |= _children(c["id"], depth + 1)
+            return out
+
+        excluded, junk = set(), set()
+        for name in _EXCLUDED_WELL_KNOWN_FOLDERS:
+            required = name in _REQUIRED_EXCLUDED_FOLDERS
+            try:
+                f = _one(name)
+                ids = {f["id"]}
+                if int(f.get("childFolderCount") or 0) > 0:
+                    ids |= _children(f["id"])
+            except Exception:  # noqa: BLE001
+                if required:
+                    raise
+                continue
+            excluded |= ids
+            if name == "junkemail":
+                junk |= ids
+        return excluded, junk
+
     def _scan_ms365_mailbox(self, result, token, upn, folder, filt, mark_read,
                             max_messages):
         user = urllib.parse.quote(upn)
         top = min(max_messages, 50)
+        excluded_ids, junk_ids = set(), set()
+        if folder is None:
+            try:
+                excluded_ids, junk_ids = self._excluded_folder_ids(user, token)
+            except Exception as exc:  # noqa: BLE001
+                _log_scan_exc(exc, f"ms365 folder ids {upn}")
+                result.errors.append(
+                    f"ms365 {upn}: could not resolve the Sent / Drafts / "
+                    "Deleted folder ids -- scanned the Inbox only (see server log)")
+                folder = "Inbox"
         q = {
             "$top": str(top),
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments",
+            "$select": ("id,internetMessageId,parentFolderId,subject,from,"
+                        "toRecipients,ccRecipients,receivedDateTime,isRead,"
+                        "hasAttachments"),
             "$orderby": "receivedDateTime desc",
         }
         if filt:
@@ -1710,8 +1799,14 @@ class EmailInboxClient:
             # sort — pages still come back, just not strictly date-ordered.
             if "hasAttachments" in filt:
                 q.pop("$orderby", None)
-        list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
-                    f"?{urllib.parse.urlencode(q)}")
+        # NB: never put `hasAttachments eq true` in this $filter -- Graph
+        # answers 504 on it for these mailboxes.
+        if folder is None:
+            list_url = (f"{GRAPH_BASE}/users/{user}/messages"
+                        f"?{urllib.parse.urlencode(q)}")
+        else:
+            list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
+                        f"?{urllib.parse.urlencode(q)}")
 
         fetched = 0
         pages = 0
@@ -1728,6 +1823,10 @@ class EmailInboxClient:
                     break
                 mid = m.get("id")
                 if not mid:
+                    continue
+                if excluded_ids and m.get("parentFolderId") in excluded_ids:
+                    if m.get("parentFolderId") in junk_ids:
+                        self._flag_junk(result, m, upn)
                     continue
                 result.messages_seen += 1
                 # Pre-qualify each listed message by sender/recipient before
@@ -1855,6 +1954,23 @@ class EmailInboxClient:
                             "sent": _msg_date_iso(msg),
                         })
             list_url = page.get("@odata.nextLink")
+
+    @staticmethod
+    def _flag_junk(result, m, upn):
+        """A known distributor / rep sender's message sitting in Junk Email:
+        not applied (Junk is where spoofed mail goes), but a person should
+        look -- it may be this week's report."""
+        snd = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "")
+        if not _sender_is_known_source(snd):
+            return
+        key = m.get("internetMessageId") or m.get("id")
+        text = (f"mail from {snd} ({(m.get('subject') or '')[:80]!r}, received "
+                f"{m.get('receivedDateTime') or '?'}) is in the Junk Email "
+                f"folder of {upn} -- NOT scanned. Move it to the Inbox if it "
+                "is genuine.")
+        result.errors.append(text)
+        result.issues.append({"key": f"junk-mail:{key}", "message": text,
+                              "severity": "warn"})
 
     def _scan_imap(self, result, max_messages):
         host = os.environ["EMAIL_IMAP_HOST"]
