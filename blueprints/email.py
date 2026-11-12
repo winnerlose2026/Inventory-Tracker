@@ -687,6 +687,91 @@ def _send_recipient_allowed(addr: str) -> bool:
     return any(dom == d or dom.endswith("." + d) for d in _send_allowed_domains())
 
 
+# --- /api/email/send duplicate protection ------------------------------------
+SEND_DEDUP_TTL = timedelta(hours=24)
+_SENT_LOG_NAME = "sent_log.json"
+_SENT_LOG_MAX = 2000
+
+
+def _send_dedup_key(sender, to, subject, content, idempotency_key="") -> str:
+    import hashlib
+    if idempotency_key:
+        return "key:" + hashlib.sha256(
+            idempotency_key.encode("utf-8", "replace")).hexdigest()
+    blob = "\x1f".join([
+        (sender or "").strip().lower(),
+        ",".join(sorted(a.strip().lower() for a in (to or []))),
+        (subject or "").strip(),
+        str(content or ""),
+    ])
+    return "msg:" + hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def _sent_log_load(_it, now):
+    """The log with expired entries dropped. Caller holds data_lock."""
+    data = _it._read_json(_it.DATA_DIR / _SENT_LOG_NAME, {})
+    if not isinstance(data, dict):
+        data = {}
+    cutoff = (now - SEND_DEDUP_TTL).isoformat()
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and str(v.get("at") or "") >= cutoff}
+
+
+def _sent_log_peek(key):
+    try:
+        import inventory_tracker as _it
+        with _it.data_lock():
+            return _sent_log_load(_it, datetime.now()).get(key)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log peek")
+        return None
+
+
+def _sent_log_reserve(key, sender, to, subject):
+    """None when this send may go ahead (and is now reserved, so a concurrent
+    identical request on the other worker is refused); the earlier entry when
+    it is a duplicate. A log that cannot be read or written never blocks a
+    send -- it is logged and the send proceeds."""
+    try:
+        import inventory_tracker as _it
+        now = datetime.now()
+        with _it.data_lock():
+            log = _sent_log_load(_it, now)
+            if key in log:
+                return log[key]
+            log[key] = {"at": now.isoformat(), "status": "sending",
+                        "from": sender, "to": list(to or []),
+                        "subject": (subject or "")[:200]}
+            if len(log) > _SENT_LOG_MAX:
+                log = dict(sorted(log.items(),
+                                  key=lambda kv: kv[1].get("at") or "")[-_SENT_LOG_MAX:])
+            _it._write_json(_it.DATA_DIR / _SENT_LOG_NAME, log)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log reserve")
+        return None
+
+
+def _sent_log_finish(key, *, sent, force=False, sender="", to=None, subject=""):
+    """Mark a reserved send as sent, or release it when it failed. A forced
+    send records itself too, so the NEXT unforced identical send is caught."""
+    try:
+        import inventory_tracker as _it
+        now = datetime.now()
+        with _it.data_lock():
+            log = _sent_log_load(_it, now)
+            if sent:
+                cur = dict(log.get(key) or {"from": sender, "to": list(to or []),
+                                            "subject": (subject or "")[:200]})
+                cur.update(at=cur.get("at") or now.isoformat(), status="sent")
+                log[key] = cur
+            elif not force:
+                log.pop(key, None)
+            _it._write_json(_it.DATA_DIR / _SENT_LOG_NAME, log)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log finish")
+
+
 @email_bp.route("/api/email/send", methods=["POST"])
 def api_email_send():
     """Send an email from the configured M365 mailbox via Microsoft Graph.
@@ -714,8 +799,17 @@ def api_email_send():
              "content_type": "image/png",          # png / jpeg / gif only
              "content_b64": "<base64>"}            # max 24 images, 3 MB total
           ],
-          "dry_run": false                         # optional; build, don't send
+          "dry_run": false,                        # optional; build, don't send
+          "idempotency_key": "chaser-2026-11-09-zeb", # optional; a second send
+                                                   #   with the same key within
+                                                   #   24 h is not sent
+          "force": false                           # optional; true sends even
+                                                   #   if it is a duplicate
         }
+
+    Duplicate protection: without idempotency_key, a send identical in
+    (from, to, subject, body) to one made in the last 24 h returns
+    {"ok": true, "sent": false, "duplicate": true, "first_sent_at": ...}.
 
     Always returns a structured 200 (never a bare 500):
       {"ok": true, "sent": true, ...} or {"ok": false, "error": "..."} --
@@ -821,11 +915,32 @@ def api_email_send():
         if not sender:
             return jsonify({"ok": False, "error": "no sender configured (set MS365_SEND_AS or MS365_USER, or pass 'from')"}), 200
 
+        # Duplicate protection. A retried task, a double click or two tasks
+        # with the same job used to send the same chaser twice. The send is
+        # keyed by the caller's idempotency_key when given, else by a hash of
+        # (from, sorted to, subject, body); an identical send inside
+        # SEND_DEDUP_TTL answers sent:false duplicate:true. "force": true
+        # bypasses. The recipient / from policy above is untouched.
+        idem = str(body.get("idempotency_key") or "").strip()[:200]
+        force = bool(body.get("force", False))
+        send_key = _send_dedup_key(sender, to, subject, content, idem)
+
         if dry_run:
             return jsonify({"ok": True, "sent": False, "dry_run": True,
                             "from": sender, "from_overridden": from_overridden,
                             "to": to, "cc": cc, "inline_images": len(attachments),
-                            "subject": subject, "threaded": bool(reply_to)})
+                            "subject": subject, "threaded": bool(reply_to),
+                            "duplicate": _sent_log_peek(send_key) is not None})
+
+        if not force:
+            prior = _sent_log_reserve(send_key, sender, to, subject)
+            if prior is not None:
+                return jsonify({"ok": True, "sent": False, "duplicate": True,
+                                "dry_run": False,
+                                "first_sent_at": prior.get("at") or "",
+                                "from": sender, "from_overridden": from_overridden,
+                                "to": to, "cc": cc, "subject": subject,
+                                "threaded": bool(reply_to)})
 
         client = EmailInboxClient()
         token = client._ms365_token()
@@ -854,6 +969,7 @@ def api_email_send():
                 draft = _json.loads(draft_raw or "{}")
                 draft_id = draft.get("id")
                 if not draft_id:
+                    _sent_log_finish(send_key, sent=False, force=force)
                     return jsonify({"ok": False, "error": f"createReply returned no draft id: {draft_raw[:300]}"}), 200
                 patch = {"body": {"contentType": content_type, "content": content},
                          "toRecipients": _recips(to)}
@@ -878,11 +994,19 @@ def api_email_send():
                 detail = exc.read().decode("utf-8", "replace")[:500]
             except Exception:  # noqa: BLE001
                 detail = ""
+            _sent_log_finish(send_key, sent=False, force=force)
             return jsonify({"ok": False,
                             "error": _safe_err(exc, "graph send"),
                             "detail": ""}), 200
+        except Exception:
+            # Not sent: release the reservation so a retry is not a "duplicate".
+            _sent_log_finish(send_key, sent=False, force=force)
+            raise
 
+        _sent_log_finish(send_key, sent=True, force=force,
+                         sender=sender, to=to, subject=subject)
         return jsonify({"ok": True, "sent": True, "dry_run": False,
+                        "duplicate": False,
                         "from": sender, "from_overridden": from_overridden,
                         "to": to, "cc": cc, "inline_images": len(attachments),
                         "subject": subject, "threaded": bool(reply_to)})
