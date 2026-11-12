@@ -32,6 +32,20 @@ def _fh():
     return feed_health
 
 
+# One PO-ledger build per run_checks() call (three checks read it).
+_RUN_CACHE: dict = {}
+
+
+def _ledger() -> list:
+    if "ledger" in _RUN_CACHE:
+        return _RUN_CACHE["ledger"]
+    from blueprints.pos import build_po_ledger
+    rows = build_po_ledger()
+    if _RUN_CACHE.get("active"):
+        _RUN_CACHE["ledger"] = rows
+    return rows
+
+
 def _log(msg: str) -> None:
     print(f"[po_health] {msg}", file=sys.stderr)
 
@@ -279,10 +293,9 @@ def suggest_absorb(row: dict, inv: dict, trk, now: datetime):
 
 def _check_stuck(now: datetime) -> dict:
     """po-stuck:<po> for every ledger row that is stuck (see hold_state)."""
-    from blueprints.pos import build_po_ledger
     fh = _fh()
     keep, n_suggest = set(), 0
-    for r in build_po_ledger():
+    for r in _ledger():
         if not r.get("stuck"):
             continue
         key = f"po-stuck:{r.get('po_number')}"
@@ -364,9 +377,8 @@ def untracked_pos(now: datetime) -> dict:
     but that the PO ledger has never heard of. The lost-PO detector: an
     emailed PO that failed to parse leaves no other trace."""
     import inventory_tracker as it
-    from blueprints.pos import build_po_ledger
     from core.util import _norm_po_key
-    known = {_norm_po_key(r.get("po_number") or "") for r in build_po_ledger()}
+    known = {_norm_po_key(r.get("po_number") or "") for r in _ledger()}
     try:
         known |= {_norm_po_key(k) for k in (it.load_canceled_pos() or {})}
     except Exception:  # noqa: BLE001
@@ -465,11 +477,11 @@ def _check_arrived_unconfirmed(now: datetime) -> dict:
 def _check_chase(now: datetime) -> dict:
     """po-chase:<po>: automatic follow-ups are exhausted -- a person calls."""
     import inventory_tracker as it
-    from blueprints.delivery import _is_open, _ledger_by_po
-    from integrations.po_delivery import chase_exhausted
+    from blueprints.delivery import _is_open
+    from integrations.po_delivery import chase_exhausted, norm_po
     fh = _fh()
     tracking = it.load_po_delivery() or {}
-    ledger = _ledger_by_po()
+    ledger = {norm_po(r.get("po_number") or ""): r for r in _ledger()}
     keep = set()
     for key, rec in tracking.items():
         if not _is_open(ledger.get(key), rec):
@@ -565,10 +577,15 @@ def run_checks() -> dict:
     Never raises."""
     out: dict = {}
     now = datetime.now(timezone.utc)
-    for name, fn in list(CHECKS):
-        try:
-            out[name] = fn(now) or {}
-        except Exception as exc:  # noqa: BLE001
-            _log(f"check {name} failed: {type(exc).__name__}: {exc}")
-            out[name] = {"error": f"{type(exc).__name__}: {exc}"}
+    _RUN_CACHE.clear()
+    _RUN_CACHE["active"] = True
+    try:
+        for name, fn in list(CHECKS):
+            try:
+                out[name] = fn(now) or {}
+            except Exception as exc:  # noqa: BLE001
+                _log(f"check {name} failed: {type(exc).__name__}: {exc}")
+                out[name] = {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _RUN_CACHE.clear()
     return out
