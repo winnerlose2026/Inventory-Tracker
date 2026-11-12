@@ -76,6 +76,13 @@ DEFAULTS = {
         "usage_basis": "reps",
         "horizon_days": 56,
         "exclude_categories": ["bagels-lto"],
+        # Seasonal uplift on daily demand (and so on safety stock) for the
+        # dates in each window -- "MM-DD" both ends, inclusive; a window may
+        # wrap the year end. Edit or empty this list in
+        # data/planning_config.json ("ordering": {"seasonal": [...]}).
+        "seasonal": [
+            {"from": "12-15", "to": "01-02", "factor": 1.25, "label": "Holiday"},
+        ],
     },
     # How old a DC's numbers may be before Suggested Orders says "check data
     # first" instead of "order now" (integrations/order_plan.py).

@@ -69,3 +69,16 @@ if __name__ == "__main__":
             bad += 1; print("FAIL:", fn.__name__, e)
     print(f"\n{len(fns)-bad}/{len(fns)} passed")
     sys.exit(1 if bad else 0)
+
+
+def test_usage_freshness_is_the_usage_reports_date_not_the_counts():
+    inv = {"plain": {"name": "Plain Bagel 4oz [USF - Alcoa]", "distributor": "US Foods",
+                     "warehouse": "Alcoa, TN", "weekly_usage": 7,
+                     "last_count_at": "2026-06-25T10:00:00",
+                     "last_usage_report_at": "2026-04-01T10:00:00"}}
+    [r] = warehouse_demand(inv, now=NOW)
+    assert r["stale"] is True and r["confidence"] == "low"       # a fresh count no longer masks it
+    assert r["usage_as_of_basis"] == "usage_report" and r["count_age_days"] < 1
+    inv["plain"].pop("last_usage_report_at")
+    [r] = warehouse_demand(inv, now=NOW)
+    assert r["stale"] is False and r["usage_as_of_basis"] == "count"   # legacy record

@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta
 
-from core.util import business_now, naive_local_dt
+from core.util import business_dt, business_now, naive_local_dt
 
 ORDER_DEFAULTS = {
     "lead_days": 30, "review_days": 7, "safety_days_top4": 14,
@@ -40,7 +40,12 @@ ORDER_DEFAULTS = {
     "horizon_days": 56, "exclude_categories": ["bagels-lto"],
     "distributors": ["US Foods", "Cheney Brothers"],
     "counts_min_windows": 3, "counts_min_days": 14,
+    "seasonal": [],
 }
+
+# Suggested Orders says "check data first" past these ages (days); override
+# under "data_age" in planning_config.
+DATA_AGE_DEFAULTS = {"count_max_days": 10, "usage_max_days": 21}
 
 
 def _f(v, d=0.0):
@@ -80,6 +85,101 @@ def usage_rate(item: dict, key: str, basis: str, count_items: "dict | None",
 
 
 # ---------------------------------------------------------------------------
+# Seasonal uplift
+# ---------------------------------------------------------------------------
+
+def _md(v):
+    try:
+        m, d = str(v or "").strip().split("-")
+        m, d = int(m), int(d)
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            return (m, d)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def seasonal_windows(oc: dict) -> list:
+    """Validated [{from:(m,d), to:(m,d), factor, label, from_s, to_s}] from
+    ordering.seasonal. A malformed entry is skipped, never raised on."""
+    out = []
+    for e in (oc.get("seasonal") or []):
+        if not isinstance(e, dict):
+            continue
+        a, b = _md(e.get("from")), _md(e.get("to"))
+        try:
+            f = float(e.get("factor"))
+        except (TypeError, ValueError):
+            continue
+        if not a or not b or f <= 0 or f == 1.0:
+            continue
+        out.append({"from": a, "to": b, "factor": f,
+                    "label": str(e.get("label") or "Seasonal"),
+                    "from_s": f"{a[0]:02d}-{a[1]:02d}", "to_s": f"{b[0]:02d}-{b[1]:02d}"})
+    return out
+
+
+def _in_window(w: dict, d: datetime) -> bool:
+    md = (d.month, d.day)
+    if w["from"] <= w["to"]:
+        return w["from"] <= md <= w["to"]
+    return md >= w["from"] or md <= w["to"]          # wraps the year end
+
+
+def seasonal_factor(windows: list, d: datetime) -> float:
+    """Demand multiplier for one calendar day (1.0 outside every window;
+    overlapping windows multiply)."""
+    f = 1.0
+    for w in windows or []:
+        if _in_window(w, d):
+            f *= w["factor"]
+    return f
+
+
+def _factor_sum(windows: list, start: datetime, days: int) -> float:
+    """Sum of the daily factors for the `days` days AFTER `start`. With no
+    windows this is exactly float(days), so an unconfigured plan is
+    bit-for-bit what it was before seasonality existed."""
+    if not windows:
+        return float(days)
+    return sum(seasonal_factor(windows, start + timedelta(days=i))
+               for i in range(1, days + 1))
+
+
+def _seasonal_applied(windows: list, start: datetime, days: int) -> list:
+    """Which windows touch the `days` days after `start`, with the actual
+    first/last date each one applied to."""
+    out = []
+    for w in windows or []:
+        hit = [start + timedelta(days=i) for i in range(1, days + 1)
+               if _in_window(w, start + timedelta(days=i))]
+        if hit:
+            out.append({"label": w["label"], "factor": w["factor"],
+                        "from": hit[0].date().isoformat(), "to": hit[-1].date().isoformat(),
+                        "days": len(hit), "window": f"{w['from_s']}..{w['to_s']}"})
+    return out
+
+
+def seasonal_note(applied: list) -> str:
+    """'includes +25% holiday uplift for 12/15-1/2' (plain words for the UI)."""
+    parts = []
+    for a in applied or []:
+        pct = round((a["factor"] - 1.0) * 100)
+        f = naive_local_dt(a["from"]); t = naive_local_dt(a["to"])
+        rng = f"{f.month}/{f.day}\u2013{t.month}/{t.day}"
+        parts.append(f"{'+' if pct >= 0 else ''}{pct}% {a['label'].lower()} "
+                     f"{'uplift' if pct >= 0 else 'reduction'} for {rng}")
+    return ("includes " + " and ".join(parts)) if parts else ""
+
+
+def _age_days(raw, now: datetime):
+    dt = business_dt(raw)
+    if dt is None:
+        return None
+    return max(0, (now.date() - dt.date()).days)
+
+
+# ---------------------------------------------------------------------------
 # 1) Order plan
 # ---------------------------------------------------------------------------
 
@@ -96,6 +196,9 @@ def plan_orders(inv: dict, cfg: dict, basis: str = "reps",
     top4 = set(cfg.get("top4") or [])
     default_min = int(cfg.get("min_po_pallets_default") or 2)
     default_transit = int(cfg.get("transit_default_days") or 7)
+    windows = seasonal_windows(oc)
+    ages = dict(DATA_AGE_DEFAULTS, **(cfg.get("data_age") or {}))
+    stamps: dict = {}     # warehouse -> {"count": newest stamp, "usage": newest stamp}
 
     by_wh: dict = {}
     excluded = set()
@@ -107,6 +210,12 @@ def plan_orders(inv: dict, cfg: dict, basis: str = "reps",
             excluded.add(variety)
             continue
         wk, used_basis = usage_rate(it, key, basis, count_items, oc)
+        st = stamps.setdefault(it.get("warehouse") or "", {"count": "", "usage": ""})
+        for fld, src in (("count", "last_count_at"), ("usage", "last_usage_report_at")):
+            v = str(it.get(src) or "")
+            if v and (not st[fld] or (business_dt(v) or datetime.min)
+                      > (business_dt(st[fld]) or datetime.min)):
+                st[fld] = v
         arrivals = []
         for o in it.get("on_order") or []:
             q = _f(o.get("qty"))
@@ -129,16 +238,50 @@ def plan_orders(inv: dict, cfg: dict, basis: str = "reps",
         wcfg = _wh_cfg(cfg, wh)
         min_pallets = int(wcfg.get("min_po_pallets") or default_min)
         transit = int(wcfg.get("transit_days") or default_transit)
-        out.append(_plan_dc(wh, skus, today, lead, review, mult, pallet, horizon,
-                            min_pallets, transit))
+        dc = _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon,
+                      min_pallets, transit, windows)
+        # How old are the numbers this suggestion stands on? The count and the
+        # usage report are judged separately: a fresh count used to mask a
+        # months-old usage figure.
+        st = stamps.get(wh) or {}
+        c_age, u_age = _age_days(st.get("count"), now), _age_days(st.get("usage"), now)
+        # A DC whose records predate the usage-date stamp: go by its count
+        # date until its next report stamps one (and say so).
+        u_basis = "usage_report"
+        if u_age is None and c_age is not None:
+            u_age, u_basis = c_age, "count"
+        why = []
+        if c_age is None:
+            why.append("no count on file")
+        elif c_age > float(ages["count_max_days"]):
+            why.append(f"count is {c_age} days old")
+        if u_age is None:
+            why.append("no usage report on file")
+        elif u_age > float(ages["usage_max_days"]):
+            why.append(f"usage is {u_age} days old")
+        dc.update({"count_as_of": st.get("count") or "", "usage_as_of": st.get("usage") or "",
+                   "count_age_days": c_age, "usage_age_days": u_age,
+                   "usage_age_basis": u_basis if u_age is not None else "none",
+                   "data_stale": bool(why), "data_stale_reasons": why,
+                   "check_data_first": bool(why) and bool(dc.get("order_now"))})
+        out.append(dc)
     out.sort(key=lambda w: (-w["short_count"], 0 if w["order_now"] else 1,
                             w["next_order_date"] or "9999", w["warehouse"]))
     return {"basis": basis, "warehouses": out, "excluded_varieties": sorted(excluded),
             "params": {**oc, "pallet_cs": pallet, "min_po_pallets_default": default_min},
+            "data_age_limits": {"count_max_days": ages["count_max_days"],
+                                "usage_max_days": ages["usage_max_days"]},
+            "seasonal": {
+                "configured": [{"from": w["from_s"], "to": w["to_s"], "factor": w["factor"],
+                                "label": w["label"]} for w in windows],
+                "applied": _seasonal_applied(windows, today, horizon),
+            },
             "as_of": now.isoformat(timespec="seconds")}
 
 
-def _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon, min_pallets, transit):
+def _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon, min_pallets, transit,
+             windows=None):
+    windows = windows or []
     # Without any new order: when does each SKU run out? ("short" = before an
     # order placed today could land)
     lands = today + timedelta(days=lead)
@@ -150,7 +293,7 @@ def _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon, min_pallets, 
             while arr and arr[0][0] <= date:
                 q += arr.pop(0)[1]
             if t:
-                q -= s["d"]
+                q -= s["d"] * seasonal_factor(windows, date)
             if q < 0 and out_date is None:
                 out_date = date
         s["stockout"] = out_date
@@ -167,21 +310,25 @@ def _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon, min_pallets, 
         for s in skus:
             st = state[s["key"]]
             if t:
-                st["q"] -= s["d"]
+                st["q"] -= s["d"] * seasonal_factor(windows, date)
             while st["arr"] and st["arr"][0][0] <= date:
                 st["q"] += st["arr"].pop(0)[1]
         if t < next_ok:
             continue
         pos = {s["key"]: state[s["key"]]["q"] + sum(a[1] for a in state[s["key"]]["arr"])
                for s in skus}
-        trig = [s for s in skus if s["d"] > 0 and pos[s["key"]] < s["d"] * (lead + s["safety"])]
+        # Demand over the days this order must cover, seasonal uplift included
+        # (lead + safety for the trigger; + the review period for the size).
+        trig = [s for s in skus if s["d"] > 0
+                and pos[s["key"]] < s["d"] * _factor_sum(windows, date, lead + s["safety"])]
         if not trig:
             continue
         qty = {}
         for s in skus:
             if s["d"] <= 0:
                 continue
-            need = s["d"] * (lead + review + s["safety"]) - pos[s["key"]]
+            need = s["d"] * _factor_sum(windows, date, lead + review + s["safety"]) \
+                - pos[s["key"]]
             if need > 0:
                 qty[s["key"]] = int(math.ceil(need / mult) * mult)
         raw = sum(qty.values())
@@ -201,7 +348,10 @@ def _plan_dc(wh, skus, today, lead, review, mult, pallet, horizon, min_pallets, 
                   "padded": qty[s["key"]] - base.get(s["key"], 0)}
                  for s in skus if qty.get(s["key"])]
         lines.sort(key=lambda l: (0 if l["top4"] else 1, -l["qty"]))
+        applied = _seasonal_applied(
+            windows, date, lead + review + max([s["safety"] for s in skus] or [0]))
         orders.append({
+            "seasonal": applied, "seasonal_note": seasonal_note(applied),
             "order_date": date.date().isoformat(), "arrival_date": arrive.date().isoformat(),
             "ship_date": ship.date().isoformat(), "bake_by": bake_by.date().isoformat(),
             "total_cs": target, "pallets": target // pallet,
@@ -460,4 +610,5 @@ def scenario_summary(plan: dict) -> dict:
 
 
 __all__ = ["plan_orders", "production_load", "daily_schedule", "scenario_summary",
-           "usage_rate", "cw_weekly_runrate", "ORDER_DEFAULTS"]
+           "usage_rate", "cw_weekly_runrate", "ORDER_DEFAULTS", "DATA_AGE_DEFAULTS",
+           "seasonal_windows", "seasonal_factor", "seasonal_note"]

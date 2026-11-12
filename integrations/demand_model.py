@@ -49,10 +49,17 @@ def warehouse_demand(inv: dict, now: datetime = None, stale_days: int = 14) -> l
     rows = []
     for key, item in (inv or {}).items():
         wu = float(item.get("weekly_usage") or 0)
-        as_of = max([d for d in (_parse_iso(item.get("last_usage_report_at")),
-                                 _parse_iso(item.get("last_count_at"))) if d] or [None],
-                    default=None)
+        # Usage freshness is the USAGE REPORT's date only. max(usage, count)
+        # let a weekly count keep a months-old usage figure looking fresh.
+        count_as_of = _parse_iso(item.get("last_count_at"))
+        as_of = _parse_iso(item.get("last_usage_report_at"))
+        # Records that have never had a usage date stamped (older than the
+        # stamp) fall back to the count date, and say so.
+        usage_basis = "usage_report" if as_of else ("count" if count_as_of else "none")
+        as_of = as_of or count_as_of
         fresh_days = round((now - as_of).total_seconds() / 86400.0, 1) if as_of else None
+        count_age = round((now - count_as_of).total_seconds() / 86400.0, 1) \
+            if count_as_of else None
         stale = (fresh_days is None) or (fresh_days > stale_days)
         rate = wu / 7.0
         if wu <= 0:
@@ -70,6 +77,10 @@ def warehouse_demand(inv: dict, now: datetime = None, stale_days: int = 14) -> l
             "rate_cs_per_day": round(rate, 3),
             "usage_as_of": as_of.isoformat() if as_of else None,
             "freshness_days": fresh_days,
+            "usage_age_days": fresh_days,
+            "usage_as_of_basis": usage_basis,
+            "count_as_of": count_as_of.isoformat() if count_as_of else None,
+            "count_age_days": count_age,
             "stale": stale,
             "confidence": confidence,
             "transfer_group": transfer_group_for(wh),
