@@ -674,10 +674,22 @@ def _run_screenshot_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
                   file=sys.stderr)
             rc = 1
             continue
+        # The route answers ok:true even when a Graph call inside it failed
+        # and lists that in "errors". An empty "messages" then does NOT mean
+        # nothing is pending -- it means we could not look. Fail the run.
+        endpoint_errors = [str(e) for e in (data.get("errors") or [])]
+        if endpoint_errors:
+            print(f"ERROR: usf-screenshots {wh}: the mailbox could not be "
+                  f"read completely ({len(endpoint_errors)} error(s)):",
+                  file=sys.stderr)
+            for e in endpoint_errors[:10]:
+                print(f"  - {_redact(e, [token])}", file=sys.stderr)
+            rc = 1
         pending = data.get("messages") or []
         if not pending:
             print(f"usf-screenshots: {wh} nothing pending "
-                  f"(last count {data.get('last_count_at')})")
+                  f"(last count {data.get('last_count_at')})"
+                  + (" -- UNVERIFIED, see errors above" if endpoint_errors else ""))
             continue
         env = _ocr_env(app_url, token)
         if any(m.get("images") for m in pending):
@@ -851,6 +863,10 @@ def run(argv: list[str] | None = None) -> int:
     # ---- discover qualifying messages
     qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
     mailbox_diag: list[str] = []  # one line per mailbox, always logged
+    # Mailboxes that could not be listed at all. The run used to print the
+    # error, carry on, and exit 0 ("nothing new") -- a dead mailbox read as a
+    # quiet day.
+    mailbox_failures: list[str] = []
     # --lineage-lookback-hours was parsed and never used: render.yaml passes
     # 2160 believing a 90-day Lineage sweep runs, but every invoice older
     # than --lookback-hours was skipped (and never back-filled). List the
@@ -879,6 +895,7 @@ def run(argv: list[str] | None = None) -> int:
             err_line = f"list_recent_messages({mb}) failed: {msg}"
             print(f"ERROR: {err_line}", file=sys.stderr)
             mailbox_diag.append(f"{mb}: ERROR ({msg[:120]})")
+            mailbox_failures.append(mb)
             continue
         # Count senders we recognise so we can tell "scanner found CW emails
         # but skipped them" from "scanner saw no relevant senders at all".
@@ -921,6 +938,11 @@ def run(argv: list[str] | None = None) -> int:
             })
 
     if not qualifying:
+        if mailbox_failures:
+            print(f"ERROR: could not list {len(mailbox_failures)} mailbox(es): "
+                  f"{', '.join(mailbox_failures)} -- nothing was read from them",
+                  file=sys.stderr)
+            return 1
         print(f"nothing new; seen-set size = {len(seen_ids)}")
         return 0
 
@@ -1262,6 +1284,21 @@ def run(argv: list[str] | None = None) -> int:
         for b in blocked_pos:
             print(f"  - {b}", file=sys.stderr)
         return 2
+    # Anything that means "this run did not read or apply everything" fails
+    # it: a mailbox that would not list, an attachment/body that would not
+    # download, or an apply report that is not ok.
+    fetch_failures = [e for e in error_strs
+                      if "[list-att]" in e or "[fetch-att]" in e
+                      or "[body-fetch]" in e]
+    if mailbox_failures or fetch_failures or rep_status not in ("ok", "partial"):
+        if mailbox_failures:
+            print(f"ERROR: could not list mailbox(es): "
+                  f"{', '.join(mailbox_failures)}", file=sys.stderr)
+        for e in fetch_failures[:10]:
+            print(f"ERROR: {_redact(e, secrets_to_redact)}", file=sys.stderr)
+        if rep_status not in ("ok", "partial"):
+            print(f"ERROR: ingest-events status={rep_status}", file=sys.stderr)
+        return 1
     return 0
 
 

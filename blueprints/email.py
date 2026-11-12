@@ -1006,8 +1006,11 @@ def api_cheney_stock_images():
                             "received": recv, "image_content_type": ctype,
                             "image_b64": base64.b64encode(img).decode("ascii"),
                         }
+        # "complete": false = a Graph call failed, so an empty list does not
+        # mean nothing is there. Callers must treat errors as a failed run.
         return jsonify({"ok": True, "lookback_days": lookback, "sender": sender,
-                        "facilities": list(facilities.values()), "errors": errors})
+                        "facilities": list(facilities.values()), "errors": errors,
+                        "complete": not errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "cheney-stock-images")
         return jsonify({"ok": False, "error": _safe_err(exc), "facilities": []}), 200
@@ -1251,7 +1254,8 @@ def api_usf_screenshots():
         return jsonify({"ok": True, "warehouse": warehouse,
                         "last_count_at": last_count or None,
                         "lookback_days": lookback, "pending_only": pending_only,
-                        "messages": out, "errors": errors})
+                        "messages": out, "errors": errors,
+                        "complete": not errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "usf-screenshots")
         return jsonify({"ok": False, "error": _safe_err(exc), "messages": []}), 200
