@@ -252,6 +252,11 @@ class EmailEvent:
     # sync_inventory._onhand_source_rank uses this to stop a low-confidence
     # extraction overwriting a high-confidence one for the same count_date.
     parser_source: str = ""
+    # Cases the distributor's own report shows ON ORDER for this SKU (the USF
+    # weekly report's "ON ORDER" column). NEVER applied -- the PO is booked
+    # from its own confirmation. Kept on the item (reported_on_order) so
+    # integrations/ingest_health can cross-check it against our pending POs.
+    reported_on_order: Optional[float] = None
 
 
 @dataclass
@@ -1176,6 +1181,8 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
     The ``ON ORDER`` column is intentionally NOT emitted as a restock: the open
     PO is ingested separately from its own confirmation, and the report body
     excludes it from CURRENT ON HAND, so applying it here would double count.
+    It rides along as ``reported_on_order`` for the read-only cross-check in
+    integrations/ingest_health.
 
     The warehouse is resolved from the sending rep. This function self-detects
     a report (returns no events for unrelated mail) and only surfaces an
@@ -1253,6 +1260,7 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
             ),
             source_message_id=msg_id,
             source_subject=subject,
+            reported_on_order=line.on_order,
         ))
 
     return events, errors

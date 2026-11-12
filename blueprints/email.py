@@ -1527,6 +1527,9 @@ def _api_email_ingest_events_locked():
                 source_sender=str(e.get("source_sender") or ""),
                 count_date=str(e.get("count_date") or ""),
                 parser_source=str(e.get("parser_source") or ""),
+                reported_on_order=(float(e["reported_on_order"])
+                                   if e.get("reported_on_order") is not None
+                                   else None),
             ))
         except (TypeError, ValueError, KeyError) as exc:
             build_errors.append(f"events[{idx}]: error")

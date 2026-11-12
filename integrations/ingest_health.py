@@ -13,6 +13,13 @@ po-gap:<warehouse>
     mailbox -- or one the scanner cannot see -- produces no error anywhere;
     the only trace is the silence.
 
+on-order-mismatch:<warehouse>
+    The distributor's own weekly report says how many cases it has ON ORDER
+    per SKU. That column is parsed and kept (item["reported_on_order"], never
+    applied). When it differs from what we hold as pending for the same SKU
+    by more than a pallet, either a PO is missing here or one we still show
+    as pending has already been received there.
+
 stale issues
     Issues raised by the apply path (a rejected on-hand, a held report) have
     no scan that re-derives them, so they are closed here once the warehouse
@@ -30,6 +37,10 @@ PO_GAP_MIN_GAPS = 4        # gaps needed before a cadence is trusted (5 PO days)
 PO_GAP_MAX_GAPS = 8        # ...taken from the most recent this-many gaps
 PO_GAP_FACTOR = 2.0        # overdue when silence > factor x the median gap
 PO_GAP_MIN_DAYS = 14       # ...and longer than this, whatever the cadence
+
+# --- on-order cross-check -----------------------------------------------------
+PALLET_CS = 56             # one pallet; smaller differences are timing noise
+ON_ORDER_REPORT_MAX_AGE_DAYS = 9   # ignore a reported figure older than this
 
 # --- stale issues -------------------------------------------------------------
 STALE_ISSUE_DAYS = 15
@@ -116,6 +127,75 @@ def check_po_cadence(now=None) -> dict:
 
 
 # ------------------------------------------------------------------------------
+# On-order cross-check
+# ------------------------------------------------------------------------------
+
+def _pending_as_of(item: dict, key: str, usage: list, as_of) -> float:
+    """Cases we held as ON ORDER for this SKU at ``as_of``: pending rows that
+    were already booked then, plus receipts that have rolled into on-hand
+    SINCE (they were still on order at the time of the report)."""
+    total = 0.0
+    for o in (item.get("on_order") or []):
+        booked = _dt(o.get("source_received_at")) or _dt(o.get("ordered_at"))
+        if booked is not None and booked > as_of:
+            continue
+        total += float(o.get("qty") or 0)
+    from core.util import rollover_row_live
+    for row in usage:
+        if row.get("item_key") != key or not rollover_row_live(row):
+            continue
+        arrived = _dt(row.get("arrival_date")) or _dt(row.get("timestamp"))
+        if arrived is not None and arrived > as_of:
+            total += abs(float(row.get("amount") or 0))
+    return total
+
+
+def check_on_order(now=None) -> dict:
+    from core import feed_health
+    from inventory_tracker import load_inventory, load_usage
+    now = now or datetime.now(timezone.utc)
+    inv = load_inventory()
+    usage = None
+    by_wh: dict = {}
+    seen_wh = set()
+    for key, item in inv.items():
+        rep = item.get("reported_on_order")
+        if not isinstance(rep, dict) or rep.get("qty") is None:
+            continue
+        wh = item.get("warehouse") or ""
+        at = _dt(rep.get("at"))
+        if at is None or (now - at) > timedelta(days=ON_ORDER_REPORT_MAX_AGE_DAYS):
+            continue
+        seen_wh.add(wh)
+        if usage is None:
+            usage = load_usage() or []
+        ours = _pending_as_of(item, key, usage, at)
+        theirs = float(rep["qty"])
+        if abs(theirs - ours) > PALLET_CS:
+            by_wh.setdefault(wh, []).append({
+                "sku": item.get("name") or key, "reported": theirs,
+                "pending": round(ours, 2), "as_of": rep.get("at")})
+    # Clear for every warehouse that has a figure and no mismatch; warehouses
+    # with no fresh figure keep whatever state they had cleared by age below.
+    for wh in sorted(seen_wh):
+        key = f"on-order-mismatch:{wh}"
+        rows = by_wh.get(wh)
+        if not rows:
+            feed_health.clear_issue(key)
+            continue
+        detail = "; ".join(
+            f"{r['sku']}: report {r['reported']:g} cs vs pending {r['pending']:g} cs"
+            for r in rows[:6])
+        feed_health.raise_issue(
+            key,
+            f"{wh}: the distributor's report (as of {str(rows[0]['as_of'])[:10]}) "
+            f"and our pending POs disagree by more than a pallet on "
+            f"{len(rows)} SKU(s) -- {detail}. A PO may be missing here, or "
+            "one shown as pending has already been received.", "warn")
+    return by_wh
+
+
+# ------------------------------------------------------------------------------
 # Stale issues
 # ------------------------------------------------------------------------------
 
@@ -132,7 +212,7 @@ def expire_stale_issues(now=None) -> list:
         _log(exc, "freshness")
     closed = []
     for key, rec in issues.items():
-        if not key.startswith(_APPLY_ISSUE_PREFIXES):
+        if not key.startswith(_APPLY_ISSUE_PREFIXES + ("on-order-mismatch:",)):
             continue
         last_seen = _dt(rec.get("last_seen"))
         first_seen = _dt(rec.get("first_seen"))
@@ -155,6 +235,7 @@ def run_checks() -> dict:
     out: dict = {"ok": True, "checks": {}, "errors": []}
     steps = (
         ("po_cadence", "PO_GAP_CHECK", check_po_cadence),
+        ("on_order", "ON_ORDER_CROSSCHECK", check_on_order),
         ("stale_issues", "", expire_stale_issues),
     )
     for name, switch, fn in steps:
@@ -176,5 +257,5 @@ def run_checks() -> dict:
     return out
 
 
-__all__ = ["run_checks", "check_po_cadence", "expire_stale_issues",
-           "po_gap_verdict", "po_days_by_warehouse"]
+__all__ = ["run_checks", "check_po_cadence", "check_on_order",
+           "expire_stale_issues", "po_gap_verdict", "po_days_by_warehouse"]

@@ -1287,6 +1287,17 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
                         and _evt_rcv and _cur_rcv and _rcv_cmp < 0):
                     report["unchanged"] += 1
                     return
+        # What the distributor's report says is ON ORDER for this SKU. Kept
+        # for the read-only cross-check (integrations/ingest_health); it is
+        # never added to on-hand or to on_order.
+        _roo = getattr(evt, "reported_on_order", None)
+        if _roo is not None and not dry_run:
+            try:
+                item["reported_on_order"] = {
+                    "qty": float(_roo), "at": _evt_cd or now,
+                    "source": getattr(evt, "source_message_id", "") or ""}
+            except (TypeError, ValueError):
+                pass
         # An inventory worksheet carries both the on-hand count and the rep's
         # average weekly usage. Treat the event as a no-op only when NEITHER
         # changed, so a weekly-usage refresh still lands even if cases on hand
