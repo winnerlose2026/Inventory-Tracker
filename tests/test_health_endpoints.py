@@ -83,10 +83,9 @@ def test_readyz_lock_busy_and_disk_full(client, monkeypatch):
     @contextlib.contextmanager
     def busy(blocking=True):
         yield False if not blocking else True
-    monkeypatch.setattr(it, "data_lock", busy)
-    assert client.get("/readyz").get_json()["reasons"] == ["data_lock_busy"]
-    monkeypatch.undo()
-    monkeypatch.setenv("INVENTORY_API_TOKEN", TOKEN)
+    with monkeypatch.context() as m:        # never monkeypatch.undo(): that
+        m.setattr(it, "data_lock", busy)    # would undo the data-dir isolation
+        assert client.get("/readyz").get_json()["reasons"] == ["data_lock_busy"]
     DU = collections.namedtuple("DU", "total used free")
     monkeypatch.setattr(shutil, "disk_usage", lambda p: DU(10**9, 10**9, 10**6))
     assert "disk_full" in client.get("/readyz").get_json()["reasons"]

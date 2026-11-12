@@ -60,3 +60,27 @@ def _isolated_data_dir(tmp_path_factory, monkeypatch):
         pass
     yield new
     it._FILE_CACHE.clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_stray_data_dir():
+    """blueprints/email.py opens its ingest lock at the literal path
+    "data/.ingest.lock" (relative to the working directory, not DATA_DIR), so
+    any test that calls a scan / ingest route creates an empty data/ in the
+    checkout. If this run created the folder and it holds nothing but empty
+    lock files, remove it again. A data/ that was already there is never
+    touched."""
+    data = ROOT / "data"
+    existed = data.exists()
+    yield
+    if existed or not data.is_dir():
+        return
+    try:
+        entries = list(data.iterdir())
+        if all(p.is_file() and p.name.endswith(".lock") and p.stat().st_size == 0
+               for p in entries):
+            for p in entries:
+                p.unlink()
+            data.rmdir()
+    except OSError:
+        pass
