@@ -92,6 +92,8 @@ class InventoryWorksheet:
     unmapped_codes: list = field(default_factory=list)
     # Rows skipped because CS OH held something that is not a number.
     bad_cells: list = field(default_factory=list)
+    # Parsed only in part (CS OH read, no usage column beside it).
+    warnings: list = field(default_factory=list)
 
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -220,6 +222,12 @@ def parse_worksheet_xlsx(xlsx_bytes: bytes, *, distributor: str,
     active = candidates[-1]
     _, _, cs_col, wk_col, label = active
     ws_out.snapshot_label = label
+    if wk_col is None:
+        _next = header[cs_col + 1] if (cs_col + 1) < len(header) else ""
+        ws_out.warnings.append(
+            f"CS OH was read but the column beside it ({_next!r}) is not a "
+            "usage column -- weekly usage not refreshed. Headers seen: "
+            + " | ".join(h[:20] for h in header if h)[:300])
 
     for r in data_rows:
         mfg_raw = r[col_mfg] if col_mfg < len(r) else None

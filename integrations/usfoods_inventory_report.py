@@ -167,6 +167,10 @@ class InventoryReport:
     # Rows skipped because the on-hand cell held something that is not a
     # number ("12 (3 on hold)", "N/A"): ["<item>: on hand '<cell>'", ...].
     bad_cells: list = field(default_factory=list)
+    # The report parsed only in part -- e.g. on hand was read but no usage /
+    # forecast column was recognised (USF renames columns without notice, and
+    # on-hand alone used to parse with no diagnostic at all).
+    warnings: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +336,11 @@ def _build_report_from_table(table: list[list[str]],
 
     report = InventoryReport(distributor=distributor, warehouse=warehouse,
                              week_label=week_label)
+    if not week_cols:
+        report.warnings.append(
+            "on hand was read but NO usage / forecast column was found -- "
+            "weekly usage not refreshed. Headers seen: "
+            + " | ".join(str(h)[:30] for h in header)[:300])
 
     for r in table[header_idx + 1:]:
         usf_item = _clean_code(r[col_item]) if (col_item is not None and col_item < len(r)) else ""
@@ -624,6 +633,12 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
 
     report = InventoryReport(distributor=distributor, warehouse=warehouse,
                              week_label=week_label)
+    if not col_use_list:
+        report.warnings.append(
+            "on hand was read but NO usage column was found (expected Cases / "
+            "Forecast / Weekly Average Demand / <N> Week Average ...) -- "
+            "weekly usage not refreshed. Headers seen: "
+            + " | ".join(str(h)[:30] for h in header if h is not None)[:300])
     for r in rows[header_idx + 1:]:
         usf_item = _clean_code(r[col_item]) if col_item < len(r) else ""
         if not re.fullmatch(r"\d{3,}", usf_item):

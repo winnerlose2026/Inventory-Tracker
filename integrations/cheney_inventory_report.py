@@ -392,12 +392,17 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
     # never yielded on_hand and last_count_at froze at the prior week's date.)
     as_of_iso = _report_as_of(rows_by_sheet, filename)
     headers_seen: list[str] = []
+    weekly_usage_grid = False   # a <=7-day case-movement grid (the weekly workbook)
     idx = 0
     for rows in rows_by_sheet:
         # Usage (case-movement) block on this sheet -> usage_rate events.
         cm_events, cm_errors = _parse_case_movement(rows, warehouse, filename, distributor)
         events.extend(cm_events)
         errors.extend(cm_errors)
+        if cm_events:
+            _span, _lo, _hi, _note = _span_days(rows)
+            if not _note and _span <= 7:
+                weekly_usage_grid = True
 
         # On-hand stock grid on this sheet -- attempted even when a usage block
         # was found above, since the two can be stacked in one workbook/sheet.
@@ -476,6 +481,19 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
         for e in events:
             if e["event_type"] == "usage_rate":
                 e["count_date"] = as_of_iso
+
+    # A WEEKLY usage grid with no on-hand grid beside it: since Aug 2026
+    # Ross's weekly workbook carries the stock in cells, so its absence means
+    # the Stock header was renamed or the grid moved -- the count would
+    # silently go stale while usage kept refreshing. (The older stand-alone
+    # monthly case-movement export has no stock grid by design.)
+    if weekly_usage_grid \
+            and not any(e["event_type"] == "on_hand" for e in events):
+        seen = ("; ".join(headers_seen)) or "no other header rows"
+        errors.append(
+            f"partial parse: {filename} ({warehouse}): the usage grid was read "
+            f"but NO on-hand (Stock) grid was found -- the count was not "
+            f"refreshed. First rows seen: {seen}")
 
     if not events and not errors:
         seen = ("; ".join(headers_seen)) or "no non-empty rows"

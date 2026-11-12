@@ -8,8 +8,9 @@ from integrations.usfoods_po_parser import UsFoodsPO, UsFoodsPOLine
 from ingest_fakes import FakeGraph, PDF, mime, scan_with, sku
 
 RECEIVED = "2026-11-09T14:00:05Z"
-TABLE = ("<table><tr><td>ITEM</td><td>Vendor#</td><td>CURRENT ON HAND</td></tr>"
-         "<tr><td>7095637</td><td>1150</td><td>81</td></tr></table>")
+TABLE = ("<table><tr><td>ITEM</td><td>Vendor#</td><td>CURRENT ON HAND</td>"
+         "<td>Forecast 11/15/2026</td></tr>"
+         "<tr><td>7095637</td><td>1150</td><td>81</td><td>22</td></tr></table>")
 REP = "maria.hernandez@usfoods.com"
 
 

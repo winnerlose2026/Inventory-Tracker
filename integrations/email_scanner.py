@@ -1096,6 +1096,8 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
         )
 
+    for w in getattr(sheet, "warnings", None) or []:
+        errors.append(f"partial parse: inventory worksheet ({warehouse}): {w}")
     if getattr(sheet, "bad_cells", None):
         errors.append(
             f"inventory worksheet ({warehouse}): on-hand cell is not a number "
@@ -1191,6 +1193,8 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
         )
 
+    for w in getattr(report, "warnings", None) or []:
+        errors.append(f"partial parse: inventory & usage report ({warehouse}): {w}")
     if getattr(report, "bad_cells", None):
         errors.append(
             f"inventory & usage report ({warehouse}): on-hand cell is not a "
