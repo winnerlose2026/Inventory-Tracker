@@ -1375,7 +1375,8 @@ def api_admin_bakery_workbook_upload():
         filename = (up.filename or "")[:200]
     else:
         data = request.get_data(cache=False) or b""
-        filename = (request.headers.get("X-Filename") or "")[:200]
+        from urllib.parse import unquote
+        filename = unquote(request.headers.get("X-Filename") or "")[:200]
     if not data:
         return jsonify({"ok": False, "error": "No file received. Send the .xlsx as "
                         "form field 'file' or as the request body."}), 400

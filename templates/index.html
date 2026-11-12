@@ -215,6 +215,38 @@
   .toast-msg { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 18px; font-size: 13px; max-width: 320px; box-shadow: 0 10px 30px rgba(5,23,71,.12); animation: slideIn .2s ease; }
   .toast-msg.success { border-left: 3px solid var(--green); }
   .toast-msg.error { border-left: 3px solid var(--red); }
+  .toast-msg { cursor: pointer; }
+  .toast-msg.error { background: #FFF4F1; border-color: rgba(236,80,57,.45); color: #7A1E10; font-weight: 500; max-width: 420px; }
+
+  /* Health strip (top of every tab) + per-tab load status */
+  .health-strip { border-radius: var(--radius); margin: 0 0 14px 0; font-size: 13px; border: 1px solid; overflow: hidden; }
+  .health-red { background: #FFF4F1; border-color: rgba(236,80,57,.45); color: #7A1E10; }
+  .health-amber { background: #FFF8E6; border-color: rgba(240,179,35,.6); color: #5A3F00; }
+  .health-head { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 14px; background: transparent; border: 0; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+  .health-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--yellow); }
+  .health-red .health-dot { background: var(--red); }
+  .health-chev { margin-left: auto; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; opacity: .75; }
+  .health-list { margin: 0; padding: 4px 14px 12px 38px; line-height: 1.55; }
+  .health-list li { margin: 2px 0; }
+  .health-detail { opacity: .75; font-size: 12px; }
+  .load-status { margin: 0 0 10px 0; }
+  .page-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 14px; border-radius: var(--radius); font-size: 13px; border: 1px solid; margin-bottom: 6px; }
+  .page-bar-red { background: #FFF4F1; border-color: rgba(236,80,57,.45); color: #7A1E10; }
+  .page-bar-amber { background: #FFF8E6; border-color: rgba(240,179,35,.6); color: #5A3F00; }
+  .page-bar > span { min-width: 0; }
+  .page-bar > .btn { flex: 0 0 auto; }
+  .page-bar-detail { opacity: .8; font-size: 12px; }
+  .load-stamp { font-size: 11px; color: var(--muted); text-align: right; }
+  .notice { padding: 10px 14px; border-radius: var(--radius); font-size: 13px; border: 1px solid; margin: 0 0 14px 0; line-height: 1.5; }
+  .notice-red { background: #FFF4F1; border-color: rgba(236,80,57,.45); color: #7A1E10; }
+  .notice-amber { background: #FFF8E6; border-color: rgba(240,179,35,.6); color: #5A3F00; }
+  .notice ul { margin: 4px 0 0 18px; padding: 0; }
+  .btn.is-busy, .btn:disabled { opacity: .55; cursor: progress; pointer-events: none; }
+  .dim-stale { opacity: .55; }
+  .inline-confirm { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .po-prompt { margin: 0 0 8px 0; padding: 10px 14px; border-radius: 6px; background: #FFF8E6; border: 1px solid rgba(240,179,35,.6); color: #5A3F00; font-size: 13px; line-height: 1.5; white-space: normal; }
+  .po-table > tbody > tr.po-prompt-row > td { grid-column: 1 / -1 !important; font-family: var(--font-body) !important; font-size: 13px !important; font-weight: 400 !important; }
+  .po-table > tbody > tr.po-prompt-row > td:nth-child(1) div { display: block !important; }
   @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
   /* Report charts */
@@ -895,6 +927,9 @@
 
   <!-- Main -->
   <main class="main">
+
+    <!-- Background-feed health: shown only when something needs a look -->
+    <div id="health-strip" class="health-strip" style="display:none" role="status"></div>
 
     <!-- Inventory -->
     <div class="page active" id="page-inventory">
@@ -1644,6 +1679,15 @@
           </div>
           <div id="plh-window-label" style="font-weight:600;color:var(--text);font-size:13px;text-align:right">&nbsp;</div>
         </div>
+        <!-- How current the workbook data is + upload it without the laptop -->
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 20px 0 20px">
+          <div id="plh-data-through" style="font-size:12px;color:var(--muted)">&nbsp;</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <input type="file" id="bakery-workbook-file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none" onchange="onBakeryWorkbookChosen(this)">
+            <button class="btn btn-ghost btn-sm" id="bakery-workbook-btn" onclick="document.getElementById('bakery-workbook-file').click()" title="Upload the Bakery Model - Sales v. Labor workbook (.xlsx)">Upload bakery workbook</button>
+          </div>
+        </div>
+        <div id="bakery-workbook-msg" style="padding:0 20px"></div>
         <div style="padding:8px 20px 16px 20px">
           <canvas id="plh-chart" height="260" style="max-height:280px"></canvas>
         </div>
@@ -1665,6 +1709,7 @@
                 <span style="width:1px;height:18px;background:var(--border);margin:0 2px"></span>
                 <button class="btn btn-ghost btn-sm" id="toast-sales-today" onclick="resetToastSalesOffset()" title="Jump to today's period" style="padding:2px 8px">Today</button>
               </div>
+              <button class="btn btn-ghost btn-sm" id="toast-sales-refresh" onclick="refreshToastSales()" title="Pull this period again from Toast now (can take up to 30 seconds)">Refresh from Toast</button>
               <div class="btn-group">
                 <button class="btn btn-ghost btn-sm active" id="toast-sales-period-week" onclick="setToastSalesPeriod('week')">Weekly</button>
                 <button class="btn btn-ghost btn-sm" id="toast-sales-period-month" onclick="setToastSalesPeriod('month')">Monthly</button>
@@ -1672,7 +1717,7 @@
             </div>
           </div>
           <div style="padding:6px 20px;color:var(--muted);font-size:12px" id="toast-sales-subtitle">
-            Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${period}.
+            Top-selling items by retail $ from Toast POS with sales mix %.
           </div>
           <div style="padding:6px 20px 16px 20px" id="toast-sales-container">
             <div class="empty" style="padding:18px;color:var(--muted)">Loading Toast sales…</div>
@@ -1777,7 +1822,7 @@
     </div>
     <div class="form-actions">
       <button class="btn btn-ghost" onclick="closeModal('item-modal')">Cancel</button>
-      <button class="btn btn-primary" onclick="submitItem()">Save</button>
+      <button class="btn btn-primary" id="item-submit" onclick="submitItem()">Save</button>
     </div>
   </div>
 </div>
@@ -1844,7 +1889,7 @@
       <button class="btn btn-danger" onclick="cancelModifyPO()">Cancel PO</button>
       <div style="display:flex;gap:8px">
         <button class="btn btn-ghost" onclick="closeModal('modify-po-modal')">Close</button>
-        <button class="btn btn-primary" onclick="saveModifyPO()">Save</button>
+        <button class="btn btn-primary" id="modify-po-save" onclick="saveModifyPO()">Save</button>
       </div>
     </div>
   </div>
