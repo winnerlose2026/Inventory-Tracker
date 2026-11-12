@@ -237,3 +237,15 @@ def test_cw_apply_marks_needs_review_and_raises_issue(monkeypatch, issues):
     rep = sync._apply_cw_pos([rec])
     assert saved["recs"][0]["needs_review"] is True
     assert rep["needs_review"] and "po-total:1226111" in issues
+
+
+def test_usf_matching_total_outranks_a_stray_row_shaped_line():
+    text = USF_OK.replace(" **** TOTALS ****",
+                          "   20 CASES   9999            PALLET NOTE LINE\n **** TOTALS ****")
+    po = usf_parse(text)
+    assert len(po.lines) == 2 and po.integrity_error == ""
+
+
+def test_cheney_phone_like_lines_are_not_item_rows():
+    text = CHENEY + "  561 8451800 Receiving\n   10 4511758943 reference only\n"
+    assert cheney_parse(text).integrity_error == ""

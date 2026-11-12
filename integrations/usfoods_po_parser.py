@@ -263,9 +263,12 @@ def check_integrity(po: "UsFoodsPO", text: str) -> str:
             and abs(parsed - sum(totals)) > 1e-6:
         return (f"parsed lines add up to {parsed:g} cs but the PDF prints "
                 f"TOTALS {totals[-1]:g} UNITS ({len(po.lines)} line(s) read)")
-    if seen_rows > len(po.lines):
+    # Only when the PDF prints no total to check against (a total that
+    # matches is the stronger evidence; a stray row-shaped line must not
+    # hold a PO whose lines add up).
+    if not totals and seen_rows > len(po.lines):
         return (f"{seen_rows} item rows on the PDF but only {len(po.lines)} "
-                f"could be read")
+                f"could be read (and the PDF prints no TOTALS line to check)")
     return ""
 
 

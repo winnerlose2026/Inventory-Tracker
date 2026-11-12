@@ -183,7 +183,8 @@ _LINE_HEAD_RE = re.compile(
 )
 # Anything that LOOKS like an item row (position + Cheney catalog number +
 # text), read or not.
-_ITEM_ROW_RE = re.compile(r"^\s*\d{1,4}\s+\d{6,10}\s+[A-Za-z]")
+_ITEM_ROW_RE = re.compile(
+    r"^\s*\d{1,4}\s+\d{6,10}\s+[A-Za-z].*?\s\d{1,3}/\d+\s")   # ... a pack size too
 _TOTAL_RE = re.compile(
     r"^\s*(?:Grand\s+)?Total(?:\s+(?:net\s+)?(?:value|amount))?[^\d\n]*?"
     r"(?P<total>[\d,]+\.\d{2})\s*(?:USD)?\s*$", re.IGNORECASE | re.MULTILINE)
