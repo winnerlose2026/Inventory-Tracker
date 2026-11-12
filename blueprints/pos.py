@@ -13,6 +13,7 @@ from core.errors import _log_exc, _safe_err
 from core.util import _norm_po_key, rollover_row_live, absorbed_row_live, absorbed_row_qty
 from core.util import NOT_ARRIVED_STATUSES
 from core.util import with_data_lock
+from inventory_tracker import save_inventory_and_usage
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -566,8 +567,7 @@ def api_pending_reopen():
     removed_cs = un["removed_cs"]
     delivery_status = un["delivery_reopened"]
     if restored:
-        save_inventory(inv)
-        save_usage(usage)
+        save_inventory_and_usage(inv, usage)
     return jsonify({
         "ok": restored > 0,
         "po_number": po_number,
@@ -700,8 +700,7 @@ def api_pos_absorb_pending():
                       "count_at": count_at, "reason": reason})
     delivery_released = False
     if not dry_run:
-        save_inventory(inv)
-        save_usage(usage)
+        save_inventory_and_usage(inv, usage)
         try:
             append_inventory_audit(audit)
         except Exception:  # noqa: BLE001 -- audit is best-effort
@@ -907,8 +906,7 @@ def api_arrived_po_adjust():
                                 and entry.get("unrolled_at") == now_iso):
                             entry["ship_date_source"] = ("operator-override"
                                                          if override_freight else "operator")
-            save_inventory(inv)
-            save_usage(usage)
+            save_inventory_and_usage(inv, usage)
         return jsonify({
             "ok": un["restored_lines"] > 0,
             "po_number": po_number,
@@ -1034,8 +1032,7 @@ def api_arrived_po_adjust():
 
     if audit_rows:
         usage.extend(audit_rows)
-    save_inventory(inv)
-    save_usage(usage)
+    save_inventory_and_usage(inv, usage)
 
     return jsonify({
         "ok": True,
@@ -1146,8 +1143,7 @@ def api_pending_set_status():
                         include_absorbed=True,
                         why=f"PO {po_number} set to {label}")
         if un["restored_lines"]:
-            save_inventory(inv)
-            save_usage(usage)
+            save_inventory_and_usage(inv, usage)
             out["moved_back_on_order"] = {
                 "lines": un["restored_lines"],
                 "cs": round(sum(l["qty"] for l in un["lines"]), 2),

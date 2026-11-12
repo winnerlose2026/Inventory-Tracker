@@ -26,9 +26,10 @@ def _ingest_lock():
     holds it -- callers answer 409 rather than queueing, because a scan that
     waits behind a 3-minute scan just dies on the worker timeout instead.
     """
-    lock_path = os.path.join("data", ".ingest.lock")
+    import inventory_tracker as _it_lock
+    lock_path = str(_it_lock.DATA_DIR / ".ingest.lock")
     try:
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(str(_it_lock.DATA_DIR), exist_ok=True)
     except OSError:
         pass
     try:

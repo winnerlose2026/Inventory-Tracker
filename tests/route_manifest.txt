@@ -13,6 +13,8 @@
 /api/admin/backups/latest GET
 /api/admin/backups/upload POST
 /api/admin/bakery-sales/ingest POST
+/api/admin/bakery-workbook/status GET
+/api/admin/bakery-workbook/upload POST
 /api/admin/labor/ingest POST
 /api/admin/po-order-date POST
 /api/admin/production/reclassify POST
@@ -30,11 +32,13 @@
 /api/chefs-warehouse/ship-date POST
 /api/distributors GET
 /api/email/cheney-stock-images GET
+/api/email/held-reports/release POST
 /api/email/ingest-events POST
 /api/email/scan POST
 /api/email/send POST
 /api/email/usf-screenshots GET
 /api/export.xlsx GET
+/api/feeds/cheney/heartbeat POST
 /api/feeds/health GET
 /api/forecast/backfill-historical POST
 /api/forecast/decrement-daily POST
@@ -49,6 +53,7 @@
 /api/graph/subscriptions GET,POST
 /api/graph/subscriptions/renew POST
 /api/hidden-skus GET
+/api/ingest/cheney-810 POST
 /api/ingest/cheney-inventory-csv POST
 /api/insights GET
 /api/inventory GET
@@ -65,6 +70,7 @@
 /api/planning/demand GET
 /api/planning/guide GET
 /api/planning/plan GET
+/api/pos/absorb-pending POST
 /api/pos/arrived/adjust POST
 /api/pos/delivery GET
 /api/pos/delivery/chased POST
@@ -75,6 +81,7 @@
 /api/pos/reconcile POST
 /api/production GET
 /api/production/<source_message_id> DELETE
+/api/production/health GET
 /api/production/ingest POST
 /api/production/lots-by-pair GET
 /api/production/scan POST
@@ -84,14 +91,17 @@
 /api/report/bakery-sales GET
 /api/report/plh GET
 /api/report/toast-sales GET
+/api/reps GET
 /api/restock POST
 /api/sales/ingest POST
 /api/sales/locations GET
 /api/scan/health GET
 /api/seed POST
 /api/sync POST
+/api/toast/nightly-pull POST
 /api/traceability/search GET
 /api/usage GET
+/api/usage/cheney-crosscheck GET
 /api/usage/reverse POST
 /api/use POST
 /api/warehouses GET

@@ -26,6 +26,7 @@ from integrations import (
     CheneyBrothersClient, USFoodsClient,
     DistributorClient, EmailInboxClient, NotConfiguredError, SyncItem,
 )
+from inventory_tracker import save_inventory_and_usage
 from inventory_tracker import (
     load_inventory, save_inventory, load_usage, save_usage,
     load_chefs_warehouse_pos, save_chefs_warehouse_pos,
@@ -403,8 +404,7 @@ def sync_all(clients: list[DistributorClient] | None = None,
         reports = [_sync_one(c, inv, usage, dry_run, prefetched=f)
                    for c, f in zip(clients, fetched)]
         if not dry_run:
-            save_inventory(inv)
-            save_usage(usage)
+            save_inventory_and_usage(inv, usage)
     return reports
 
 
@@ -2125,8 +2125,7 @@ def _apply_events(events: list,
         _apply_email_event(evt, inv, usage, now, report, dry_run)
 
     if not dry_run:
-        save_inventory(inv)
-        save_usage(usage)
+        save_inventory_and_usage(inv, usage)
         # Append an audit trail of every applied change (roadmap #9) so a bad
         # ingest can be diffed / rolled back. Best-effort; never blocks a save.
         try:

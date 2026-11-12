@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request, send_file
 
 from core.errors import _safe_err
 from core.util import business_today, with_data_lock
+from inventory_tracker import save_inventory_and_usage
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -1614,8 +1615,7 @@ def api_forecast_decrement_daily():
             item["updated"] = now_iso
 
     if not dry_run and applied:
-        save_usage(usage)
-        save_inventory(inv)
+        save_inventory_and_usage(inv, usage)
 
     return jsonify({
         "ok": True,
@@ -1945,8 +1945,7 @@ def api_forecast_true_up():
         item["last_count_at"] = now_iso
 
     if not dry_run and reconciled:
-        save_usage(usage)
-        save_inventory(inv)
+        save_inventory_and_usage(inv, usage)
 
     return jsonify({
         "ok": True,
