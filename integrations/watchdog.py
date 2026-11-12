@@ -202,7 +202,14 @@ def _when(ts: str) -> str:
     return dt.strftime("%b %d %H:%M UTC") if dt else "never"
 
 
-def _check_feeds(view: dict) -> None:
+# A feed whose last run failed is only worth an alert once it has gone this
+# long without a success: the 20-minute jobs hit the odd busy lock or Graph
+# timeout and recover on the next run.
+FAILING_GRACE_HOURS = 3
+
+
+def _check_feeds(view: dict, now: datetime | None = None) -> None:
+    now = now or _utcnow()
     stale_keep, fail_keep = set(), set()
     for name, f in view["feeds"].items():
         label = FRIENDLY.get(name, "Feed '%s'" % name)
@@ -221,6 +228,10 @@ def _check_feeds(view: dict) -> None:
                              ("%g" % limit) if limit else "few"),
                 "error" if name in REQUIRED_FEEDS or name == "scheduler" else "warn")
         elif not f["ok"]:
+            last_ok = _parse(f["last_ok"])
+            if last_ok is not None and (
+                    now - last_ok) < timedelta(hours=FAILING_GRACE_HOURS):
+                continue
             key = "feed-failing:" + name
             fail_keep.add(key)
             feed_health.raise_issue(
@@ -548,7 +559,7 @@ def run(now: datetime | None = None, *, books: bool | None = None,
         _step("books", _books)
     # Feeds last, with this run counted: the watchdog is alive if it got here.
     feed_health.record("watchdog", True, "checks running")
-    _step("feeds", lambda: _check_feeds(feeds_view(now)))
+    _step("feeds", lambda: _check_feeds(feeds_view(now), now))
 
     sent_ok = True
     try:
