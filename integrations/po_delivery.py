@@ -711,16 +711,45 @@ def speaks_for_all(text: str) -> bool:
     return bool(_COLLECTIVE.search(own_text(text or "")))
 
 
+def asked_in_answered(msg: dict, messages: list, po_numbers: list) -> list:
+    """The POs asked about in the H&H message ``msg`` answers: the latest H&H
+    message on the thread before it, passing over internal test notes and a
+    bare "thanks" that names no PO. [] when there is none or it names no PO."""
+    sent = parse_dt(msg.get("sent") or "")
+    if sent is None:
+        return []
+    earlier = []
+    for m in messages:
+        t = parse_dt(m.get("sent") or "")
+        if t is None or t >= sent or not is_hh(m.get("from") or ""):
+            continue
+        if (m.get("text") or "").lstrip().startswith(INTERNAL_TEST_PREFIX):
+            continue
+        earlier.append((t, own_text(m.get("text") or "")))
+    for _t, own in sorted(earlier, key=lambda x: x[0], reverse=True):
+        if is_ack(own) and not any(names_po(own, p) for p in po_numbers):
+            continue
+        return [p for p in po_numbers if names_po(own, p)]
+    return []
+
+
 def answered_since_chase(rec: dict, messages: list, po_numbers: list,
                          now: datetime) -> Optional[str]:
     """Did Lineage / the dock reply on this thread AFTER our last follow-up
     about this PO (and within ANSWERED_HOLD_FOR)? Then the ball is in our
     court -- the reply needs reading, not another ask. Returns the hold
-    reason, or None. A reply naming other POs only doesn't count; one naming
-    none counts for every PO on the thread. Auto-replies never count.
+    reason, or None. A reply naming other POs only doesn't count. One naming
+    none counts for the POs the H&H message it answers asked about -- or,
+    when that message named none (or there is none), for every PO on the
+    thread. Auto-replies never count.
 
     Before this, a reply the server couldn't read ("Both shows delivered
-    today") was invisible to the chase rule, so the next run asked again."""
+    today") was invisible to the chase rule, so the next run asked again.
+
+    11/9 21:10 UTC, 8-Orders thread: Belinda's "Reaching out to dispatch to
+    confirm." answered JD's ask about 1226134 alone, but (naming no PO) it
+    held 064511780513, 1220440 and 9314683Y for the full 48 h -- two missed
+    days of follow-ups on two passed appointments."""
     last = _last_chase(rec)
     if last is None:
         return None
@@ -735,6 +764,10 @@ def answered_since_chase(rec: dict, messages: list, po_numbers: list,
         named = [p for p in pos if names_po(own_text(m.get("text") or ""), p)]
         if named and key not in named:
             continue
+        if not named:
+            asked = asked_in_answered(m, messages, pos)
+            if asked and key not in asked:
+                continue      # it answered an ask about other POs
         return (f"{m.get('from')} replied {sent.strftime('%m/%d %H:%M')} UTC after the "
                 "last follow-up -- that reply needs reading, not another ask")
     return None
@@ -966,6 +999,7 @@ def delivered_at_from(line: str, sent: str, zone: str,
         return None
     tz = ZoneInfo(zone)
     sent_local = sent_dt.astimezone(tz)
+    line = delivery_part(line) or line   # "picked up 1556PM/13th, delivered 0651AM/21st"
     day = _day(line, sent_local)
     if day is None:
         a = parse_dt(appt)
@@ -1006,12 +1040,36 @@ _APPT_HEDGE = re.compile(
     r"capacity|delivered|picked)\b", re.I)
 
 
+_PICKUP_CUE = re.compile(r"\bpick(?:ed|ing)?[\s-]?up", re.I)
+_DELIVERY_WORD = re.compile(r"\bdeliver\w*", re.I)
+
+
+def delivery_part(line: str) -> str:
+    """The part of a line that is about the DELIVERY. Belinda puts both on one
+    line -- "014511780511-pickup 1100AM/16th and delivery is set for
+    1000AM/18th" -- and the first date / time there is the pickup (11/11: the
+    server booked the 11/16 11:00 pickup as the delivery appointment, and
+    re-booked it on every sync after the task corrected it). A line with no
+    pickup cue is all delivery; one with a pickup cue is read from its first
+    "deliver..." word up to the next pickup cue; "" when it has no delivery
+    word at all (a pickup time is not a delivery appointment)."""
+    line = line or ""
+    if not _PICKUP_CUE.search(line):
+        return line
+    d = _DELIVERY_WORD.search(line)
+    if not d:
+        return ""
+    p = _PICKUP_CUE.search(line, d.end())
+    return line[d.start():p.start() if p else len(line)]
+
+
 def appointment_lines(text: str) -> list:
     """Firm delivery-appointment statements in a message's own words:
     "We show this PO scheduled for 11/11 at 8:30 AM", "Appointment: 10/19/2026
-    8:00 AM", "Delivery moved to 0830AM/18th". Each line must state a day.
-    A hedged / conditional / requesting line is skipped, and a message whose
-    firm lines disagree on the day is skipped whole (ambiguous)."""
+    8:00 AM", "Delivery moved to 0830AM/18th". Each line must state a day
+    (in its delivery part -- see delivery_part). A hedged / conditional /
+    requesting line is skipped, and a message whose firm lines disagree on the
+    day is skipped whole (ambiguous)."""
     own = own_text(text or "")
     if _PROBLEM.search(own):
         return []
@@ -1020,12 +1078,12 @@ def appointment_lines(text: str) -> list:
         line = raw.strip().strip(".!").strip()
         if not line or len(line) > 220:
             continue
-        if not (_APPT_CUE.search(line) and quote_dates(line)):
+        if not (_APPT_CUE.search(line) and quote_dates(delivery_part(line))):
             continue
         if _APPT_HEDGE.search(line):
             continue
         out.append(line)
-    days = {quote_dates(l)[0] for l in out}
+    days = {quote_dates(delivery_part(l))[0] for l in out}
     return out if len(days) == 1 else []
 
 
@@ -1041,6 +1099,7 @@ def appointment_from(line: str, sent: str, zone: str,
         return None
     tz = ZoneInfo(zone)
     s = sent_dt.astimezone(tz)
+    line = delivery_part(line)       # never the pickup's day / time
     qd = quote_dates(line)
     if not qd:
         return None
