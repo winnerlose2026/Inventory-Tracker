@@ -77,6 +77,7 @@ def _busy_response(what):
 # What a caller that names no window gets (the UI "Scan now" button sends
 # only {dry_run}); the cron passes the same values explicitly.
 DEFAULT_SCAN_LOOKBACK_DAYS = 14
+DEFAULT_SCAN_MAX_MESSAGES = 200
 # Issue-key prefixes that are re-derived from scratch by every full mailbox
 # scan: one that a full, clean scan does not report again is resolved.
 _SCAN_OWNED_ISSUE_PREFIXES = (
@@ -211,6 +212,14 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
         # sweeps go further when paired with a narrowing MS365_FILTER; the
         # 180s worker timeout still binds, so callers requesting more than a
         # few hundred without a filter should expect a 504.
+        # A caller that names NO window (the UI "Scan now" button posts only
+        # {dry_run}) gets the cron's: 14 days / 200 per mailbox. It used to
+        # get "the newest 60 messages", which on a busy day missed a report
+        # that the next cron run then had to pick up.
+        if body.get("lookback_days") in (None, "") and \
+                body.get("max_messages") in (None, ""):
+            body = {**body, "lookback_days": DEFAULT_SCAN_LOOKBACK_DAYS,
+                    "max_messages": DEFAULT_SCAN_MAX_MESSAGES}
         try:
             max_messages = int(body.get("max_messages") or 60)
         except (TypeError, ValueError):
@@ -287,6 +296,9 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
         # "partial"; the cron exits non-zero on mailbox failures and on any
         # failure it has not reported before (new_failures).
         _scan_errors_summarize(report, list(scan.errors or []))
+        report["truncated"] = list(getattr(scan, "truncated", None) or [])
+        if report["truncated"] and report.get("status") == "ok":
+            report["status"] = "partial"
         # Persist a scan-health heartbeat + capture recognized-but-unparsed
         # distributor mail (real runs only) so a missed warehouse or parser
         # gap is observable on /api/scan/health (roadmap #2/#5/#6).
@@ -332,6 +344,7 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
                         "errors": (report.get("errors") or [])[:_HEALTH_MAX_LINES],
                         "mailbox_failures": report.get("mailbox_failures") or [],
                         "po_failures": report.get("po_failures") or [],
+                        "truncated": report.get("truncated") or [],
                         "warnings": ((report.get("warnings") or [])
                                      + (report.get("rejected") or [])
                                      )[:_HEALTH_MAX_LINES],
@@ -386,8 +399,7 @@ def _clear_resolved_scan_issues(report: dict, issues: list, lookback_days: int) 
         return
     if lookback_days < DEFAULT_SCAN_LOOKBACK_DAYS:
         return
-    if any(str(e).lower().startswith("scan truncated")
-           for e in (report.get("errors") or [])):
+    if report.get("truncated"):
         return
     try:
         from core import feed_health

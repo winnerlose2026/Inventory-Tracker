@@ -150,6 +150,10 @@ _EXCLUDED_WELL_KNOWN_FOLDERS = ("sentitems", "drafts", "deleteditems",
 _REQUIRED_EXCLUDED_FOLDERS = ("sentitems", "drafts", "deleteditems")
 
 
+# Listing pages per mailbox per scan (x $top<=50 ~= 4000 messages screened).
+_MAX_LIST_PAGES = 80
+
+
 def _scan_all_folders_enabled() -> bool:
     """All-folder scanning: on unless MS365_SCAN_ALL_FOLDERS is off, or
     MS365_FOLDER names a folder other than the default Inbox (an explicit
@@ -254,6 +258,9 @@ class ScanResult:
     # (core.feed_health.raise_issue): {key, message, severity}. The route
     # raises them; the scanner itself never writes health state.
     issues: list[dict] = field(default_factory=list)
+    # Mailboxes whose listing stopped at the message budget or the page cap
+    # with mail in the window still unread.
+    truncated: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1854,13 +1861,19 @@ class EmailInboxClient:
         # Page ceiling so a date-only lookback over a high-volume mailbox can't
         # walk unbounded metadata pages (80 * $top<=50 ~= 4000 messages
         # screened per mailbox, well beyond any real lookback window).
-        while list_url and fetched < max_messages and pages < 80:
+        cut_mid_page = False
+        while list_url and fetched < max_messages and pages < _MAX_LIST_PAGES:
             pages += 1
             raw, _ = self._graph_get(list_url, token)
             page = json.loads(raw.decode("utf-8"))
             messages = page.get("value", [])
-            for m in messages:
+            for _i, m in enumerate(messages):
                 if fetched >= max_messages:
+                    # Budget spent with listed messages left on this page.
+                    cut_mid_page = any(
+                        not filt or _msg_event_candidate(x) for x in messages[_i:]
+                        if not (excluded_ids
+                                and x.get("parentFolderId") in excluded_ids))
                     break
                 mid = m.get("id")
                 if not mid:
@@ -1995,6 +2008,19 @@ class EmailInboxClient:
                             "sent": _msg_date_iso(msg),
                         })
             list_url = page.get("@odata.nextLink")
+
+        # The loop stopped with more of the window unread: the message budget
+        # ran out, or the page cap did. Older mail in the lookback was NOT
+        # looked at -- say so instead of reporting a clean scan. (Only for a
+        # bounded window; an unfiltered scan is "the newest N" by design.)
+        if filt and (list_url or cut_mid_page):
+            why = (f"the {max_messages}-message budget" if fetched >= max_messages
+                   else f"the {_MAX_LIST_PAGES}-page listing cap")
+            result.truncated.append(upn)
+            result.errors.append(
+                f"scan truncated: {upn} stopped at {why} with older mail in "
+                "the window unread -- raise max_messages or shorten "
+                "lookback_days")
 
     @staticmethod
     def _flag_junk(result, m, upn):
