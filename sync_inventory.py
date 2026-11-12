@@ -1331,6 +1331,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         if _is_replay:
             if wu_changed and not dry_run:
                 item["weekly_usage"] = round(float(new_wu), 2)
+                item["last_usage_report_at"] = getattr(evt, "count_date", "") or now
                 item["updated"] = now
                 report["changes"].append({
                     "name": item["name"],
@@ -1447,6 +1448,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     # On-hand worksheets also refresh the variety's average weekly usage.
     if evt.event_type == "on_hand" and evt.item.weekly_usage is not None:
         item["weekly_usage"] = round(float(evt.item.weekly_usage), 2)
+        # The worksheet's usage figure is as of this count -- stamp it, so
+        # a later worksheet that silently loses its usage column shows as
+        # OLD usage instead of hiding behind a fresh count.
+        item["last_usage_report_at"] = getattr(evt, "count_date", "") or now
     entry = {
         "item_key": key,
         "item_name": item["name"],

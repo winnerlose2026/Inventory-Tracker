@@ -76,7 +76,17 @@ DEFAULTS = {
         "usage_basis": "reps",
         "horizon_days": 56,
         "exclude_categories": ["bagels-lto"],
+        # Seasonal uplift on daily demand (and so on safety stock) for the
+        # dates in each window -- "MM-DD" both ends, inclusive; a window may
+        # wrap the year end. Edit or empty this list in
+        # data/planning_config.json ("ordering": {"seasonal": [...]}).
+        "seasonal": [
+            {"from": "12-15", "to": "01-02", "factor": 1.25, "label": "Holiday"},
+        ],
     },
+    # How old a DC's numbers may be before Suggested Orders says "check data
+    # first" instead of "order now" (integrations/order_plan.py).
+    "data_age": {"count_max_days": 10, "usage_max_days": 21},
     "varieties": [{"name": v, "top4": v in TOP4, "case_size": 60} for v in _VARIETIES],
 }
 
@@ -155,3 +165,41 @@ def transit_days_for(warehouse: str) -> int:
         if wh.get("warehouse") == w:
             return int(wh.get("transit_days") or cfg.get("transit_default_days") or 7)
     return int(cfg.get("transit_default_days") or 7)
+
+
+def daily_capacity_cs(cfg: dict | None = None) -> float:
+    """The one daily bake cap every planner view uses (6 pallets/day)."""
+    cfg = cfg if cfg is not None else load_planning_config()
+    try:
+        v = float((cfg.get("capacity") or {}).get("max_cs_per_day") or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    return v or float(DEFAULTS["capacity"]["max_cs_per_day"])
+
+
+def production_weekdays(cfg: dict | None = None) -> list:
+    """Production days as weekday indexes (Mon=0)."""
+    cfg = cfg if cfg is not None else load_planning_config()
+    names = [str(x)[:3].lower() for x in ((cfg.get("capacity") or {}).get("production_days")
+                                         or ["Mon", "Tue", "Wed", "Thu", "Fri"])]
+    order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    return [order.index(n) for n in names if n in order]
+
+
+def weekly_capacity_cs(cfg: dict | None = None) -> float:
+    cfg = cfg if cfg is not None else load_planning_config()
+    return daily_capacity_cs(cfg) * (len(production_weekdays(cfg)) or 5)
+
+
+def planning_inventory(inv: dict, cfg: dict | None = None, *,
+                       drop_finished_lto: bool = False) -> dict:
+    """The inventory every planning view works from: hidden SKUs (finished
+    LTOs taken off the Inventory tab) are out. ``drop_finished_lto`` also
+    drops the LTO categories ("ordering.exclude_categories") -- Buffer Watch
+    must not ask anyone to build ahead on a promo that is over."""
+    out = {k: v for k, v in (inv or {}).items() if not (v or {}).get("hidden")}
+    if drop_finished_lto:
+        cfg = cfg if cfg is not None else load_planning_config()
+        cats = set(((cfg.get("ordering") or {}).get("exclude_categories")) or [])
+        out = {k: v for k, v in out.items() if (v.get("category") or "") not in cats}
+    return out

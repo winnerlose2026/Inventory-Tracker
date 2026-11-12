@@ -45,14 +45,22 @@ def _parse(iso_s):
 def build_production_guide(inv: dict, ledger: list, demand_rows: list,
                            config: dict, toast_trend: dict = None,
                            now: datetime = None) -> dict:
-    now = now or datetime.now()
+    from core.util import business_now
+    now = now or business_now()
     pallet = int(config.get("pallet_cs") or 56)
     cap = config.get("capacity") or {}
+    from integrations.planning_config import (daily_capacity_cs,
+                                              production_weekdays)
     dep_day = float(cap.get("dependable_cs_per_day") or 224)
-    max_day = float(cap.get("max_cs_per_day") or 280)
-    prod_days = len(cap.get("production_days") or [1, 2, 3, 4, 5]) or 5
+    # ONE daily cap for the whole page: the load table and bake schedule use
+    # capacity.max_cs_per_day (6 pallets/day); this card used to judge the
+    # same queue against 4 pallets/day and fall back to 280.
+    max_day = daily_capacity_cs(config)
+    prod_days = len(production_weekdays(config)) or 5
     wk_dependable = dep_day * prod_days
     wk_max = max_day * prod_days
+    today = now.date()
+    excl_cats = set(((config.get("ordering") or {}).get("exclude_categories")) or [])
     prio = {d: i for i, d in enumerate(config.get("distributor_priority")
             or ["US Foods", "Cheney Brothers", "Chefs Warehouse"])}
     top4 = set(config.get("top4") or [])
@@ -66,13 +74,42 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     top4_floor = float(bd.get("top4_floor") or 7)
     other_floor = float(bd.get("other_floor") or 5)
 
-    def _shipped(po):
-        """A PO is already produced+shipped when its ship_date is in the past
-        (in transit) or it has arrived."""
-        if (po.get("status") or "") == "arrived":
-            return True
+    def _baked_vs_ordered(po):
+        ordered = sum(float(L.get("qty") or 0) for L in (po.get("lines") or [])) \
+            or float(po.get("total_cs") or 0)
+        baked = float(((po.get("production") or {}).get("baked_cs")) or 0)
+        return baked, ordered
+
+    def _ship_passed(po):
         sd = _parse(po.get("ship_date"))
-        return bool(sd and sd <= now)
+        return bool(sd and sd.date() <= today)
+
+    def _shipped(po):
+        """Has this PO really left the bakery?
+
+        A ship date that has merely gone by is NOT proof: the ledger turns a
+        PO "in transit" at 00:00 of its ship date whether or not a single
+        case was baked, so a PO that missed its truck silently left the bake
+        queue and never showed as late. It counts as shipped only when
+          * it has arrived, or an operator set it In Transit by hand;
+          * the ship date is verified (freight invoice / Lineage pickup);
+          * the Daily Production sheets show it fully baked; or
+          * the status says in transit and there is no ship date to doubt.
+        Dates are the bakery's (America/New_York) calendar.
+        """
+        st = (po.get("status") or "")
+        if st == "arrived":
+            return True
+        if (po.get("override") or "") == "in_transit":
+            return True
+        if not (po.get("ship_date") or "").strip():
+            return st == "in_transit"
+        if not _ship_passed(po):
+            return False
+        if (po.get("ship_date_source") or "") in ("freight", "lineage"):
+            return True
+        baked, ordered = _baked_vs_ordered(po)
+        return ordered > 0 and baked >= ordered - 1e-9
 
     # =====================================================================
     # 1) PRODUCTION QUEUE -- active POs not yet produced/shipped (bake-to-order)
@@ -90,9 +127,13 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
         # Produce-by: ready the day before a scheduled ship; else as soon as
         # possible (no ship date set yet). Urgency key sorts dated ahead of ASAP.
         ship_dt = _parse(ship)
+        late_days = 0
         if ship_dt:
             produce_by = (ship_dt - timedelta(days=1)).date().isoformat()
             urgency = ship_dt.date().isoformat()
+            # Ship date gone by and still not baked/verified shipped: LATE.
+            if ship_dt.date() <= today:
+                late_days = (today - ship_dt.date()).days + 1
         else:
             produce_by = None
             urgency = "ASAP"
@@ -124,6 +165,9 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
             "ordered_cs": round(ordered_cs, 1), "baked_cs": round(baked_cs, 1),
             "po_number": po.get("po_number") or "", "distributor": dist, "warehouse": wh,
             "transfer_group": po.get("transfer_group"), "status": st,
+            "late": late_days > 0, "late_days": late_days,
+            "ship_date_source": po.get("ship_date_source") or "",
+            "arrival_date": (po.get("arrival_date") or po.get("eta") or ""),
             "ship_date": ship or None, "produce_by": produce_by, "urgency": urgency,
             "transit_days": transit, "total_cs": total,
             "has_top4": any(L["top4"] for L in lines), "lines": lines,
@@ -134,6 +178,8 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
                 q["urgency"] if q["urgency"] != "ASAP" else "0000-00-00",
                 -q["total_cs"])
     queue.sort(key=_q_key)
+    queue.sort(key=lambda q: 0 if q["late"] else 1)     # stable: late first
+    late_pos = [q["po_number"] for q in queue if q["late"]]
     queue_cs = round(sum(q["total_cs"] for q in queue), 1)
     queue_top4_cs = round(sum(L["qty"] for q in queue for L in q["lines"] if L["top4"]), 1)
 
@@ -152,15 +198,22 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     # 2) CAPACITY -- the queue is the committed bake load this cycle
     # =====================================================================
     committed = queue_cs
+    pallets_day = round(max_day / pallet, 1)
     capacity = {
         "committed_cs": committed, "committed_pallets": round(committed / pallet, 1),
         "weekly_dependable_cs": wk_dependable, "weekly_max_cs": wk_max,
+        # The figures the card shows -- same cap as the load table below.
+        "capacity_cs_per_day": max_day, "capacity_pallets_per_day": pallets_day,
+        "weekly_capacity_cs": wk_max, "production_days_per_week": prod_days,
+        "utilization_pct": round(committed / wk_max * 100, 0) if wk_max else None,
         "utilization_pct_of_dependable": round(committed / wk_dependable * 100, 0) if wk_dependable else None,
-        "feasible_on_normal_week": committed <= wk_dependable,
-        "needs_surge": committed > wk_dependable,
+        "feasible_on_normal_week": committed <= wk_max,
+        "needs_surge": committed > wk_max,
         "spare_for_buildahead_cs_max": round(max(0.0, wk_max - committed), 0),
-        "note": ("Fits a normal Mon-Fri week." if committed <= wk_dependable
-                 else "Exceeds dependable capacity -- use the 5th pallet / weekend or expansion levers."),
+        "note": (f"Fits one week at {pallets_day:g} pallets/day."
+                 if committed <= wk_max
+                 else f"More than one week of baking at {pallets_day:g} pallets/day "
+                      "-- see the load table for which weeks run over."),
     }
 
     # =====================================================================
@@ -169,6 +222,9 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     # =====================================================================
     onhand, dist_of = {}, {}
     for key, item in (inv or {}).items():
+        # Hidden SKUs and finished LTOs are not a build-ahead risk.
+        if item.get("hidden") or (item.get("category") or "") in excl_cats:
+            continue
         wh = item.get("warehouse") or ""
         var = _variety(item.get("name") or key)
         onhand[(wh, var)] = onhand.get((wh, var), 0.0) + float(item.get("quantity") or 0)
@@ -209,26 +265,54 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
         if not u["distributor"]:
             u["distributor"] = dist_of.get(wh, "")
 
+    # Open (still to bake) PO cases per (unit, variety) with the day each is
+    # expected to land: arrival/ETA, else ship date + transit, else unknown.
+    open_incoming: dict = {}
+    for q in queue:
+        unit = wh_group.get(q["warehouse"], q["warehouse"])
+        arr = _parse(q.get("arrival_date"))
+        if arr is None and q.get("ship_date"):
+            sd = _parse(q["ship_date"])
+            arr = sd + timedelta(days=q["transit_days"]) if sd else None
+        for L in q["lines"]:
+            open_incoming.setdefault((unit, L["variety"]), []).append(
+                (arr.date() if arr else None, float(L["qty"] or 0) + float(L.get("baked") or 0)))
+
     buffer_watch = []
     for (unit, var), u in units.items():
-        if (unit, var) in queued_unit_variety:
-            continue   # already has an open PO in the queue -- don't double-flag
         rate = u["rate"]
         if rate <= 0:
             continue   # no demand signal -> not a buffer risk
         is_top4 = var in top4
         floor_d = top4_floor if is_top4 else other_floor
+        need_days = floor_d + u["transit"]
         cover = (u["on_hand"] + u["incoming"]) / rate
-        if cover < (floor_d + u["transit"]):
-            buffer_watch.append({
-                "unit": unit, "is_pool": u["is_pool"], "distributor": u["distributor"],
-                "variety": var, "top4": is_top4, "on_hand": round(u["on_hand"], 1),
-                "shipped_incoming_cs": round(u["incoming"], 1),
-                "rate_cs_per_day": round(rate, 3), "cover_days": round(cover, 1),
-                "floor_days": floor_d, "transit_days": u["transit"],
-                "confidence": "low" if u["stale"] else "high",
-                "note": "Depleting and no open PO -- order/produce proactively.",
-            })
+        if cover >= need_days:
+            continue
+        # An open PO used to hide the flag outright. It only does so when the
+        # cases landing before the cover-floor date actually close the gap
+        # (a PO with no arrival estimate is given the benefit of the doubt).
+        floor_date = today + timedelta(days=int(math.ceil(need_days)))
+        opens = open_incoming.get((unit, var)) or []
+        in_time = sum(q for (d, q) in opens if d is None or d <= floor_date)
+        open_total = sum(q for (_d, q) in opens)
+        if opens and (u["on_hand"] + u["incoming"] + in_time) / rate >= need_days:
+            continue
+        buffer_watch.append({
+            "unit": unit, "is_pool": u["is_pool"], "distributor": u["distributor"],
+            "variety": var, "top4": is_top4, "on_hand": round(u["on_hand"], 1),
+            "shipped_incoming_cs": round(u["incoming"], 1),
+            "rate_cs_per_day": round(rate, 3), "cover_days": round(cover, 1),
+            "floor_days": floor_d, "transit_days": u["transit"],
+            "confidence": "low" if u["stale"] else "high",
+            "open_po_cs": round(open_total, 1),
+            "open_po_in_time_cs": round(in_time, 1),
+            "cover_floor_date": floor_date.isoformat(),
+            "note": ("Depleting and no open PO -- order/produce proactively."
+                     if not opens else
+                     f"Open PO ({open_total:g} cs) will not cover it by "
+                     f"{floor_date.isoformat()} -- only {in_time:g} cs land in time."),
+        })
     buffer_watch.sort(key=lambda w: (0 if w["top4"] else 1, prio.get(w["distributor"], 9), w["cover_days"]))
 
     # =====================================================================
@@ -238,10 +322,15 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     toast_note = None
     if tt.get("available"):
         d = tt.get("direction")
-        toast_note = (f"Retail bagel demand {d} ({tt.get('pct_change')}% vs prior "
-                      f"{tt.get('window_days')}d) -- "
+        pct = tt.get("pct_change")
+        sign = "+" if (pct or 0) > 0 else ""
+        toast_note = (f"Retail bagel demand {d} ({sign}{pct}% vs prior "
+                      f"{tt.get('window_days')}d; as of {tt.get('as_of') or tt.get('anchored_to')}, "
+                      f"{tt.get('stores')} stores, same stores and days compared) -- "
                       + ("distributor reorders likely to rise; pull build-ahead forward."
                          if d == "rising" else "no action from Toast."))
+    elif tt.get("reason") and tt.get("matched_location_days") is not None:
+        toast_note = f"Toast trend not shown: {tt['reason']}."
 
     return {
         "generated_at": now.isoformat(),
@@ -250,11 +339,13 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
             "produce_now_cs": queue_cs,
             "produce_now_top4_cs": queue_top4_cs,
             "produce_now_pallets": round(queue_cs / pallet, 1),
+            "late_pos": len(late_pos),
             "buffer_watch": len(buffer_watch),
         },
         "capacity": capacity,
         "bake_by_variety": bake_by_variety,
         "production_queue": queue,
+        "late_pos": late_pos,
         "buffer_watch": buffer_watch,
         "buildahead": {
             "freezer_pallet_cap": config.get("freezer_pallet_cap"),

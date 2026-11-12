@@ -45,17 +45,48 @@ def test_pool_demand_aggregates_cheney_fl():
     assert ("Alcoa, TN", "Sesame") in pools and pools[("Alcoa, TN", "Sesame")]["is_pool"] is False
 
 
+def _toast_days(store, start_day, n, qty):
+    from datetime import date, timedelta
+    d0 = date.fromisoformat(start_day)
+    return [{"restaurant_guid": store, "business_date": (d0 + timedelta(days=i)).isoformat(),
+             "menu_group": "Bagels", "item": "Dozen Bagels", "qty": qty} for i in range(n)]
+
+
 def test_toast_trend_direction():
+    # two stores, 28 full days: prior 14 at 100/day, recent 14 at 130/day
     rows = []
-    # prior window (14-28d before anchor 2026-06-25): lower
-    for day in ["2026-06-02", "2026-06-05"]:
-        rows.append({"business_date": day, "menu_group": "Bagels", "item": "Dozen Bagels", "qty": 100})
-    # recent window (0-14d): higher -> rising
-    for day in ["2026-06-20", "2026-06-25"]:
-        rows.append({"business_date": day, "item": "Bagel w/ Plain Cream Cheese", "qty": 300})
-    rows.append({"business_date": "2026-06-24", "item": "Nova Salmon", "qty": 999})  # non-bagel, ignored
+    for st in ("A", "B"):
+        rows += _toast_days(st, "2026-05-29", 14, 100) + _toast_days(st, "2026-06-12", 14, 130)
+    rows.append({"restaurant_guid": "A", "business_date": "2026-06-24", "item": "Nova Salmon", "qty": 999})
     t = toast_demand_trend(rows, window_days=14)
-    assert t["available"] is True and t["direction"] == "rising" and t["pct_change"] > 10
+    assert t["available"] is True and t["direction"] == "rising" and t["pct_change"] == 30.0
+    assert t["as_of"] == "2026-06-25" and t["stores"] == 2 and t["matched_location_days"] == 28
+
+
+def test_toast_trend_compares_only_store_days_present_in_both_windows():
+    # Store B has no data in the prior window (its pulls were missing). The
+    # old sum-everything trend read that as demand doubling.
+    rows = _toast_days("A", "2026-05-29", 28, 100) + _toast_days("B", "2026-06-12", 14, 100)
+    t = toast_demand_trend(rows, window_days=14)
+    assert t["available"] is False and "not enough comparable" in t["reason"]   # 14 of 28
+    # with three full stores the one gappy store is simply left out
+    rows += _toast_days("C", "2026-05-29", 28, 100) + _toast_days("D", "2026-05-29", 28, 100)
+    t = toast_demand_trend(rows, window_days=14)
+    assert t["available"] and t["direction"] == "flat" and t["pct_change"] == 0.0
+    assert t["stores"] == 3
+
+
+def test_toast_trend_needs_coverage_and_skips_the_open_day():
+    sparse = [{"business_date": d, "menu_group": "Bagels", "item": "Bagel", "qty": q}
+              for d, q in (("2026-06-02", 100), ("2026-06-05", 100),
+                           ("2026-06-20", 300), ("2026-06-25", 300))]
+    assert toast_demand_trend(sparse)["available"] is False
+    rows = _toast_days("A", "2026-05-29", 28, 100) + _toast_days("A", "2026-06-26", 1, 5)
+    t = toast_demand_trend(rows, window_days=14, today="2026-06-26")
+    assert t["as_of"] == "2026-06-25" and t["pct_change"] == 0.0
+
+
+def test_toast_trend_no_bagel_rows():
     assert toast_demand_trend([{"business_date": "2026-06-20", "item": "Coffee", "qty": 5}])["available"] is False
 
 
@@ -69,3 +100,16 @@ if __name__ == "__main__":
             bad += 1; print("FAIL:", fn.__name__, e)
     print(f"\n{len(fns)-bad}/{len(fns)} passed")
     sys.exit(1 if bad else 0)
+
+
+def test_usage_freshness_is_the_usage_reports_date_not_the_counts():
+    inv = {"plain": {"name": "Plain Bagel 4oz [USF - Alcoa]", "distributor": "US Foods",
+                     "warehouse": "Alcoa, TN", "weekly_usage": 7,
+                     "last_count_at": "2026-06-25T10:00:00",
+                     "last_usage_report_at": "2026-04-01T10:00:00"}}
+    [r] = warehouse_demand(inv, now=NOW)
+    assert r["stale"] is True and r["confidence"] == "low"       # a fresh count no longer masks it
+    assert r["usage_as_of_basis"] == "usage_report" and r["count_age_days"] < 1
+    inv["plain"].pop("last_usage_report_at")
+    [r] = warehouse_demand(inv, now=NOW)
+    assert r["stale"] is False and r["usage_as_of_basis"] == "count"   # legacy record

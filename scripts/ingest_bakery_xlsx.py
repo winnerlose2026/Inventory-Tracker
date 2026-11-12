@@ -44,204 +44,37 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
 
-import openpyxl
+# The parser lives in integrations/bakery_workbook.py so the server's
+# POST /api/admin/bakery-workbook/upload and this laptop script read the
+# workbook the same way. It is loaded BY FILE, not as `integrations.…`: the
+# package's __init__ imports the mail/PDF stack, which the laptop that runs
+# this script does not need installed.
+import importlib.util  # noqa: E402
 
+_BW_PATH = Path(__file__).resolve().parent.parent / "integrations" / "bakery_workbook.py"
+_spec = importlib.util.spec_from_file_location("hh_bakery_workbook", _BW_PATH)
+_bw = importlib.util.module_from_spec(_spec)
+sys.modules.setdefault("hh_bakery_workbook", _bw)
+_spec.loader.exec_module(_bw)
 
-WORKBOOK_START = date(2021, 7, 19)
-DOW_COLS = ["B", "C", "D", "E", "F", "G", "H"]
-CHANNEL_ROWS = list(range(3, 9))  # N3..N8
+CHANNEL_ROWS, DOW_COLS = _bw.CHANNEL_ROWS, _bw.DOW_COLS
+SOURCE_TAG, WORKBOOK_START = _bw.SOURCE_TAG, _bw.WORKBOOK_START
+WorkbookError = _bw.WorkbookError
+parse_sheet, parse_workbook = _bw.parse_sheet, _bw.parse_workbook
+parse_workbook_detailed, resolve_weeks = _bw.parse_workbook_detailed, _bw.resolve_weeks
+_num, _all_equal = _bw._num, _bw._all_equal
+_parse_sheet_name, _walk_week = _bw._parse_sheet_name, _bw._walk_week
 
 DEFAULT_API = os.environ.get(
     "INVENTORY_API_BASE",
     "https://bagel-inventory.onrender.com",
 )
 DEFAULT_XLSX = "Bakery Model - Sales v. Labor.xlsx"
-SOURCE_TAG = "bakery-xlsx"
-
-
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-_NAME_RE = re.compile(
-    r"^\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s*-\s*"
-    r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s*$"
-)
-
-
-def _parse_sheet_name(name: str):
-    m = _NAME_RE.match(name)
-    if not m:
-        return None, None
-    sm, sd, sy, em, ed, ey = m.groups()
-    yr_s = int(sy) if sy else None
-    yr_e = int(ey) if ey else None
-    if yr_s is not None and yr_s < 100:
-        yr_s += 2000
-    if yr_e is not None and yr_e < 100:
-        yr_e += 2000
-    start = end = None
-    if yr_s:
-        try:
-            start = date(yr_s, int(sm), int(sd))
-        except ValueError:
-            pass
-    if yr_e:
-        try:
-            end = date(yr_e, int(em), int(ed))
-        except ValueError:
-            pass
-    return start, end
-
-
-def _walk_week(idx: int):
-    ws = WORKBOOK_START + timedelta(days=7 * idx)
-    we = ws + timedelta(days=6)
-    return ws, we
-
-
-def _resolve_week(idx: int, sheet_name: str):
-    """Pick the authoritative (week_start, week_end). Prefer the parsed
-    name when it has explicit years AND agrees with the walked date.
-    Otherwise trust the walk."""
-    walked_s, walked_e = _walk_week(idx)
-    parsed_s, _ = _parse_sheet_name(sheet_name)
-    if parsed_s and parsed_s == walked_s:
-        return walked_s, walked_e, "match"
-    if parsed_s and parsed_s != walked_s:
-        return walked_s, walked_e, (
-            "drift: walked=" + str(walked_s) +
-            " parsed=" + str(parsed_s) + " -- trusting walk"
-        )
-    return walked_s, walked_e, "no-year"
-
-
-def _num(v) -> float:
-    """Best-effort numeric coercion. Returns 0.0 for empty / DIV-error
-    sentinels."""
-    if v is None or v == "":
-        return 0.0
-    if isinstance(v, str):
-        s = v.strip()
-        if s.startswith("#") or s.upper() in {"NA", "N/A"}:
-            return 0.0
-        try:
-            return float(s.replace(",", "").replace("$", ""))
-        except ValueError:
-            return 0.0
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _all_equal(xs, tol: float = 0.05) -> bool:
-    """True when every value in xs is within tol of the first one. Used
-    to detect formula-spread placeholders (weekly_total / 7 written into
-    every daily cell) vs. real day-by-day actuals."""
-    if not xs:
-        return False
-    base = xs[0]
-    return all(abs(x - base) <= tol for x in xs)
-
-
-def parse_sheet(ws, week_start):
-    raw_dol = [_num(ws[col + "10"].value) for col in DOW_COLS]
-    raw_hrs = [_num(ws[col + "11"].value) for col in DOW_COLS]
-    is_forecast_dollars = _all_equal(raw_dol) and any(v > 0 for v in raw_dol)
-    is_forecast_hours   = _all_equal(raw_hrs) and any(v > 0 for v in raw_hrs)
-
-    labor_daily = []
-    if not is_forecast_dollars and not is_forecast_hours:
-        for i, col in enumerate(DOW_COLS):
-            d = week_start + timedelta(days=i)
-            hrs = raw_hrs[i]
-            dol = raw_dol[i]
-            if hrs <= 0 and dol <= 0:
-                continue
-            labor_daily.append({
-                "date":    d.isoformat(),
-                "hours":   round(hrs, 4),
-                "dollars": round(dol, 2),
-            })
-
-    channels = {}
-    for r in CHANNEL_ROWS:
-        name = ws["N" + str(r)].value
-        if not name or not isinstance(name, str):
-            continue
-        amt = _num(ws["O" + str(r)].value)
-        if amt <= 0:
-            continue
-        channels[name.strip()] = round(amt, 2)
-
-    total = _num(ws["I3"].value)
-    splh  = _num(ws["O10"].value) or None
-
-    return {
-        "week_start":  week_start.isoformat(),
-        "week_end":    (week_start + timedelta(days=6)).isoformat(),
-        "labor_daily": labor_daily,
-        "channels":    channels,
-        "total":       round(total, 2),
-        "splh":        round(splh, 4) if splh else None,
-    }
-
-
-def parse_workbook(path: Path):
-    # NB: read_only=False is deliberate. The workbook has one sheet per ISO
-    # week and grows ~52 sheets/year (260+ as of 2026-07). parse_sheet()
-    # reads cells by address (ws["B10"] etc.), and openpyxl's read-only
-    # worksheets re-scan on every such random access -- across hundreds of
-    # sheets that pushed a full parse past 2 minutes and timed out the daily
-    # auto-ingest. A normal (eager) load parses the whole ~1-2 MB file once
-    # and gives O(1) cell access, finishing in ~5s. data_only=True still
-    # returns Excel's cached values, so the parsed result is identical.
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=False)
-    labor_entries = []
-    bakery_weeks = []
-    drift_notes = []
-
-    for idx, sheet_name in enumerate(wb.sheetnames):
-        ws = wb[sheet_name]
-        week_start, week_end, note = _resolve_week(idx, sheet_name)
-        if note != "match" and note != "no-year":
-            drift_notes.append("  [" + str(idx) + "] " + repr(sheet_name) + ": " + note)
-        rec = parse_sheet(ws, week_start)
-        if not rec["labor_daily"] and rec["total"] <= 0:
-            continue
-
-        for L in rec["labor_daily"]:
-            labor_entries.append({
-                "date":    L["date"],
-                "hours":   L["hours"],
-                "dollars": L["dollars"],
-                "source":  SOURCE_TAG,
-            })
-        bakery_weeks.append({
-            "week_start": rec["week_start"],
-            "week_end":   rec["week_end"],
-            "location":   "Bakery",
-            "channels":   rec["channels"],
-            "total":      rec["total"],
-            "splh":       rec["splh"],
-            "source":     SOURCE_TAG,
-        })
-
-    if drift_notes:
-        print("Sheet-name drift detected (walk wins):", file=sys.stderr)
-        for n in drift_notes:
-            print(n, file=sys.stderr)
-
-    return labor_entries, bakery_weeks
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +120,9 @@ def main() -> int:
                    help="API token (or set INVENTORY_API_TOKEN) -- sent as X-Inventory-Token")
     p.add_argument("--dry-run", action="store_true",
                    help="Parse and print a summary; don't POST")
+    p.add_argument("--force", action="store_true",
+                   help="Ingest even when sheet names don't line up into clean "
+                        "Monday weeks (best-effort dates are used)")
     args = p.parse_args()
 
     path = Path(args.xlsx)
@@ -294,7 +130,20 @@ def main() -> int:
         print("ERROR: workbook not found at " + str(path), file=sys.stderr)
         return 2
 
-    labor, weeks = parse_workbook(path)
+    try:
+        res = parse_workbook_detailed(path, force=args.force)
+    except WorkbookError as exc:
+        # Nothing is posted: every run REPLACES all stored bakery rows, so a
+        # mis-dated or truncated workbook must not overwrite good history.
+        print("ERROR: " + str(exc), file=sys.stderr)
+        for prob in exc.problems:
+            print("  - " + prob, file=sys.stderr)
+        return 5
+    labor, weeks = res["labor"], res["weeks"]
+    for n in res["problems"]:
+        print("WARNING (forced): " + n, file=sys.stderr)
+    for n in res["notes"]:
+        print("note: " + n, file=sys.stderr)
     print("Parsed " + str(len(weeks)) + " non-empty week(s), " +
           str(len(labor)) + " daily labor entries.")
     if weeks:

@@ -36,6 +36,13 @@ class ToastAPIError(RuntimeError):
     """Raised when Toast returns a non-2xx response we can't recover from."""
 
 
+#: 429 handling: how many times one request is retried, and the longest a
+#: single Retry-After is honoured (a longer one fails the pair; the next
+#: pull retries it).
+_RETRY_429_ATTEMPTS = 3
+_RETRY_AFTER_CAP_S = 20.0
+
+
 def _config() -> dict:
     cid    = os.environ.get("TOAST_CLIENT_ID", "").strip()
     secret = os.environ.get("TOAST_CLIENT_SECRET", "").strip()
@@ -117,17 +124,7 @@ def _get(path: str, params: dict, restaurant_guid: str) -> dict:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read().decode() or "null")
 
-    try:
-        return _do(_access_token())
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            with _token_lock:
-                _token_cache["access_token"] = None
-                _token_cache["expires_at"]   = 0.0
-            return _do(_access_token())
-        if e.code == 404:
-            # No orders for that date - return empty rather than raising.
-            return []
+    def _fail(e):
         body = ""
         try:
             body = e.read().decode()[:300]
@@ -135,6 +132,39 @@ def _get(path: str, params: dict, restaurant_guid: str) -> dict:
             pass
         raise ToastAPIError(
             f"Toast {path} failed: HTTP {e.code} {e.reason} - {body}") from e
+
+    refreshed = False
+    for attempt in range(1, _RETRY_429_ATTEMPTS + 1):
+        try:
+            return _do(_access_token())
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and not refreshed:
+                # Stale token: drop it and try once more.
+                refreshed = True
+                with _token_lock:
+                    _token_cache["access_token"] = None
+                    _token_cache["expires_at"]   = 0.0
+                try:
+                    return _do(_access_token())
+                except urllib.error.HTTPError as e2:
+                    _fail(e2)
+            if e.code == 429 and attempt < _RETRY_429_ATTEMPTS:
+                # Rate limited: wait as long as Toast asks (bounded), retry.
+                try:
+                    wait = float((e.headers or {}).get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+                wait = wait or float(2 ** attempt)
+                if wait > _RETRY_AFTER_CAP_S:
+                    _fail(e)
+                time.sleep(wait)
+                continue
+            # A 404 is NOT "no orders that day". It used to return [] here,
+            # and the caller then remembered the day as empty forever; a
+            # wrong/unpublished restaurant GUID or a Toast outage looked
+            # like a store with no sales. Fail the pair so it is retried.
+            _fail(e)
+    raise ToastAPIError(f"Toast {path} failed: still rate limited after retries")
 
 
 def _yyyymmdd(date_iso: str) -> str:
@@ -238,32 +268,64 @@ def fetch_product_mix_batch_with_status(pairs, max_workers: int = 6,
     The Report tab needs this to tell "Toast says no sales that day" (safe to
     remember as empty) from "that request failed / timed out" (retry next
     view): both used to come back as simply no rows."""
+    res = fetch_product_mix_batch_detailed(pairs, max_workers=max_workers,
+                                           timeout_s=timeout_s)
+    return res["rows"], res["ok_pairs"]
+
+
+def fetch_product_mix_batch_detailed(pairs, max_workers: int = 6,
+                                     timeout_s: float = 28.0) -> dict:
+    """Fetch many (restaurant_guid, business_date, location_name) tuples and
+    say exactly what happened to each:
+
+        {"rows": [...], "ok_pairs": {(guid, date)}, "failed_pairs": [(guid,
+         date, name, why)], "requested": N, "error": "" | "N of M
+         location-days failed", "timed_out": bool}
+
+    ``timeout_s`` BOUNDS the call. The old ``with ThreadPoolExecutor`` block
+    waited for every in-flight request on exit, so a 28 s budget could run
+    for minutes; and when everything failed the caller got [] with no error
+    and reported "no new orders". Completed results are always kept.
+    """
     pairs = list(pairs)
-    if not pairs:
-        return [], set()
     out: list = []
     ok_pairs: set = set()
-    deadline = time.time() + timeout_s
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(fetch_product_mix, guid, date, name): (guid, date, name)
-            for (guid, date, name) in pairs
-        }
-        try:
-            for fut in as_completed(futures, timeout=timeout_s):
-                guid, date, name = futures[fut]
-                if time.time() > deadline:
-                    break
-                try:
-                    out.extend(fut.result() or [])
-                    ok_pairs.add((guid, date))
-                except Exception as e:
-                    print(f"[toast_api] fetch failed "
-                          f"{name or guid} {date}: {e}", file=sys.stderr)
-        except Exception as e:
-            print(f"[toast_api] batch fetch terminated early: {e}",
-                  file=sys.stderr)
-    return out, ok_pairs
+    failed: list = []
+    if not pairs:
+        return {"rows": out, "ok_pairs": ok_pairs, "failed_pairs": failed,
+                "requested": 0, "error": "", "timed_out": False}
+    timed_out = False
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {
+        ex.submit(fetch_product_mix, guid, date, name): (guid, date, name)
+        for (guid, date, name) in pairs
+    }
+    done: set = set()
+    try:
+        for fut in as_completed(futures, timeout=timeout_s):
+            guid, date, name = futures[fut]
+            done.add(fut)
+            try:
+                out.extend(fut.result() or [])
+                ok_pairs.add((guid, date))
+            except Exception as e:
+                failed.append((guid, date, name, type(e).__name__))
+                print(f"[toast_api] fetch failed "
+                      f"{name or guid} {date}: {e}", file=sys.stderr)
+    except Exception as e:      # concurrent.futures.TimeoutError
+        timed_out = True
+        print(f"[toast_api] batch fetch stopped at its {timeout_s:.0f}s budget: "
+              f"{type(e).__name__}", file=sys.stderr)
+    finally:
+        # Do NOT wait for stragglers: cancel what hasn't started and let the
+        # in-flight requests die on their own 20 s socket timeout.
+        ex.shutdown(wait=False, cancel_futures=True)
+    for fut, (guid, date, name) in futures.items():
+        if fut not in done:
+            failed.append((guid, date, name, "timed out"))
+    error = (f"{len(failed)} of {len(pairs)} location-days failed" if failed else "")
+    return {"rows": out, "ok_pairs": ok_pairs, "failed_pairs": failed,
+            "requested": len(pairs), "error": error, "timed_out": timed_out}
 
 
 def is_configured() -> bool:

@@ -255,7 +255,7 @@ _FUZZY_CANDIDATES = [k for k in _VARIETY_ALIASES
 
 def _tokens(key: str) -> frozenset:
     """Significant word tokens of a label, minus filler."""
-    parts = re.split(r"[\s\-_.]+", key)
+    parts = re.split(r"[\s\-_./&,]+", key)
     return frozenset(t for t in parts if t and t not in _STOPWORDS)
 
 
@@ -507,18 +507,38 @@ class ProductionSheet:
     unmapped_varieties: list = field(default_factory=list)
     raw_text: str = ""
     error: str = ""
+    #: What the sheet's own "<n> Total Cases" header printed (0 if absent) and
+    #: what the parsed lines add up to. When they differ a line was dropped or
+    #: mis-keyed -- see ``warnings``.
+    header_total_cases: int = 0
+    line_total_cases: int = 0
+    #: Plain-language reasons this sheet "needs a look" (it is still stored):
+    #: header total != line sum, an unmapped variety, a blank distributor.
+    warnings: list = field(default_factory=list)
+
+    @property
+    def warning(self) -> str:
+        return "; ".join(self.warnings)
 
 
 # --------------------------------------------------------------------------
 # Regexes
 # --------------------------------------------------------------------------
 
-# "<qty> CS <variety>"  — variety may include hyphens and spaces, stops at
-# end of line / before next number.
+# "<qty> CS <variety>". These sheets are hand-keyed, and every line this
+# regex does not match is a line that silently vanishes from the record (a
+# sheet printing 336 total cases was stored with lines summing to 112). So it
+# is deliberately tolerant: any letter case ("56 cs Plain"), a thousands
+# separator ("1,120 CS"), no space before CS ("56CS PLAIN"), and the
+# punctuation people type in variety names ("JALAPENO/CHEDDAR",
+# "CINN. RAISIN", "SALT & PEPPER", "EVERYTHING, SLICED").
 _LINE_RE = re.compile(
-    r"^\s*(\d+)\s+CS\s+([A-Z][A-Z0-9\- ]+?)\s*$",
-    re.MULTILINE,
+    r"^[ \t]*(\d{1,3}(?:,\d{3})+|\d+)[ \t]*CS[ \t]+"
+    r"([A-Z][A-Z0-9\-/.&, \t]*?)[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
 )
+
+_TRAILING_LOT_DATE_RE = re.compile(r"\s+\d[\d/]{7,}$")
 
 # "<total> Total Cases<WAREHOUSE>.PO.<po_number>"
 _HEADER_RE = re.compile(
@@ -876,6 +896,7 @@ def parse_production_text(text: str, subject: str = "",
     m = _HEADER_RE.search(text)
     if m:
         sheet.total_cases = int(m.group(1))
+        sheet.header_total_cases = sheet.total_cases
         sheet.warehouse_raw = m.group(2).strip()
         sheet.po_number = m.group(3).strip()
         sheet.po_body = sheet.po_number
@@ -906,8 +927,13 @@ def parse_production_text(text: str, subject: str = "",
     # Line items — "<qty> CS <variety>"
     seen_unknown = set()
     for match in _LINE_RE.finditer(text):
-        cs = int(match.group(1))
-        raw_v = match.group(2).strip()
+        cs = int(match.group(1).replace(",", ""))
+        raw_v = " ".join(match.group(2).split())
+        # A lot code (and its date) sometimes lands in the variety's text run:
+        # "PARB-PLAIN 11500430264/30/2026". It is not part of the name.
+        raw_v = _TRAILING_LOT_DATE_RE.sub("", raw_v).strip(" .,&/-")
+        if not raw_v:
+            continue
         # A "TOTAL" footer row matches the line regex exactly like a real
         # item. Storing it double-counts the sheet.
         if is_non_item_label(raw_v):
@@ -995,7 +1021,31 @@ def parse_production_text(text: str, subject: str = "",
     if not sheet.lines:
         sheet.error = (sheet.error or "") + " no line items detected".strip()
 
+    sheet.line_total_cases = sum(L.cs_count for L in sheet.lines)
+    sheet.warnings = sheet_warnings(
+        header_total=sheet.header_total_cases, line_total=sheet.line_total_cases,
+        unmapped=sheet.unmapped_varieties, distributor=sheet.distributor,
+        has_lines=bool(sheet.lines))
     return sheet
+
+
+def sheet_warnings(*, header_total, line_total, unmapped, distributor,
+                   has_lines=True) -> list:
+    """Why a parsed sheet needs a person to look at it (empty = clean)."""
+    out = []
+    if not has_lines:
+        return out                      # an unreadable sheet is a parse error
+    try:
+        ht, lt = int(header_total or 0), int(line_total or 0)
+    except (TypeError, ValueError):
+        ht, lt = 0, 0
+    if ht and ht != lt:
+        out.append(f"sheet says {ht} total cases but its lines add up to {lt}")
+    if unmapped:
+        out.append("variety not recognised: " + ", ".join(str(u) for u in list(unmapped)[:4]))
+    if not (distributor or "").strip():
+        out.append("could not tell which distributor/warehouse this sheet is for")
+    return out
 
 
 _DIGIT_RUN_RE = re.compile(r"\d{10,}")

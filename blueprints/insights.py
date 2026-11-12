@@ -16,23 +16,24 @@ from datetime import datetime
 from flask import Blueprint, jsonify
 
 from core.errors import _log_exc
+from core.util import business_now
 
 insights_bp = Blueprint("insights", __name__)
 
 
 def build_insights() -> dict:
     from inventory_tracker import load_inventory, load_usage, load_inventory_audit
-    from integrations.planning_config import load_planning_config
+    from integrations.planning_config import load_planning_config, planning_inventory
     from integrations.stock_insights import count_checks
     from integrations.order_plan import plan_orders
     from blueprints.pos import build_po_ledger
     cfg = load_planning_config()
-    inv = {k: v for k, v in load_inventory().items() if not v.get("hidden")}
+    inv = planning_inventory(load_inventory(), cfg)
     ledger = build_po_ledger()
     checks = count_checks(inv, load_usage(), load_inventory_audit(0),
                           cfg.get("count_check") or {}, ledger=ledger)
     basis = (cfg.get("ordering") or {}).get("usage_basis") or "reps"
-    plan = plan_orders(inv, cfg, basis, checks["items"], now=datetime.now())
+    plan = plan_orders(inv, cfg, basis, checks["items"], now=business_now())
     return {"ok": True, "count_checks": checks, "orders": plan}
 
 

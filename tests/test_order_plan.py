@@ -145,3 +145,110 @@ def test_backtest_scores_both_sources_without_peeking():
     assert w["windows"] == 6 and abs(w["reps_bias_pct"] - 73) <= 2     # 52 vs 30
     assert w["counts_windows"] >= 3 and abs(w["counts_bias_pct"]) <= 1
     assert w["counts_closer_pct"] == 100
+
+
+# --- data age + seasonal (review 2026-11-12) --------------------------------
+
+def _cfg(seasonal=None, **age):
+    cfg = load_planning_config()
+    cfg["ordering"]["seasonal"] = seasonal or []
+    if age:
+        cfg["data_age"] = dict(cfg.get("data_age") or {}, **age)
+    return cfg
+
+
+def _dc(plan, wh="Alcoa, TN"):
+    return next(w for w in plan["warehouses"] if w["warehouse"] == wh)
+
+
+def test_usage_age_comes_from_the_usage_report_not_the_count():
+    inv = _inv(_item("Plain", "Alcoa, TN", 10, 70,
+                     last_count_at="2026-10-21T10:00:00",
+                     last_usage_report_at="2026-09-01T10:00:00"))
+    dc = _dc(plan_orders(inv, _cfg(), now=NOW))
+    assert dc["count_age_days"] == 2 and dc["usage_age_days"] == 52
+    assert dc["usage_age_basis"] == "usage_report"
+    assert dc["data_stale"] and dc["check_data_first"] and dc["order_now"]
+    assert dc["data_stale_reasons"] == ["usage is 52 days old"]
+
+
+def test_fresh_data_is_not_flagged_and_old_count_is():
+    fresh = _inv(_item("Plain", "Alcoa, TN", 10, 70, last_count_at="2026-10-20",
+                       last_usage_report_at="2026-10-20"))
+    dc = _dc(plan_orders(fresh, _cfg(), now=NOW))
+    assert not dc["data_stale"] and not dc["check_data_first"]
+    old = _inv(_item("Plain", "Alcoa, TN", 10, 70, last_count_at="2026-10-01",
+                     last_usage_report_at="2026-10-20"))
+    dc = _dc(plan_orders(old, _cfg(), now=NOW))
+    assert dc["count_age_days"] == 22 and dc["data_stale_reasons"] == ["count is 22 days old"]
+    never = _inv(_item("Plain", "Alcoa, TN", 10, 70))
+    dc = _dc(plan_orders(never, _cfg(), now=NOW))
+    assert dc["count_age_days"] is None and "no count on file" in dc["data_stale_reasons"]
+
+
+def test_records_without_a_usage_stamp_fall_back_to_the_count_date():
+    inv = _inv(_item("Plain", "Alcoa, TN", 10, 70, last_count_at="2026-10-20"))
+    dc = _dc(plan_orders(inv, _cfg(), now=NOW))
+    assert dc["usage_age_days"] == 3 and dc["usage_age_basis"] == "count"
+    assert not dc["data_stale"]
+
+
+def _strip(plan):
+    """The plan minus the fields that only exist to describe seasonality."""
+    import copy
+    p = copy.deepcopy(plan)
+    p.pop("seasonal", None)
+    p["params"].pop("seasonal", None)
+    for w in p["warehouses"]:
+        for o in w["projected_orders"]:
+            o.pop("seasonal", None); o.pop("seasonal_note", None)
+        if w.get("order_now"):
+            w["order_now"].pop("seasonal", None); w["order_now"].pop("seasonal_note", None)
+    return p
+
+
+def test_no_seasonal_configured_is_identical_to_a_neutral_window():
+    inv = _inv(_item("Plain", "Alcoa, TN", 40, 63), _item("Onion", "Alcoa, TN", 300, 17))
+    base = plan_orders(inv, _cfg(), now=NOW)
+    # a window with factor 1.0 is dropped; a window that never touches the horizon changes nothing
+    same = plan_orders(inv, _cfg([{"from": "12-15", "to": "01-02", "factor": 1.0}]), now=NOW)
+    far = plan_orders(inv, _cfg([{"from": "05-01", "to": "05-10", "factor": 2.0}]), now=NOW)
+    assert _strip(base) == _strip(same) == _strip(far)
+    assert base["seasonal"] == {"configured": [], "applied": []}
+    assert all(o["seasonal"] == [] and o["seasonal_note"] == ""
+               for w in base["warehouses"] for o in w["projected_orders"])
+
+
+def test_seasonal_factor_applies_only_inside_the_window():
+    from integrations.order_plan import seasonal_windows, seasonal_factor
+    w = seasonal_windows({"seasonal": [{"from": "12-15", "to": "01-02", "factor": 1.25,
+                                        "label": "Holiday"}]})
+    f = lambda m, d, y=2026: seasonal_factor(w, datetime(y, m, d))
+    assert f(12, 14) == 1.0 and f(12, 15) == 1.25 and f(12, 31) == 1.25
+    assert f(1, 1, 2027) == 1.25 and f(1, 2, 2027) == 1.25 and f(1, 3, 2027) == 1.0   # wraps
+    assert f(7, 4) == 1.0
+    # malformed entries are skipped, not raised on
+    assert seasonal_windows({"seasonal": [{"from": "13-40", "to": "x", "factor": "a"}, 7]}) == []
+
+
+def test_seasonal_uplift_raises_the_order_and_says_so():
+    inv = _inv(_item("Plain", "Alcoa, TN", 0, 70))      # 10 cs/day, nothing on hand
+    now = datetime(2026, 11, 12, 9, 0)
+    hol = [{"from": "12-15", "to": "01-02", "factor": 1.25, "label": "Holiday"}]
+    base = _dc(plan_orders(inv, _cfg(), now=now))["order_now"]
+    up = _dc(plan_orders(inv, _cfg(hol), now=now))["order_now"]
+    # cover window = 30 lead + 7 review + 14 safety = 51 days (11/13..1/2);
+    # 12/15..1/2 = 19 days at +25% -> 10*(51 + 19*0.25) = 557.5 vs 510
+    assert base["needed_cs"] == 512 and up["needed_cs"] == 560        # 8-cs layers
+    assert up["seasonal"] == [{"label": "Holiday", "factor": 1.25, "from": "2026-12-15",
+                               "to": "2027-01-02", "days": 19, "window": "12-15..01-02"}]
+    assert up["seasonal_note"] == "includes +25% holiday uplift for 12/15–1/2"
+    plan = plan_orders(inv, _cfg(hol), now=now)
+    assert plan["seasonal"]["configured"][0]["factor"] == 1.25
+    assert plan["seasonal"]["applied"][0]["from"] == "2026-12-15"
+
+
+def test_default_config_ships_the_holiday_window():
+    s = load_planning_config()["ordering"]["seasonal"]
+    assert s == [{"from": "12-15", "to": "01-02", "factor": 1.25, "label": "Holiday"}]
+    assert load_planning_config()["data_age"] == {"count_max_days": 10, "usage_max_days": 21}

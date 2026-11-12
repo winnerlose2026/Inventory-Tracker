@@ -159,24 +159,138 @@ def api_production_summary():
                 start.date().isoformat(), end.date().isoformat())
 
     buckets: dict = {}
+
+    def _blank(key, start, end):
+        return {"key": key, "start": start, "end": end,
+                "total_cs": 0, "by_distributor": {}, "by_variety": {}}
+
     for r in records:
         key, start, end = bucket_key(r.get("production_date") or "")
         if not key:
             continue
-        b = buckets.setdefault(key, {
-            "key": key, "start": start, "end": end,
-            "total_cs": 0, "by_distributor": {}, "by_variety": {},
-        })
+        b = buckets.setdefault(key, _blank(key, start, end))
         b["total_cs"] += int(r.get("total_cases") or 0)
         d = r.get("distributor") or "Unassigned"
         b["by_distributor"][d] = b["by_distributor"].get(d, 0) + int(r.get("total_cases") or 0)
         for line in (r.get("lines") or []):
             v = line.get("variety") or "Unknown"
             b["by_variety"][v] = b["by_variety"].get(v, 0) + int(line.get("cs_count") or 0)
+
+    # "This week" must be THIS week. buckets[0] used to be the last period
+    # that HAD data, so ten weeks without a sheet still showed a healthy
+    # "This week" card. Emit the current period (the bakery's calendar) and
+    # every empty period back to the newest one with data, zero-filled.
+    from core.util import business_today
+    today = business_today()
+    cur_key, cur_start, cur_end = bucket_key(today.isoformat())
+    newest_start = max((b["start"] for b in buckets.values() if b["start"] <= cur_start),
+                       default="")
+    cursor, guard = today, 0
+    while cur_key and guard < 120:
+        guard += 1
+        key, start, end = bucket_key(cursor.isoformat())
+        if not key or (newest_start and start <= newest_start):
+            break
+        if key not in buckets:
+            # Daily view: only business days get an empty row.
+            if period != "day" or cursor.weekday() < 5 or cursor == today:
+                buckets[key] = dict(_blank(key, start, end), empty=True)
+        if not newest_start:
+            break                          # no data at all: just the current one
+        cursor = datetime.fromisoformat(start).date() - timedelta(days=1)
+    if cur_key in buckets:
+        buckets[cur_key]["current"] = True
     return jsonify({
         "period": period,
+        "current_key": cur_key,
         "buckets": sorted(buckets.values(), key=lambda x: x["start"], reverse=True),
+        "health": production_health(records),
     })
+
+
+#: No Daily Production sheet for this many business days = red banner.
+PRODUCTION_STALE_BUSINESS_DAYS = 3
+#: How far back the "Needs attention" block looks (by received date).
+NEEDS_ATTENTION_DAYS = 45
+
+
+def production_health(records=None) -> dict:
+    """Is the Production tab current? Newest sheet date, business days since,
+    the last catch-up scan / webhook result (core.feed_health) and the sheets
+    a person needs to look at (unreadable, or lines that don't add up)."""
+    from datetime import datetime as _dt, timedelta as _td
+    from core import feed_health
+    from core.util import business_days_between, business_today
+    from integrations.production_store import (
+        is_stub, newest_production_date, stub_attempt_days, STUB_RETRY_DAYS,
+    )
+    if records is None:
+        from inventory_tracker import load_production
+        records = load_production()
+    today = business_today()
+    newest = newest_production_date(records)
+    since = None
+    if newest:
+        try:
+            since = business_days_between(_dt.fromisoformat(newest).date(), today)
+        except ValueError:
+            since = None
+    feeds = (feed_health.snapshot() or {}).get("feeds") or {}
+    scan = dict(feeds.get("production-scan") or {})
+    hook = dict(feeds.get("production-webhook") or {})
+    reasons = []
+    if not newest:
+        reasons.append("No Daily Production sheet has been read yet.")
+    elif since is not None and since >= PRODUCTION_STALE_BUSINESS_DAYS:
+        reasons.append(f"No Daily Production sheet for {since} business days "
+                       f"(newest is {newest}).")
+    if scan and scan.get("complete") is False:
+        reasons.append("The last mailbox scan for production sheets did not finish"
+                       + (f": {scan.get('detail')}" if scan.get("detail") else "."))
+    elif scan and scan.get("ok") is False:
+        reasons.append("The last mailbox scan for production sheets failed"
+                       + (f": {scan.get('detail')}" if scan.get("detail") else "."))
+    cutoff = (today - _td(days=NEEDS_ATTENTION_DAYS)).isoformat()
+    attention = []
+    for r in records or []:
+        if (r.get("received_at") or "")[:10] < cutoff:
+            continue
+        if is_stub(r):
+            n = len(stub_attempt_days(r))
+            attention.append({
+                "kind": "unreadable", "source_message_id": r.get("source_message_id") or "",
+                "subject": r.get("source_subject") or "", "received_at": r.get("received_at") or "",
+                "detail": r.get("parse_error") or "could not be read",
+                "attempts": n, "will_retry": n < STUB_RETRY_DAYS})
+        elif r.get("warning"):
+            attention.append({
+                "kind": "warning", "source_message_id": r.get("source_message_id") or "",
+                "subject": r.get("source_subject") or "", "received_at": r.get("received_at") or "",
+                "detail": r.get("warning"), "po_number": r.get("po_number") or "",
+                "warehouse": r.get("warehouse") or "",
+                "production_date": r.get("production_date") or "",
+                "total_cases": r.get("total_cases") or 0})
+    attention.sort(key=lambda a: a.get("received_at") or "", reverse=True)
+    return {
+        "newest_production_date": newest,
+        "business_days_since_last_sheet": since,
+        "stale_after_business_days": PRODUCTION_STALE_BUSINESS_DAYS,
+        "stale": bool(reasons),
+        "reasons": reasons,
+        "scan": scan, "webhook": hook,
+        "needs_attention": attention,
+    }
+
+
+@production_bp.route("/api/production/health")
+def api_production_health():
+    """Freshness of the Daily Production feed for the Production and Planner
+    tabs' banner. Read-only."""
+    try:
+        return jsonify({"ok": True, **production_health()})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "production health")
+        return jsonify({"ok": False, "error": "internal error"}), 500
 
 
 @production_bp.route("/api/production/ingest", methods=["POST"])
@@ -285,6 +399,37 @@ def _json_loads(txt):
     return _json.loads(txt)
 
 
+#: Mail folders a Daily Production sheet is never ingested from. Everything
+#: else is scanned: sheets filed by an Outlook rule into a sub-folder (or
+#: dragged out of the Inbox) used to be invisible to the catch-up scan.
+_SCAN_EXCLUDED_FOLDERS = ("sentitems", "drafts", "deleteditems")
+
+
+def _excluded_folder_ids(client, token, user_q: str) -> "set | None":
+    """Graph ids of Sent / Drafts / Deleted for one mailbox, or None when any
+    lookup fails (the caller then scans the Inbox only, as before)."""
+    from integrations.email_scanner import GRAPH_BASE
+    ids = set()
+    for name in _SCAN_EXCLUDED_FOLDERS:
+        try:
+            raw, _ = client._graph_get(
+                f"{GRAPH_BASE}/users/{user_q}/mailFolders/{name}?$select=id", token)
+            fid = (_json_loads(raw.decode("utf-8")) or {}).get("id")
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, f"production scan folder {name}")
+            return None
+        if not fid:
+            return None
+        ids.add(fid)
+    return ids
+
+
+def _pdf_key(msg_id: str, n: int) -> str:
+    """Store key for the n-th (1-based) PDF on an email. The first keeps the
+    bare message id so records stored before multi-PDF support still dedupe."""
+    return msg_id if n <= 1 else f"{msg_id}#{n}"
+
+
 @production_bp.route("/api/production/scan", methods=["POST"])
 def api_production_scan():
     """Wide-lookback scan of mailbox(es) for Daily Production sheet emails.
@@ -368,10 +513,22 @@ def api_production_scan():
     # Everything already accounted for: stored ids, emails a newer sheet
     # replaced, and deleted (tombstoned) records -- a delete used to be undone
     # by the next 14-day-lookback scan.
-    seen_msg_ids = seen_message_ids(load_production(), load_tombstones())
+    _stored = load_production()
+    seen_msg_ids = seen_message_ids(_stored, load_tombstones())
+    # How many PDFs each already-stored email carried (set the first time its
+    # attachments are listed), so a fully-ingested email is skipped without
+    # another Graph call.
+    known_pdf_counts = {r.get("source_message_id"): int(r.get("pdf_count") or 0)
+                        for r in _stored if r.get("source_message_id")}
+    new_pdf_counts: dict = {}
     # Parsed sheets are collected here and stored in ONE locked write after
     # all Graph I/O is done (never hold data_lock across the network).
     to_store = []   # [(record, po_body, po_subject, brief)]
+    # Mailboxes where the page / message cap was hit with more mail left.
+    truncated = []
+    notes = []
+    all_folders = (os.environ.get("PRODUCTION_SCAN_FOLDERS", "all").strip().lower()
+                   != "inbox")
 
     for upn in users:
         user = urllib.parse.quote(upn)
@@ -382,12 +539,23 @@ def api_production_scan():
         qs = urllib.parse.urlencode({
             "$top": "100",
             "$select": ("id,subject,from,toRecipients,receivedDateTime,"
-                        "hasAttachments,internetMessageId"),
+                        "hasAttachments,internetMessageId,parentFolderId"),
             "$filter": f"hasAttachments eq true and {date_filter}",
         })
-        next_url = f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages?{qs}"
+        # Every folder except Sent / Drafts / Deleted. If those three can't be
+        # identified, fall back to the Inbox-only scan rather than risk
+        # ingesting a forwarded copy out of Sent Items.
+        excluded = _excluded_folder_ids(client, token, user) if all_folders else None
+        if all_folders and excluded is None:
+            notes.append(f"{upn}: could not identify Sent/Drafts/Deleted - "
+                         f"scanned the Inbox only on this run.")
+        if excluded is not None:
+            next_url = f"{GRAPH_BASE}/users/{user}/messages?{qs}"
+        else:
+            next_url = f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages?{qs}"
         pages = 0
         per_mailbox = 0
+        aborted = hit_cap = False
         while next_url and pages < 40 and per_mailbox < max_messages:
             pages += 1
             try:
@@ -402,10 +570,12 @@ def api_production_scan():
                     f"({_safe_err(exc, 'graph fetch')}) - the rest of this "
                     f"mailbox was NOT scanned on this run."
                 )
+                aborted = True
                 break
             for m in page.get("value", []):
                 scanned += 1
                 if per_mailbox >= max_messages:
+                    hit_cap = True
                     break
                 subject = m.get("subject") or ""
                 sender = (((m.get("from") or {}).get("emailAddress") or {})
@@ -417,10 +587,15 @@ def api_production_scan():
                     continue
                 if "daily production" not in subject.lower():
                     continue
+                if excluded and (m.get("parentFolderId") or "") in excluded:
+                    continue
                 qualifying_count += 1
                 msg_id = m.get("internetMessageId") or m.get("id") or ""
-                if msg_id and msg_id in seen_msg_ids and not refresh:
-                    continue  # already ingested
+                n_known = known_pdf_counts.get(msg_id) or 0
+                if (msg_id and not refresh and n_known
+                        and all(_pdf_key(msg_id, i) in seen_msg_ids
+                                for i in range(1, n_known + 1))):
+                    continue  # every PDF on this email is already ingested
                 # Pull the attachments list
                 att_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments"
                 try:
@@ -436,6 +611,8 @@ def api_production_scan():
                             if (a.get("name") or "").lower().endswith(".pdf")
                             or (a.get("contentType") or "").lower() == "application/pdf"]
                 if not pdf_atts:
+                    if msg_id in seen_msg_ids and not refresh:
+                        continue
                     names = [a.get("name") or "?" for a in apage.get("value", [])]
                     skipped_no_pdf.append({
                         "subject": subject[:90],
@@ -443,50 +620,67 @@ def api_production_scan():
                         "attachments": names[:6],
                     })
                     continue
-                # Fetch + parse the first PDF attachment
-                a = pdf_atts[0]
-                acid = a.get("id")
-                fetch_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments/{acid}"
-                try:
-                    fraw, _ = client._graph_get(fetch_url, token)
-                    apayload = _json.loads(fraw.decode("utf-8"))
-                    pdf_bytes = base64.b64decode(apayload.get("contentBytes") or "")
-                except Exception as exc:  # noqa: BLE001
-                    _log_exc(exc, f"production scan fetch-att {subject[:60]!r}")
-                    fetch_errors.append(
-                        f"{subject[:60]!r}: could not download the PDF "
-                        f"({_safe_err(exc, 'graph fetch')})")
-                    continue
+                if msg_id and known_pdf_counts.get(msg_id) != len(pdf_atts):
+                    new_pdf_counts[msg_id] = len(pdf_atts)
                 received_at = m.get("receivedDateTime") or ""
-                sheet = parse_production_pdf(pdf_bytes, subject=subject,
-                                             received_at=received_at)
-                if sheet.error and not sheet.lines:
-                    parse_errors.append(f"{subject[:60]!r}: {sheet.error}")
-                    if dry_run:
-                        per_mailbox += 1
+                took_any = False
+                # EVERY PDF on the email is a sheet (two DCs' sheets are
+                # sometimes sent together); only the first used to be read.
+                for n, a in enumerate(pdf_atts, start=1):
+                    key = _pdf_key(msg_id, n)
+                    if key and key in seen_msg_ids and not refresh:
+                        continue  # already ingested
+                    acid = a.get("id")
+                    fetch_url = f"{GRAPH_BASE}/users/{user}/messages/{m.get('id')}/attachments/{acid}"
+                    try:
+                        fraw, _ = client._graph_get(fetch_url, token)
+                        apayload = _json.loads(fraw.decode("utf-8"))
+                        pdf_bytes = base64.b64decode(apayload.get("contentBytes") or "")
+                    except Exception as exc:  # noqa: BLE001
+                        _log_exc(exc, f"production scan fetch-att {subject[:60]!r}")
+                        fetch_errors.append(
+                            f"{subject[:60]!r}: could not download the PDF "
+                            f"({_safe_err(exc, 'graph fetch')})")
                         continue
-                    # Persist a stub so the operator sees it in the UI
-                    record = record_from_sheet(sheet, message_id=msg_id, subject=subject,
+                    sheet = parse_production_pdf(pdf_bytes, subject=subject,
+                                                 received_at=received_at)
+                    took_any = True
+                    if sheet.error and not sheet.lines:
+                        parse_errors.append(f"{subject[:60]!r}: {sheet.error}")
+                        if dry_run:
+                            continue
+                        # Persist a stub so the operator sees it in the UI. Its
+                        # id is NOT treated as seen until it has failed on 3
+                        # different days (production_store.STUB_RETRY_DAYS).
+                        record = record_from_sheet(sheet, message_id=key, subject=subject,
+                                                   sender=sender, received_at=received_at)
+                        seen_msg_ids.add(key)      # once per run is enough
+                        to_store.append((record, "", "", {
+                            "subject": subject, "po_number": "", "warehouse": "",
+                            "total_cases": 0, "parse_error": sheet.error}))
+                        continue
+                    if dry_run:
+                        continue
+                    record = record_from_sheet(sheet, message_id=key, subject=subject,
                                                sender=sender, received_at=received_at)
-                    seen_msg_ids.add(msg_id)
-                    to_store.append((record, "", "", {
-                        "subject": subject, "po_number": "", "warehouse": "",
-                        "total_cases": 0, "parse_error": sheet.error}))
+                    seen_msg_ids.add(key)
+                    brief = {
+                        "subject": subject, "po_number": sheet.po_number,
+                        "warehouse": sheet.warehouse, "production_date": sheet.production_date,
+                        "total_cases": sheet.total_cases,
+                    }
+                    if sheet.warning:
+                        brief["warning"] = sheet.warning
+                    to_store.append((record, sheet.po_body, sheet.po_subject, brief))
+                if took_any:
                     per_mailbox += 1
-                    continue
-                if dry_run:
-                    per_mailbox += 1
-                    continue
-                record = record_from_sheet(sheet, message_id=msg_id, subject=subject,
-                                           sender=sender, received_at=received_at)
-                seen_msg_ids.add(msg_id)
-                to_store.append((record, sheet.po_body, sheet.po_subject, {
-                    "subject": subject, "po_number": sheet.po_number,
-                    "warehouse": sheet.warehouse, "production_date": sheet.production_date,
-                    "total_cases": sheet.total_cases,
-                }))
-                per_mailbox += 1
             next_url = page.get("@odata.nextLink")
+        if (next_url or hit_cap) and not aborted:
+            # Stopped at the page / message cap with mail still unread. That
+            # is NOT a complete scan, however clean the pages that were read.
+            truncated.append(
+                f"{upn}: stopped after {pages} page(s) / {per_mailbox} sheet email(s) "
+                f"with more mail left - raise max_messages or narrow lookback_days.")
 
     if not dry_run and to_store:
         # One locked load -> ingest -> save against the CURRENT file (a
@@ -494,7 +688,7 @@ def api_production_scan():
         # end-of-run merge re-appended every record that had no message id,
         # doubling it on each daily run.
         results = store_parsed([(rec, b, s) for rec, b, s, _brief in to_store],
-                               refresh=refresh)
+                               refresh=refresh, source="", pdf_counts=new_pdf_counts)
         for (status, stored), (_rec, _b, _s, brief) in zip(results, to_store):
             if status in ("ingested", "replaced", "refreshed"):
                 ingested += 1
@@ -504,16 +698,43 @@ def api_production_scan():
                     brief["po_number"] = stored["po_number"]
                 brief_records.append(brief)
 
+    elif not dry_run and new_pdf_counts:
+        store_parsed([], source="", pdf_counts=new_pdf_counts)
+
+    complete = not fetch_errors and not truncated
+    if not dry_run:
+        # Persist what this run did, success or not, so "the scan stopped" and
+        # "the scan runs but can't finish" both show on the Production tab.
+        try:
+            from core import feed_health
+            from integrations.production_store import newest_production_date
+            problems = (fetch_errors + truncated)
+            detail = (f"{ingested} new sheet(s), {len(parse_errors)} unreadable"
+                      if complete else
+                      f"incomplete: {problems[0][:200]}"
+                      + (f" (+{len(problems) - 1} more)" if len(problems) > 1 else ""))
+            feed_health.record(
+                "production-scan", complete, detail,
+                complete=complete, ingested=ingested,
+                parse_errors=len(parse_errors), fetch_errors=len(fetch_errors),
+                truncated=len(truncated), messages_qualifying=qualifying_count,
+                newest_production_date=newest_production_date(load_production()))
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "production scan health")
+
     return jsonify({
         "ok": True, "dry_run": dry_run,
         "lookback_days": lookback_days, "mailboxes": users,
+        "folders": "all except Sent/Drafts/Deleted" if all_folders else "inbox",
         "messages_scanned": scanned,
         "messages_qualifying": qualifying_count,
         "ingested": ingested,
         "parse_errors": parse_errors,
         "fetch_errors": fetch_errors,
+        "truncated": truncated,
+        "notes": notes,
         "skipped_no_pdf": skipped_no_pdf,
-        "complete": not fetch_errors,
+        "complete": complete,
         "records": brief_records,
     })
 
@@ -804,4 +1025,10 @@ def api_production_delete(source_message_id):
                                    "warehouse": r.get("warehouse") or "",
                                    "production_date": r.get("production_date") or ""}
         save_tombstones(stones)
+        try:   # a deleted sheet no longer "needs a look"
+            from core import feed_health
+            from integrations.production_store import sheet_issue_key
+            feed_health.clear_issue(sheet_issue_key(source_message_id))
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "production delete health")
     return jsonify({"ok": True, "removed": removed})

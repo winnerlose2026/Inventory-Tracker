@@ -25,21 +25,11 @@ function populateWarehouseSelect(selectEl, distributor, selected = '', includeAl
   const list = distributor ? (warehouseCatalog[distributor] || [])
                            : [].concat(...Object.values(warehouseCatalog));
   for (const wh of list) {
-    options.push(`<option value="${escAttr(wh)}" ${wh === selected ? 'selected' : ''}>${escHtml(wh)}</option>`);
+    options.push(`<option value="${escHtml(wh)}" ${wh === selected ? 'selected' : ''}>${escHtml(wh)}</option>`);
   }
   selectEl.innerHTML = options.join('');
 }
 
-async function onDistributorFilterChange() {
-  await ensureWarehouses();
-  populateWarehouseSelect(
-    document.getElementById('inv-filter-warehouse'),
-    document.getElementById('inv-filter-distributor').value,
-    '',
-    true
-  );
-  loadInventory();
-}
 
 async function onFormDistributorChange() {
   await ensureWarehouses();
@@ -64,6 +54,7 @@ function showPage(page) {
 }
 
 function refresh(page) {
+  refreshHealthBanner();
   if (page === 'inventory') loadInventory();
   else if (page === 'usage') loadUsage();
   else if (page === 'distributors') showPage('inventory');
@@ -92,9 +83,59 @@ function toast(msg, type = 'success') {
   const el = document.createElement('div');
   el.className = `toast-msg ${type}`;
   el.textContent = msg;
+  // An error must be readable before it goes: it stays three times as long
+  // and a click dismisses it.
+  el.title = 'Click to dismiss';
+  el.addEventListener('click', () => el.remove());
   document.getElementById('toast').appendChild(el);
-  setTimeout(() => el.remove(), 3500);
+  setTimeout(() => el.remove(), type === 'error' ? 10000 : 3500);
 }
+
+// The words to show a person for a thrown error (no "Error: " prefix).
+function errText(e) {
+  if (!e) return 'unknown error';
+  if (typeof e === 'string') return e;
+  return e.message || String(e);
+}
+
+// Run fn() with a button disabled, so a second click (or Enter) while the
+// POST is in flight cannot send it twice. `btn` is an element or an id; if
+// it is already busy the call is dropped.
+async function withBusy(btn, fn) {
+  const el = (typeof btn === 'string') ? document.getElementById(btn) : btn;
+  if (el && el.dataset.busy === '1') return undefined;
+  if (el) {
+    el.dataset.busy = '1';
+    el.disabled = true;
+    el.classList.add('is-busy');
+  }
+  try {
+    return await fn();
+  } finally {
+    if (el) {
+      delete el.dataset.busy;
+      el.disabled = false;
+      el.classList.remove('is-busy');
+    }
+  }
+}
+
+// A fresh id per submit: the server uses it to drop a repeated request
+// (double click, retry after a timeout) instead of booking it twice.
+function newRequestId() {
+  try { if (window.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) { /* fall through */ }
+  return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+}
+
+// Anything that still escapes a try/catch is shown, not swallowed. Before
+// this, a failed save in an async onclick handler left the page looking as
+// if it had worked.
+window.addEventListener('unhandledrejection', ev => {
+  const e = ev.reason;
+  if (e && e.silent) return;
+  console.error('Unhandled error:', e);
+  toast('Something went wrong: ' + errText(e), 'error');
+});
 
 // -------------------------------------------------------------------------
 // API helpers — auth is handled by the Flask session cookie (set when the
@@ -105,14 +146,39 @@ function authHeaders() {
   return { 'Content-Type': 'application/json' };
 }
 
-async function api(url, method = 'GET', body = null) {
-  const opts = {
+// Thrown by api() when the server said no. `status` is the HTTP status and
+// `body` the parsed JSON (when there was one), for callers that need details
+// such as a 409's `current` item.
+class ApiError extends Error {
+  constructor(message, status, body) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+// api() THROWS when the request did not succeed: a non-2xx status, or a JSON
+// body that says {ok:false}. It used to hand the error body back as if it
+// were data, so every caller that did not check `.ok` -- most of the writes
+// -- showed a green "Saved" toast for a change the server had refused.
+//
+// opts.raw = true restores the old behaviour for the few callers that read
+// details out of an error body themselves (a JSON body is returned as-is
+// whatever the status).
+async function api(url, method = 'GET', body = null, opts = {}) {
+  const fopts = {
     method,
     headers: authHeaders(),
     credentials: 'same-origin', // ensure session cookie is sent
   };
-  if (body) opts.body = JSON.stringify(body);
-  let r = await fetch(url, opts);
+  if (body) fopts.body = JSON.stringify(body);
+  let r;
+  try {
+    r = await fetch(url, fopts);
+  } catch (e) {
+    throw new ApiError('Could not reach the server (check your connection and try again).', 0, null);
+  }
   if (r.status === 401) {
     // Session expired or never existed — bounce to the login page,
     // preserving the current page so we land back here after signing in.
@@ -121,7 +187,9 @@ async function api(url, method = 'GET', body = null) {
       const next = encodeURIComponent(location.pathname + location.search);
       location.href = '/login?next=' + next;
     }, 800);
-    return {};
+    const err = new ApiError('Session expired — signing in again.', 401, null);
+    err.silent = true;      // already told the user; don't toast it twice
+    throw err;
   }
   // Never call r.json() blind. A Render 502, a Flask 500 traceback page, an
   // nginx error page or an empty body are all non-JSON, and parsing them threw
@@ -129,17 +197,26 @@ async function api(url, method = 'GET', body = null) {
   // which told the operator nothing about what actually failed and masked
   // every 5xx behind a "json error" toast. (Reported against the Pending POs
   // ship-date box, 2026-08-03.)
-  //
-  // Deliberately compatible: a JSON body is still returned as-is for ANY
-  // status, so the 34 call sites that inspect `r.ok` / `r.error` keep working.
-  // Only the case that already threw now throws -- with a usable message.
   const raw = await r.text();
   const ctype = (r.headers.get('content-type') || '').toLowerCase();
   if (ctype.includes('json') && raw.trim()) {
+    let data, parsed = false;
     try {
-      return JSON.parse(raw);
+      data = JSON.parse(raw);
+      parsed = true;
     } catch (e) {
       // Content-Type lied, or the body was truncated mid-flight.
+    }
+    if (parsed) {
+      if (opts.raw) return data;
+      const saysNo = data && typeof data === 'object' && !Array.isArray(data) && data.ok === false;
+      if (!r.ok || saysNo) {
+        let msg = data && (data.error || data.message);
+        if (msg && typeof msg !== 'string') msg = JSON.stringify(msg);
+        if (!msg) msg = `The server refused the request (HTTP ${r.status}).`;
+        throw new ApiError(msg, r.status, data);
+      }
+      return data;
     }
   }
   if (r.ok && !raw.trim()) return {};   // 204 / empty success
@@ -152,12 +229,177 @@ async function api(url, method = 'GET', body = null) {
   const where = `${method} ${url}`;
   const status = `HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''}`;
   if (r.status === 502 || r.status === 503 || r.status === 504) {
-    throw new Error(`${where} -> ${status}. The server is restarting or `
-      + `overloaded; wait a few seconds and retry.`);
+    throw new ApiError(`${where} -> ${status}. The server is restarting or `
+      + `overloaded; wait a few seconds and retry.`, r.status, null);
   }
-  throw new Error(`${where} -> ${status} (non-JSON response)`
-    + (snippet ? `: ${snippet}` : ''));
+  throw new ApiError(`${where} -> ${status} (non-JSON response)`
+    + (snippet ? `: ${snippet}` : ''), r.status, null);
 }
+
+// -------------------------------------------------------------------------
+// Page loads: one wrapper for every tab's data load.
+//
+// A failed read used to leave the tab showing whatever it had (or nothing)
+// with no sign anything was wrong. loadPage() keeps the last good render on
+// screen, shows a red bar saying the data is old and from when, and stamps
+// each tab with the time it last loaded. `soft(label, fallback)` is for the
+// secondary reads a tab can render without: it records that the part is
+// missing instead of silently substituting an empty value.
+// -------------------------------------------------------------------------
+const _pageLoads = {};   // page key -> { at: Date|null, error: string|null, soft: [labels] }
+
+function _clock(d) {
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function _pageStatusEl(key) {
+  const page = document.getElementById('page-' + key);
+  if (!page) return null;
+  let el = page.querySelector(':scope > .load-status');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'load-status';
+    const header = page.querySelector(':scope > .page-header');
+    if (header && header.nextSibling) page.insertBefore(el, header.nextSibling);
+    else page.insertBefore(el, page.firstChild);
+  }
+  return el;
+}
+
+function renderPageStatus(key) {
+  const el = _pageStatusEl(key);
+  const st = _pageLoads[key];
+  if (!el || !st) return;
+  let html = '';
+  if (st.error) {
+    const from = st.at
+      ? `showing data from ${escHtml(_clock(st.at))}`
+      : 'nothing has loaded yet';
+    html += `<div class="page-bar page-bar-red" role="alert">
+      <span><strong>Could not load</strong> &mdash; ${from}. <span class="page-bar-detail">${escHtml(st.error)}</span></span>
+      <button class="btn btn-ghost btn-sm" onclick="refresh('${escAttr(key)}')">Try again</button>
+    </div>`;
+  } else if (st.soft && st.soft.length) {
+    html += `<div class="page-bar page-bar-amber" role="status">
+      <span><strong>Some of this page did not load:</strong> ${st.soft.map(escHtml).join(', ')}. The rest is current.</span>
+      <button class="btn btn-ghost btn-sm" onclick="refresh('${escAttr(key)}')">Try again</button>
+    </div>`;
+  }
+  if (st.at) html += `<div class="load-stamp">Loaded ${escHtml(_clock(st.at))}</div>`;
+  el.innerHTML = html;
+}
+
+async function loadPage(key, fn) {
+  const st = _pageLoads[key] || (_pageLoads[key] = { at: null, error: null, soft: [] });
+  const softNow = [];
+  const soft = (label, fallback) => (e) => {
+    if (e && e.silent) throw e;
+    console.warn(`[${key}] ${label} failed to load:`, e);
+    softNow.push(label);
+    return fallback;
+  };
+  try {
+    await fn(soft);
+    st.at = new Date();
+    st.error = null;
+    st.soft = softNow;
+  } catch (e) {
+    if (e && e.silent) return;
+    console.error(`[${key}] load failed:`, e);
+    st.error = errText(e);
+  }
+  renderPageStatus(key);
+}
+
+// -------------------------------------------------------------------------
+// Health banner: GET /api/feeds/health on every tab load and every 5 minutes.
+// When a background feed has stopped or a specific problem needs a person,
+// a slim strip at the top says how many things need a look.
+// -------------------------------------------------------------------------
+const FEED_LABELS = [
+  // [test, label] -- first match wins; feed names are matched loosely so a
+  // new job shows with a sensible name without a code change.
+  [/production.*(webhook|live|notif)/i, 'Production sheets (live delivery)'],
+  [/production/i, 'Production sheets'],
+  [/toast/i, 'Toast sales'],
+  [/bakery|workbook/i, 'Bakery workbook'],
+  [/forecast|burn|decrement/i, 'Daily usage burn'],
+  [/deliver|lineage/i, 'Lineage delivery sync'],
+  [/backup/i, 'Backups'],
+  [/notif|alert|mail-send|email-send|smtp/i, 'Mail notifications'],
+  [/mailbox|email|inbox|scan/i, 'Mailbox scan'],
+];
+let _healthOpen = false;
+let _healthData = null;
+
+function feedLabel(name) {
+  for (const [re, label] of FEED_LABELS) if (re.test(name)) return label;
+  return String(name || 'Background job').replace(/[-_]+/g, ' ').replace(/^./, c => c.toUpperCase());
+}
+
+// "3 hours ago (Tue 11/10, 6:05 PM)" in plain words.
+function agoWords(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const mins = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000));
+  let ago;
+  if (mins < 2) ago = 'just now';
+  else if (mins < 90) ago = `${mins} minutes ago`;
+  else if (mins < 36 * 60) ago = `${Math.round(mins / 60)} hours ago`;
+  else ago = `${Math.round(mins / 1440)} days ago`;
+  const when = d.toLocaleString([], { weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `${ago} (${when})`;
+}
+
+function toggleHealth() {
+  _healthOpen = !_healthOpen;
+  renderHealthBanner(_healthData);
+}
+
+function renderHealthBanner(h) {
+  const el = document.getElementById('health-strip');
+  if (!el) return;
+  _healthData = h;
+  if (!h || h.ok !== false) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  const issues = Array.isArray(h.issues) ? h.issues : [];
+  const feeds = Object.entries(h.feeds || {})
+    .filter(([, f]) => f && (f.ok === false || f.stale))
+    .map(([name, f]) => ({ name, ...f }));
+  const n = issues.length + feeds.length;
+  if (!n) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  const red = feeds.some(f => f.ok === false) || issues.some(i => (i.severity || '') === 'error');
+  const rows = [];
+  feeds.forEach(f => {
+    const last = f.last_ok ? `last worked ${agoWords(f.last_ok)}` : 'has not worked yet';
+    const what = f.ok === false ? 'is failing' : 'has not run on time';
+    rows.push(`<li><strong>${escHtml(feedLabel(f.name))}</strong> ${what} &mdash; ${escHtml(last)}.${f.detail ? ` <span class="health-detail">${escHtml(f.detail)}</span>` : ''}</li>`);
+  });
+  issues.forEach(i => {
+    const since = i.first_seen ? ` <span class="health-detail">since ${escHtml(agoWords(i.first_seen))}</span>` : '';
+    rows.push(`<li>${escHtml(i.message || i.key || 'Needs a look')}${since}</li>`);
+  });
+  el.className = 'health-strip ' + (red ? 'health-red' : 'health-amber');
+  el.style.display = '';
+  el.innerHTML = `<button class="health-head" onclick="toggleHealth()" aria-expanded="${_healthOpen ? 'true' : 'false'}">
+      <span class="health-dot"></span>
+      <span><strong>${n} thing${n === 1 ? '' : 's'} need${n === 1 ? 's' : ''} a look</strong></span>
+      <span class="health-chev">${_healthOpen ? 'Hide' : 'Show'}</span>
+    </button>
+    ${_healthOpen ? `<ul class="health-list">${rows.join('')}</ul>` : ''}`;
+}
+
+async function refreshHealthBanner() {
+  let h = null;
+  try {
+    const r = await fetch('/api/feeds/health', { credentials: 'same-origin', headers: authHeaders() });
+    // 404 = the endpoint is not deployed yet; any other failure = we simply
+    // don't know. Neither is a reason to show (or keep) a banner.
+    if (r.ok && (r.headers.get('content-type') || '').toLowerCase().includes('json')) h = await r.json();
+  } catch (e) { h = null; }
+  renderHealthBanner(h);
+}
+setInterval(refreshHealthBanner, 5 * 60 * 1000);
 
 // -------------------------------------------------------------------------
 // Dashboard
@@ -366,7 +608,8 @@ async function reverseActivity(timestamp, itemKey, amount, poNumber) {
     res = await api('/api/usage/reverse', 'POST', {
       timestamp, item_key: itemKey || '', amount, po_number: poNumber || '' });
   } catch (err) {
-    toast('Reverse failed: ' + String(err), 'error');
+    if (err && err.silent) return;
+    toast('Reverse failed: ' + errText(err), 'error');
     return;
   }
   if (!res || !res.ok) {
@@ -442,9 +685,9 @@ function populateSkuEditSelect() {
   const items = inventoryCache.slice().sort((a, b) => (a.name < b.name ? -1 : 1));
   const hidden = window._hiddenSkus || [];
   sel.innerHTML = '<option value="">Select a SKU\u2026</option>' +
-    items.map(i => `<option value="${escAttr(i.name)}">${escHtml(i.name)}</option>`).join('') +
+    items.map(i => `<option value="${escHtml(i.name)}">${escHtml(i.name)}</option>`).join('') +
     (hidden.length ? `<optgroup label="Hidden from Inventory (${hidden.length})">` +
-      hidden.map(n => `<option value="${escAttr(n)}">${escHtml(n)}</option>`).join('') +
+      hidden.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('') +
       '</optgroup>' : '');
   if (prev) sel.value = prev;
 }
@@ -456,7 +699,11 @@ function editSelectedSku() {
   openEditModal(name);
 }
 
-async function loadInventory() {
+function loadInventory() {
+  return loadPage('inventory', _loadInventory);
+}
+
+async function _loadInventory(soft) {
   // Inventory now uses the grouped (distributor -> warehouse -> SKU) layout
   // that used to live on the Distributors tab. It also pulls the lot map
   // so each row can expand a lot-history sub-table.
@@ -464,9 +711,9 @@ async function loadInventory() {
   // it to the Low Stock Alerts card so its rows match the table exactly.
   const [groups, lotMap, insights, hiddenSkus] = await Promise.all([
     api('/api/distributors'),
-    api('/api/production/lots-by-pair').catch(() => ({})),
-    api('/api/insights').catch(() => null),
-    api('/api/hidden-skus').catch(() => []),
+    api('/api/production/lots-by-pair').catch(soft('lot history', {})),
+    api('/api/insights').catch(soft('count checks and order suggestions', null)),
+    api('/api/hidden-skus').catch(soft('the hidden-SKU list', [])),
   ]);
   window._hiddenSkus = Array.isArray(hiddenSkus) ? hiddenSkus : [];
   window._lotMapByPair = lotMap || {};
@@ -679,95 +926,9 @@ async function loadInventory() {
 // -------------------------------------------------------------------------
 // Distributor sync
 // -------------------------------------------------------------------------
-async function runSync(dryRun) {
-  const box = document.getElementById('sync-report');
-  box.style.display = '';
-  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing sync…' : 'Syncing from distributors…'}</div></div>`;
-  let result;
-  try {
-    result = await api('/api/sync', 'POST', { dry_run: dryRun });
-  } catch (e) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Sync failed: ${escHtml(String(e))}</div></div>`;
-    return;
-  }
-  box.innerHTML = renderSyncReport(result);
-  toast(dryRun ? 'Preview complete.' : 'Sync complete.');
-  if (!dryRun) loadInventory();
-}
 
-async function runSeed() {
-  const box = document.getElementById('sync-report');
-  box.style.display = '';
-  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">Seeding bagel catalog…</div></div>`;
-  let result;
-  try {
-    result = await api('/api/seed', 'POST', { reset: false });
-  } catch (e) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Seed failed: ${escHtml(String(e))}</div></div>`;
-    return;
-  }
-  if (!result.ok) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Seed failed: ${escHtml(result.error || 'unknown error')}</div></div>`;
-    return;
-  }
-  box.innerHTML = `<div class="card">
-    <div class="card-header"><span class="card-title">Seed Complete</span></div>
-    <div style="padding:14px 20px;font-size:13px">
-      Added <strong>${result.added}</strong> SKU(s), skipped <strong>${result.skipped}</strong> existing.
-      Catalog total: ${result.total} (Cheney ${result.cheney} · US Foods ${result.us_foods}).
-    </div>
-  </div>`;
-  toast('Bagel catalog seeded.');
-  loadInventory();
-  loadDashboard();
-}
 
-async function runMigrateUnits() {
-  if (!confirm('This converts every item from "each" to "cs": quantity, threshold, and weekly usage are divided by case_size, and price becomes the case cost. Run only once on a fresh deploy. Proceed?')) return;
-  const box = document.getElementById('sync-report');
-  box.style.display = '';
-  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">Converting units to cases…</div></div>`;
-  let result;
-  try {
-    result = await api('/api/migrate-units', 'POST', {});
-  } catch (e) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(String(e))}</div></div>`;
-    return;
-  }
-  if (!result.ok) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Convert failed: ${escHtml(result.error || 'unknown error')}</div></div>`;
-    return;
-  }
-  box.innerHTML = `<div class="card">
-    <div class="card-header"><span class="card-title">Unit Conversion Complete</span></div>
-    <div style="padding:14px 20px;font-size:13px">
-      Converted <strong>${result.converted}</strong> SKU(s) to cases.
-      ${result.already_in_cases ? `Already in cases: ${result.already_in_cases}. ` : ''}
-      ${result.skipped_no_case_size ? `<span style="color:var(--yellow)">Skipped (no case_size set): ${result.skipped_no_case_size}.</span> ` : ''}
-      Total catalog: ${result.total}.
-    </div>
-  </div>`;
-  toast(`Converted ${result.converted} SKU(s) to case units.`);
-  loadInventory();
-  loadInventory();
-  loadDashboard();
-}
 
-async function runEmailScan(dryRun) {
-  const box = document.getElementById('sync-report');
-  box.style.display = '';
-  box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--muted)">${dryRun ? 'Previewing email scan…' : 'Scanning mailbox…'}</div></div>`;
-  let result;
-  try {
-    result = await api('/api/email/scan', 'POST', { dry_run: dryRun });
-  } catch (e) {
-    box.innerHTML = `<div class="card"><div style="padding:16px 20px;color:var(--red)">Email scan failed: ${escHtml(String(e))}</div></div>`;
-    return;
-  }
-  box.innerHTML = renderSyncReport(result);
-  toast(dryRun ? 'Email preview complete.' : 'Email scan complete.');
-  if (!dryRun) { loadInventory(); loadDashboard(); }
-}
 
 function renderSyncReport(result) {
   const isEmail = result.reports.some(r => r.distributor === 'Email Inbox');
@@ -956,13 +1117,17 @@ function _varietyFromItemName(name) {
   return (name || '').split(' Bagel')[0];
 }
 
-async function loadUsage() {
+function loadUsage() {
+  return loadPage('usage', _loadUsage);
+}
+
+async function _loadUsage(soft) {
   // Populate item filter dropdown from inventory.
   const inv = await api('/api/inventory');
   const sel = document.getElementById('filter-item');
   const current = sel.value;
   sel.innerHTML = '<option value="">All items</option>' +
-    inv.map(i => `<option value="${escAttr(i.name)}" ${i.name === current ? 'selected' : ''}>${escHtml(i.name)}</option>`).join('');
+    inv.map(i => `<option value="${escHtml(i.name)}" ${i.name === current ? 'selected' : ''}>${escHtml(i.name)}</option>`).join('');
 
   const name = document.getElementById('filter-item').value;
   const limit = document.getElementById('filter-limit').value || 500;
@@ -973,7 +1138,7 @@ async function loadUsage() {
   // codes alongside the cs amounts.
   const [usage, production] = await Promise.all([
     api(usageUrl),
-    api('/api/production').catch(() => []),
+    api('/api/production').catch(soft('lot numbers', [])),
   ]);
   _usageCache = usage || [];
 
@@ -1183,12 +1348,17 @@ function renderUsageChrono() {
 // come from /api/production (= what was BAKED per warehouse).
 let vrankProdCache = [];
 
-async function loadReport() {
+function loadReport() {
+  return loadPage('report', _loadReport);
+}
+
+async function _loadReport(soft) {
   // Bakery Sales vs. Labor sits at the top of the page now -- kick it off
   // first so it has data on screen by the time the lower cards finish.
-  loadPlhChart();
-  // Toast sales feed (Top Consumed card)
+  const plh = loadPlhChart().catch(soft('the Sales vs Labor chart', null));
+  // Toast sales feed (Top Consumed card) reports its own errors in place.
   loadToastSales();
+  await plh;
   const [report, prod] = await Promise.all([
     api('/api/report'),
     api('/api/production'),
@@ -1366,7 +1536,79 @@ async function loadPlhChart() {
   requestAnimationFrame(paint);
 }
 
+// "Data through week of 11/02 · uploaded 3 days ago" under the Sales vs Labor
+// chart; red once the newest week ended more than 10 days ago. The chart
+// slides its window back to the last populated week, which used to make a
+// month-old workbook look like this week's numbers.
+function renderBakeryDataThrough(bd) {
+  const el = document.getElementById('plh-data-through');
+  if (!el) return;
+  if (!bd) { el.innerHTML = '&nbsp;'; return; }
+  if (!bd.data_through) {
+    el.innerHTML = '<span style="color:var(--red);font-weight:600">No bakery workbook data yet — upload the workbook.</span>';
+    return;
+  }
+  const days = bd.days_since_data_through;
+  const through = `Data through week of ${formatDate(bd.data_through)}`
+    + (bd.data_through_end ? ` (ends ${formatDate(bd.data_through_end)})` : '');
+  const up = bd.uploaded_at ? ` · uploaded to the server ${agoWords(bd.uploaded_at)}` : ' · last loaded from the laptop script';
+  if (bd.stale) {
+    el.innerHTML = `<span style="color:var(--red);font-weight:600">${escHtml(through)} — ${days} days ago. The chart is showing old weeks; upload the current workbook.</span><span>${escHtml(up)}</span>`;
+  } else {
+    el.innerHTML = `<span style="font-weight:600;color:var(--text)">${escHtml(through)}</span><span>${escHtml(up)}</span>`;
+  }
+}
+
+function _bakeryMsg(html, kind) {
+  const el = document.getElementById('bakery-workbook-msg');
+  if (!el) return;
+  el.innerHTML = html ? `<div class="notice ${kind === 'error' ? 'notice-red' : 'notice-amber'}" style="margin:8px 0 0 0">${html}</div>` : '';
+}
+
+// Upload the "Bakery Model - Sales v. Labor" workbook straight to the server
+// (POST /api/admin/bakery-workbook/upload) -- no laptop, no Dropbox copy.
+function onBakeryWorkbookChosen(input, force) {
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  return withBusy('bakery-workbook-btn', async () => {
+    _bakeryMsg('', '');
+    let r, body = null;
+    try {
+      r = await fetch('/api/admin/bakery-workbook/upload' + (force ? '?force=1' : ''), {
+        method: 'POST', credentials: 'same-origin', body: file,
+        headers: { 'Content-Type': 'application/octet-stream',
+                   'X-Filename': encodeURIComponent(file.name || '') },
+      });
+      try { body = await r.json(); } catch (e) { body = null; }
+    } catch (e) {
+      _bakeryMsg('<strong>Upload failed.</strong> Could not reach the server — check your connection and try again.', 'error');
+      return;
+    } finally {
+      if (!force) input.value = '';        // allow choosing the same file again
+    }
+    if (r.status === 401) { location.href = '/login?next=' + encodeURIComponent(location.pathname); return; }
+    if (!r.ok || !body || body.ok === false) {
+      const why = (body && body.error) || `The server refused the file (HTTP ${r.status}).`;
+      const probs = (body && body.problems) || [];
+      const list = probs.length ? `<ul>${probs.slice(0, 8).map(p => `<li>${escHtml(p)}</li>`).join('')}</ul>` : '';
+      _bakeryMsg(`<strong>Workbook not loaded — nothing was changed.</strong> ${escHtml(why)}${list}`, 'error');
+      toast('Bakery workbook was not loaded: ' + why, 'error');
+      return;
+    }
+    if (body.unchanged) {
+      toast('That is the same workbook as last time — nothing to update.');
+    } else {
+      toast(`Bakery workbook loaded: ${body.weeks} weeks, data through week of ${formatDate(body.data_through)}.`);
+      const notes = (body.notes || []).concat(body.problems || []);
+      if (notes.length) _bakeryMsg(`<strong>Loaded, with notes:</strong><ul>${notes.slice(0, 8).map(n => `<li>${escHtml(n)}</li>`).join('')}</ul>`, 'warn');
+    }
+    plhOffset = 0;
+    loadPlhChart();
+  });
+}
+
 function renderPlhWindowNav(data) {
+  renderBakeryDataThrough(data && data.bakery_data);
   const lbl = document.getElementById('plh-window-label');
   if (lbl) lbl.textContent = data && data.window_label ? data.window_label : '';
   const nextBtn = document.getElementById('plh-next');
@@ -1787,7 +2029,7 @@ function _populateRestockWarehouseDropdown() {
   const sorted = [...names].sort((a, b) => a.localeCompare(b));
   const current = restockWarehouse;
   sel.innerHTML = '<option value="">All warehouses</option>' +
-    sorted.map(n => `<option value="${escAttr(n)}"${n === current ? ' selected' : ''}>${escHtml(n)}</option>`).join('');
+    sorted.map(n => `<option value="${escHtml(n)}"${n === current ? ' selected' : ''}>${escHtml(n)}</option>`).join('');
 }
 
 function renderRestockedByVarietyLocation() {
@@ -1948,12 +2190,43 @@ async function openAddModal() {
   document.getElementById('f-name').focus();
 }
 
-async function openEditModal(name) {
+// What the Edit modal showed when it opened: {fields as the form holds them,
+// updated: the item's server stamp}. Save sends ONLY the fields that differ
+// from this, plus the stamp, so (a) changing a price no longer rewrites
+// on-hand and books a "manual correction", and (b) a tab left open cannot
+// overwrite a count that landed since.
+let _editBaseline = null;
+
+function _itemFormValues() {
+  const num = id => document.getElementById(id).value.trim();
+  const hb = document.getElementById('f-hidden');
+  return {
+    quantity: num('f-qty'),
+    unit: document.getElementById('f-unit').value.trim(),
+    category: document.getElementById('f-cat').value.trim(),
+    price: num('f-price'),
+    distributor: document.getElementById('f-distributor').value,
+    warehouse: document.getElementById('f-warehouse').value,
+    low_stock_threshold: num('f-threshold'),
+    case_cost: num('f-case-cost'),
+    case_size: num('f-case-size'),
+    weekly_usage: num('f-weekly'),
+    hidden: hb ? !!hb.checked : false,
+  };
+}
+
+async function openEditModal(name, forceReload) {
   await ensureWarehouses();
   // Resolve the item from the cache; refetch if it isn't there yet.
-  let item = findCachedItem(name);
+  let item = forceReload ? null : findCachedItem(name);
   if (!item) {
-    inventoryCache = await api('/api/inventory');
+    try {
+      // include_hidden: a hidden SKU must still be editable (to un-hide it).
+      inventoryCache = await api('/api/inventory?include_hidden=1');
+    } catch (e) {
+      toast(`Could not load "${name}" for editing: ${errText(e)}`, 'error');
+      return;
+    }
     item = findCachedItem(name);
   }
   if (!item) {
@@ -1983,10 +2256,16 @@ async function openEditModal(name) {
   if (hw) hw.style.display = '';
   const hb = document.getElementById('f-hidden');
   if (hb) hb.checked = !!item.hidden;
+  // Snapshot AFTER filling the form, so "changed" means "the user changed it".
+  _editBaseline = { name: item.name, updated: item.updated || '', values: _itemFormValues() };
   document.getElementById('item-modal').classList.add('open');
 }
 
-async function submitItem() {
+function submitItem() {
+  return withBusy('item-submit', _submitItem);
+}
+
+async function _submitItem() {
   const name = document.getElementById('f-name').value.trim();
   const qty  = Math.round(parseFloat(document.getElementById('f-qty').value));
   const unit = document.getElementById('f-unit').value.trim();
@@ -2004,20 +2283,52 @@ async function submitItem() {
     return;
   }
 
-  const payload = {
+  const full = {
     quantity: qty, unit, category: cat, price, distributor, warehouse,
     low_stock_threshold: threshold,
     case_cost: caseCost, case_size: caseSize, weekly_usage: weekly,
   };
 
-  if (editingName) {
-    const hb = document.getElementById('f-hidden');
-    if (hb) payload.hidden = hb.checked;
-    await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
-    toast(`Updated "${editingName}".`);
-  } else {
-    await api('/api/inventory', 'POST', { name, ...payload });
-    toast(`Added "${name}".`);
+  try {
+    if (editingName) {
+      const hb = document.getElementById('f-hidden');
+      if (hb) full.hidden = hb.checked;
+      // Only what the user actually changed. On-hand in particular is sent
+      // ONLY when the Quantity box was edited: the box shows a rounded
+      // number, and sending it back on every save rewrote 212.4 cs as 212
+      // and logged a manual correction nobody made.
+      const base = (_editBaseline && _editBaseline.name === editingName) ? _editBaseline : null;
+      const now = _itemFormValues();
+      const payload = {};
+      Object.keys(full).forEach(k => {
+        if (!base || String(now[k]) !== String(base.values[k])) payload[k] = full[k];
+      });
+      if (!Object.keys(payload).length) {
+        toast(`No changes to "${editingName}".`);
+        closeModal('item-modal');
+        return;
+      }
+      if (base && base.updated) payload.expected_updated = base.updated;
+      await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
+      toast(`Updated "${editingName}".`);
+    } else {
+      await api('/api/inventory', 'POST', { name, ...full });
+      toast(`Added "${name}".`);
+    }
+  } catch (e) {
+    if (e && e.silent) return;
+    const changed = e && e.status === 409 && e.body && e.body.error === 'changed';
+    if (changed && editingName) {
+      // Someone (or a count) changed this item after the modal opened.
+      // Nothing was saved; show the item as it is now and let them redo it.
+      toast(`"${editingName}" was changed by someone else while this window was open. `
+        + 'Nothing was saved — it has been reloaded with the current numbers; make your change again.', 'error');
+      await loadInventory();
+      await openEditModal(editingName, true);
+      return;
+    }
+    toast((editingName ? 'Could not save: ' : 'Could not add: ') + errText(e), 'error');
+    return;
   }
   closeModal('item-modal');
   loadInventory();
@@ -2027,33 +2338,13 @@ async function submitItem() {
 // -------------------------------------------------------------------------
 // Modals – Use / Restock
 // -------------------------------------------------------------------------
-function openUseModal(name) {
-  txnType = 'use';
-  txnItemName = name;
-  document.getElementById('txn-title').textContent = `Use: ${name}`;
-  document.getElementById('txn-submit').textContent = 'Record Usage';
-  document.getElementById('txn-submit').className = 'btn btn-danger';
-  document.getElementById('txn-name').value = name;
-  document.getElementById('txn-amount').value = '';
-  document.getElementById('txn-note').value = '';
-  document.getElementById('txn-modal').classList.add('open');
-  document.getElementById('txn-amount').focus();
+
+
+function submitTxn() {
+  return withBusy('txn-submit', _submitTxn);
 }
 
-function openRestockModal(name) {
-  txnType = 'restock';
-  txnItemName = name;
-  document.getElementById('txn-title').textContent = `Restock: ${name}`;
-  document.getElementById('txn-submit').textContent = 'Add Stock';
-  document.getElementById('txn-submit').className = 'btn btn-success';
-  document.getElementById('txn-name').value = name;
-  document.getElementById('txn-amount').value = '';
-  document.getElementById('txn-note').value = '';
-  document.getElementById('txn-modal').classList.add('open');
-  document.getElementById('txn-amount').focus();
-}
-
-async function submitTxn() {
+async function _submitTxn() {
   const amount = Math.round(parseFloat(document.getElementById('txn-amount').value));
   const note = document.getElementById('txn-note').value.trim();
   if (isNaN(amount) || amount <= 0) {
@@ -2061,22 +2352,17 @@ async function submitTxn() {
     return;
   }
   const url = txnType === 'use' ? '/api/use' : '/api/restock';
-  await api(url, 'POST', { name: txnItemName, amount, note });
+  try {
+    await api(url, 'POST', { name: txnItemName, amount, note, request_id: newRequestId() });
+  } catch (e) {
+    if (e && e.silent) return;
+    toast(`Could not ${txnType === 'use' ? 'record the usage' : 'add the stock'}: ${errText(e)}`, 'error');
+    return;
+  }
   toast(`${txnType === 'use' ? 'Used' : 'Restocked'} ${amount} of "${txnItemName}".`);
   closeModal('txn-modal');
   if (currentPage === 'inventory') loadInventory();
   else if (currentPage === 'usage') loadUsage();
-  loadDashboard();
-}
-
-// -------------------------------------------------------------------------
-// Delete
-// -------------------------------------------------------------------------
-async function deleteItem(name) {
-  if (!confirm(`Delete "${name}" from inventory?`)) return;
-  await api(`/api/inventory/${encodeURIComponent(name)}`, 'DELETE');
-  toast(`Removed "${name}".`);
-  loadInventory();
   loadDashboard();
 }
 
@@ -2154,18 +2440,6 @@ function _sortValue(item, key) {
   return String(v).toLowerCase();
 }
 
-function applyInvSort(items) {
-  if (!invSortKey || !invSortDir) return items.slice();
-  const key = invSortKey;
-  const dir = invSortDir;
-  return items.slice().sort((a, b) => {
-    const va = _sortValue(a, key);
-    const vb = _sortValue(b, key);
-    if (va < vb) return -1 * dir;
-    if (va > vb) return  1 * dir;
-    return 0;
-  });
-}
 
 function updateSortIndicators(tbodyId) {
   // Walk the matching thead and set sort-asc / sort-desc classes.
@@ -2182,13 +2456,6 @@ function updateSortIndicators(tbodyId) {
   });
 }
 
-function onInvSortClick(key) {
-  if (invSortKey !== key) { invSortKey = key; invSortDir = 1; }
-  else if (invSortDir === 1) invSortDir = -1;
-  else if (invSortDir === -1) { invSortKey = null; invSortDir = 0; }
-  else invSortDir = 1;
-  loadInventory();
-}
 
 // -------------------------------------------------------------------------
 // Pending POs page
@@ -2215,13 +2482,6 @@ function setPendingFilter(mode) {
   renderPendingPOs();
 }
 
-function onPendingSortClick(key) {
-  if (pendingSortKey !== key) { pendingSortKey = key; pendingSortDir = 1; }
-  else if (pendingSortDir === 1) pendingSortDir = -1;
-  else if (pendingSortDir === -1) { pendingSortKey = null; pendingSortDir = 0; }
-  else pendingSortDir = 1;
-  renderPendingPOs();
-}
 
 // Stash of Chefs Warehouse PO groups, kept separate from `pendingCache`
 // (which is built from inventory `on_order` pairs). CW POs don't live
@@ -2254,7 +2514,35 @@ function _currentPendingStatus() {
   return (el && el.value) || 'pending';
 }
 
-async function loadPendingPOs() {
+function loadPendingPOs() {
+  return loadPage('pending-pos', _loadPendingPOs);
+}
+
+// Shown above the Pending POs table when the canonical PO ledger could not
+// be read and the tab fell back to stitching the older sources together.
+// That fallback used to be announced with a console.warn only.
+let pendingLegacyReason = '';
+
+function renderPendingLegacyNotice() {
+  const page = document.getElementById('page-pending-pos');
+  if (!page) return;
+  let el = document.getElementById('pending-legacy-notice');
+  if (!pendingLegacyReason) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'pending-legacy-notice';
+    el.className = 'notice notice-amber';
+    const status = page.querySelector(':scope > .load-status');
+    const anchor = status || page.querySelector(':scope > .page-header');
+    if (anchor && anchor.nextSibling) page.insertBefore(el, anchor.nextSibling);
+    else page.appendChild(el);
+  }
+  el.innerHTML = `<strong>Showing a simpler backup view of the POs.</strong> The main PO list could not be loaded
+    (${escHtml(pendingLegacyReason)}), so statuses, baked totals and delivery notes below may be incomplete.
+    <button class="btn btn-ghost btn-sm" style="margin-left:8px" onclick="loadPendingPOs()">Try again</button>`;
+}
+
+async function _loadPendingPOs(soft) {
   refreshFlowAlerts();
   await ensureWarehouses();
   // Populate warehouse filter dropdown
@@ -2264,11 +2552,22 @@ async function loadPendingPOs() {
   }
   // Phase 2b: read the canonical PO ledger as the single source. Fall
   // back to the legacy multi-source stitch only if the ledger read fails.
-  usingLedger = false; ledgerGroups = [];
+  let ledgerOk = false, ledgerRows = [];
+  pendingLegacyReason = '';
   try {
     const lg = await api('/api/pos/ledger');
-    if (lg && lg.ok && Array.isArray(lg.pos)) { ledgerGroups = lg.pos; usingLedger = true; }
-  } catch (e) { console.warn('PO ledger fetch failed; using legacy sources:', e); }
+    if (lg && Array.isArray(lg.pos)) { ledgerRows = lg.pos; ledgerOk = true; }
+    else pendingLegacyReason = 'the server sent an unexpected reply';
+  } catch (e) {
+    if (e && e.silent) throw e;
+    console.warn('PO ledger fetch failed; using legacy sources:', e);
+    pendingLegacyReason = errText(e);
+  }
+  // Only swap the data in once the read has succeeded, so a failed refresh
+  // leaves the last good table on screen.
+  if (ledgerOk) { ledgerGroups = ledgerRows; usingLedger = true; }
+  else { usingLedger = false; ledgerGroups = []; }
+  renderPendingLegacyNotice();
   if (!usingLedger) {
   const items = await api('/api/inventory');
   const pairs = [];
@@ -2288,7 +2587,7 @@ async function loadPendingPOs() {
     const cwResp = await api('/api/chefs-warehouse/pos?status=all');
     cwPendingGroups = (cwResp && cwResp.pos) ? cwResp.pos : [];
   } catch (e) {
-    console.warn('Failed to load Chefs Warehouse POs:', e);
+    soft('Chefs Warehouse POs', null)(e);
     cwPendingGroups = [];
   }
 
@@ -2298,7 +2597,7 @@ async function loadPendingPOs() {
     const arrResp = await api('/api/arrived-pos');
     arrivedInvGroups = (arrResp && arrResp.pos) ? arrResp.pos : [];
   } catch (e) {
-    console.warn('Failed to load arrived inventory POs:', e);
+    soft('arrived POs', null)(e);
     arrivedInvGroups = [];
   }
 
@@ -2308,7 +2607,7 @@ async function loadPendingPOs() {
     const fr = await api('/api/freight/ship-date-index');
     freightShipIndex = (fr && fr.index) || {};
   } catch (e) {
-    console.warn('Failed to load freight ship-date index:', e);
+    soft('freight-verified ship dates', null)(e);
     freightShipIndex = {};
   }
 
@@ -2316,7 +2615,7 @@ async function loadPendingPOs() {
     const so = await api('/api/pending/status-overrides');
     statusOverrides = (so && so.overrides) || {};
   } catch (e) {
-    console.warn('Failed to load status overrides:', e);
+    soft('manual PO statuses', null)(e);
     statusOverrides = {};
   }
   }  // end legacy fallback
@@ -2502,6 +2801,88 @@ function _poTagHtml(state) {
 //    confirms it is a new shipment by setting its ship date.
 //  - canceled_remainder: canceled after part of it arrived; the arrived lines
 //    stay (they are real stock), the rest was canceled.
+// PO numbers whose "count already includes this PO" prompt is on its
+// are-you-sure step (an in-page confirm; no window.confirm).
+let absorbConfirming = new Set();
+
+function _mdShort(iso) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${Number(m[2])}/${Number(m[3])}` : '';
+}
+
+// "The 11/10 count of 212 already looks like it includes this PO" -- shown
+// when the ledger row carries suggest_absorb. One button, then a confirm
+// step in the row itself, then POST suggest_absorb.payload to
+// suggest_absorb.endpoint and reload.
+function _poAbsorbPromptHtml(g) {
+  const sa = g.suggest_absorb;
+  if (!sa || !sa.endpoint) return '';
+  const po = g.po_number || '';
+  const poAttr = escAttr(po);
+  const when = _mdShort(sa.count_at);
+  const counted = (sa.counted === undefined || sa.counted === null) ? '' : ` of ${_actNum(sa.counted)}`;
+  const detail = (sa.projected_without !== undefined && sa.projected_with !== undefined
+                  && sa.projected_without !== null && sa.projected_with !== null)
+    ? ` We expected about ${_actNum(sa.projected_without)} cs without this PO and ${_actNum(sa.projected_with)} with it.`
+    : '';
+  const reason = sa.reason ? ` <span style="opacity:.8">${escHtml(sa.reason)}</span>` : '';
+  const confirming = absorbConfirming.has(po);
+  const buttons = confirming
+    ? `<span class="inline-confirm"><strong>Mark PO ${escHtml(po)} as received in the ${escHtml(when || 'last')} count?</strong>
+         On-hand stays at the count; the PO stops showing as on order.
+         <button class="btn btn-primary btn-sm" id="absorb-yes-${escHtml(po)}" onclick="confirmAbsorbPO('${poAttr}', this)">Yes, mark received</button>
+         <button class="btn btn-ghost btn-sm" onclick="cancelAbsorbPO('${poAttr}')">No</button></span>`
+    : `<button class="btn btn-ghost btn-sm" onclick="askAbsorbPO('${poAttr}')">Mark as received in that count</button>`;
+  // Its own full-width row under the PO: the status column is far too
+  // narrow to hold a sentence and two buttons.
+  return `<tr class="po-prompt-row"><td colspan="10" style="padding-top:0;border-top:0">
+    <div class="po-prompt">The ${escHtml(when)} count${escHtml(counted)} already looks like it includes this PO &mdash; mark as received in that count?${escHtml(detail)}${reason}
+    <div style="margin-top:6px">${buttons}</div></div></td></tr>`;
+}
+
+// "Stuck N days" / "Needs a person" -- shown beside the PO number.
+function _poAttentionBadgesHtml(g) {
+  let h = '';
+  if (g.stuck) {
+    const n = (g.held_days === null || g.held_days === undefined) ? null : Math.round(g.held_days);
+    const d = n === null ? '' : ` ${n} day${n === 1 ? '' : 's'}`;
+    h += `<br><span class="badge badge-red" style="font-size:10px;cursor:help;white-space:nowrap;margin-top:3px" title="This PO has been waiting${d} without moving to the next step">Stuck${d}</span>`;
+  }
+  if (g.needs_human) {
+    h += `<br><span class="badge badge-red" style="font-size:10px;cursor:help;white-space:nowrap;margin-top:3px" title="The system cannot settle this PO on its own — someone needs to decide">Needs a person</span>`;
+  }
+  // A span, not a div: the phone layout hides divs in the PO-number cell.
+  return h ? `<span style="font-family:var(--font-body)">${h}</span>` : '';
+}
+
+function askAbsorbPO(po) { absorbConfirming.add(po); renderPendingPOs(); }
+function cancelAbsorbPO(po) { absorbConfirming.delete(po); renderPendingPOs(); }
+
+function confirmAbsorbPO(po, btn) {
+  return withBusy(btn, async () => {
+    const g = (ledgerGroups || []).find(r => (r.po_number || '') === po);
+    const sa = g && g.suggest_absorb;
+    // Only ever post to this app's own API.
+    if (!sa || typeof sa.endpoint !== 'string' || !/^\/api\//.test(sa.endpoint)) {
+      toast('This suggestion is no longer available — reloading.', 'error');
+      absorbConfirming.delete(po);
+      await loadPendingPOs();
+      return;
+    }
+    try {
+      await api(sa.endpoint, 'POST', sa.payload || {});
+    } catch (e) {
+      if (e && e.silent) return;
+      toast(`Could not mark PO ${po} as received: ${errText(e)}`, 'error');
+      return;
+    }
+    absorbConfirming.delete(po);
+    toast(`PO ${po} marked as received in the ${_mdShort(sa.count_at) || 'last'} count.`);
+    await loadPendingPOs();
+    loadDashboard();
+  });
+}
+
 function _poFlagsHtml(g) {
   let h = '';
   if (g.rebooked_after_count) {
@@ -2629,6 +3010,11 @@ function _groupsFromLedger(records) {
       transit_days: (r.transit_days === undefined || r.transit_days === null) ? null : Number(r.transit_days),
       transit_basis: r.transit_basis || '',
       production: r.production || null,
+      // Hardening fields from the ledger (absent on older servers).
+      stuck: !!r.stuck,
+      held_days: (r.held_days === undefined || r.held_days === null) ? null : Number(r.held_days),
+      needs_human: !!r.needs_human,
+      suggest_absorb: (r.suggest_absorb && typeof r.suggest_absorb === 'object') ? r.suggest_absorb : null,
       _source: src,
     };
     // The server is the authority on arrived vs pending: on-hand is only
@@ -2791,9 +3177,11 @@ function _poItemsCellEditableHtml(g) {
 async function _postArrivedAdjust(payload) {
   let r;
   try {
-    r = await api('/api/pos/arrived/adjust', 'POST', payload);
+    // raw: this caller reads `freight_verified` out of a refused reply.
+    r = await api('/api/pos/arrived/adjust', 'POST', payload, { raw: true });
   } catch (e) {
-    toast('Adjust failed: ' + String(e), 'error');
+    if (e && e.silent) return null;
+    toast('Adjust failed: ' + errText(e), 'error');
     return null;
   }
   if (!r || !r.ok) {
@@ -2998,7 +3386,7 @@ function _pendingRowHtml(g, now) {
     ? 'Tick to edit this arrived PO (arrival date, ship date, received qty)'
     : 'Tick to modify this PO ship date';
   return `<tr${rowStyle}>
-      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="${chkTitle}" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${poAttr}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span>${_poBakedNoteHtml(g)}</td>
+      <td style="white-space:nowrap"><input type="checkbox" class="po-row-chk" title="${chkTitle}" ${editing ? 'checked' : ''} onclick="togglePoRowEdit('${poAttr}')" style="margin-right:7px;vertical-align:middle;cursor:pointer"><span style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}</span>${_poAttentionBadgesHtml(g)}${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${itemsCell}
@@ -3008,7 +3396,7 @@ function _pendingRowHtml(g, now) {
       <td style="white-space:nowrap">${arrivalCell}</td>
       <td style="white-space:nowrap;color:var(--muted)">${eta}</td>
       <td>${_poTagHtml(state)}${_poFlagsHtml(g)}</td>
-    </tr>`;
+    </tr>${_poAbsorbPromptHtml(g)}`;
 }
 
 function renderInProductionSection(list) {
@@ -3030,7 +3418,7 @@ function renderInProductionSection(list) {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">—</span>';
     const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poBakedNoteHtml(g)}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poAttentionBadgesHtml(g)}${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
@@ -3040,7 +3428,7 @@ function renderInProductionSection(list) {
       <td style="white-space:nowrap">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td>${_poTagHtml(g._state || 'in_production')}${_poFlagsHtml(g)}</td>
-    </tr>`;
+    </tr>${_poAbsorbPromptHtml(g)}`;
   }).join('');
 }
 
@@ -3066,7 +3454,7 @@ function renderInTransitSection(list) {
     const ship = g.ship_date ? (formatDate(g.ship_date) + (g.ship_date_source === 'freight' ? _shipVerifiedMark() : '')) : '<span style="color:var(--muted)">&mdash;</span>';
     const arrival = (g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">&mdash;</span>') + _deliveryNoteHtml(g) + _arrivalEstimateNoteHtml(g, g._state);
     return `<tr>
-      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poBakedNoteHtml(g)}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:12px">${escHtml(g.po_number || '—')}${_poAttentionBadgesHtml(g)}${_poBakedNoteHtml(g)}</td>
       <td>${distributorBadge(g.distributor)}</td>
       <td>${_poWarehouseLabel(g)}</td>
       ${_poItemsCellHtml(g)}
@@ -3076,7 +3464,7 @@ function renderInTransitSection(list) {
       <td style="white-space:nowrap;font-weight:600">${arrival}</td>
       <td style="white-space:nowrap;color:var(--muted)">${g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
       <td>${_poTagHtml(g._state || 'in_transit')}${_poFlagsHtml(g)}</td>
-    </tr>`;
+    </tr>${_poAbsorbPromptHtml(g)}`;
   }).join('');
 }
 
@@ -3262,7 +3650,11 @@ function onModifyStatusChange() {
   }
 }
 
-async function saveModifyPO() {
+function saveModifyPO() {
+  return withBusy('modify-po-save', _saveModifyPO);
+}
+
+async function _saveModifyPO() {
   const po = modifySelectedPo;
   if (!po) { closeModal('modify-po-modal'); return; }
   const info = modifyPoMap[po] || {};
@@ -3305,7 +3697,10 @@ async function saveModifyPO() {
       }
     }
   } catch (e) {
-    toast('Save failed: ' + String(e), 'error');
+    if (e && e.silent) return;
+    toast('Save failed: ' + errText(e), 'error');
+    // The status may have saved before the ship date failed: show the truth.
+    if (changed) await loadPendingPOs();
     return;
   }
   toast(changed ? `Updated PO ${po}${movedMsg}` : `No changes for PO ${po}`);
@@ -3322,31 +3717,6 @@ async function cancelModifyPO() {
   await cancelPendingPO(po, info.lines || 0, (info.total_cs || 0).toFixed(0), info.source || 'inventory');
 }
 
-async function reopenPendingPO(poNumber, source, totalCs) {
-  if (!poNumber) return;
-  source = source || 'inventory';
-  const isCW = source === 'chefs_warehouse';
-  const msg = isCW
-    ? `Reopen Chefs Warehouse PO ${poNumber}?\n\nThis clears its ship/arrival date so it returns to the active pipeline as pending. Inventory is not affected.`
-    : `Reopen PO ${poNumber}?\n\nThis removes the ${totalCs} cs that were added to on-hand when this PO was marked Arrived (use only if it hasn't actually arrived) and returns it to the tab as Open, awaiting a ship date.`;
-  if (!confirm(msg)) return;
-  let result;
-  try {
-    result = await api('/api/pending/reopen', 'POST', { po_number: poNumber, source });
-  } catch (e) {
-    toast('Reopen failed: ' + String(e), 'error');
-    return;
-  }
-  if (!result || !result.ok) {
-    toast('Reopen failed: ' + ((result && result.error) || 'unknown'), 'error');
-    return;
-  }
-  toast(isCW
-    ? `Reopened CW PO ${poNumber}`
-    : `Reopened PO ${poNumber} (${result.restored_lines} line${result.restored_lines === 1 ? '' : 's'}, ${result.removed_cs} cs back to pending)`);
-  await loadPendingPOs();
-  loadDashboard();
-}
 
 async function cancelPendingPO(poNumber, lineCount, totalCs, source) {
   if (!poNumber) return;
@@ -3361,11 +3731,8 @@ async function cancelPendingPO(poNumber, lineCount, totalCs, source) {
     const endpoint = isCW ? '/api/chefs-warehouse/cancel' : '/api/admin/remove-po';
     result = await api(endpoint, 'POST', { po_number: poNumber });
   } catch (e) {
-    toast('Cancel failed: ' + String(e));
-    return;
-  }
-  if (!result.ok) {
-    toast('Cancel failed: ' + (result.error || 'unknown'));
+    if (e && e.silent) return;
+    toast('Cancel failed: ' + errText(e), 'error');
     return;
   }
   if (isCW) {
@@ -4001,13 +4368,17 @@ function drawFreightChart() {
 }
 
 
-async function loadProduction() {
+function loadProduction() {
+  return loadPage('production', _loadProduction);
+}
+
+async function _loadProduction(soft) {
   await ensureWarehouses();
   // Pull production records AND the PO ledger in parallel — the ledger
   // gives each production row its PO's status / ship / arrival by po_number.
   const [records, ledger] = await Promise.all([
     api('/api/production'),
-    api('/api/pos/ledger').catch(() => null),
+    api('/api/pos/ledger').catch(soft('PO status for each sheet', null)),
   ]);
   prodCache = records;
   prodPoLookup = _buildProdPoLookup((ledger && ledger.pos) || []);
@@ -4030,12 +4401,65 @@ async function loadProduction() {
   }
 
   renderProductionDetail();
-  loadProductionSummary();
+  await loadProductionSummary();
 }
 
 async function loadProductionSummary() {
   const data = await api('/api/production/summary?period=' + encodeURIComponent(prodPeriod));
   renderProductionSummary(data);
+  renderProductionHealth('production', data.health || null);
+}
+
+// Red banner + "Needs attention" block for the Daily Production feed. Shown
+// on the Production tab (from the summary's `health`) and on the Planner
+// (from GET /api/production/health): no sheet for 3+ business days, a scan
+// that did not finish, sheets that could not be read or whose lines don't
+// add up. Before this, a ten-week gap looked exactly like a quiet week.
+function renderProductionHealth(pageKey, h) {
+  const page = document.getElementById('page-' + pageKey);
+  if (!page) return;
+  const id = 'prod-health-' + pageKey;
+  let el = document.getElementById(id);
+  const attention = (h && Array.isArray(h.needs_attention)) ? h.needs_attention : [];
+  const showAttention = pageKey === 'production' && attention.length;
+  if (!h || (!h.stale && !showAttention)) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = id;
+    const status = page.querySelector(':scope > .load-status');
+    const anchor = status || page.querySelector(':scope > .page-header');
+    if (anchor && anchor.nextSibling) page.insertBefore(el, anchor.nextSibling);
+    else page.insertBefore(el, page.firstChild);
+  }
+  let html = '';
+  if (h.stale) {
+    const reasons = (h.reasons || []).map(r => `<li>${escHtml(r)}</li>`).join('');
+    const scan = h.scan || {};
+    const scanLine = scan.last_attempt
+      ? `Last mailbox scan for sheets: ${escHtml(agoWords(scan.last_attempt))}${scan.last_ok && scan.last_ok !== scan.last_attempt ? `; last complete scan ${escHtml(agoWords(scan.last_ok))}` : ''}.`
+      : 'The nightly mailbox scan for sheets has not reported in yet.';
+    html += `<div class="notice notice-red" role="alert">
+      <strong>Daily Production may be out of date.</strong>${pageKey === 'planner' ? ' What has been baked for each PO below comes from these sheets, so the bake queue may overstate what is left.' : ''}
+      <ul>${reasons}</ul>
+      <div style="margin-top:4px;font-size:12px;opacity:.85">${scanLine}</div>
+    </div>`;
+  }
+  if (showAttention) {
+    const rows = attention.slice(0, 12).map(a => {
+      const subj = (a.subject || '').replace(/^Daily [Pp]roduction\s*/, '') || '(no subject)';
+      const when = a.received_at ? formatDate(a.received_at) : '';
+      const what = a.kind === 'unreadable'
+        ? `could not be read (${escHtml(a.detail || 'unreadable')})${a.will_retry ? ' — will be tried again tonight' : ' — tried on 3 days; ask for a text PDF to be re-sent'}`
+        : escHtml(a.detail || 'needs a look');
+      return `<li><strong>${escHtml(subj)}</strong>${when ? ` <span style="opacity:.75">(${when})</span>` : ''}: ${what}</li>`;
+    }).join('');
+    const more = attention.length > 12 ? `<div style="font-size:12px;opacity:.8;margin-top:4px">+ ${attention.length - 12} more</div>` : '';
+    html += `<div class="notice notice-amber">
+      <strong>Needs attention &mdash; ${attention.length} sheet${attention.length === 1 ? '' : 's'}</strong>
+      <ul>${rows}</ul>${more}
+    </div>`;
+  }
+  el.innerHTML = html;
 }
 
 function renderProductionSummary(data) {
@@ -4045,7 +4469,12 @@ function renderProductionSummary(data) {
     `Rolled up by ${periodLabel.toLowerCase()}, newest first`;
 
   // Summary cards — current period totals
-  const current = buckets[0] || { total_cs: 0, by_distributor: {}, by_variety: {} };
+  // "This week" is the CURRENT period (the server flags it and zero-fills
+  // it), not the newest period that happens to have data.
+  const current = buckets.find(b => b.current)
+    || buckets.find(b => data.current_key && b.key === data.current_key)
+    || buckets[0] || { total_cs: 0, by_distributor: {}, by_variety: {} };
+  const withData = buckets.filter(b => !b.empty).length;
   const cumulative = buckets.reduce((acc, b) => {
     acc.total_cs += b.total_cs || 0;
     return acc;
@@ -4058,9 +4487,10 @@ function renderProductionSummary(data) {
        <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">This ${prodPeriod}</div>
        <div style="font-size:28px;font-weight:700">${(current.total_cs || 0).toFixed(0)} <span style="color:var(--muted);font-size:14px">cs</span></div>
        <div style="color:var(--muted);font-size:12px">${current.start ? formatDate(current.start) : ''}${current.end && current.end !== current.start ? ' – ' + formatDate(current.end) : ''}</div>
+       ${current.empty ? '<div style="color:var(--red);font-size:12px;margin-top:2px">No production sheets received for this period yet.</div>' : ''}
      </div>`,
     `<div class="card" style="padding:16px 20px">
-       <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">Cumulative (${buckets.length} ${prodPeriod}${buckets.length === 1 ? '' : 's'})</div>
+       <div style="color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.5px">Cumulative (${withData} ${prodPeriod}${withData === 1 ? '' : 's'} with production)</div>
        <div style="font-size:28px;font-weight:700">${cumulative.total_cs.toFixed(0)} <span style="color:var(--muted);font-size:14px">cs</span></div>
        <div style="color:var(--muted);font-size:12px">all production logged to date</div>
      </div>`,
@@ -4248,7 +4678,9 @@ function renderProductionDetail() {
     }).join('\n');
     const errBadge = r.parse_error
       ? '<div style="color:var(--warning,#c00);font-size:11px;margin-top:2px">PDF needs re-scan</div>'
-      : '';
+      : (r.warning
+        ? `<div style="margin-top:3px"><span class="badge badge-yellow" style="font-size:10px" title="${escHtml(r.warning)}">needs a look</span> <span style="color:#B07F0E;font-size:11px">${escHtml(r.warning)}</span></div>`
+        : '');
     const srcSubj = (r.source_subject || '').replace(/^Daily [Pp]roduction\s*/, '');
     const srcSender = (r.source_sender || '').match(/<([^>]+)>/)?.[1] || r.source_sender || '';
     // Cross-link to the PO ledger's status for this PO number.
@@ -4352,7 +4784,9 @@ async function onShipDateChange(poNumber, shipDate, source) {
             + (r && r.error ? ': ' + r.error : ''), 'error');
     }
   } catch (exc) {
-    toast('Error: ' + exc.message, 'error');
+    if (exc && exc.silent) return;
+    toast('Ship date was NOT saved: ' + errText(exc), 'error');
+    loadPendingPOs();      // put the box back to what is actually stored
   }
 }
 
@@ -4363,16 +4797,24 @@ async function onShipDateChange(poNumber, shipDate, source) {
 function formatDate(s) {
   if (!s) return '';
   const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (!m) return s;
+  // Not a date we recognise: hand it back, but escaped -- this value goes
+  // straight into innerHTML at most call sites.
+  if (!m) return escHtml(String(s));
   return m[2] + '/' + m[3] + '/' + m[1];
 }
 
 // -------------------------------------------------------------------------
 // Escape HTML helpers
 // -------------------------------------------------------------------------
+// escHtml: for text AND for plain double-quoted attribute values such as
+// <option value="...">. (An apostrophe is fine inside double quotes.)
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+// escAttr: ONLY for a value placed inside a quoted JS string in an inline
+// handler -- onclick="fn('...')". It backslash-escapes the apostrophe, which
+// is wrong in a plain attribute: <option value="O\'Hare"> never matched the
+// name it was built from.
 function escAttr(s) {
   // '&' first: inside an onclick="..." attribute an entity like &#39; decodes
   // before the JS is parsed, which would end the quoted string early.
@@ -4384,6 +4826,7 @@ function escAttr(s) {
 // session has expired, api() bounces the user to /login.
 // -------------------------------------------------------------------------
 loadInventory();
+refreshHealthBanner();
 // -------------------------------------------------------------------------
 // Traceability tab
 // -------------------------------------------------------------------------
@@ -4404,7 +4847,7 @@ async function initTraceability() {
   const mfgSel = document.getElementById('trace-filter-mfg');
   if (mfgSel && Object.keys(_traceMfgCodeMap).length) {
     const opts = Object.keys(_traceMfgCodeMap).sort().map(code =>
-      `<option value="${escAttr(code)}">${escHtml(code)} &mdash; ${escHtml(_traceMfgCodeMap[code])}</option>`
+      `<option value="${escHtml(code)}">${escHtml(code)} &mdash; ${escHtml(_traceMfgCodeMap[code])}</option>`
     );
     mfgSel.innerHTML = '<option value="">All varieties</option>' + opts.join('');
   }
@@ -4483,7 +4926,7 @@ async function runTraceabilitySearch() {
     res = await api('/api/traceability/search?' + qs.toString());
   } catch (e) {
     document.getElementById('trace-results-container').innerHTML =
-      `<div class="empty" style="padding:24px;color:var(--red)">Search failed: ${escHtml(String(e))}</div>`;
+      `<div class="empty" style="padding:24px;color:var(--red)">Search failed: ${escHtml(errText(e))}</div>`;
     return;
   }
   _traceLastResults = res.records || [];
@@ -4648,7 +5091,7 @@ async function ensureToastLocationDropdown() {
         const name  = L.location || L.restaurant_guid;
         const state = L.state || '';
         const label = escHtml(state ? `${name}, ${state}` : name);
-        return `<option value="${escAttr(L.restaurant_guid)}">${label}</option>`;
+        return `<option value="${escHtml(L.restaurant_guid)}">${label}</option>`;
       });
       sel.innerHTML = '<option value="">All locations</option>' + opts.join('');
     }
@@ -4658,61 +5101,83 @@ async function ensureToastLocationDropdown() {
   const inp = document.getElementById('toast-sales-date');
   if (inp && !inp.value) inp.value = toastSalesAnchor;
 }
-async function loadToastSales() {
+// Opening the tab (or changing the period) reads the STORE -- the nightly
+// pull keeps it current. Only this button asks Toast for the data live.
+function refreshToastSales() {
+  return withBusy('toast-sales-refresh', () => loadToastSales(true));
+}
+
+async function loadToastSales(live) {
   await ensureToastLocationDropdown();
   const loc = document.getElementById('toast-sales-location').value;
   const qs = new URLSearchParams();
   qs.set('period', toastSalesPeriod);
   if (loc) qs.set('location', loc);
   if (toastSalesAnchor) qs.set('end_date', toastSalesAnchor);
+  if (live) qs.set('live', '1');
   const subtitle = document.getElementById('toast-sales-subtitle');
-  if (subtitle) subtitle.textContent =
-    `Top-selling items by retail $ from Toast POS with sales mix %. Pulled per location, aggregated by ${toastSalesPeriod}.`;
-
-  // When the user picks a specific date the backend may fetch live
-  // from Toast - that can take up to ~30s. Show an explicit loading
-  // state instead of leaving the previous render on screen.
   const container = document.getElementById('toast-sales-container');
-  if (toastSalesAnchor) {
-    container.innerHTML = `<div class="empty" style="padding:18px;color:var(--muted)">
-      <div style="display:flex;align-items:center;gap:8px">
-        <div class="spinner" style="width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--text);border-radius:50%;animation:spin 0.8s linear infinite"></div>
-        <span>Checking cache${loc ? ' for the selected location' : ' for all retail locations'}, fetching from Toast if needed (up to 30s)...</span>
-      </div>
-    </div>`;
+  if (live) {
+    // A live pull can take up to ~30s: say so, but keep the current table
+    // on screen underneath rather than blanking it.
+    if (subtitle) subtitle.textContent = `Pulling ${loc ? 'the selected location' : 'all retail locations'} from Toast now (up to 30 seconds)…`;
   }
 
   let res;
   try {
     res = await api('/api/report/toast-sales?' + qs.toString());
   } catch (e) {
-    container.innerHTML =
-      `<div class="empty" style="padding:18px;color:var(--red)">Failed: ${escHtml(String(e))}</div>`;
+    if (e && e.silent) return;
+    if (subtitle) {
+      subtitle.innerHTML = `<span style="color:var(--red);font-weight:600">Could not ${live ? 'refresh from Toast' : 'load Toast sales'}: ${escHtml(errText(e))}</span>`
+        + (container.querySelector('table') ? ' <span>The table below is what was on screen before.</span>' : '');
+    }
+    if (!container.querySelector('table')) {
+      container.innerHTML =
+        `<div class="empty" style="padding:18px;color:var(--red)">Failed: ${escHtml(errText(e))}</div>`;
+    }
     return;
   }
   const buckets = (res && res.buckets) || [];
   const fetchMeta = (res && res.fetch) || {};
+  const store = (res && res.store) || {};
   if (!buckets.length) {
-    container.innerHTML = '<div class="empty" style="padding:18px">No Toast sales rows ingested yet. Run the Toast sync from a Cowork session to populate.</div>';
+    container.innerHTML = '<div class="empty" style="padding:18px">No Toast sales stored yet. The nightly pull fills this in; press &ldquo;Refresh from Toast&rdquo; to pull this period now.</div>';
     return;
   }
-  // Surface the fetch result in the subtitle so the user knows whether
-  // they got cached data or a fresh Toast pull, and any auth issues.
+  // Say plainly how current the numbers are, and whether a refresh worked.
   if (subtitle && toastSalesAnchor) {
-    let tag = '';
+    let tag = '', bad = false;
     if (fetchMeta.fetch_error === 'toast_not_configured') {
-      tag = ' · cache only (set TOAST_CLIENT_ID/SECRET/HOSTNAME on Render to enable live fetch)';
+      tag = 'Live refresh is not set up on the server (Toast credentials missing) — showing stored data.';
+      bad = true;
     } else if (fetchMeta.fetch_error) {
-      tag = ` · live fetch failed: ${escHtml(fetchMeta.fetch_error)}`;
-    } else if (fetchMeta.rows_fetched > 0) {
-      tag = ` · pulled ${fetchMeta.rows_fetched} fresh rows from Toast`;
-    } else if (fetchMeta.fetched_at) {
-      tag = ' · fetched from Toast (no new orders found)';
-    } else {
-      tag = ' · served from cache';
+      // e.g. "12 of 119 location-days failed" -- NOT "no new orders".
+      tag = `Refresh from Toast did not fully work: ${fetchMeta.fetch_error}. Numbers below may be incomplete — try again in a minute.`;
+      bad = true;
+    } else if (fetchMeta.live && fetchMeta.rows_fetched > 0) {
+      tag = `Refreshed from Toast just now (${fetchMeta.rows_fetched} rows).`;
+    } else if (fetchMeta.live && fetchMeta.requested > 0) {
+      tag = 'Refreshed from Toast just now — nothing new.';
+    } else if (fetchMeta.live) {
+      tag = 'Already up to date with Toast.';
     }
-    subtitle.textContent =
-      `Top-selling items by retail $ from Toast POS with sales mix %, aggregated by ${toastSalesPeriod}.${tag}`;
+    let asOf = '';
+    if (store.newest_fetched_at) {
+      asOf = `Stored data last pulled from Toast ${agoWords(store.newest_fetched_at)}`
+        + (store.oldest_fetched_at && store.oldest_fetched_at !== store.newest_fetched_at
+            ? `; oldest day in this period pulled ${agoWords(store.oldest_fetched_at)}` : '') + '.';
+    } else if (!fetchMeta.live) {
+      asOf = 'Showing stored data.';
+    }
+    const missing = Number(store.location_days_not_pulled) || 0;
+    const missTxt = missing
+      ? ` ${missing} of ${store.location_days} location-days in this period have not been pulled yet.` : '';
+    subtitle.innerHTML =
+      `Top-selling items by retail $ from Toast POS, by ${escHtml(toastSalesPeriod)}. `
+      + (tag ? `<span style="${bad ? 'color:var(--red);font-weight:600' : 'color:var(--green);font-weight:600'}">${escHtml(tag)}</span> ` : '')
+      + `<span>${escHtml(asOf)}</span>`
+      + (missTxt ? `<span style="color:#B07F0E;font-weight:600">${escHtml(missTxt)}</span>` : '');
   }
   container.innerHTML = buckets.map(b => {
     const headerLabel = b.label || b.key;
@@ -4725,8 +5190,8 @@ async function loadToastSales() {
       <td style="text-align:right;font-weight:600">${it.mix_pct.toFixed(1)}%</td>
     </tr>`).join('');
     const emptyHelp = fetchMeta.fetch_error
-      ? `Live Toast pull failed (${escHtml(fetchMeta.fetch_error)}). Falling back to cached data, which has no rows for this ${toastSalesPeriod}.`
-      : `No Toast sales found for this ${toastSalesPeriod}${loc ? ' at this location' : ''}. Either the restaurant had no orders that ${toastSalesPeriod === 'week' ? 'week' : 'month'}, or the data hasn't been ingested yet.`;
+      ? `The refresh from Toast failed (${escHtml(fetchMeta.fetch_error)}), and nothing is stored for this ${toastSalesPeriod}.`
+      : `Nothing is stored for this ${toastSalesPeriod}${loc ? ' at this location' : ''}. Either there were no orders, or it has not been pulled yet — press “Refresh from Toast”.`;
     const body = items.length
       ? `<table style="margin:0;font-size:12px">
         <thead><tr>
@@ -4756,26 +5221,50 @@ function openPlanner() {
   if (nav) nav.click();
 }
 
-async function loadProductionGuide() {
-  loadOrderPlan();
+function loadProductionGuide() {
+  return loadPage('planner', _loadProductionGuide);
+}
+
+// "count 3 days old · usage 12 days old" badge for one DC (Suggested Orders,
+// Buffer Watch). Red when either is past its limit -- an order suggestion
+// built on a month-old usage figure used to look exactly like a fresh one.
+function dataAgeBadge(w) {
+  if (!w || (w.count_age_days === undefined && w.usage_age_days === undefined)) return '';
+  const part = (label, days) => (days === null || days === undefined)
+    ? `no ${label} on file` : `${label} ${days} day${days === 1 ? '' : 's'} old`;
+  const usage = part('usage', w.usage_age_days)
+    + (w.usage_age_basis === 'count' ? ' (by count date)' : '');
+  const txt = `${part('count', w.count_age_days)} · ${usage}`;
+  const tip = w.data_stale
+    ? 'Check this warehouse\'s latest inventory/usage report before ordering: ' + (w.data_stale_reasons || []).join('; ')
+    : 'How old the count and the usage figure behind this suggestion are';
+  return `<span class="badge ${w.data_stale ? 'badge-red' : 'badge-gray'}" style="font-size:10px" title="${escHtml(tip)}">${escHtml(txt)}</span>`;
+}
+
+async function _loadProductionGuide(soft) {
+  // The order plan and the sheet-freshness banner load alongside the guide;
+  // neither blocks it.
+  const planP = loadOrderPlan().catch(soft('the order plan', null));
+  const healthP = api('/api/production/health').catch(() => null);
   const sum = document.getElementById('planner-summary');
   const body = document.getElementById('planner-body');
   if (!sum || !body) return;
-  sum.innerHTML = '<div style="color:var(--muted)">Loading the weekly guide…</div>';
-  body.innerHTML = '';
-  let g;
-  try { g = await api('/api/planning/guide'); }
-  catch (e) { sum.innerHTML = '<div style="color:var(--red)">Failed to load guide: ' + escHtml(String(e)) + '</div>'; return; }
-  if (!g || !g.ok) { sum.innerHTML = '<div style="color:var(--red)">Guide unavailable.</div>'; return; }
+  if (!sum.innerHTML.trim()) sum.innerHTML = '<div style="color:var(--muted)">Loading the weekly guide…</div>';
+  // Throws on failure: loadPage shows the red bar and whatever guide was on
+  // screen stays there.
+  const g = await api('/api/planning/guide');
+  renderProductionHealth('planner', await healthP);
+  await planP;
   const s = g.summary || {}, cap = g.capacity || {}, ba = g.buildahead || {};
   const chip = (l, v, c) => `<span class="badge ${c || 'badge-gray'}" style="font-size:12px;margin-right:6px">${escHtml(l)}: ${escHtml(String(v))}</span>`;
   sum.innerHTML = `<div class="card" style="padding:14px 18px">
     <div style="margin-bottom:8px">
       ${chip('Bake now', (s.produce_now_cs || 0) + ' cs / ' + (s.produce_now_pos || 0) + ' POs', (s.produce_now_cs ? 'badge-red' : 'badge-green'))}
+      ${s.late_pos ? chip('Late', s.late_pos + ' PO' + (s.late_pos === 1 ? '' : 's') + ' past ship date', 'badge-red') : ''}
       ${chip('Top-4', (s.produce_now_top4_cs || 0) + ' cs', 'badge-yellow')}
       ${chip('Buffer watch', s.buffer_watch || 0, (s.buffer_watch ? 'badge-yellow' : 'badge-green'))}
     </div>
-    <div style="font-size:13px">Capacity: <strong>${cap.committed_cs || 0}</strong> cs (${cap.committed_pallets || 0} pallets) / ${cap.weekly_dependable_cs || 0} dependable (${cap.utilization_pct_of_dependable || 0}%) &mdash; ${escHtml(cap.note || '')}</div>
+    <div style="font-size:13px">Capacity: <strong>${cap.committed_cs || 0}</strong> cs (${cap.committed_pallets || 0} pallets) to bake / ${cap.weekly_capacity_cs || cap.weekly_max_cs || 0} cs a week at ${cap.capacity_pallets_per_day || 6} pallets/day (${cap.utilization_pct === undefined ? (cap.utilization_pct_of_dependable || 0) : (cap.utilization_pct || 0)}% of one week) &mdash; ${escHtml(cap.note || '')}</div>
     <div style="font-size:13px;margin-top:4px">Build-ahead spare: <strong>${ba.spare_capacity_pallets_max || 0}</strong> pallets (within ${ba.freezer_pallet_cap || '—'}-pallet freezer).</div>
     ${g.toast_note ? `<div style="font-size:13px;margin-top:6px;color:var(--accent)">&#128200; ${escHtml(g.toast_note)}</div>` : ''}
   </div>`;
@@ -4788,8 +5277,8 @@ async function loadProductionGuide() {
         <td>${distributorBadge(r.distributor)}</td>
         <td>${escHtml(r.warehouse)}${r.transfer_group ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td>
         <td style="text-align:right;font-weight:600">${Number(r.total_cs || 0).toFixed(0)}</td>
-        <td style="white-space:nowrap">${r.produce_by || '<span style="color:var(--accent)">ASAP</span>'}</td>
-        <td><span class="badge badge-gray" style="font-size:10px">${escHtml(r.status)}</span></td>
+        <td style="white-space:nowrap">${r.produce_by ? escHtml(r.produce_by) : '<span style="color:var(--accent)">ASAP</span>'}${r.late ? ` <span class="badge badge-red" style="font-size:10px" title="Its ship date has passed and the production sheets do not show it fully baked, nor does freight/Lineage show it picked up">LATE ${r.late_days} day${r.late_days === 1 ? '' : 's'}</span>` : ''}</td>
+        <td><span class="badge badge-gray" style="font-size:10px">${escHtml(r.late ? 'not shipped' : r.status)}</span>${r.baked_cs ? ` <span style="color:var(--muted);font-size:11px">${Number(r.baked_cs).toFixed(0)} of ${Number(r.ordered_cs).toFixed(0)} baked</span>` : ''}</td>
       </tr>`).join('')
     }</tbody></table></div>` : '<div style="color:var(--muted);padding:8px">No open POs to bake &mdash; production queue is clear.</div>';
   const bake = g.bake_by_variety || [];
@@ -4800,9 +5289,9 @@ async function loadProductionGuide() {
     }</tbody></table></div>` : '';
   const bw = g.buffer_watch || [];
   const bwTbl = bw.length ? `<div class="card" style="margin-bottom:16px">
-    <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge badge-yellow" style="font-size:10px">BUFFER WATCH</span> <strong>${bw.length}</strong> depleting with no open PO</div>
-    <table class="table"><thead><tr><th>Dist</th><th>Unit</th><th>Variety</th><th style="text-align:right">On-hand</th><th style="text-align:right">Cover</th></tr></thead><tbody>${
-      bw.map(r => `<tr><td>${distributorBadge(r.distributor)}</td><td>${escHtml(r.unit)}${r.is_pool ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td><td>${escHtml(r.variety)}${r.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td><td style="text-align:right">${r.on_hand}</td><td style="text-align:right">${r.cover_days}d</td></tr>`).join('')
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border)"><span class="badge badge-yellow" style="font-size:10px">BUFFER WATCH</span> <strong>${bw.length}</strong> running down with nothing (or not enough) on order to cover it</div>
+    <table class="table"><thead><tr><th>Dist</th><th>Unit</th><th>Variety</th><th style="text-align:right">On-hand</th><th style="text-align:right">Cover</th><th>Why</th></tr></thead><tbody>${
+      bw.map(r => `<tr${r.confidence === 'low' ? ' class="dim-stale"' : ''}><td>${distributorBadge(r.distributor)}</td><td>${escHtml(r.unit)}${r.is_pool ? ' <span class="badge badge-cheney" style="font-size:10px">pool</span>' : ''}</td><td>${escHtml(r.variety)}${r.top4 ? ' <span class="badge badge-yellow" style="font-size:10px">top-4</span>' : ''}</td><td style="text-align:right">${r.on_hand}</td><td style="text-align:right">${r.cover_days}d</td><td style="font-size:12px">${r.open_po_cs ? escHtml(`Open PO of ${r.open_po_cs} cs won't cover it by ${formatDate(r.cover_floor_date)}`) : 'No open PO'}${r.confidence === 'low' ? ' <span class="badge badge-red" style="font-size:10px" title="The usage figure for this warehouse is more than 14 days old">old usage — check data first</span>' : ''}</td></tr>`).join('')
     }</tbody></table></div>` : '';
   body.innerHTML = qTbl + bakeTbl + bwTbl;
 }
@@ -4945,7 +5434,7 @@ async function loadActivity() {
       api('/api/activity/flow-check').catch(() => null),
     ]);
   } catch (e) {
-    if (info) info.textContent = 'Could not load the activity log: ' + String(e);
+    if (info) info.textContent = 'Could not load the activity log: ' + errText(e);
     return;
   }
   activityData = data || { events: [] };
@@ -5123,7 +5612,7 @@ function renderWarehouseInsightChips(warehouse) {
   if (rw && (rw.short_count || rw.order_now)) {
     const label = rw.short_count
       ? `${rw.short_count} SKU${rw.short_count === 1 ? '' : 's'} run short`
-      : `Order ${rw.order_now.pallets} pallets`;
+      : (rw.check_data_first ? 'Check data first' : `Order ${rw.order_now.pallets} pallets`);
     h += ` <span class="wh-fresh ${rw.short_count ? 'wh-fresh-red' : ''}" style="${rw.short_count ? '' : 'background:rgba(5,23,71,.08);color:var(--accent);'}cursor:pointer" title="See Suggested Orders on the Production Planner" onclick="openPlanner()">&#128230; ${escHtml(label)}</span>`;
   }
   return h;
@@ -5215,11 +5704,17 @@ async function loadOrderPlan() {
   });
   let r;
   try { r = await api('/api/planning/plan?basis=' + encodeURIComponent(basis)); }
-  catch (e) { r = null; }
-  if (!r || !r.ok) {
-    const el = document.getElementById('plan-load');
-    if (el) el.innerHTML = '<div style="color:var(--red)">Plan unavailable.</div>';
-    return;
+  catch (e) {
+    if (e && e.silent) throw e;
+    // Put the last good plan back (if there is one) and say it is old,
+    // rather than leaving four "Loading…" boxes or a bare "unavailable".
+    if (_planData) { renderPlanLoad(_planData); renderPlanSchedule(_planData); renderPlanOrders(_planData); renderPlanCompare(_planData); }
+    else ['plan-schedule', 'plan-orders', 'plan-compare'].forEach(id => { const x = document.getElementById(id); if (x) x.innerHTML = ''; });
+    if (!_planData) {
+      const el = document.getElementById('plan-load');
+      if (el) el.innerHTML = '<div style="color:var(--red);padding:6px 0">The order plan could not be loaded: ' + escHtml(errText(e)) + '</div>';
+    }
+    throw e;
   }
   _planData = r;
   const note = document.getElementById('plan-basis-note');
@@ -5304,19 +5799,35 @@ function renderPlanOrders(r) {
   const O = r.orders || {};
   const whs = O.warehouses || [];
   const p = O.params || {};
-  const nowCs = whs.reduce((a, w) => a + (w.order_now ? w.order_now.total_cs : 0), 0);
+  // Suggestions standing on old data are counted apart: they are a prompt
+  // to check the DC's report, not an order to place.
+  const nowCs = whs.reduce((a, w) => a + (w.order_now && !w.check_data_first ? w.order_now.total_cs : 0), 0);
+  const checkN = whs.filter(w => w.check_data_first).length;
   const shorts = whs.reduce((a, w) => a + (w.short_count || 0), 0);
-  if (sub) sub.textContent = `${_palTxt(nowCs)} pallets suggested now` + (shorts ? ` · ${shorts} SKU${shorts === 1 ? '' : 's'} run short before a new PO could land` : '');
+  if (sub) sub.textContent = `${_palTxt(nowCs)} pallets suggested now`
+    + (checkN ? ` · ${checkN} warehouse${checkN === 1 ? '' : 's'} need a data check first` : '')
+    + (shorts ? ` · ${shorts} SKU${shorts === 1 ? '' : 's'} run short before a new PO could land` : '');
+  const seas = (O.seasonal && O.seasonal.configured) || [];
+  const seasTxt = seas.length
+    ? ' Seasonal uplift: ' + seas.map(x => `${x.label} ×${x.factor} for ${x.from.replace('-', '/')}–${x.to.replace('-', '/')}`).join('; ') + ' (applied to the usage on those dates).'
+    : '';
+  const lim = O.data_age_limits || {};
   const excl = O.excluded_varieties || [];
-  el.innerHTML = `<div class="ins-note info" style="margin:8px 12px">Lead time ${p.lead_days || 30} days. A DC orders when any SKU&rsquo;s on-hand + on-order drops below ${p.lead_days || 30} days + safety (${p.safety_days_top4 || 14} d top-4, ${p.safety_days_other || 10} d others) of usage; it orders every SKU back up to that + a ${p.review_days || 7}-day cycle, in 8-cs layers mixed on pallets, padded to its PO minimum (${p.min_po_pallets_default || 2} pallets; 6 at Riviera Beach, La Mirada, Ocala, US Foods Chicago, Zebulon). ${excl.length ? 'Not planned: ' + escHtml(excl.join(', ')) + ' (LTO).' : ''}</div>` +
+  el.innerHTML = `<div class="ins-note info" style="margin:8px 12px">Lead time ${p.lead_days || 30} days. A DC orders when any SKU&rsquo;s on-hand + on-order drops below ${p.lead_days || 30} days + safety (${p.safety_days_top4 || 14} d top-4, ${p.safety_days_other || 10} d others) of usage; it orders every SKU back up to that + a ${p.review_days || 7}-day cycle, in 8-cs layers mixed on pallets, padded to its PO minimum (${p.min_po_pallets_default || 2} pallets; 6 at Riviera Beach, La Mirada, Ocala, US Foods Chicago, Zebulon). ${excl.length ? 'Not planned: ' + escHtml(excl.join(', ')) + ' (LTO).' : ''}${escHtml(seasTxt)} A suggestion is greyed out as &ldquo;check data first&rdquo; when the warehouse&rsquo;s count is more than ${lim.count_max_days || 10} days old or its usage figure more than ${lim.usage_max_days || 21}.</div>` +
   whs.map((w, idx) => {
     const id = 'plan-wh-' + idx;
     const o = w.order_now;
+    const stale = !!w.check_data_first;
+    const seasNote = (o && o.seasonal_note) ? ` <span class="badge badge-yellow" style="font-size:10px" title="Seasonal uplift from the planning settings">${escHtml(o.seasonal_note)}</span>` : '';
     const head = o
-      ? `<span class="badge badge-blue">order now: ${o.pallets} pallets (${o.total_cs} cs)</span>` + (o.padded_cs ? ` <span style="color:var(--muted);font-size:12px">needs ${o.needed_cs} cs, padded +${o.padded_cs} to the ${o.min_pallets}-pallet minimum</span>` : '')
+      ? (stale
+          ? `<span class="badge badge-gray dim-stale" title="${escHtml((w.data_stale_reasons || []).join('; '))}">check data first: ${o.pallets} pallets (${o.total_cs} cs) on old numbers</span>`
+          : `<span class="badge badge-blue">order now: ${o.pallets} pallets (${o.total_cs} cs)</span>`)
+        + (o.padded_cs ? ` <span style="color:var(--muted);font-size:12px">needs ${o.needed_cs} cs, padded +${o.padded_cs} to the ${o.min_pallets}-pallet minimum</span>` : '')
+        + seasNote
       : (w.next_order_date ? `<span style="color:var(--muted);font-size:12px">next PO ~${_wkLabel(w.next_order_date)}</span>` : '<span style="color:var(--muted);font-size:12px">no PO needed in the next 8 weeks</span>');
     const proj = (w.projected_orders || []).map(x => `<tr>
-        <td>${x.now ? '<strong>now</strong>' : _wkLabel(x.order_date)}</td><td style="text-align:right">${x.pallets}</td>
+        <td>${x.now ? '<strong>now</strong>' : _wkLabel(x.order_date)}${x.seasonal_note ? ` <span title="${escHtml(x.seasonal_note)}" style="cursor:help;color:#B07F0E">&#9650;</span>` : ''}</td><td style="text-align:right">${x.pallets}</td>
         <td style="text-align:right">${x.total_cs}</td><td>${_wkLabel(x.bake_by)}</td><td>${_wkLabel(x.ship_date)}</td><td>${_wkLabel(x.arrival_date)}</td>
         <td style="font-size:11.5px;color:var(--muted)">${x.lines.map(l => escHtml(l.variety) + ' ' + l.qty).join(' · ')}</td></tr>`).join('');
     return `<div style="border-top:1px solid var(--border)">
@@ -5325,12 +5836,13 @@ function renderPlanOrders(r) {
         <span style="font-family:var(--font-display);font-weight:700;font-size:18px;color:var(--accent)">${escHtml(w.warehouse)}</span>
         ${w.short_count ? `<span class="badge badge-red">${w.short_count} run short</span>` : ''}
         ${head}
+        ${dataAgeBadge(w)}
         <span style="color:var(--muted);font-size:12px">· ${_actNum(w.weekly_usage)} cs/wk · min ${w.min_pallets} pallets</span>
       </div>
       <div id="${id}" style="display:none;padding:0 16px 12px">
         <div style="overflow-x:auto"><table class="ins-table">
           <thead><tr><th>Variety</th><th style="text-align:right">Theoretical</th><th style="text-align:right">Usage /wk</th><th>On order</th>
-          <th style="text-align:right">Cover</th><th>Runs out</th><th style="text-align:right">Order now</th></tr></thead>
+          <th style="text-align:right">Cover</th><th>Runs out</th><th style="text-align:right">${stale ? 'Check data first' : 'Order now'}</th></tr></thead>
           <tbody>${(w.lines || []).map(l => `<tr>
             <td style="font-weight:600">${escHtml(l.variety)}${l.short ? ' <span class="badge badge-red" style="font-size:10px" title="Runs out before a PO placed today could land">short</span>' : ''}</td>
             <td style="text-align:right">${_actNum(l.theoretical)}</td>
@@ -5338,7 +5850,7 @@ function renderPlanOrders(r) {
             <td>${l.on_order ? `${_actNum(l.on_order)} cs <span style="color:var(--muted);font-size:11px">next ${_wkLabel(l.next_arrival)}</span>` : '<span style="color:var(--muted)">none</span>'}</td>
             <td style="text-align:right">${l.weeks_cover === null ? '&mdash;' : l.weeks_cover + ' wk'}</td>
             <td style="${l.short ? 'color:var(--red);font-weight:600' : ''}">${l.stockout_date ? _wkLabel(l.stockout_date) : '<span style="color:var(--muted)">&mdash;</span>'}</td>
-            <td style="text-align:right;font-weight:700">${l.suggest_cs ? l.suggest_cs + ' cs' : '<span style="color:var(--muted);font-weight:400">&mdash;</span>'}</td></tr>`).join('')}</tbody>
+            <td style="text-align:right;font-weight:700"${stale ? ' class="dim-stale"' : ''}>${l.suggest_cs ? l.suggest_cs + ' cs' : '<span style="color:var(--muted);font-weight:400">&mdash;</span>'}</td></tr>`).join('')}</tbody>
         </table></div>
         ${proj ? `<div style="font-size:12px;font-weight:600;margin:10px 0 4px">Projected POs (next 8 weeks)</div>
         <div style="overflow-x:auto"><table class="ins-table"><thead><tr><th>Order</th><th style="text-align:right">Pallets</th><th style="text-align:right">cs</th><th>Bake by</th><th>Ships</th><th>Arrives</th><th>Mix</th></tr></thead><tbody>${proj}</tbody></table></div>` : ''}
