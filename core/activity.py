@@ -75,6 +75,11 @@ LABELS = {
     "production.api_admin_production_renormalize_varieties": "Production varieties renormalized",
     "production.api_admin_production_repair": "Production repaired",
     "production.api_production_delete": "Production record deleted",
+    "ops.api_backup_run": "Backup taken",
+    "ops.api_backups_restore": "Backup restored",
+    "ops.api_backups_upload": "Backup archive uploaded",
+    "ops.api_backup_offsite_ack": "Off-site backup confirmed",
+    "ops.api_watchdog_run": "Watchdog check",
     "webhooks.api_graph_subscriptions": "Graph subscription created",
     "webhooks.api_graph_subscriptions_renew": "Graph subscriptions renewed",
 }

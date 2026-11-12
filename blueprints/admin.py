@@ -545,10 +545,20 @@ def api_seed():
 
 
 def _snapshot_data_files(tag: str) -> dict:
-    """Copy inventory.json + usage.json to data/backups/<name>-<ts>-<tag>.json
-    before a destructive admin action. Returns {file: snapshot path}."""
+    """Snapshot the data before a destructive admin action. No snapshot, no
+    action: raises when it could not be taken.
+
+    Takes a full backup of every data file (integrations/backups.py; "pre-*"
+    snapshots are kept 30 days) and, as before, plain copies of
+    inventory.json + usage.json at data/backups/<name>-<ts>-<tag>.json, which
+    can be opened without unpacking anything. Returns {file: copy path} plus
+    "backup": the full snapshot's name."""
     import shutil
     import inventory_tracker as it
+    from integrations import backups
+    res = backups.make_snapshot(tag, record_feed=False)
+    if not res.get("ok") and res.get("skipped") != "empty":
+        raise RuntimeError(res.get("error") or "snapshot failed")
     bdir = it.DATA_DIR / "backups"
     bdir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -558,6 +568,8 @@ def _snapshot_data_files(tag: str) -> dict:
             dst = bdir / f"{src.stem}-{ts}-{tag}.json"
             shutil.copyfile(src, dst)
             out[src.name] = str(dst)
+    if res.get("ok"):
+        out["backup"] = res["name"]
     return out
 
 
