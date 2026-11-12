@@ -64,11 +64,36 @@ def save_tombstones(data: dict) -> None:
     _it()._write_json(_tombstone_path(), data)
 
 
+#: An unreadable sheet is retried on this many DIFFERENT days before its
+#: message id counts as "seen". It used to be seen after the first failure,
+#: so one bad parse (or a parser bug fixed a day later) hid the sheet forever.
+STUB_RETRY_DAYS = 3
+
+
+def is_stub(r: dict) -> bool:
+    return bool(r.get("parse_error")) and not r.get("lines")
+
+
+def stub_attempt_days(r: dict) -> list:
+    days = [d for d in (r.get("attempt_days") or []) if d]
+    if not days:
+        d = (r.get("ingested_at") or "")[:10]
+        days = [d] if d else []
+    return sorted(set(days))
+
+
+def stub_retryable(r: dict) -> bool:
+    return is_stub(r) and len(stub_attempt_days(r)) < STUB_RETRY_DAYS
+
+
 def seen_message_ids(records: list, tombstones: dict | None = None) -> set:
     """Every message id the store already accounts for: live records, the
-    emails they replaced, and deleted (tombstoned) ones."""
+    emails they replaced, and deleted (tombstoned) ones. A parse-error stub
+    is NOT seen until it has been tried on STUB_RETRY_DAYS different days."""
     seen = set()
     for r in records or []:
+        if stub_retryable(r):
+            continue
         if r.get("source_message_id"):
             seen.add(r["source_message_id"])
         for m in r.get("replaced") or []:
@@ -101,6 +126,7 @@ def record_from_sheet(sheet, *, message_id: str, subject: str = "",
             "source_message_id": message_id, "source_subject": subject,
             "source_sender": sender, "received_at": received_at or now_iso,
             "ingested_at": now_iso, "parse_error": sheet.error,
+            "attempt_days": [now_iso[:10]], "parse_attempts": 1,
         }
     return {
         "production_date":    sheet.production_date,
@@ -122,6 +148,11 @@ def record_from_sheet(sheet, *, message_id: str, subject: str = "",
         "received_at":        received_at or now_iso,
         "ingested_at":        now_iso,
         "parse_error":        "",
+        # Why this sheet "needs a look" (still stored and counted): header
+        # total != line sum, unmapped variety, blank distributor.
+        "warning":            getattr(sheet, "warning", "") or "",
+        "header_total_cases": int(getattr(sheet, "header_total_cases", 0) or 0),
+        "line_total_cases":   int(getattr(sheet, "line_total_cases", 0) or 0),
         # Raw PO sources, so resolve_po (and a later repair) can re-judge.
         "po_body":            getattr(sheet, "po_body", "") or "",
         "po_subject":         getattr(sheet, "po_subject", "") or "",
@@ -253,6 +284,19 @@ def ingest_production_record(records: list, record: dict, *, refresh: bool = Fal
     if mid and mid in (tombstones or {}):
         return "tombstoned", None
     for i, r in enumerate(records):
+        if mid and r.get("source_message_id") == mid and is_stub(r):
+            # A retry of a sheet that could not be read before.
+            if record.get("lines"):
+                record["received_at"] = r.get("received_at") or record.get("received_at")
+                records[i] = record
+                return "ingested", record           # readable now
+            days = sorted(set(stub_attempt_days(r))
+                          | {(record.get("ingested_at") or "")[:10]} - {""})
+            r["attempt_days"] = days
+            r["parse_attempts"] = int(r.get("parse_attempts") or 1) + 1
+            r["parse_error"] = record.get("parse_error") or r.get("parse_error")
+            r["last_attempt_at"] = record.get("ingested_at") or ""
+            return "parse_error", r
         if mid and r.get("source_message_id") == mid:
             if refresh and record.get("lines"):
                 record["received_at"] = r.get("received_at") or record.get("received_at")
@@ -286,11 +330,19 @@ def ingest_production_record(records: list, record: dict, *, refresh: bool = Fal
     return "ingested", record
 
 
-def store_parsed(items: list, *, refresh: bool = False, ledger_index: dict | None = None):
+def store_parsed(items: list, *, refresh: bool = False, ledger_index: dict | None = None,
+                 source: str = "production-webhook", pdf_counts: dict | None = None):
     """Persist a batch of parsed records under data_lock (no network inside).
 
     ``items`` is a list of (record, body_po, subject_po). Returns a list of
     (status, record) in the same order.
+
+    ``source`` names the caller for the shared feed-health record. The Graph
+    webhook (integrations/graph_subscriptions.py) calls this without one, so
+    the default IS the webhook; the catch-up scan reports its own run and
+    passes source="" to skip the per-batch record.
+    ``pdf_counts`` {message id: number of PDFs on that email} is remembered
+    on the first PDF's record so the scan need not re-list attachments.
     """
     it = _it()
     if ledger_index is None:
@@ -312,9 +364,64 @@ def store_parsed(items: list, *, refresh: bool = False, ledger_index: dict | Non
             if status in ("refreshed", "replaced", "superseded", "parse_error", "ingested"):
                 changed = True
             out.append((status, stored))
+        for mid, n in (pdf_counts or {}).items():
+            for r in records:
+                if r.get("source_message_id") == mid and r.get("pdf_count") != n:
+                    r["pdf_count"] = n
+                    changed = True
         if changed:
             it.save_production(records)
+        newest = newest_production_date(records)
+    _report_health(out, source, newest)
     return out
+
+
+def newest_production_date(records: list) -> str:
+    """Latest production_date among real (parsed) records, '' if none."""
+    best = ""
+    for r in records or []:
+        d = (r.get("production_date") or "")[:10]
+        if d and r.get("lines") and len(d) == 10 and d[4] == "-" and d > best:
+            best = d
+    return best
+
+
+def sheet_issue_key(message_id: str) -> str:
+    return "production-sheet:" + (message_id or "?")[:120]
+
+
+def _report_health(results: list, source: str, newest: str) -> None:
+    """Feed-health side effects of a store: one issue per sheet that needs a
+    look (cleared when a later copy reads clean), and -- for the webhook --
+    a "sheet arrived" record. Never raises."""
+    try:
+        from core import feed_health
+        ingested = 0
+        for status, rec in results:
+            if not rec or status in ("duplicate", "tombstoned", "superseded"):
+                continue
+            mid = rec.get("source_message_id") or ""
+            subj = (rec.get("source_subject") or "Daily Production sheet")[:80]
+            if status == "parse_error":
+                feed_health.raise_issue(
+                    sheet_issue_key(mid),
+                    f"Could not read production sheet \"{subj}\": "
+                    f"{(rec.get('parse_error') or 'unreadable')[:160]}", "error")
+                continue
+            ingested += 1
+            if rec.get("warning"):
+                feed_health.raise_issue(
+                    sheet_issue_key(mid),
+                    f"Production sheet \"{subj}\" needs a look: {rec['warning'][:300]}",
+                    "warn")
+            else:
+                feed_health.clear_issue(sheet_issue_key(mid))
+        if source and results:
+            feed_health.record(source, True,
+                               f"{ingested} sheet(s) stored, {len(results) - ingested} not stored",
+                               ingested=ingested, newest_production_date=newest)
+    except Exception:  # noqa: BLE001 -- health must never break an ingest
+        pass
 
 
 # ---------------------------------------------------------------------------
