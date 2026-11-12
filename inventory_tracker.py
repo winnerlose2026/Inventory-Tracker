@@ -1865,32 +1865,69 @@ def migrate_units_to_case(inv: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Manual changes (the Add / Edit / Use / Restock / Delete buttons, the CLI)
+# ---------------------------------------------------------------------------
+# Each helper RETURNS what happened: {"ok": True, ...} or
+# {"ok": False, "code": "not_found" | "exists" | "insufficient" | "changed" |
+#  "invalid", "error": "<plain sentence>"}. They used to print a message and
+# return None either way, so the API answered {"ok": true} for a Use larger
+# than the stock, a Restock of a SKU that does not exist, a duplicate Add --
+# and the page said "Done" for a change that never happened.
+
+def _fail(code: str, error: str, **extra) -> dict:
+    print(f"  {error}")
+    return {"ok": False, "code": code, "error": error, **extra}
+
+
+def _finite(value) -> bool:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return False
+    return f == f and f not in (float("inf"), float("-inf"))
+
+
+def _usage_row_for_request(usage: list, request_id: str):
+    """The ledger row a previous call with this request_id wrote, if any."""
+    if not request_id:
+        return None
+    for row in reversed(usage):
+        if row.get("request_id") == request_id:
+            return row
+    return None
+
+
 def add_item(name: str, quantity: float, unit: str, category: str = "general",
              low_stock_threshold: float = 5.0, price: float = 0.0,
              distributor: str = "", warehouse: str = "",
              case_cost: float = 0.0, case_size: int = 0,
              weekly_usage: float = 0.0):
-    inv = load_inventory()
-    key = name.lower().strip()
-    if key in inv:
-        print(f"  Item '{name}' already exists. Use 'update' to modify it.")
-        return
-    inv[key] = {
-        "name": name,
-        "quantity": quantity,
-        "unit": unit,
-        "category": category,
-        "low_stock_threshold": low_stock_threshold,
-        "price": price,
-        "distributor": distributor,
-        "warehouse": warehouse,
-        "case_cost": case_cost,
-        "case_size": case_size,
-        "weekly_usage": weekly_usage,
-        "added": datetime.now().isoformat(),
-    }
-    save_inventory(inv)
+    with data_lock():
+        inv = load_inventory()
+        key = name.lower().strip()
+        if not key:
+            return _fail("invalid", "A SKU needs a name.")
+        if key in inv:
+            return _fail("exists",
+                         f"Item '{name}' already exists. Use 'update' to modify it.")
+        inv[key] = {
+            "name": name,
+            "quantity": quantity,
+            "unit": unit,
+            "category": category,
+            "low_stock_threshold": low_stock_threshold,
+            "price": price,
+            "distributor": distributor,
+            "warehouse": warehouse,
+            "case_cost": case_cost,
+            "case_size": case_size,
+            "weekly_usage": weekly_usage,
+            "added": datetime.now().isoformat(),
+        }
+        save_inventory(inv)
     print(f"  Added '{name}': {quantity} {unit}")
+    return {"ok": True, "name": name, "quantity": quantity}
 
 
 def update_item(name: str, quantity: Optional[float] = None,
@@ -1902,100 +1939,162 @@ def update_item(name: str, quantity: Optional[float] = None,
                 case_cost: Optional[float] = None,
                 case_size: Optional[int] = None,
                 weekly_usage: Optional[float] = None,
-                hidden: Optional[bool] = None):
-    inv = load_inventory()
-    key = name.lower().strip()
-    if key not in inv:
-        print(f"  Item '{name}' not found.")
-        return
-    item = inv[key]
-    qty_delta_row = None
-    if quantity is not None:
-        old_qty = float(item.get("quantity") or 0)
-        if abs(float(quantity) - old_qty) >= 1e-9:
-            # A hand edit of on-hand used to leave no trace in the ledger, so
-            # nothing could tell a later re-read of the week's count report
-            # that the figure had been corrected after it -- the count won.
-            qty_delta_row = (old_qty - float(quantity))   # positive = consumed
-        item["quantity"] = quantity
-    if unit is not None:
-        item["unit"] = unit
-    if category is not None:
-        item["category"] = category
-    if low_stock_threshold is not None:
-        item["low_stock_threshold"] = low_stock_threshold
-    if price is not None:
-        item["price"] = price
-    if distributor is not None:
-        item["distributor"] = distributor
-    if warehouse is not None:
-        item["warehouse"] = warehouse
-    if case_cost is not None:
-        item["case_cost"] = case_cost
-    if case_size is not None:
-        item["case_size"] = case_size
-    if weekly_usage is not None:
-        item["weekly_usage"] = weekly_usage
-    if hidden is not None:
-        # Hidden = off the Inventory tab (a finished LTO, JD 2026-11-12). The
-        # SKU keeps ingesting counts/POs; only the display skips it.
-        if hidden:
-            item["hidden"] = True
+                hidden: Optional[bool] = None,
+                expected_updated: Optional[str] = None):
+    """Edit a SKU. Only the fields passed are touched: with ``quantity`` left
+    as None on-hand is not changed and no correction row is written.
+
+    ``expected_updated``: the item's ``updated`` stamp as the caller last saw
+    it. When given and the stored stamp differs, nothing is written and the
+    result is {"ok": False, "code": "changed", "current": <item>} -- someone
+    (or a scan) changed the SKU while the edit form was open."""
+    with data_lock():
+        inv = load_inventory()
+        key = name.lower().strip()
+        if key not in inv:
+            return _fail("not_found", f"Item '{name}' not found.")
+        item = inv[key]
+        if expected_updated is not None and \
+                str(expected_updated) != str(item.get("updated") or ""):
+            return _fail("changed",
+                         f"'{item.get('name', name)}' was changed by someone "
+                         "else while you were editing it.",
+                         current=copy.deepcopy(item))
+        qty_delta_row = None
+        if quantity is not None:
+            old_qty = float(item.get("quantity") or 0)
+            if abs(float(quantity) - old_qty) >= 1e-9:
+                # A hand edit of on-hand used to leave no trace in the ledger,
+                # so nothing could tell a later re-read of the week's count
+                # report that the figure had been corrected after it -- the
+                # count won.
+                qty_delta_row = (old_qty - float(quantity))  # positive = consumed
+            item["quantity"] = quantity
+        if unit is not None:
+            item["unit"] = unit
+        if category is not None:
+            item["category"] = category
+        if low_stock_threshold is not None:
+            item["low_stock_threshold"] = low_stock_threshold
+        if price is not None:
+            item["price"] = price
+        if distributor is not None:
+            item["distributor"] = distributor
+        if warehouse is not None:
+            item["warehouse"] = warehouse
+        if case_cost is not None:
+            item["case_cost"] = case_cost
+        if case_size is not None:
+            item["case_size"] = case_size
+        if weekly_usage is not None:
+            item["weekly_usage"] = weekly_usage
+        if hidden is not None:
+            # Hidden = off the Inventory tab (a finished LTO, JD 2026-11-12).
+            # The SKU keeps ingesting counts/POs; only the display skips it.
+            if hidden:
+                item["hidden"] = True
+            else:
+                item.pop("hidden", None)
+        item["updated"] = datetime.now().isoformat()
+        if qty_delta_row is None:
+            save_inventory(inv)
         else:
-            item.pop("hidden", None)
-    item["updated"] = datetime.now().isoformat()
-    save_inventory(inv)
-    if qty_delta_row is not None:
-        _record_usage(key, item.get("name", key), round(qty_delta_row, 4),
-                      item.get("unit", "cs"),
-                      f"Manual on-hand correction -> {float(quantity):g}",
-                      warehouse=item.get("warehouse", ""),
-                      variety=_variety_from_name(item.get("name", "")),
-                      source="manual-correction")
+            # On-hand and the correction row that explains it: one commit.
+            usage = load_usage()
+            usage.append(_usage_entry(
+                key, item.get("name", key), round(qty_delta_row, 4),
+                item.get("unit", "cs"),
+                f"Manual on-hand correction -> {float(quantity):g}",
+                warehouse=item.get("warehouse", ""),
+                variety=_variety_from_name(item.get("name", "")),
+                source="manual-correction"))
+            save_inventory_and_usage(inv, usage)
     print(f"  Updated '{name}'.")
+    return {"ok": True, "name": item.get("name", name),
+            "quantity": item.get("quantity"), "updated": item["updated"],
+            "correction": round(qty_delta_row, 4) if qty_delta_row is not None else None}
 
 
-def restock(name: str, amount: float, note: str = ""):
-    inv = load_inventory()
-    key = name.lower().strip()
-    if key not in inv:
-        print(f"  Item '{name}' not found.")
-        return
-    inv[key]["quantity"] += amount
-    inv[key]["updated"] = datetime.now().isoformat()
-    save_inventory(inv)
-    _record_usage(key, inv[key]["name"], -amount, inv[key]["unit"],
-                  note or f"Restocked +{amount}",
-                  warehouse=inv[key].get("warehouse", ""),
-                  variety=_variety_from_name(inv[key].get("name", "")),
-                  source="manual-restock")
+def restock(name: str, amount: float, note: str = "",
+            request_id: Optional[str] = None):
+    """Add ``amount`` to on-hand. ``request_id`` makes a retry harmless: a
+    second call with the same id changes nothing and returns the first
+    call's result with "duplicate": True."""
+    if not _finite(amount) or float(amount) <= 0:
+        return _fail("invalid", "The amount must be a number greater than 0.")
+    with data_lock():
+        inv = load_inventory()
+        key = name.lower().strip()
+        if key not in inv:
+            return _fail("not_found", f"Item '{name}' not found.")
+        usage = load_usage()
+        prior = _usage_row_for_request(usage, request_id or "")
+        if prior is not None:
+            return {"ok": True, "duplicate": True, "name": inv[key]["name"],
+                    "amount": -float(prior.get("amount") or 0),
+                    "quantity": prior.get("quantity_after",
+                                          inv[key].get("quantity"))}
+        inv[key]["quantity"] += amount
+        inv[key]["updated"] = datetime.now().isoformat()
+        row = _usage_entry(key, inv[key]["name"], -amount, inv[key]["unit"],
+                           note or f"Restocked +{amount}",
+                           warehouse=inv[key].get("warehouse", ""),
+                           variety=_variety_from_name(inv[key].get("name", "")),
+                           source="manual-restock")
+        row["quantity_after"] = inv[key]["quantity"]
+        if request_id:
+            row["request_id"] = request_id
+        usage.append(row)
+        save_inventory_and_usage(inv, usage)
     print(f"  Restocked '{name}' by {amount} {inv[key]['unit']}. "
           f"New total: {inv[key]['quantity']}")
+    return {"ok": True, "name": inv[key]["name"], "amount": amount,
+            "quantity": inv[key]["quantity"]}
 
 
-def record_usage(name: str, amount: float, note: str = ""):
-    inv = load_inventory()
-    key = name.lower().strip()
-    if key not in inv:
-        print(f"  Item '{name}' not found.")
-        return
-    item = inv[key]
-    if item["quantity"] < amount:
-        print(f"  Warning: only {item['quantity']} {item['unit']} available "
-              f"(tried to use {amount}).")
-        return
-    item["quantity"] -= amount
-    item["updated"] = datetime.now().isoformat()
-    save_inventory(inv)
-    _record_usage(key, item["name"], amount, item["unit"], note,
-                  warehouse=item.get("warehouse", ""),
-                  variety=_variety_from_name(item.get("name", "")),
-                  source="manual-use")
+def record_usage(name: str, amount: float, note: str = "",
+                 request_id: Optional[str] = None):
+    """Take ``amount`` off on-hand. Refused (nothing written) when the SKU
+    does not exist or holds less than ``amount``. ``request_id`` as restock."""
+    if not _finite(amount) or float(amount) <= 0:
+        return _fail("invalid", "The amount must be a number greater than 0.")
+    with data_lock():
+        inv = load_inventory()
+        key = name.lower().strip()
+        if key not in inv:
+            return _fail("not_found", f"Item '{name}' not found.")
+        item = inv[key]
+        usage = load_usage()
+        prior = _usage_row_for_request(usage, request_id or "")
+        if prior is not None:
+            return {"ok": True, "duplicate": True, "name": item["name"],
+                    "amount": float(prior.get("amount") or 0),
+                    "quantity": prior.get("quantity_after", item.get("quantity"))}
+        if item["quantity"] < amount:
+            return _fail(
+                "insufficient",
+                f"Only {item['quantity']:g} {item['unit']} of '{item['name']}' "
+                f"on hand (tried to use {amount:g}).",
+                quantity=item["quantity"])
+        item["quantity"] -= amount
+        item["updated"] = datetime.now().isoformat()
+        row = _usage_entry(key, item["name"], amount, item["unit"], note,
+                           warehouse=item.get("warehouse", ""),
+                           variety=_variety_from_name(item.get("name", "")),
+                           source="manual-use")
+        row["quantity_after"] = item["quantity"]
+        if request_id:
+            row["request_id"] = request_id
+        usage.append(row)
+        save_inventory_and_usage(inv, usage)
     print(f"  Used {amount} {item['unit']} of '{name}'. "
           f"Remaining: {item['quantity']}")
-    if item["quantity"] <= float(item.get("low_stock_threshold") or 0):
+    low = item["quantity"] <= float(item.get("low_stock_threshold") or 0)
+    if low:
         print(f"  *** LOW STOCK ALERT: '{name}' is at or below threshold "
               f"({item.get('low_stock_threshold', 0)} {item['unit']}) ***")
+    return {"ok": True, "name": item["name"], "amount": amount,
+            "quantity": item["quantity"], "low_stock": low}
 
 
 def _variety_from_name(name: str) -> str:
@@ -2023,6 +2122,17 @@ def _record_usage(key: str, display_name: str, amount: float,
     on the inventory item; see :func:`compute_lot_fifo_state`.
     """
     usage = load_usage()
+    usage.append(_usage_entry(key, display_name, amount, unit, note,
+                              warehouse=warehouse, variety=variety,
+                              source=source))
+    save_usage(usage)
+
+
+def _usage_entry(key: str, display_name: str, amount: float,
+                 unit: str, note: str,
+                 warehouse: str = "", variety: str = "",
+                 source: str = "") -> dict:
+    """Build (do not save) one ledger row -- see _record_usage."""
     entry = {
         "item_key": key,
         "item_name": display_name,
@@ -2039,8 +2149,7 @@ def _record_usage(key: str, display_name: str, amount: float,
         # Lets sync_inventory._movement_after_count keep a manual Use /
         # Restock when the week's count report is re-read.
         entry["source"] = source
-    usage.append(entry)
-    save_usage(usage)
+    return entry
 
 
 _REVERSE_PO_ROW_SOURCES = ("on_order_rollover", "on_order_absorbed",
@@ -2362,15 +2471,18 @@ def compute_lot_fifo_state(warehouse: str, variety: str,
 
 
 def remove_item(name: str):
-    inv = load_inventory()
-    key = name.lower().strip()
-    if key not in inv:
-        print(f"  Item '{name}' not found.")
-        return
-    del inv[key]
-    # Deleting a SKU is a deliberate shrink.
-    save_inventory(inv, allow_shrink=True)
+    with data_lock():
+        inv = load_inventory()
+        key = name.lower().strip()
+        if key not in inv:
+            return _fail("not_found", f"Item '{name}' not found.")
+        removed = inv[key]
+        del inv[key]
+        # Deleting a SKU is a deliberate shrink.
+        save_inventory(inv, allow_shrink=True)
     print(f"  Removed '{name}' from inventory.")
+    return {"ok": True, "name": removed.get("name", name),
+            "quantity": removed.get("quantity")}
 
 
 # ---------------------------------------------------------------------------

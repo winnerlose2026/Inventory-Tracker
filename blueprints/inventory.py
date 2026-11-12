@@ -155,45 +155,128 @@ def api_inventory():
     return jsonify([_enrich_on_order(dict(v)) for v in inv.values()])
 
 
+# What a helper's failure code means over HTTP.
+_STATUS = {"not_found": 404, "exists": 409, "insufficient": 409,
+           "changed": 409, "invalid": 400}
+
+
+class _BadInput(ValueError):
+    pass
+
+
+def _body() -> dict:
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        raise _BadInput("send a JSON object")
+    return d
+
+
+def _num(d: dict, field: str, *, required: bool = False, default=None,
+         minimum: float = 0.0, integer: bool = False):
+    """A finite number >= minimum from the body, or `default` when the field
+    is absent. NaN, Infinity, negatives and non-numbers are a 400: JSON.parse
+    in Python accepts NaN/Infinity, and one of those in inventory.json made
+    every page unreadable in the browser."""
+    if field not in d or d[field] is None or d[field] == "":
+        if required:
+            raise _BadInput(f"{field} is required")
+        return default
+    raw = d[field]
+    if isinstance(raw, bool):
+        raise _BadInput(f"{field} must be a number")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        raise _BadInput(f"{field} must be a number") from None
+    if val != val or val in (float("inf"), float("-inf")):
+        raise _BadInput(f"{field} must be a real number")
+    if val < minimum:
+        raise _BadInput(f"{field} cannot be less than {minimum:g}")
+    return int(val) if integer else val
+
+
+def _text(d: dict, field: str, *, required: bool = False, default=None):
+    if field not in d or d[field] is None:
+        if required:
+            raise _BadInput(f"{field} is required")
+        return default
+    val = str(d[field]).strip()
+    if required and not val:
+        raise _BadInput(f"{field} is required")
+    return val
+
+
+def _answer(result):
+    """Helper result -> HTTP: 200 {"ok": true, ...} or 4xx {"ok": false,
+    "error": ...}."""
+    result = result if isinstance(result, dict) else {"ok": True}
+    if result.get("ok"):
+        return jsonify(result)
+    return jsonify(result), _STATUS.get(result.get("code"), 400)
+
+
+def _bad(exc):
+    return jsonify({"ok": False, "code": "invalid", "error": str(exc)}), 400
+
+
 @inventory_bp.route("/api/inventory", methods=["POST"])
 @with_data_lock
 def api_add():
-    d = request.json
-    add_item(
-        name=d["name"],
-        quantity=float(d["quantity"]),
-        unit=d["unit"],
-        category=d.get("category", "general"),
-        low_stock_threshold=float(d.get("low_stock_threshold", 5)),
-        price=float(d.get("price", 0)),
-        distributor=d.get("distributor", ""),
-        warehouse=d.get("warehouse", ""),
-        case_cost=float(d.get("case_cost", 0)),
-        case_size=int(d.get("case_size", 0) or 0),
-        weekly_usage=float(d.get("weekly_usage", 0)),
-    )
-    return jsonify({"ok": True})
+    try:
+        d = _body()
+        kwargs = dict(
+            name=_text(d, "name", required=True),
+            quantity=_num(d, "quantity", required=True),
+            unit=_text(d, "unit", required=True),
+            category=_text(d, "category", default="general") or "general",
+            low_stock_threshold=_num(d, "low_stock_threshold", default=5.0),
+            price=_num(d, "price", default=0.0),
+            distributor=_text(d, "distributor", default=""),
+            warehouse=_text(d, "warehouse", default=""),
+            case_cost=_num(d, "case_cost", default=0.0),
+            case_size=_num(d, "case_size", default=0, integer=True),
+            weekly_usage=_num(d, "weekly_usage", default=0.0),
+        )
+    except _BadInput as exc:
+        return _bad(exc)
+    return _answer(add_item(**kwargs))
 
 
 @inventory_bp.route("/api/inventory/<path:name>", methods=["PUT"])
 @with_data_lock
 def api_update(name):
-    d = request.json
-    update_item(
-        name,
-        quantity=float(d["quantity"]) if "quantity" in d else None,
-        unit=d.get("unit"),
-        category=d.get("category"),
-        low_stock_threshold=float(d["low_stock_threshold"]) if "low_stock_threshold" in d else None,
-        price=float(d["price"]) if "price" in d else None,
-        distributor=d.get("distributor"),
-        warehouse=d.get("warehouse"),
-        case_cost=float(d["case_cost"]) if "case_cost" in d else None,
-        case_size=int(d["case_size"]) if "case_size" in d else None,
-        weekly_usage=float(d["weekly_usage"]) if "weekly_usage" in d else None,
-        hidden=bool(d["hidden"]) if "hidden" in d else None,
-    )
-    return jsonify({"ok": True})
+    """Edit a SKU. Send only the fields that changed: a body without
+    `quantity` leaves on-hand alone and writes no correction row.
+
+    Optional `expected_updated`: the item's `updated` stamp as the page
+    loaded it. If the SKU has changed since -> 409 {"ok": false,
+    "error": "changed", "current": {...}} and nothing is written."""
+    try:
+        d = _body()
+        kwargs = dict(
+            quantity=_num(d, "quantity"),
+            unit=_text(d, "unit"),
+            category=_text(d, "category"),
+            low_stock_threshold=_num(d, "low_stock_threshold"),
+            price=_num(d, "price"),
+            distributor=_text(d, "distributor"),
+            warehouse=_text(d, "warehouse"),
+            case_cost=_num(d, "case_cost"),
+            case_size=_num(d, "case_size", integer=True),
+            weekly_usage=_num(d, "weekly_usage"),
+            hidden=bool(d["hidden"]) if "hidden" in d else None,
+        )
+        if "expected_updated" in d and d["expected_updated"] is not None:
+            kwargs["expected_updated"] = str(d["expected_updated"])
+    except _BadInput as exc:
+        return _bad(exc)
+    result = update_item(name, **kwargs)
+    if isinstance(result, dict) and result.get("code") == "changed":
+        cur = result.get("current") or {}
+        return jsonify({"ok": False, "code": "changed", "error": "changed",
+                        "message": result.get("error"),
+                        "current": _enrich_on_order(dict(cur))}), 409
+    return _answer(result)
 
 
 @inventory_bp.route("/api/hidden-skus")
@@ -207,24 +290,52 @@ def api_hidden_skus():
 @inventory_bp.route("/api/inventory/<path:name>", methods=["DELETE"])
 @with_data_lock
 def api_remove(name):
-    remove_item(name)
-    return jsonify({"ok": True})
+    return _answer(remove_item(name))
+
+
+def _request_id(d: dict):
+    rid = _text(d, "request_id")
+    if rid and len(rid) > 100:
+        raise _BadInput("request_id is too long")
+    return rid or None
 
 
 @inventory_bp.route("/api/use", methods=["POST"])
 @with_data_lock
 def api_use():
-    d = request.json
-    record_usage(d["name"], float(d["amount"]), d.get("note", ""))
-    return jsonify({"ok": True})
+    """Body: {name, amount (> 0), note?, request_id?}. 404 for an unknown
+    SKU, 409 when there is less than `amount` on hand. A repeat with the same
+    request_id changes nothing and returns the first result
+    ("duplicate": true), so a double-click or a retried request is safe."""
+    try:
+        d = _body()
+        name = _text(d, "name", required=True)
+        amount = _num(d, "amount", required=True)
+        if amount <= 0:
+            raise _BadInput("amount must be greater than 0")
+        note = _text(d, "note", default="") or ""
+        rid = _request_id(d)
+    except _BadInput as exc:
+        return _bad(exc)
+    return _answer(record_usage(name, amount, note, request_id=rid))
 
 
 @inventory_bp.route("/api/restock", methods=["POST"])
 @with_data_lock
 def api_restock():
-    d = request.json
-    restock(d["name"], float(d["amount"]), d.get("note", ""))
-    return jsonify({"ok": True})
+    """Body: {name, amount (> 0), note?, request_id?}. 404 for an unknown
+    SKU. request_id as /api/use."""
+    try:
+        d = _body()
+        name = _text(d, "name", required=True)
+        amount = _num(d, "amount", required=True)
+        if amount <= 0:
+            raise _BadInput("amount must be greater than 0")
+        note = _text(d, "note", default="") or ""
+        rid = _request_id(d)
+    except _BadInput as exc:
+        return _bad(exc)
+    return _answer(restock(name, amount, note, request_id=rid))
 
 
 @inventory_bp.route("/api/usage")
