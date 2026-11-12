@@ -553,12 +553,16 @@ def api_delivery_sync_threads():
                         **_safe_sync_age()}), 500
 
 
-def _record_sync(ok: bool, detail: str, **extra) -> None:
+def _record_feed(feed: str, ok: bool, detail: str, **extra) -> None:
     try:
         from core import feed_health
-        feed_health.record("delivery-sync", ok, detail, **extra)
-    except Exception:  # noqa: BLE001 -- health must never break the sync
+        feed_health.record(feed, ok, detail, **extra)
+    except Exception:  # noqa: BLE001 -- health must never break the job
         pass
+
+
+def _record_sync(ok: bool, detail: str, **extra) -> None:
+    _record_feed("delivery-sync", ok, detail, **extra)
 
 
 def _safe_sync_age() -> dict:
@@ -1198,10 +1202,14 @@ def api_delivery_send_followups():
             cache = load_po_delivery_threads() or {}
             synced = parse_dt(cache.get("synced_at") or "")
             if synced is None or now - synced > SYNC_FRESH_FOR:
+                _record_feed("lineage-followups", False,
+                             "refused: threads not synced recently")
                 return jsonify({"ok": False, "error": "threads not synced in the last "
                                 f"{int(SYNC_FRESH_FOR.total_seconds() // 60)} min -- "
                                 "run sync-threads first", "emails": []}), 200
             if cache.get("errors"):
+                _record_feed("lineage-followups", False,
+                             "refused: the last sync was a partial read")
                 return jsonify({"ok": False, "error": "the last sync couldn't read every "
                                 "mailbox; not following up off a partial read",
                                 "sync_errors": cache["errors"], "emails": []}), 200
@@ -1340,6 +1348,12 @@ def api_delivery_send_followups():
             out["send_state"] = "sent"
             out["sent"] = True
             emails.append(out)
+        _n_sent = sum(1 for e in emails if e.get("sent"))
+        _n_err = sum(1 for e in emails if e.get("error"))
+        if not dry_run:
+            _record_feed("lineage-followups", _n_err == 0 and not no_thread,
+                         f"sent {_n_sent}, {_n_err} failed, "
+                         f"{len(no_thread)} due with no thread", sent=_n_sent)
         return jsonify({"ok": True, "dry_run": dry_run,
                         "synced_at": cache.get("synced_at"),
                         "emails": emails,
@@ -1351,4 +1365,5 @@ def api_delivery_send_followups():
                         "due_without_thread": no_thread})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-send-followups")
+        _record_feed("lineage-followups", False, _safe_err(exc))
         return jsonify({"ok": False, "error": _safe_err(exc), "emails": []}), 200
