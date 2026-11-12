@@ -1,15 +1,37 @@
-# Render Blueprint — source of truth for the Inventory-Tracker family:
-# the bagel-inventory web service plus the 6-hour mailbox-scan cron.
+# Render Blueprint for the Inventory-Tracker family: the bagel-inventory web
+# service, the 6-hour mailbox-scan cron and the Lineage PO follow-ups cron.
 #
-# In-process daily jobs: the two lightweight daily jobs that used to be their
-# own cron services — the forecast decrement (was 05:05 UTC) and the Graph
-# subscription renew (was 09:00 UTC) — now run INSIDE the web service via
-# scheduler.py, which gunicorn starts once from its arbiter (see
-# gunicorn.conf.py, when_ready). Both jobs only POST an empty body to this
-# service's own idempotent endpoints, so moving them in-process removes two
-# services with no behavior change. Toggle with INPROCESS_SCHEDULER (default
-# on). The two former cron services should be deleted in the dashboard after
-# the scheduler is confirmed running (blueprint re-sync won't delete them).
+# WHAT IS DASHBOARD-MANAGED (read this before trusting the file):
+#   * These services were created by hand in the Render dashboard, NOT from
+#     this blueprint. Nothing here is applied automatically. Keep the two in
+#     step by hand; where they differ, the dashboard is what runs.
+#   * Every `sync: false` value (secrets, logins, tokens) lives ONLY in the
+#     dashboard. This file lists the key so nobody forgets it exists.
+#   * Deploys: autoDeploy is OFF. The web service is deployed by the GitHub
+#     Actions deploy job (.github/workflows/ci.yml) through its Deploy Hook
+#     after the tests pass; the workflow then waits for /healthz to report
+#     the new commit, checks /readyz, and only then triggers the scan cron's
+#     hook (RENDER_CRON_DEPLOY_HOOK_URL, optional).
+#   * Health check path: /healthz (set in the dashboard: Settings -> Health
+#     Check Path). /readyz and /healthz/deep are for people and CI.
+#
+# IN-PROCESS JOBS (scheduler.py, started once by gunicorn's arbiter -- see
+# gunicorn.conf.py). They are NOT Render services; all times UTC:
+#   forecast-burn     05:05 daily   POST /api/forecast/decrement-daily
+#                                   (+ fills missed days in the last 7)
+#   graph-renew       09:00, 21:00  POST /api/graph/subscriptions/renew
+#   production-scan   23:30 daily   POST /api/production/scan
+#   delivery-sync     :07/:27/:47 from 10:00 to 03:59
+#                                   POST /api/pos/delivery/sync-threads
+#   toast-nightly     08:15 daily   POST /api/toast/nightly-pull
+#   backup            hourly :20    POST /api/admin/backup/run
+#   watchdog          hourly :40    POST /api/watchdog/run (alert email)
+#   heartbeat         every 5 min   feed "scheduler"
+#   catch-up          90 s after every start: re-runs an overdue job
+# Toggle the lot with INPROCESS_SCHEDULER (default on). The former cron
+# services bagel-inventory-forecast-daily and bagel-inventory-graph-sub-renew
+# must stay deleted/suspended in the dashboard (a blueprint re-sync would not
+# delete them).
 #
 # Region: every service is pinned to `virginia` so the family is co-located
 # with the web service's persistent disk (which can't move regions) and close
@@ -34,17 +56,75 @@ services:
     # gunicorn.conf.py holds workers/threads/timeout/bind AND starts the
     # in-process scheduler once via its when_ready hook.
     startCommand: gunicorn -c gunicorn.conf.py app:app
+    # Shallow liveness probe (touches no data). Dashboard: Settings -> Health
+    # Check Path must say the same.
+    healthCheckPath: /healthz
+    # Deploys come from the CI deploy hook only, after tests pass.
+    autoDeploy: false
     disk:
+      # ALL state lives here as JSON files: inventory, the usage ledger, POs,
+      # production, the activity log and data/backups/ (hourly snapshots).
       name: inventory-data
       mountPath: /opt/render/project/src/data
       sizeGB: 1
     envVars:
+      # --- Access (all dashboard-managed secrets) ---------------------------
+      # Master API key: full access. Also what the in-process jobs use to
+      # call this service, so it must be set.
       - key: INVENTORY_API_TOKEN
         sync: false
-      # In-process scheduler on/off (default on). Set to "off" to disable the
-      # daily forecast-decrement + Graph-renew jobs without a code change.
+      # Optional named keys, each limited to a scope:
+      #   name:token:scope[,name:token:scope...]
+      #   scope = full | read | ingest | send | backup   (join with +)
+      - key: INVENTORY_API_TOKENS
+        sync: false
+      # Limited key for the Lineage delivery task (its four routes only).
+      - key: DELIVERY_API_TOKEN
+        sync: false
+      # Browser login: comma-separated allowlist + ONE shared password.
+      - key: INVENTORY_USERNAMES
+        sync: false
+      - key: INVENTORY_PASSWORD
+        sync: false
+      # Who may run seed reset / restore / backup restore. Empty = every
+      # logged-in user (as before).
+      - key: INVENTORY_ADMINS
+        sync: false
+      # Signs the login cookie. If unset the app derives a stable key from
+      # INVENTORY_API_TOKEN and logs a warning; set it once and leave it
+      # (changing it signs everyone out).
+      - key: FLASK_SECRET_KEY
+        sync: false
+      # Uncomment (value "on") once everyone has signed in again after the
+      # release that introduced it: sessions issued before then stop working.
+      # - key: SESSION_REQUIRE_PWV
+      #   value: "on"
+      # --- Alerts ----------------------------------------------------------
+      # Where the watchdog's email goes (default jd@hhbagels.com; must be in
+      # EMAIL_SEND_ALLOWED_DOMAINS). ALERTS_ENABLED=off silences it.
+      - key: ALERT_EMAIL_TO
+        sync: false
+      # - key: ALERTS_ENABLED
+      #   value: "on"
+      # Sender for /api/email/send and the alert email (else first MS365_USER).
+      - key: MS365_SEND_AS
+        sync: false
+      # --- Toast (Report tab sales pulls, nightly pull) --------------------
+      - key: TOAST_CLIENT_ID
+        sync: false
+      - key: TOAST_CLIENT_SECRET
+        sync: false
+      - key: TOAST_API_HOSTNAME
+        sync: false
+      - key: TOAST_USER_ACCESS_TYPE
+        sync: false
+      # In-process scheduler on/off (default on). Set to "off" to stop every
+      # in-process job listed at the top of this file without a code change.
       - key: INPROCESS_SCHEDULER
         value: "on"
+      # Days of missed forecast burn the 05:05 job may fill (0 = none).
+      # - key: FORECAST_BACKFILL_DAYS
+      #   value: "7"
       - key: MS365_TENANT_ID
         sync: false
       - key: MS365_CLIENT_ID
@@ -141,3 +221,23 @@ services:
         sync: false
       - key: MAILBOXES
         value: JD@ms.hhbagels.com,info@ms.hhbagels.com
+
+  # Lineage PO follow-ups: on weekdays, chase delivery confirmations that are
+  # overdue. NOT YET CREATED in the dashboard -- create it by hand with these
+  # settings once scripts/lineage_followups.py is on main. It needs only the
+  # LIMITED delivery key, never the master token.
+  - type: cron
+    name: lineage-po-followups
+    runtime: python
+    plan: starter
+    branch: main
+    region: virginia
+    # 14:50 and 20:50 UTC, Monday-Friday (9:50 am / 3:50 pm Eastern in winter).
+    schedule: "50 14,20 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/lineage_followups.py
+    envVars:
+      - key: APP_URL
+        sync: false  # https://bagel-inventory.onrender.com
+      - key: DELIVERY_API_TOKEN
+        sync: false
