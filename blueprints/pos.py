@@ -119,6 +119,34 @@ def _booked_eta(entry: dict, distributor: str) -> str:
     return (anchor + timedelta(days=lead)).isoformat()
 
 
+SHIP_DATE_MAX_PAST_DAYS = 60
+SHIP_DATE_MAX_FUTURE_DAYS = 180
+
+
+def _implausible_dates(ship_dt, arrival_dt, now=None) -> str:
+    """Why an operator-typed ship / arrival date looks like a typo, or "".
+    A wrong year (2025 for 2026) or a swapped pair silently moves stock: a
+    ship date far in the past derives an arrival in the past and the PO rolls
+    into on-hand on the next read. ``force`` on the request skips this."""
+    from datetime import timedelta
+    now = now or datetime.now()
+    for label, dt in (("ship_date", ship_dt), ("arrival_date", arrival_dt)):
+        if dt is None:
+            continue
+        if dt < now - timedelta(days=SHIP_DATE_MAX_PAST_DAYS):
+            return (f"{label} {dt.date().isoformat()} is more than "
+                    f"{SHIP_DATE_MAX_PAST_DAYS} days in the past -- check the "
+                    "year; send force=true if it is right")
+        if dt > now + timedelta(days=SHIP_DATE_MAX_FUTURE_DAYS):
+            return (f"{label} {dt.date().isoformat()} is more than "
+                    f"{SHIP_DATE_MAX_FUTURE_DAYS} days in the future -- check "
+                    "the year; send force=true if it is right")
+    if ship_dt is not None and arrival_dt is not None and arrival_dt.date() < ship_dt.date():
+        return (f"arrival_date {arrival_dt.date().isoformat()} is before ship_date "
+                f"{ship_dt.date().isoformat()}; send force=true if it is right")
+    return ""
+
+
 @pos_bp.route("/api/on-order/ship-date", methods=["POST"])
 @with_data_lock
 def api_on_order_ship_date():
@@ -187,6 +215,12 @@ def api_on_order_ship_date():
                     "error": "arrival_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
                 }), 400
             arrival_explicit = True
+        if not body.get("force"):
+            why = _implausible_dates(
+                ship_dt, _naive_dt(arrival_iso) if arrival_explicit else None)
+            if why:
+                return jsonify({"ok": False, "error": why,
+                                "needs_force": True}), 400
 
     # No explicit arrival: estimate it from this location's learned transit
     # (integrations/lead_times.py) instead of a flat 7 days.
@@ -209,7 +243,9 @@ def api_on_order_ship_date():
             continue
         pending = item.get("on_order") or []
         for entry in pending:
-            if (entry.get("po_number") or "") != po_number:
+            # Normalised, like every other PO match ("hhb-7500000o" used to
+            # update nothing and still answer ok).
+            if _norm_po_key(entry.get("po_number") or "") != _norm_po_key(po_number):
                 continue
             entry["ship_date"] = ship_iso
             if ship_iso:
@@ -250,6 +286,13 @@ def api_on_order_ship_date():
             updated += 1
             if item.get("name") not in touched_items:
                 touched_items.append(item.get("name") or key)
+    if not updated:
+        # Nothing matched: saying ok with entries_updated 0 read as "saved".
+        return jsonify({"ok": False, "po_number": po_number, "entries_updated": 0,
+                        "error": f"no pending lines found for PO {po_number}"
+                                 + (f" on {item_key}" if item_key else "")
+                                 + " -- it may have arrived already (use Adjust) "
+                                   "or the number is wrong"}), 404
     save_inventory(inv)
     return jsonify({
         "ok": True,
@@ -326,6 +369,7 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
     restored = 0
     removed_cs = 0.0
     new_rows, lines = [], []
+    warnings: list = []
     model = None
     for e in usage:
         absorbed = include_absorbed and absorbed_row_live(e)
@@ -347,9 +391,16 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
         # rollover, on-hand already excludes these cases and subtracting would
         # remove them twice. See _rollover_still_in_onhand.
         still_in_onhand = (not absorbed) and _rollover_still_in_onhand(e, item)
+        taken = 0.0
         if still_in_onhand:
-            item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
-            removed_cs += qty
+            # On-hand can't go below zero, so what actually comes out may be
+            # less than the PO line. The audit row used to record the FULL
+            # quantity, and the ledger then no longer added up to on-hand.
+            before_q = float(item.get("quantity") or 0)
+            item["quantity"] = max(0.0, before_q - qty)
+            taken = round(before_q - item["quantity"], 4)
+            removed_cs += taken
+        clamped = still_in_onhand and taken + 1e-9 < qty
         item["updated"] = now_iso
         entry = {
             "qty":          qty,
@@ -407,9 +458,15 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
         new_rows.append({
             "item_key":   ik,
             "item_name":  e.get("item_name") or item.get("name") or ik,
-            "amount":     qty if still_in_onhand else 0.0,
+            "amount":     taken if still_in_onhand else 0.0,
+            **({"clamped_at_zero": True, "requested_amount": qty,
+                "warning": (f"only {taken:g} of {qty:g} cs were on hand to take "
+                            f"back -- on-hand stopped at 0; reconcile this SKU")}
+               if clamped else {}),
             "unit":       e.get("unit") or item.get("unit") or "",
-            "note":       ((f"{label} -- un-rolled from Arrived")
+            "note":       ((f"{label} -- un-rolled from Arrived"
+                            + (f" (only {taken:g} of {qty:g} cs were on hand; "
+                               f"on-hand stopped at 0)" if clamped else ""))
                            if still_in_onhand else
                            (f"{label} -- on-hand left on the "
                             f"{(item.get('last_count_at') or '')[:10]} count, "
@@ -420,9 +477,12 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
             "warehouse":  item.get("warehouse") or "",
             "reverses_timestamp": e.get("timestamp") or "",
         })
+        if clamped:
+            warnings.append(f"{item.get('name') or ik}: only {taken:g} of {qty:g} cs "
+                            f"were on hand to take back -- on-hand stopped at 0")
         lines.append({"item_key": ik, "name": item.get("name") or ik,
                       "warehouse": item.get("warehouse") or "",
-                      "qty": qty, "onhand_delta": -qty if still_in_onhand else 0.0,
+                      "qty": qty, "onhand_delta": -taken if still_in_onhand else 0.0,
                       "ship_date": entry["ship_date"],
                       "arrival_date": entry["arrival_date"]})
         restored += 1
@@ -450,7 +510,8 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
             delivery_status = tracking[norm_po(po_number)].get("status")
             save_po_delivery(tracking)
     return {"restored_lines": restored, "removed_cs": round(removed_cs, 2),
-            "lines": lines, "delivery_reopened": delivery_status}
+            "lines": lines, "delivery_reopened": delivery_status,
+            "warnings": warnings}
 
 
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
@@ -514,6 +575,7 @@ def api_pending_reopen():
         "restored_lines": restored,
         "removed_cs": round(removed_cs, 2),
         "delivery_reopened": delivery_status,
+        "warnings": un.get("warnings") or [],
         "error": None if restored else "No rolled-over lines found for this PO",
     })
 
@@ -1040,7 +1102,32 @@ def api_pending_set_status():
         arrival_iso, err = _parse_iso_date(body["arrival_date"], "arrival_date")
         if err:
             return err
+        if not body.get("force"):
+            why = _implausible_dates(None, _naive_dt(arrival_iso))
+            if why:
+                return jsonify({"ok": False, "error": why, "needs_force": True}), 400
     key = _norm_po_key(po_number)
+    if status == "cancelled":
+        # "Cancelled" was a label only: the PO's pending lines stayed on
+        # order and still rolled into on-hand on their date. Cancelling a PO
+        # that has pending lines has to remove them and put the PO on the
+        # ignore list (so a re-scan can't re-book it) -- that is
+        # /api/admin/remove-po, which records what it removed and can be
+        # undone with /api/admin/uncancel-po. Refuse here rather than leave a
+        # cancelled PO that silently becomes stock.
+        pending_cs = sum(float(e.get("qty") or 0)
+                         for item in load_inventory().values()
+                         for e in (item.get("on_order") or [])
+                         if _norm_po_key(e.get("po_number") or "") == key)
+        if pending_cs > 0:
+            return jsonify({
+                "ok": False, "po_number": po_number,
+                "error": (f"PO {po_number} still has {pending_cs:g} cs on order; "
+                          "marking it Cancelled would leave them to roll into "
+                          "on-hand. Use Cancel PO (POST /api/admin/remove-po "
+                          "{po_number, reason}) to remove them."),
+                "use_endpoint": "/api/admin/remove-po",
+                "pending_cs": round(pending_cs, 2)}), 400
     overrides = load_status_overrides()
     if status:
         overrides[key] = status
@@ -1067,6 +1154,7 @@ def api_pending_set_status():
                 "onhand_removed_cs": un["removed_cs"],
                 "delivery_reopened": un["delivery_reopened"],
                 "detail": un["lines"],
+                "warnings": un.get("warnings") or [],
             }
     elif arrival_iso:
         inv = load_inventory()
@@ -1247,6 +1335,11 @@ def api_chefs_warehouse_ship_date():
                 return jsonify({"ok": False,
                                 "error": "arrival_date must be YYYY-MM-DD"}), 400
             arrival_source, transit_days, transit_basis = "operator", None, ""
+        if not body.get("force"):
+            why = _implausible_dates(
+                ship_dt, _naive_dt(arrival_iso) if arrival_raw else None)
+            if why:
+                return jsonify({"ok": False, "error": why, "needs_force": True}), 400
     else:
         ship_iso = ""
         arrival_iso = ""
