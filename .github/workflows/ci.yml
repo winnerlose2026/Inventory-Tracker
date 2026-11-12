@@ -17,12 +17,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          # One source of truth: the same file Render reads for its runtime.
+          python-version-file: '.python-version'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          # pyyaml is for scripts/safe_push.py's YAML check only (render.yaml
+          # and these workflows); the app itself does not import it.
+          pip install -r requirements.txt pytest pyyaml
 
       - name: Syntax gate (byte-compile all sources)
         run: python -m compileall -q .
@@ -32,10 +35,14 @@ jobs:
         with:
           node-version: '20'
 
-      - name: File-integrity gate (NUL bytes, JS/HTML/JSON parse)
+      - name: File-integrity gate (NUL bytes, JS/HTML/JSON/YAML parse)
         # Same validator the push flow runs; checks every tracked source
         # file so a Dropbox-padded template or a truncated app.js can never
         # pass CI the way the 2026-06..10 NUL-padded index.html did.
+        # SAFE_PUSH_REQUIRE_YAML makes a missing PyYAML an error here, so the
+        # YAML check can never silently turn itself off again.
+        env:
+          SAFE_PUSH_REQUIRE_YAML: '1'
         run: |
           python scripts/safe_push.py --skip-size-check $(git ls-files '*.py' '*.html' '*.js' '*.json' '*.yaml' '*.yml' | grep -v '^tests/fixtures/')
 
@@ -48,25 +55,133 @@ jobs:
         # itself (test_cheney_stock_ocr.py mocks its OCR layer).
         run: python -m pytest -q
 
+  # The three test files that need an OCR stack skip themselves in the job
+  # above (the web build carries no OCR engine). Run them here with the
+  # optional requirements so the screenshot / stock-image readers are
+  # exercised somewhere. Advisory for now: a failure is reported but does not
+  # block the deploy.
+  ocr-tests:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+      - name: Install dependencies (with OCR extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-ocr-usf.txt pytest
+      - name: Run the OCR-dependent tests
+        run: >
+          python -m pytest -q -rs
+          tests/test_usf_screenshot.py
+          tests/test_cheney_stock_ocr.py
+          tests/test_cheney_inventory_report.py
+
   # Deterministic deploy: trigger Render via a Deploy Hook once tests pass,
   # instead of relying on Render's GitHub auto-deploy webhook (which has been
   # delivering late / dropping pushes). Dormant until the RENDER_DEPLOY_HOOK_URL
   # repo secret is set (Render dashboard -> the service -> Settings -> Deploy Hook).
+  #
+  # Order: web service -> wait until /healthz reports THIS commit -> /readyz
+  # -> only then the 6-hour cron (RENDER_CRON_DEPLOY_HOOK_URL, optional), so
+  # the cron never runs new scan code against an old or broken web service.
   deploy:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # One deploy at a time, in push order; a newer push waits rather than
+    # cancelling a deploy that is half-way through.
+    concurrency:
+      group: deploy-main
+      cancel-in-progress: false
+    env:
+      APP_URL: https://bagel-inventory.onrender.com
     steps:
+      - name: Skip if main has moved on
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Queued behind an earlier deploy, this run may no longer be the tip
+          # of main. Deploying it would roll production BACK to an older
+          # commit once the newer run has finished.
+          TIP="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "$TIP" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "main is now at $TIP; not deploying $GITHUB_SHA."
+          fi
+
       - name: Trigger Render deploy (if hook configured)
+        id: hook
+        if: steps.tip.outputs.current == 'true'
         env:
           HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
           if [ -n "$HOOK" ]; then
             # Pin the exact commit: a bare hook deploys Render's (sometimes
             # stale) cached branch tip, so always pass ref=<this commit SHA>.
-            curl -fsS "$HOOK&ref=$GITHUB_SHA" >/dev/null && echo "Render deploy triggered for $GITHUB_SHA."
+            curl -fsS "${HOOK}&ref=${GITHUB_SHA}" >/dev/null
+            echo "Render deploy triggered for $GITHUB_SHA."
+            echo "triggered=true" >> "$GITHUB_OUTPUT"
           else
             echo "RENDER_DEPLOY_HOOK_URL not set - skipping CI-driven deploy."
             echo "Add it under repo Settings -> Secrets and variables -> Actions"
             echo "to deploy automatically after tests pass."
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for the web service to report this commit
+        if: steps.hook.outputs.triggered == 'true'
+        run: |
+          WANT="${GITHUB_SHA:0:7}"
+          DEADLINE=$(( $(date +%s) + 600 ))
+          while :; do
+            GOT="$(curl -fsS --max-time 15 "$APP_URL/healthz" \
+                   | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit") or "")' \
+                   2>/dev/null || true)"
+            if [ "$GOT" = "$WANT" ]; then
+              echo "Live: $GOT"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::After 10 minutes /healthz still reports '${GOT:-nothing}', not $WANT. The deploy failed or is stuck - check the Render dashboard."
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Readiness check
+        if: steps.hook.outputs.triggered == 'true'
+        run: |
+          # /readyz: data dir writable, inventory readable, scheduler alive,
+          # data lock obtainable, disk space. Retried for ~2 minutes because
+          # the scheduler's first heartbeat and a scan holding the lock are
+          # both normal in the first moments after a deploy.
+          for i in $(seq 1 12); do
+            BODY="$(curl -sS --max-time 20 "$APP_URL/readyz" || true)"
+            echo "$BODY"
+            if echo "$BODY" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null; then
+              echo "Ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::The new version is live but /readyz is not ok (see the reason codes above)."
+          exit 1
+
+      - name: Deploy the mailbox-scan cron (after the web service is healthy)
+        if: steps.hook.outputs.triggered == 'true'
+        env:
+          CRON_HOOK: ${{ secrets.RENDER_CRON_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "$CRON_HOOK" ]; then
+            curl -fsS "${CRON_HOOK}&ref=${GITHUB_SHA}" >/dev/null
+            echo "Cron deploy triggered for $GITHUB_SHA."
+          else
+            echo "RENDER_CRON_DEPLOY_HOOK_URL not set - the cron keeps its own deploy setting."
           fi

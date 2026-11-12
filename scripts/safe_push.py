@@ -45,7 +45,7 @@ Checks per file
                  presence of </body></html>
 *.js           - `node --check`
 *.json         - json.load
-*.yaml / *.yml - yaml.safe_load (when PyYAML is installed)
+*.yaml / *.yml - yaml.safe_load (PyYAML; required in CI, optional locally)
 all text files - NO NUL BYTES. Dropbox's other corruption mode pads a file
                  with \x00 (templates/index.html carried 1,668 trailing NULs
                  on origin/main from 2026-06-10 to 2026-10-08 and served them
@@ -111,10 +111,25 @@ def json_check(path: Path) -> list[str]:
         return [f"not valid JSON: {exc}"]
 
 
+def _yaml_required() -> bool:
+    import os
+    flag = (os.environ.get("SAFE_PUSH_REQUIRE_YAML") or "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return bool(flag) or (os.environ.get("CI") or "").lower() == "true"
+
+
 def yaml_check(path: Path) -> list[str]:
     try:
         import yaml  # type: ignore
     except ImportError:
+        # Skipping quietly meant the YAML check had never once run in CI
+        # (PyYAML is not an app dependency), so a truncated render.yaml or
+        # workflow file would have passed. In CI -- or wherever
+        # SAFE_PUSH_REQUIRE_YAML is set -- a missing PyYAML is an error.
+        if _yaml_required():
+            return ["PyYAML is not installed, so this file was NOT checked "
+                    "(pip install pyyaml)"]
         return []
     try:
         yaml.safe_load(path.read_text(encoding="utf-8"))

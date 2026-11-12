@@ -11,3 +11,8 @@ integrations/us_foods_inventory.csv
 venv/
 *.bundle
 _to_delete/
+# Any *.env file may hold tokens (inventory_send.env, local overrides). Only
+# the placeholder template is tracked.
+*.env
+.env.*
+!.env.example

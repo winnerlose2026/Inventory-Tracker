@@ -1,0 +1,27 @@
+# REFERENCE ONLY -- Render does NOT build from this file.
+#
+# The web service and the cron still run `pip install -r requirements.txt`
+# (see render.yaml); switching the build command is a dashboard change. This
+# is `pip freeze` from a clean virtualenv of requirements.txt, taken on
+# 2026-11-12 with Python 3.13.18 (the development sandbox). Production runs
+# Python 3.14.3 (.python-version), where pip may resolve different versions.
+#
+# Use it to answer "what did the suite last pass against?" and to diff
+# against `pip freeze` on the live service when a dependency release is
+# suspected of breaking something. To regenerate:
+#   python -m venv /tmp/lockvenv && /tmp/lockvenv/bin/pip install -r requirements.txt
+#   /tmp/lockvenv/bin/pip freeze   (keep this header)
+APScheduler==3.11.3
+blinker==1.9.0
+click==8.5.1
+et_xmlfile==2.0.0
+Flask==3.1.3
+gunicorn==27.0.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+openpyxl==3.1.5
+pypdf==3.17.4
+pytz==2026.6
+tzlocal==5.4.5
+Werkzeug==3.1.9
