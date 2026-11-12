@@ -594,14 +594,21 @@ def api_admin_restore_inventory():
 
     Body:
       items      list of item dicts (required, non-empty)
-      dry_run    bool -- report what would change, write nothing
+      dry_run    bool, default TRUE -- report what would change, write
+                 nothing. Send "dry_run": false to apply.
+      confirm    must be true on a live run that would DROP any SKU.
       mode       "replace"     overwrite the whole file (default)
                  "fill-missing" only add SKUs not currently present, leaving
                                 existing ones untouched
+
+    A live run snapshots every data file first ("pre-restore", see
+    /api/admin/backups); if that snapshot cannot be taken nothing is written.
     """
+    from inventory_tracker import DataFileCorrupt
     body = request.json or {}
     items = body.get("items")
-    dry_run = bool(body.get("dry_run", False))
+    dry_run = body.get("dry_run", True) is not False
+    confirm = body.get("confirm") is True
     mode = (body.get("mode") or "replace").strip()
     if not isinstance(items, list) or not items:
         return jsonify({"ok": False,
@@ -617,10 +624,20 @@ def api_admin_restore_inventory():
         item = {k: v for k, v in raw.items() if k not in _DERIVED_FIELDS}
         incoming[str(raw["name"]).lower()] = item
 
+    # An unreadable current file is exactly when this endpoint is needed, so
+    # it is not an error -- but it is REPORTED, not quietly read as "empty":
+    # the caller must know the comparison below is against nothing.
+    current, unreadable = {}, ""
     try:
         current = load_inventory()
-    except Exception:  # noqa: BLE001 -- unreadable is exactly when this runs
-        current = {}
+    except DataFileCorrupt as exc:
+        unreadable = "inventory.json is unreadable: %s" % _safe_err(exc)
+    except Exception as exc:  # noqa: BLE001
+        unreadable = "inventory.json could not be loaded: %s" % _safe_err(exc)
+    if unreadable and mode == "fill-missing":
+        return jsonify({"ok": False, "current_unreadable": True,
+                        "error": unreadable + " -- fill-missing needs a "
+                                 "readable file; use mode=replace"}), 409
 
     added = sorted(set(incoming) - set(current))
     kept = sorted(set(incoming) & set(current))
@@ -642,9 +659,30 @@ def api_admin_restore_inventory():
                              for v in result.values()),
         "total_quantity": round(sum(float(v.get("quantity") or 0)
                                     for v in result.values()), 2),
+        "current_unreadable": bool(unreadable),
+        "needs_confirm": bool(dropped),
     }
-    if not dry_run:
-        save_inventory(result)
+    if unreadable:
+        summary["current_error"] = unreadable
+    if dry_run:
+        return jsonify(summary)
+    if dropped and not confirm:
+        summary.update(ok=False, error='this would remove %d SKU(s); resend '
+                       'with "confirm": true' % len(dropped))
+        return jsonify(summary), 409
+    try:
+        from integrations import backups
+        snap = backups.make_snapshot("pre-restore", record_feed=False)
+        if not snap.get("ok") and snap.get("skipped") != "empty":
+            raise RuntimeError(snap.get("error") or "snapshot failed")
+    except Exception as exc:  # noqa: BLE001 -- no snapshot, no restore
+        summary.update(ok=False, error="could not snapshot data before the "
+                       "restore; nothing was written: " + _safe_err(exc))
+        return jsonify(summary), 500
+    summary["snapshot"] = snap.get("name")
+    # A restore is a deliberate replacement: the caller has seen the dry run
+    # and confirmed any drop.
+    save_inventory(result, allow_shrink=True)
     return jsonify(summary)
 
 

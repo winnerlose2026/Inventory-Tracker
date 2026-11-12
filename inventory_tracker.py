@@ -575,7 +575,38 @@ def load_inventory() -> dict:
     return reconcile_inventory()
 
 
-def _check_inventory_write(inv: dict, *, allow_empty: bool = False) -> None:
+# Overwrite guards. Every writer reads the whole file, changes it and saves
+# the whole file back, so a caller holding a stale or partial copy can wipe
+# rows it never meant to touch. A save that would drop more than these
+# fractions is refused unless the caller says the shrink is deliberate.
+INVENTORY_SHRINK_MAX_FRACTION = 0.10      # ...and more than 3 SKUs
+INVENTORY_SHRINK_MIN_SKUS = 3
+USAGE_SHRINK_MAX_FRACTION = 0.02          # ...and more than 20 rows
+USAGE_SHRINK_MIN_ROWS = 20
+
+
+class ShrinkRefused(ValueError):
+    """A save would have dropped far more rows than any normal change does."""
+
+
+def _stored_len(path: Path, default):
+    """How many entries the stored file holds, or None when it cannot be
+    read. Served from the parsed-file cache when the file has not changed."""
+    try:
+        st = path.stat()
+    except OSError:
+        return 0
+    cached = _FILE_CACHE.get(str(path))
+    if cached is not None and cached[0] == (st.st_mtime_ns, st.st_size):
+        return len(cached[1])
+    try:
+        return len(_read_json(path, default))
+    except DataFileCorrupt:
+        return None
+
+
+def _check_inventory_write(inv: dict, *, allow_empty: bool = False,
+                           allow_shrink: bool = False) -> None:
     """Raise ValueError when `inv` must not replace the stored inventory."""
     if not inv and not allow_empty:
         try:
@@ -590,30 +621,75 @@ def _check_inventory_write(inv: dict, *, allow_empty: bool = False) -> None:
                 "refusing to overwrite %d SKUs with an empty inventory; pass "
                 "allow_empty=True for a deliberate reset" % len(existing)
             )
+    if allow_empty or allow_shrink:
+        return
+    before = _stored_len(INVENTORY_FILE, {})
+    if not before:
+        return
+    dropped = before - len(inv)
+    if (dropped > INVENTORY_SHRINK_MIN_SKUS
+            and dropped > before * INVENTORY_SHRINK_MAX_FRACTION):
+        _raise_issue_safely(
+            "save-refused:inventory",
+            "A save that would have removed %d of %d SKUs was blocked. "
+            "Nothing was lost; whatever was running did not finish."
+            % (dropped, before))
+        raise ShrinkRefused(
+            "refusing to save %d SKUs over %d (%d would disappear); pass "
+            "allow_shrink=True if that is intended" % (len(inv), before, dropped))
 
 
-def save_inventory(inv: dict, *, allow_empty: bool = False):
+def _check_usage_write(usage: list, *, allow_shrink: bool = False) -> None:
+    """Raise ShrinkRefused when `usage` would drop a chunk of the ledger."""
+    if allow_shrink:
+        return
+    before = _stored_len(USAGE_FILE, [])
+    if not before:
+        return
+    dropped = before - len(usage)
+    if (dropped > USAGE_SHRINK_MIN_ROWS
+            and dropped > before * USAGE_SHRINK_MAX_FRACTION):
+        _raise_issue_safely(
+            "save-refused:usage",
+            "A save that would have removed %d of %d ledger rows was blocked. "
+            "Nothing was lost; whatever was running did not finish."
+            % (dropped, before))
+        raise ShrinkRefused(
+            "refusing to save %d ledger rows over %d (%d would disappear); "
+            "pass allow_shrink=True if that is intended"
+            % (len(usage), before, dropped))
+
+
+def save_inventory(inv: dict, *, allow_empty: bool = False,
+                   allow_shrink: bool = False):
     """Persist inventory, refusing to replace a populated file with an empty
-    one unless the caller explicitly opts in (seeding, a deliberate reset).
+    one unless the caller explicitly opts in (seeding, a deliberate reset),
+    and refusing to drop more than 10% of the SKUs (and more than 3) unless
+    called with allow_shrink=True (deleting SKUs, a restore).
 
     save_inventory() is where every scan and every ingest ends, so it is what
     amplified the 2026-09-17 read failure into data loss: once a corrupt read
     had handed the caller {}, the next scan wrote {} back and the SKUs were
-    gone. An empty inventory is now something a caller has to ask for.
+    gone. An empty inventory is now something a caller has to ask for -- and
+    so is a much smaller one.
     """
-    _check_inventory_write(inv, allow_empty=allow_empty)
+    _check_inventory_write(inv, allow_empty=allow_empty,
+                           allow_shrink=allow_shrink)
     _save(INVENTORY_FILE, inv)
 
 
 def save_inventory_and_usage(inv: dict, usage: list, *,
-                             allow_empty: bool = False):
+                             allow_empty: bool = False,
+                             allow_shrink: bool = False):
     """Persist on-hand and the ledger as ONE commit (see commit_state).
 
     Use this wherever a change moves stock and writes the ledger row that
     explains it; save_inventory() followed by save_usage() could be cut in
     half by a crash or a deploy. Applies the same refusals as the two
     single-file savers."""
-    _check_inventory_write(inv, allow_empty=allow_empty)
+    _check_inventory_write(inv, allow_empty=allow_empty,
+                           allow_shrink=allow_shrink)
+    _check_usage_write(usage, allow_shrink=allow_shrink)
     commit_state({INVENTORY_FILE: inv, USAGE_FILE: usage})
 
 
@@ -621,7 +697,12 @@ def load_usage() -> list:
     return _load(USAGE_FILE)
 
 
-def save_usage(usage: list):
+def save_usage(usage: list, *, allow_shrink: bool = False):
+    """Persist the ledger, refusing to drop more than 2% of its rows (and
+    more than 20) unless called with allow_shrink=True. The ledger only ever
+    grows in normal use -- rows are reversed or superseded, never removed --
+    so a much shorter list means the caller is holding a stale copy."""
+    _check_usage_write(usage, allow_shrink=allow_shrink)
     _save(USAGE_FILE, usage)
 
 
@@ -2287,7 +2368,8 @@ def remove_item(name: str):
         print(f"  Item '{name}' not found.")
         return
     del inv[key]
-    save_inventory(inv)
+    # Deleting a SKU is a deliberate shrink.
+    save_inventory(inv, allow_shrink=True)
     print(f"  Removed '{name}' from inventory.")
 
 
