@@ -2270,8 +2270,8 @@ def reverse_usage(timestamp: str, item_key: Optional[str] = None,
         "reverses_timestamp": target["timestamp"],
     })
 
-    save_inventory(inv)
-    save_usage(usage)
+    # One commit: the on-hand change and the reversal row that explains it.
+    save_inventory_and_usage(inv, usage)
     return {
         "ok": True,
         "item_name": target.get("item_name", ""),

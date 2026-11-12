@@ -159,3 +159,19 @@ def test_save_inventory_and_usage_is_one_commit(monkeypatch):
     assert _read(it.INVENTORY_FILE)["a"]["quantity"] == 1     # neither landed
     assert _read(it.USAGE_FILE) == []
     assert not list(it.DATA_DIR.glob("*.tmp.*"))
+
+
+def test_reverse_usage_saves_on_hand_and_its_reversal_row_in_one_commit(monkeypatch):
+    it.save_inventory({"a": {"name": "A", "quantity": 5, "unit": "cs"}})
+    it.record_usage("A", 2)
+    row = it.load_usage()[0]
+    calls = []
+    real = it.commit_state
+    monkeypatch.setattr(it, "commit_state",
+                        lambda files: (calls.append(sorted(p.name for p in files)),
+                                       real(files))[1])
+    monkeypatch.setattr(it, "save_usage", lambda *a, **k: 1 / 0)   # not used
+    res = it.reverse_usage(row["timestamp"], item_key="a", amount=row["amount"])
+    assert res["ok"] is True
+    assert calls == [["inventory.json", "usage.json"]]
+    assert it._read_json(it.INVENTORY_FILE, {})["a"]["quantity"] == 5
