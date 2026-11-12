@@ -975,6 +975,8 @@ HOLD_EQUAL_FRACTION = 0.5    # held when MORE than this share is exactly equal
 HOLD_MIN_GAP_DAYS = 5        # ...and the report is at least this long after
 #                              the previous count
 HELD_RELEASES_FILE_NAME = "held_report_releases.json"
+# A count / usage report may be dated at most this far ahead of the apply time.
+COUNT_DATE_MAX_AHEAD = timedelta(days=1)
 
 
 def _case_units(unit) -> bool:
@@ -1129,6 +1131,25 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
     if evt.event_type == "restock" and po_num:
         _apply_po_on_order(evt, item, key, now, report, dry_run)
         return
+
+    # A count cannot be dated in the future. count_date comes from the report
+    # (subject / workbook / the email's send time); one stamped ahead of now
+    # would outrank every genuine count until the calendar caught up.
+    if evt.event_type in ("on_hand", "usage_rate"):
+        _cd_dt = _count_dt(getattr(evt, "count_date", "") or "")
+        _now_dt = _count_dt(now)
+        if _cd_dt is not None and _now_dt is not None \
+                and _cd_dt > _now_dt + COUNT_DATE_MAX_AHEAD:
+            report.setdefault("rejected", []).append(
+                f"{item['name']}: {evt.event_type} dated "
+                f"{getattr(evt, 'count_date', '')} is in the future - refused "
+                f"(source: {getattr(evt, 'source_message_id', '') or '?'})"
+            )
+            _report_issue(
+                report,
+                f"onhand-rejected:{key}:{getattr(evt, 'source_message_id', '') or '?'}",
+                report["rejected"][-1], "error")
+            return
 
     if evt.event_type == "usage_rate":
         # A reported average weekly-usage refresh -- e.g. Cheney's case-

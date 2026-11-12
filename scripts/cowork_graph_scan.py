@@ -399,6 +399,15 @@ def _post_ingest(app_url: str, token: str, payload: dict,
         return exc.code, body_txt
 
 
+def _plausible_sent(sent_iso: str, received_iso: str) -> str:
+    """sentDateTime unless it is >24 h after / >7 d before receivedDateTime."""
+    from integrations.email_scanner import _trusted_sent_time
+    used, err = _trusted_sent_time(sent_iso, received_iso)
+    if err:
+        print(f"WARNING: {err}", file=sys.stderr)
+    return used or received_iso or ""
+
+
 def _cheney_inventory_report_to_events(xlsx_bytes, filename, mid, subject):
     """Parse a Cheney per-facility inventory .xlsx into on_hand event dicts
     (warehouse keyed off the filename). Returns (events, errors)."""
@@ -876,8 +885,11 @@ def run(argv: list[str] | None = None) -> int:
                 # per-mailbox (JD@ and info@ differ) and lags by seconds to
                 # minutes, so the two paths disagreed about which copy of a
                 # PO was newer.
-                "received": (m.get("sentDateTime")
-                             or m.get("receivedDateTime") or ""),
+                # ...but the send time is written by the sender: believe it
+                # only while it is plausible against the mailbox's own receive
+                # time (email_scanner._trusted_sent_time).
+                "received": _plausible_sent(m.get("sentDateTime") or "",
+                                            m.get("receivedDateTime") or ""),
             })
 
     if not qualifying:

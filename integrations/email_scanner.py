@@ -1247,12 +1247,53 @@ def _log_scan_exc(exc, ctx: str = "") -> None:
           file=_sys.stderr)
 
 
-def parse_message_with_errors(msg, sender_address: Optional[str] = None):
+# The MIME Date header is written by the SENDER. It dates every count
+# (count_date) and orders two copies of a PO (source_received_at), so a wrong
+# clock -- or a deliberate one -- could post-date a count past every later one
+# or make a stale PO copy the newest. When the caller knows when the mailbox
+# actually RECEIVED the message (Graph receivedDateTime), a Date outside this
+# window around it is not believed.
+DATE_HEADER_MAX_AHEAD = timedelta(hours=24)
+DATE_HEADER_MAX_BEHIND = timedelta(days=7)
+
+
+def _iso_utc(value: str):
+    try:
+        from datetime import timezone as _tz
+        dt = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=_tz.utc) if dt.tzinfo is None else dt.astimezone(_tz.utc)
+
+
+def _trusted_sent_time(date_iso: str, received_iso: str):
+    """(iso to use, error or None). ``date_iso`` is the Date header normalised
+    to UTC, ``received_iso`` the mailbox's own receive time (may be "")."""
+    recv = _iso_utc(received_iso) if received_iso else None
+    if recv is None:
+        return date_iso, None
+    recv_iso = recv.isoformat().replace("+00:00", "Z")
+    sent = _iso_utc(date_iso) if date_iso else None
+    if sent is None:
+        return recv_iso, None          # no usable Date header: use receipt
+    if sent - recv > DATE_HEADER_MAX_AHEAD or recv - sent > DATE_HEADER_MAX_BEHIND:
+        return recv_iso, (
+            f"Date header {date_iso} is implausible against the mailbox "
+            f"receive time {recv_iso}; using the receive time.")
+    return date_iso, None
+
+
+def parse_message_with_errors(msg, sender_address: Optional[str] = None,
+                              received_at: Optional[str] = None):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
     ``sender_address`` -- when the caller has Graph's ``from.emailAddress``
     (the server-side scan does), pass it: it is authoritative over the MIME
     From: header for every sender -> distributor / rep / warehouse decision.
+
+    ``received_at`` -- Graph's ``receivedDateTime`` for the message, when the
+    caller has it. The sender-written Date header is used for count dates and
+    PO ordering only while it is plausible against this (_trusted_sent_time).
 
     Attachment precedence:
       1. Distributor PO PDF attachment routed by sender domain:
@@ -1275,7 +1316,8 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     from_hdr = (str(sender_address).strip() if sender_address
                 else str(msg.get("From", "")))
     from .rep_map import sender_address as _real_address
-    sent_iso = _msg_date_iso(msg)
+    _mailbox_received = str(received_at or "").strip()
+    sent_iso, _date_err = _trusted_sent_time(_msg_date_iso(msg), _mailbox_received)
 
     body = _text_body(msg)
     body_tags = {m.group(1).lower(): m.group(2).strip()
@@ -1299,7 +1341,8 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     # bumping the revision number (see integrations/po_revision).
     # Every part below runs through _guarded(): one unreadable attachment
     # records an error for itself and the rest of the message still parses.
-    received_at = _received_at_from_message(msg)
+    received_at, _ = _trusted_sent_time(_received_at_from_message(msg),
+                                        _mailbox_received)
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".pdf"):
             continue
@@ -1482,6 +1525,10 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
         for _e in events:
             if _e.event_type in ("on_hand", "usage_rate") and not _e.count_date:
                 _e.count_date = _count_iso
+
+    # Only worth saying when the message actually produced something dated.
+    if _date_err and (events or cw_pos):
+        errors.append(f"{subject[:80]!r}: {_date_err}")
 
     return events, errors, cw_pos
 
@@ -1711,7 +1758,8 @@ class EmailInboxClient:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
                     msg = email.message_from_bytes(mime_bytes)
                     events, errs, cw_pos = parse_message_with_errors(
-                        msg, sender_address=_graph_from or None)
+                        msg, sender_address=_graph_from or None,
+                        received_at=m.get("receivedDateTime") or None)
                 except Exception as exc:  # noqa: BLE001
                     _log_scan_exc(exc, f"ms365 message {upn}")
                     result.errors.append(
