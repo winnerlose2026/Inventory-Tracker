@@ -518,6 +518,22 @@ def _run_server_mode(args) -> int:
         if rep.get("status") not in (None, "ok", "partial") \
                 or rep.get("mailbox_failures"):
             rc = 1
+        # ...and when the scan reports a failure it has NOT reported before
+        # (a dropped PO, an unmapped item #, a held or unreadable report, a
+        # rejected on-hand ...). The service remembers each one by key, so a
+        # given problem fails exactly one run instead of every run for the
+        # two weeks its email stays in the window.
+        new_failures = body.get("new_failures") or rep.get("new_failures") or []
+        if new_failures and not args.dry_run:
+            print(f"NEW FAILURES: {len(new_failures)} problem(s) seen for the "
+                  "first time in this scan:", file=sys.stderr)
+            for nf in new_failures[:25]:
+                if isinstance(nf, dict):
+                    print(f"  - [{nf.get('key')}] {nf.get('message')}",
+                          file=sys.stderr)
+                else:
+                    print(f"  - {nf}", file=sys.stderr)
+            rc = 1
 
     # 2) Lineage freight invoices (actual ship dates). Server-side too, so
     #    the ship-date stamping onto pending POs runs in the same process.

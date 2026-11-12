@@ -277,6 +277,43 @@ _PO_FAILURE_RE = re.compile(
     r"|no PO# found in PDF -- skipped"
     r"|^PO PDF '.*': could not be read")
 
+# Scan errors a PERSON must act on, by class. /api/email/scan turns each into
+# a feed-health issue keyed "<class>:<hash of the text>" so it alerts ONCE
+# (the cron exits non-zero only when a scan reports a failure it has not seen
+# before), however many 6-hour scans re-read the same message. Errors that
+# match nothing here are informational: returned and logged, never alerted.
+_FAILURE_CLASSES = (
+    ("po-failure", _PO_FAILURE_RE),
+    ("report-held", re.compile(r"^report held: ")),
+    ("unmapped", re.compile(r"\bunmapped\b", re.I)),
+    ("unknown-rep", re.compile(r"\bunknown rep\b", re.I)),
+    ("fetch-failed", re.compile(r"fetch failed|ms365 parse failed for", re.I)),
+    ("truncated", re.compile(r"^scan truncated", re.I)),
+    ("partial-parse", re.compile(r"^partial parse|NOT emitted", re.I)),
+    ("bad-cell", re.compile(r"is not a number", re.I)),
+    ("date-header", re.compile(r"Date header .* is implausible", re.I)),
+    ("junk-mail", re.compile(r"is in the Junk Email folder", re.I)),
+    ("folders", re.compile(r"scanned the Inbox only", re.I)),
+    ("unreadable", re.compile(
+        r"could not be read|parse failed|cannot open xlsx"
+        r"|no recognizable inventory grid|could not determine Cheney warehouse",
+        re.I)),
+)
+
+
+def failure_class(err) -> Optional[str]:
+    """The alert class of a scan error, or None when it is informational.
+    Mailbox failures are not classed here -- they fail every run on their own
+    (is_mailbox_failure)."""
+    text = str(err or "")
+    if is_mailbox_failure(text):
+        return None
+    for slug, rx in _FAILURE_CLASSES:
+        if rx.search(text):
+            return slug
+    return None
+
+
 # A PDF that is a purchase order by its name / subject / own text. Used to
 # tell a PO the parser read NOTHING from (must be flagged) from the invoices,
 # statements and delivery paperwork the same senders also attach as PDFs.
