@@ -16,7 +16,9 @@ Flow
    The webhook fetches the message via Graph, qualifies it (sender on
    ``hhbagels.com`` + subject contains "Daily Production"), pulls the first
    PDF attachment, and ingests it through the existing
-   ``/api/production/ingest`` parse path.
+   ``/api/production/ingest`` parse path. A message from a distributor or a
+   covering rep instead triggers a debounced mailbox scan (see
+   blueprints/webhooks.py, ``SCAN_ON_NOTIFY``).
 3. Mail subscriptions cap at ~70 hours, so ``renew_subscriptions()`` PATCHes
    each one with a fresh ``expirationDateTime``. A Render cron calls the
    renew endpoint daily; if the subscription is gone, we recreate it.
@@ -650,6 +652,7 @@ def handle_notification(payload: dict) -> dict:
     summary: list[dict] = []
     seen_ids = seen_message_ids(load_production(), load_tombstones())
     to_store = []   # [(record, po_body, po_subject, subject)]
+    scan_senders: list[str] = []   # distributor / rep senders in this batch
 
     for note in notifications:
         cs = note.get("clientState") or ""
@@ -676,6 +679,17 @@ def handle_notification(payload: dict) -> dict:
                   .get("address") or "")
         received_at = msg.get("receivedDateTime") or ""
         internet_id = msg.get("internetMessageId") or msg.get("id") or msg_id
+
+        # Mail from a distributor or a covering rep (the one rep registry):
+        # not ours to parse here, but worth a mailbox scan NOW rather than at
+        # the next 6-hour cron. Only noted here; blueprints/webhooks.py runs
+        # the debounced scan.
+        try:
+            from .rep_registry import is_known_sender
+            if is_known_sender(sender):
+                scan_senders.append(sender.lower())
+        except Exception as exc:  # noqa: BLE001 -- never break production ingest
+            _log_exc_gs(exc, "handle_notification scan-sender check")
 
         dom = sender.split("@")[-1].lower() if "@" in sender else ""
         if not (dom == "hhbagels.com" or dom.endswith(".hhbagels.com")):
@@ -744,4 +758,7 @@ def handle_notification(payload: dict) -> dict:
         "skipped": skipped,
         "errors": errors,
         "summary": summary,
+        # Distributor / rep senders seen in this batch -> the caller triggers
+        # a debounced mailbox scan (SCAN_ON_NOTIFY).
+        "scan_senders": sorted(set(scan_senders)),
     }
