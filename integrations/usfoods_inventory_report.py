@@ -47,7 +47,8 @@ Two delivery shapes are understood, both handled here:
     handled by ``bagel_inventory_worksheet``.
 
 The report never names the warehouse; the *sending rep's email address*
-identifies it (``REPORT_SENDER_TO_WAREHOUSE``). Add each rep here as they come
+identifies it (``REPORT_SENDER_TO_WAREHOUSE``, derived from
+``integrations/rep_registry.py``). Add each rep to the registry as they come
 online -- an unknown sender is surfaced as an error rather than guessed.
 
 No third-party HTML library is used: the table is extracted with the stdlib
@@ -70,39 +71,16 @@ except ImportError:  # standalone / test use
 
 
 # Report-sender email (lowercased) -> (distributor, canonical warehouse).
-# The canonical warehouse string must match seed_bagels.py exactly. Extend as
-# each US Foods DC rep starts sending the weekly body report.
-REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
-    "maria.hernandez@usfoods.com": ("US Foods", "Zebulon, NC"),
-    "kathleen.thompson@usfoods.com": ("US Foods", "Zebulon, NC"),
-    "jasmin.gomez@usfoods.com": ("US Foods", "Manassas, VA"),
-    "thomas.paxson@usfoods.com": ("US Foods", "Manassas, VA"),
-    # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
-    # from the team alias rather than a named coordinator.
-    "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
-    # Manassas (MDC) weekly "Product Usage Report" now arrives from the USF
-    # Sales-Coordination customer-contact alias (Salesforce-generated; signed
-    # by Stephanie Warfle, Sales Coordination Manager - AMA/MDC), and Thomas
-    # Paxson forwards it. Route the alias to Manassas so the report ingests.
-    "usfcustomercontact@usfoods.com": ("US Foods", "Manassas, VA"),
-    "sam.travlos@usfoods.com": ("US Foods", "La Mirada, CA"),
-    "ozzy.corut@usfoods.com": ("US Foods", "La Mirada, CA"),
-    # Knoxville market (DC 6H, 2270) -- delivered as the USF "Assortment
-    # Management Tool" .xlsx export. The DC is physically in Alcoa, TN, which is
-    # the seeded warehouse label (seed_bagels.py). Kimberly Cobb is the Alcoa
-    # territory manager who sends the weekly spreadsheet; Christy Dunn is the
-    # Volunteer State area buyer copied on the same standing thread.
-    "kimberly.cobb@usfoods.com": ("US Foods", "Alcoa, TN"),
-    "christy.dunn@usfoods.com": ("US Foods", "Alcoa, TN"),
-    # NW Houston (DC B2, 13400 Hollister Rd). Charles Youngblood is the
-    # major account exec covering the Texas market; Tom Foley is the area
-    # buyer who actually cuts and re-cuts the POs. Either can send the
-    # weekly numbers, so both resolve to the same DC. (Since 2026-09-30 JD
-    # corresponds with Foley only; Youngblood stays mapped so anything he
-    # forwards still lands on Houston instead of erroring as unknown.)
-    "charles.youngblood@usfoods.com": ("US Foods", "Houston, TX"),
-    "tom.foley@usfoods.com": ("US Foods", "Houston, TX"),
-}
+# Derived from the one rep registry (integrations/rep_registry.py) -- add or
+# move a rep THERE, not here. The canonical warehouse string matches
+# seed_bagels.py exactly.
+try:
+    from .rep_registry import sender_map as _registry_sender_map
+except ImportError:  # standalone / test use
+    from rep_registry import sender_map as _registry_sender_map  # type: ignore
+
+REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = _registry_sender_map(
+    "usf-report")
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
 # arrives WITHOUT the Vendor# column (the original format JD asked the rep to

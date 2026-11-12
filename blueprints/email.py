@@ -1650,6 +1650,33 @@ def api_ingest_cheney_inventory_csv():
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
+@email_bp.route("/api/reps", methods=["GET"])
+def api_reps():
+    """The rep registry: warehouse -> distributor -> covering reps.
+
+    The single source the weekly chaser tasks read instead of carrying their
+    own copy (integrations/rep_registry.py). Token / session gated by the
+    global auth hook like every other /api/ route. Read-only.
+
+    Returns {ok, warehouses: [{warehouse, distributor, watch_only,
+    chase_variant ("standard" | "houston-screenshot"), reps: [{name, email,
+    aliases, no_chase, parser}], chase_to: [emails the chaser may write to]}],
+    never_email: [addresses no automated task may email], domains: {sender
+    domain: distributor}, chase_variants, overrides: {email: [distributor,
+    warehouse]} from data/rep_warehouse_map.json (scanner-only additions)}.
+    """
+    try:
+        from integrations import rep_registry
+        from integrations.rep_map import sender_overrides
+        out = rep_registry.as_dict()
+        out["overrides"] = {k: list(v) for k, v in sorted(sender_overrides().items())}
+        out["ok"] = True
+        return jsonify(out)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "api reps")
+        return jsonify({"ok": False, "error": "internal error"}), 500
+
+
 @email_bp.route("/api/email/held-reports/release", methods=["POST"])
 def api_release_held_report():
     """Let a report the plausibility hold stopped through on the next scan.

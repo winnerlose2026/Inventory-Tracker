@@ -129,14 +129,10 @@ from .usfoods_inventory_report import (
 
 EventType = Literal["on_hand", "restock", "usage", "usage_rate"]
 
-# Sender-domain -> our canonical distributor name.
-DOMAIN_TO_DISTRIBUTOR = {
-    "cheneybrothers.com": "Cheney Brothers",
-    "cheney.com": "Cheney Brothers",
-    "usfoods.com": "US Foods",
-    "usfood.com": "US Foods",
-    "chefswarehouse.com": "Chefs Warehouse",
-}
+# Sender-domain -> our canonical distributor name. From the one rep registry
+# (integrations/rep_registry.py); the same object, so a domain added there is
+# live here.
+from .rep_registry import DOMAIN_TO_DISTRIBUTOR  # noqa: E402
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_TOKEN_URL_FMT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"

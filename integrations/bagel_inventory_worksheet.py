@@ -41,13 +41,17 @@ except ImportError:  # standalone / test use
 
 
 # Rep email address (lowercased) -> (distributor, canonical warehouse).
-# The canonical warehouse string must match seed_bagels.py exactly so the
-# reconstructed SKU name ("<Variety> Bagel 4oz [USF - Chicago]") matches the
-# seeded inventory key. Extend as each warehouse rep starts sending weekly
-# inventory worksheets.
-REP_EMAIL_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
-    "michael.via@usfoods.com": ("US Foods", "Chicago, IL"),
-}
+# Derived from the one rep registry (integrations/rep_registry.py) -- add a
+# worksheet rep THERE (parser="worksheet"), not here. The canonical warehouse
+# string must match seed_bagels.py exactly so the reconstructed SKU name
+# ("<Variety> Bagel 4oz [USF - Chicago]") matches the seeded inventory key.
+try:
+    from .rep_registry import sender_map as _registry_sender_map
+except ImportError:  # standalone / test use
+    from rep_registry import sender_map as _registry_sender_map  # type: ignore
+
+REP_EMAIL_TO_WAREHOUSE: dict[str, tuple[str, str]] = _registry_sender_map(
+    "worksheet")
 
 # Cases per case is fixed at 60 (5 doz) across both distributors -- same value
 # seed_bagels.py stamps on every SKU.
