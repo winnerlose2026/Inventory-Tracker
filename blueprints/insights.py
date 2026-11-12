@@ -16,6 +16,7 @@ from datetime import datetime
 from flask import Blueprint, jsonify
 
 from core.errors import _log_exc
+from core.util import business_now
 
 insights_bp = Blueprint("insights", __name__)
 
@@ -32,7 +33,7 @@ def build_insights() -> dict:
     checks = count_checks(inv, load_usage(), load_inventory_audit(0),
                           cfg.get("count_check") or {}, ledger=ledger)
     basis = (cfg.get("ordering") or {}).get("usage_basis") or "reps"
-    plan = plan_orders(inv, cfg, basis, checks["items"], now=datetime.now())
+    plan = plan_orders(inv, cfg, basis, checks["items"], now=business_now())
     return {"ok": True, "count_checks": checks, "orders": plan}
 
 

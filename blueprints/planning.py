@@ -82,7 +82,8 @@ def api_planning_plan():
         basis = (request.args.get("basis") or default_basis).strip().lower()
         if basis not in ("reps", "counts"):
             basis = default_basis
-        now = datetime.now()
+        from core.util import business_now
+        now = business_now()
         inv = load_inventory()
         usage = load_usage()
         audit = load_inventory_audit(0)

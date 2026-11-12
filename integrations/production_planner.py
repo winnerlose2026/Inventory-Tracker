@@ -45,7 +45,8 @@ def _parse(iso_s):
 def build_production_guide(inv: dict, ledger: list, demand_rows: list,
                            config: dict, toast_trend: dict = None,
                            now: datetime = None) -> dict:
-    now = now or datetime.now()
+    from core.util import business_now
+    now = now or business_now()
     pallet = int(config.get("pallet_cs") or 56)
     cap = config.get("capacity") or {}
     dep_day = float(cap.get("dependable_cs_per_day") or 224)

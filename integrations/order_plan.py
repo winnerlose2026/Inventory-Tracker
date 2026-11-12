@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta
 
-from core.util import naive_local_dt
+from core.util import business_now, naive_local_dt
 
 ORDER_DEFAULTS = {
     "lead_days": 30, "review_days": 7, "safety_days_top4": 14,
@@ -87,7 +87,7 @@ def plan_orders(inv: dict, cfg: dict, basis: str = "reps",
                 count_items: "dict | None" = None,
                 now: "datetime | None" = None) -> dict:
     oc = dict(ORDER_DEFAULTS, **(cfg.get("ordering") or {}))
-    now = now or datetime.now()
+    now = now or business_now()
     today = _day0(now)
     lead, review = int(oc["lead_days"]), int(oc["review_days"])
     mult = int(oc["line_multiple_cs"]) or 1
@@ -300,7 +300,7 @@ def cw_weekly_runrate(ledger: list, now: datetime, weeks: int = 8) -> float:
 
 def production_load(queue: list, plan: dict, cfg: dict, ledger: list,
                     now: "datetime | None" = None, weeks: int = 8) -> dict:
-    now = now or datetime.now()
+    now = now or business_now()
     today = _day0(now)
     oc = dict(ORDER_DEFAULTS, **(cfg.get("ordering") or {}))
     pallet = int(cfg.get("pallet_cs") or 56)
@@ -382,7 +382,7 @@ def production_load(queue: list, plan: dict, cfg: dict, ledger: list,
 def daily_schedule(queue: list, plan: dict, cfg: dict, ledger: list,
                    now: "datetime | None" = None, days_ahead: int = 10) -> dict:
     """Fill the next ``days_ahead`` production days earliest-bake-by first."""
-    now = now or datetime.now()
+    now = now or business_now()
     today = _day0(now)
     oc = dict(ORDER_DEFAULTS, **(cfg.get("ordering") or {}))
     cap_day = _f((cfg.get("capacity") or {}).get("max_cs_per_day"), 336.0)

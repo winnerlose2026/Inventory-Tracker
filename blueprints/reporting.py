@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request, send_file
 
 from core.errors import _safe_err
-from core.util import with_data_lock
+from core.util import business_today, with_data_lock
 from inventory_tracker import (
     load_inventory, load_usage, save_inventory, save_usage,
 )
@@ -46,7 +46,8 @@ def _plh_bucket_keys(grain: str, offset: int = 0):
     (no "future" windows past now).
     """
     from datetime import datetime, timedelta
-    today = datetime.now().date()
+    from core.util import business_today
+    today = business_today()
     if offset < 0:
         offset = 0
 
@@ -309,7 +310,7 @@ def api_report_toast_sales():
                 end = ed.replace(day=31)
             else:
                 end = ed.replace(month=ed.month + 1, day=1) - _td(days=1)
-        today = _dt.now().date()
+        today = business_today()
         if end.date() > today:
             end = _dt.combine(today, _dt.min.time())
         return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
@@ -360,7 +361,7 @@ def api_report_toast_sales():
         targets = _target_locations(loc_q)
         if not targets:
             return all_rows, meta
-        fresh_from = (_dt.now().date() - _td(days=1)).isoformat()
+        fresh_from = (business_today() - _td(days=1)).isoformat()
         # Which (guid, date) pairs already have at least 1 row?
         cached_keys = set()
         for r in all_rows:

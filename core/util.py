@@ -209,3 +209,64 @@ def with_data_lock(fn):
         with data_lock():
             return fn(*args, **kwargs)
     return _inner
+
+
+# ---------------------------------------------------------------------------
+# Business calendar. The server clock is UTC; the bakery runs on Eastern time.
+# "Today" for planning (what is late, what to bake, which Toast day is still
+# open) must be the bakery's day -- at 8 pm in New York the server already
+# says tomorrow. Stored timestamps are NOT changed by any of this.
+# ---------------------------------------------------------------------------
+
+BUSINESS_TZ_DEFAULT = "America/New_York"
+
+
+def business_tz():
+    """ZoneInfo for the business calendar (env BUSINESS_TZ overrides; a bad
+    name falls back to America/New_York, never raises)."""
+    import os
+    from zoneinfo import ZoneInfo
+    name = (os.environ.get("BUSINESS_TZ") or "").strip() or BUSINESS_TZ_DEFAULT
+    try:
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        return ZoneInfo(BUSINESS_TZ_DEFAULT)
+
+
+def business_now():
+    """The current wall-clock time at the bakery, as a NAIVE datetime (the
+    planners compare against bare dates like a PO's ship date)."""
+    from datetime import datetime
+    return datetime.now(business_tz()).replace(tzinfo=None)
+
+
+def business_today():
+    """The bakery's calendar date."""
+    return business_now().date()
+
+
+def business_dt(raw):
+    """A stored ISO stamp as naive bakery-local time (None if unparseable).
+    Bare dates stay as that date at midnight; naive stamps are taken as
+    server-local, matching how the data files are written."""
+    s = str(raw or "").strip()
+    dt = naive_local_dt(s)
+    if dt is None:
+        return None
+    if len(s) <= 10:
+        return dt
+    try:
+        return dt.astimezone().astimezone(business_tz()).replace(tzinfo=None)
+    except Exception:  # noqa: BLE001
+        return dt
+
+
+def business_days_between(start, end) -> int:
+    """Mon-Fri days after `start` up to and including `end` (dates)."""
+    from datetime import timedelta
+    n, d = 0, start
+    while d < end:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
