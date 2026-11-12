@@ -1212,6 +1212,9 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
             if got:
                 record, d_errs = got
                 if record is not None:
+                    # document identity, so an older copy can't replace a newer
+                    record.setdefault("source_received_at", received_at or "")
+                    record.setdefault("source_sender", from_hdr or "")
                     cw_pos.append(record)
                 errors.extend(d_errs)
         else:

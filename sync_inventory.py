@@ -1263,10 +1263,16 @@ def _apply_cw_pos(cw_pos: list,
     except Exception:
         canceled = {}
 
+    # Same normalised match every other canceled-PO check uses (an exact
+    # string compare let "HHB-1226111" / " 1226111." back in).
+    from core.util import _norm_po_key
+    canceled_keys = {_norm_po_key(k) for k in (canceled or {})}
+    from integrations.po_revision import is_newer as _doc_is_newer
     from integrations.chefs_warehouse_po_parser import record_integrity_errors
 
     lead_days = _po_lead_days()
     now_iso = datetime.now().isoformat()
+    report.setdefault("skipped_stale", 0)
     report.setdefault("needs_review", [])
 
     def _parse_cw_date(s: str):
@@ -1287,7 +1293,7 @@ def _apply_cw_pos(cw_pos: list,
         if not po_num:
             report["skipped_invalid"] += 1
             continue
-        if po_num in canceled:
+        if _norm_po_key(po_num) in canceled_keys:
             report["skipped_canceled"] += 1
             continue
 
@@ -1303,6 +1309,27 @@ def _apply_cw_pos(cw_pos: list,
         eta = ""
 
         existing_rec = by_po.get(po_num)
+        # Document ordering. Graph lists the mailbox newest first and every
+        # record used to overwrite the one before it, so the OLDEST copy of a
+        # re-sent PO in the scan window won every scan. A stored copy that is
+        # strictly newer than the incoming one is kept; a stored record with
+        # no stamp (everything saved before 2026-11) counts as oldest, and
+        # two undated copies keep the old last-writer-wins behaviour.
+        if existing_rec is not None and existing_rec.get("source_received_at"):
+            from integrations.po_revision import parse_dt as _pdt
+            _ex_at = _pdt(existing_rec.get("source_received_at"))
+            _in_at = _pdt(record.get("source_received_at") or "")
+            _same_doc = _ex_at is not None and _ex_at == _in_at
+            if not _same_doc and not _doc_is_newer(
+                    record.get("po_revision"),
+                    record.get("source_received_at") or "",
+                    existing_rec.get("po_revision"),
+                    existing_rec.get("source_received_at") or "",
+                    record.get("source_sender") or "",
+                    existing_rec.get("source_sender") or ""):
+                report["skipped_stale"] += 1
+                report["unchanged"] += 1
+                continue
         # Preserve operator-set fields on re-ingest: ship_date,
         # arrival_date, and the ingested_at of the first booking.
         ship_date    = ""
