@@ -27,7 +27,7 @@ def build_insights() -> dict:
     from integrations.order_plan import plan_orders
     from blueprints.pos import build_po_ledger
     cfg = load_planning_config()
-    inv = load_inventory()
+    inv = {k: v for k, v in load_inventory().items() if not v.get("hidden")}
     ledger = build_po_ledger()
     checks = count_checks(inv, load_usage(), load_inventory_audit(0),
                           cfg.get("count_check") or {}, ledger=ledger)

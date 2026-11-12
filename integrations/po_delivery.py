@@ -832,6 +832,10 @@ _PROBLEM = re.compile(
 _ARRIVAL = re.compile(r"^\s*Arrival\s+Time\s*:\s*(\S.*?)\s*$", re.I | re.M)
 _DEPARTURE = re.compile(r"^\s*Departure\s+Time\s*:\s*\S", re.I | re.M)
 _SENTENCE = re.compile(r"[^\n.!?]+(?:[.!](?!\d)|$)", re.M)
+# A line that opens with its own PO number ("9314683Y-had to reach out ...",
+# "PO 1220440: shows delivered") speaks for that PO alone.
+_PO_LED = re.compile(r"^\s*(?:PO\s*#?\s*:?\s*)?(?=[A-Z0-9]*\d)[A-Z0-9]{5,16}\s*[-\u2013\u2014:]",
+                     re.I)
 
 _STATE_ZONES = {
     **{s: "America/New_York" for s in ("NY", "NJ", "CT", "MA", "PA", "MD", "DE",
@@ -919,18 +923,30 @@ def confirmation_lines(text: str) -> list:
     / "This load delivered 11/2"; "arrival" for a detention notice's
     "Arrival Time: 543AM/2nd" (it only exists once the truck unloaded, and
     only counts next to a Departure time). Empty when the message hedges or
-    reports a problem anywhere."""
+    reports a problem anywhere.
+
+    A hedged line that opens with its own PO number holds back only that PO
+    (Belinda 11/12: "064511780513-shows delivered / 1220440-shows delivered /
+    9314683Y-had to reach out to dispatch to confirm if delivered" -- the
+    third line used to discard the first two). The other lines then count
+    only when they, too, name their PO."""
     own = own_text(text or "")
     if _PROBLEM.search(own):
         return []
     out = []
+    scoped_hedge = False
     for raw in _SENTENCE.findall(own):
         line = raw.strip().strip(".!").strip()
         if not line or not _CONFIRM.search(line):
             continue
         if _HEDGE.search(line):
+            if _PO_LED.match(line):
+                scoped_hedge = True   # that PO is left to a reader; the rest stand
+                continue
             return []            # one hedged "delivered" line: leave it to a reader
         out.append((line, "delivered"))
+    if scoped_hedge:
+        out = [(ln, k) for ln, k in out if _PO_LED.match(ln)]
     if _DEPARTURE.search(own):
         for m in _ARRIVAL.finditer(own):
             line = m.group(0).strip()

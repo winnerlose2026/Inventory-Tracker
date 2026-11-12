@@ -915,9 +915,15 @@
         <div id="low-stock-body" style="padding:0 4px 8px"></div>
       </div>
 
-      <!-- Count check (integrations/stock_insights.py via /api/insights).
+      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
+      <div id="inv-flow-alert" class="flow-issue" style="display:none;margin:0 0 16px"></div>
+      <div class="card-title" style="font-size:22px;margin:28px 0 14px">Warehouse Inventory</div>
+      <div id="inventory-container"></div>
+
+      <!-- Count check (integrations/stock_insights.py via /api/insights) -- below
+           the warehouse tables since 2026-11-12 (JD: inventory comes first).
            Suggested orders live on the Production Planner tab. -->
-      <div class="card" id="countcheck-card" style="display:none;margin-bottom:20px">
+      <div class="card" id="countcheck-card" style="display:none;margin:28px 0 20px">
         <div class="card-header">
           <span class="card-title" style="font-size:22px">&#129518; Count Check <span style="font-family:var(--font-body,inherit);font-size:12px;font-weight:400;color:var(--muted)">theoretical vs. actual at the latest count</span></span>
           <span id="countcheck-count" style="color:var(--muted);font-size:12px"></span>
@@ -925,10 +931,6 @@
         <div id="countcheck-body" style="padding:0 4px 8px"></div>
       </div>
 
-      <div id="sync-report" style="display:none;margin-bottom:20px"></div>
-      <div id="inv-flow-alert" class="flow-issue" style="display:none;margin:0 0 16px"></div>
-      <div class="card-title" style="font-size:22px;margin:28px 0 14px">Warehouse Inventory</div>
-      <div id="inventory-container"></div>
 
       <!-- Bottom action bar. Per-row Edit/Restock/Use were removed to slim the
            table; pick a SKU here to edit it. Usage + restocks come from ingested
@@ -1764,6 +1766,9 @@
       <div class="form-group">
         <label>Weekly Usage (units/wk)</label>
         <input id="f-weekly" type="number" step="any" min="0" placeholder="0">
+      </div>
+      <div class="form-group" id="f-hidden-wrap" style="display:none">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input id="f-hidden" type="checkbox" style="width:auto"> Hide from Inventory tab</label>
       </div>
       <div class="form-group">
         <label>Low Stock Threshold</label>

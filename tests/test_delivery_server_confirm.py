@@ -279,3 +279,39 @@ def test_out_of_office_is_an_auto_reply():
     assert D.is_auto_reply({"subject": "RE: Quote and Schedule - 5 Orders", "text": OOO_1106})
     assert not D.is_auto_reply({"subject": "RE: Quote and Schedule - 5 Orders",
                                 "text": BOTH_1105})
+
+
+# Belinda 11/12/2026 10:01 ET, the real reply on the 8-Orders thread
+MIXED_1112 = ("064511780513-shows delivered\n1220440-shows delivered\n"
+              "9314683Y-had to reach out to dispatch to confirm if delivered\n\n"
+              "Belinda Morris\nLogistics Specialist, Senior")
+
+
+def test_a_hedged_po_line_holds_back_only_its_own_po():
+    assert D.confirmation_lines(MIXED_1112) == [
+        ("064511780513-shows delivered", "delivered"),
+        ("1220440-shows delivered", "delivered")]
+    # an unscoped hedge still discards the whole message
+    assert D.confirmation_lines("064511780513-shows delivered\n"
+                                "Not sure if the other one delivered") == []
+    # once a PO line hedged, an unscoped "delivered" line is not trusted
+    assert D.confirmation_lines("9314683Y-confirming if delivered\n"
+                                "This shows delivered") == []
+    # no PO named and no time: the day comes from the passed appointment
+    assert D.delivered_at_from("064511780513-shows delivered", "2026-11-12T15:01:53Z",
+                               "America/New_York", "2026-11-11T08:30:00-05:00") == \
+        ("2026-11-11", False)
+
+
+def test_mixed_reply_releases_the_confirmed_po_and_holds_the_hedged_one(monkeypatch):
+    lines = ("393072B2-shows delivered\n"
+             "014511763291-had to reach out to dispatch to confirm if delivered\n\n"
+             "Belinda Morris")
+    out, store = _sync(monkeypatch,
+                       {"393072B2": _scheduled(), "014511763291": _scheduled_cheney()},
+                       [("ans", 1, BELINDA, lines)], CHASE_BOTH)
+    got = [g["po_number"] for g in out["confirmed_by_server"] if g["applied"]]
+    assert got == ["393072B2"], out["confirmed_by_server"]
+    assert store["tracking"]["393072B2"]["status"] == "delivered"
+    assert store["tracking"]["393072B2"]["delivered_at"] == "2026-10-15"
+    assert store["tracking"]["014511763291"]["status"] == "scheduled"

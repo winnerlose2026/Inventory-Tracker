@@ -191,8 +191,17 @@ def api_update(name):
         case_cost=float(d["case_cost"]) if "case_cost" in d else None,
         case_size=int(d["case_size"]) if "case_size" in d else None,
         weekly_usage=float(d["weekly_usage"]) if "weekly_usage" in d else None,
+        hidden=bool(d["hidden"]) if "hidden" in d else None,
     )
     return jsonify({"ok": True})
+
+
+@inventory_bp.route("/api/hidden-skus")
+def api_hidden_skus():
+    """SKUs hidden from the Inventory tab, so they can still be picked in
+    "Modify a SKU" and un-hidden."""
+    inv = load_inventory()
+    return jsonify(sorted((v.get("name") or k) for k, v in inv.items() if v.get("hidden")))
 
 
 @inventory_bp.route("/api/inventory/<path:name>", methods=["DELETE"])
@@ -258,7 +267,9 @@ def api_warehouses():
 @inventory_bp.route("/api/distributors")
 def api_distributors():
     inv = load_inventory()
-    items_enriched = [_enrich_on_order(dict(v)) for v in inv.values()]
+    show_hidden = request.args.get("include_hidden") in ("1", "true", "yes")
+    items_enriched = [_enrich_on_order(dict(v)) for v in inv.values()
+                      if show_hidden or not v.get("hidden")]
     derived_counts = _last_count_by_warehouse(inv)
     groups: dict[str, list] = {}
     for item in items_enriched:

@@ -440,8 +440,12 @@ function populateSkuEditSelect() {
   if (!sel) return;
   const prev = sel.value;
   const items = inventoryCache.slice().sort((a, b) => (a.name < b.name ? -1 : 1));
+  const hidden = window._hiddenSkus || [];
   sel.innerHTML = '<option value="">Select a SKU\u2026</option>' +
-    items.map(i => `<option value="${escAttr(i.name)}">${escHtml(i.name)}</option>`).join('');
+    items.map(i => `<option value="${escAttr(i.name)}">${escHtml(i.name)}</option>`).join('') +
+    (hidden.length ? `<optgroup label="Hidden from Inventory (${hidden.length})">` +
+      hidden.map(n => `<option value="${escAttr(n)}">${escHtml(n)}</option>`).join('') +
+      '</optgroup>' : '');
   if (prev) sel.value = prev;
 }
 
@@ -458,11 +462,13 @@ async function loadInventory() {
   // so each row can expand a lot-history sub-table.
   // Inventory is the landing page now. Build the grouped data once and feed
   // it to the Low Stock Alerts card so its rows match the table exactly.
-  const [groups, lotMap, insights] = await Promise.all([
+  const [groups, lotMap, insights, hiddenSkus] = await Promise.all([
     api('/api/distributors'),
     api('/api/production/lots-by-pair').catch(() => ({})),
     api('/api/insights').catch(() => null),
+    api('/api/hidden-skus').catch(() => []),
   ]);
+  window._hiddenSkus = Array.isArray(hiddenSkus) ? hiddenSkus : [];
   window._lotMapByPair = lotMap || {};
   window._insights = (insights && insights.ok) ? insights : null;
   refreshLowStock(groups);
@@ -1929,6 +1935,8 @@ async function openAddModal() {
   await ensureWarehouses();
   editingName = null;
   document.getElementById('modal-title').textContent = 'Add Item';
+  const hw = document.getElementById('f-hidden-wrap');
+  if (hw) hw.style.display = 'none';
   ['f-name','f-qty','f-unit','f-cat','f-price','f-threshold',
    'f-case-cost','f-case-size','f-weekly'].forEach(id => {
     document.getElementById(id).value = '';
@@ -1971,6 +1979,10 @@ async function openEditModal(name) {
   document.getElementById('f-case-cost').value = item.case_cost || '';
   document.getElementById('f-case-size').value = item.case_size || '';
   document.getElementById('f-weekly').value = item.weekly_usage || '';
+  const hw = document.getElementById('f-hidden-wrap');
+  if (hw) hw.style.display = '';
+  const hb = document.getElementById('f-hidden');
+  if (hb) hb.checked = !!item.hidden;
   document.getElementById('item-modal').classList.add('open');
 }
 
@@ -1999,6 +2011,8 @@ async function submitItem() {
   };
 
   if (editingName) {
+    const hb = document.getElementById('f-hidden');
+    if (hb) payload.hidden = hb.checked;
     await api(`/api/inventory/${encodeURIComponent(editingName)}`, 'PUT', payload);
     toast(`Updated "${editingName}".`);
   } else {

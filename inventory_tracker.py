@@ -1485,7 +1485,8 @@ def update_item(name: str, quantity: Optional[float] = None,
                 warehouse: Optional[str] = None,
                 case_cost: Optional[float] = None,
                 case_size: Optional[int] = None,
-                weekly_usage: Optional[float] = None):
+                weekly_usage: Optional[float] = None,
+                hidden: Optional[bool] = None):
     inv = load_inventory()
     key = name.lower().strip()
     if key not in inv:
@@ -1519,6 +1520,13 @@ def update_item(name: str, quantity: Optional[float] = None,
         item["case_size"] = case_size
     if weekly_usage is not None:
         item["weekly_usage"] = weekly_usage
+    if hidden is not None:
+        # Hidden = off the Inventory tab (a finished LTO, JD 2026-11-12). The
+        # SKU keeps ingesting counts/POs; only the display skips it.
+        if hidden:
+            item["hidden"] = True
+        else:
+            item.pop("hidden", None)
     item["updated"] = datetime.now().isoformat()
     save_inventory(inv)
     if qty_delta_row is not None:
