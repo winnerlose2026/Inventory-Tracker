@@ -891,10 +891,17 @@ _STATE_ZONES = {
 }
 
 
+_EAST_TN = re.compile(r"\b(?:alcoa|knoxville|maryville|chattanooga)\b", re.I)
+
+
 def dock_zone(*places: str) -> str:
     """IANA zone of the receiving dock from an address or a "City, ST"
     warehouse label; Eastern when nothing says."""
     for p in places:
+        # East Tennessee (Alcoa / Knoxville) keeps Eastern time; the state
+        # table below would put it an hour off.
+        if _EAST_TN.search(str(p or "")):
+            return "America/New_York"
         for st in re.findall(r"\b([A-Z]{2})\b\.?\s*(?:\d{5})?\s*$|,\s*([A-Z]{2})\b",
                              str(p or "")):
             for s in st:

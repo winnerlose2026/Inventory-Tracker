@@ -94,7 +94,8 @@ def _rollover_arrival(e: dict) -> str:
     return m.group(1) if m else (e.get("timestamp") or "")[:10]
 
 
-def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
+def _receipts_after_count(usage: list, item_key: str, count_date: str,
+                          warehouse: str = "") -> float:
     """Cases received for this SKU whose ARRIVAL postdates ``count_date``.
 
     A reported on-hand figure is the truth at the moment it was counted -- it
@@ -125,7 +126,8 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
             continue
         # By day, refined for confirmed deliveries (exact time, and a count
         # proven to have missed the receipt) -- core.util.receipt_inside_count.
-        if not receipt_inside_count(e, count_date, _rollover_arrival(e)):
+        if not receipt_inside_count(e, count_date, _rollover_arrival(e),
+                                    warehouse=warehouse):
             total += abs(float(e.get("amount") or 0))
     return total
 
@@ -209,7 +211,8 @@ _POST_COUNT_MOVEMENT_SOURCES = ("forecast-daily", "manual-use", "manual-restock"
                                 "manual-correction")
 
 
-def _movement_after_count(usage: list, item_key: str, count_date: str) -> float:
+def _movement_after_count(usage: list, item_key: str, count_date: str,
+                          warehouse: str = "") -> float:
     """Net cases consumed for this SKU by movements dated AFTER ``count_date``
     (positive = consumed; a manual restock counts negative).
 
@@ -221,7 +224,10 @@ def _movement_after_count(usage: list, item_key: str, count_date: str) -> float:
     +0.45 forecast-daily at 05:05 and -0.45 "Email on-hand sync" at 10:12,
     three days running -- on-hand never moved between weekly counts.
     """
-    cd = (count_date or "")[:10]
+    # The count's day AT THE DOCK (a Monday-evening count is stamped Tuesday
+    # in UTC and used to reset Tuesday's burn). Rows carry their own day.
+    from core.util import dock_local_day
+    cd = dock_local_day(count_date or "", warehouse)
     if not cd or not item_key:
         return 0.0
     total = 0.0
@@ -528,11 +534,14 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
         # same reason _receipts_after_count is: a wide-lookback backfill
         # posts long-past arrivals "now". Same-day counts as absorbed.
         if item is not None:
-            _count_date = (item.get("last_count_at") or "")[:10]
+            from core.util import (dock_local_day as _dld,
+                                   receipt_inside_count as _inside)
+            _wh = item.get("warehouse") or ""
+            _count_date = _dld(item.get("last_count_at") or "", _wh)
             _arrival = _rollover_arrival(entry)
-            from core.util import receipt_inside_count as _inside
             if _count_date and _arrival and _inside(
-                    entry, item.get("last_count_at") or "", _arrival):
+                    entry, item.get("last_count_at") or "", _arrival,
+                    warehouse=_wh):
                 report.setdefault("reversals_absorbed", []).append(
                     f"PO {po_number} rev {new_rev_tag}: kept "
                     f"{abs(float(entry.get('amount') or 0)):g} cs of "
@@ -1100,8 +1109,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # dated after it, so they are not reset either. Derived from the
         # reported count plus recorded ledger rows, so re-applying the same
         # report lands on the same number.
-        _receipts = _receipts_after_count(usage, key, _evt_cd)
-        _moved = _movement_after_count(usage, key, _evt_cd)
+        _receipts = _receipts_after_count(usage, key, _evt_cd,
+                                          warehouse=item.get("warehouse") or "")
+        _moved = _movement_after_count(usage, key, _evt_cd,
+                                       warehouse=item.get("warehouse") or "")
         _target_qty = amount + _receipts - _moved
         qty_changed = abs(_target_qty - old_qty) >= 1e-9
         # Record that a fresh count was received for this warehouse today,
@@ -1678,7 +1689,9 @@ def _apply_events(events: list,
                     report["unmatched"].append(
                         evt.item.name or f"{evt.item.variety}@{evt.item.warehouse}")
                     continue
-                count_date = (item.get("last_count_at") or "")[:10]
+                from core.util import dock_local_day as _dld2
+                count_date = _dld2(item.get("last_count_at") or "",
+                                   item.get("warehouse") or "")
                 qty = float(evt.item.quantity or 0)
                 if _arrival and count_date and _arrival <= count_date:
                     report.setdefault("gained_absorbed", []).append(

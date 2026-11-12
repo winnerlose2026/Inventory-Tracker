@@ -282,7 +282,8 @@ def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
     count_at = item.get("last_count_at") or ""
     if not count_at[:10]:
         return True          # never counted -> the rollover is all on-hand has
-    return not receipt_inside_count(row, count_at, _rollover_arrival(row))
+    return not receipt_inside_count(row, count_at, _rollover_arrival(row),
+                                    warehouse=item.get("warehouse") or "")
 
 
 def _future_iso(raw: str, now: datetime) -> str:

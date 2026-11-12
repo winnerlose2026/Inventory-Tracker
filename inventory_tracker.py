@@ -963,7 +963,8 @@ def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
     still showed all 1,120 cs on order and 404 cs on hand; the day rule
     zeroed the receipt and the PO vanished from the ledger.
     """
-    from core.util import CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery
+    from core.util import (CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery,
+                           dock_local_day as _dock_local_day)
     missed: dict = {}
     groups: dict = {}
     for key, item in inv.items():
@@ -977,7 +978,11 @@ def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
             gate, delivered_at = _delivery_gate(entry, tracking)
             if gate != "delivered" or delivered_at is None or delivered_at > now:
                 continue
-            if delivered_at.date().isoformat() > count_at[:10]:
+            _wh = item.get("warehouse") or ""
+            _d_day = (_dock_local_day(delivered_at.isoformat(), _wh)
+                      if _delivery_time_known(entry, tracking)
+                      else delivered_at.date().isoformat())
+            if _d_day > _dock_local_day(count_at, _wh):
                 continue            # arrives after the count by day anyway
             po = entry.get("po_number") or ""
             # Exact-time rule only for a REAL delivery time; a date-only
@@ -1038,7 +1043,8 @@ def _rollover_on_order(inv: dict) -> bool:
         overrides = load_status_overrides() or {}
     except Exception:  # noqa: BLE001 -- a bad overrides file must not stop reads
         overrides = {}
-    from core.util import NOT_ARRIVED_STATUSES, _norm_po_key
+    from core.util import (NOT_ARRIVED_STATUSES, _norm_po_key, dock_local_day,
+                           dock_midnight_naive)
     rolled_pos: set = set()
     for key, item in inv.items():
         pending = item.get("on_order") or []
@@ -1081,7 +1087,17 @@ def _rollover_on_order(inv: dict) -> bool:
                 # can correct it (typically via /api/on-order/ship-date).
                 kept.append(entry)
                 continue
-            if trigger > now:
+            # The day the dock means, and the moment it starts there. A
+            # date-only trigger (an ETA, a ship-date arrival, a date-only
+            # Lineage confirmation) used to fire at 00:00 SERVER time (UTC):
+            # 6-8 pm the evening before at the dock.
+            _wh = item.get("warehouse") or ""
+            _exact = (gate == "delivered" and delivered_at is not None
+                      and _delivery_time_known(entry, tracking))
+            _date_only = (not _exact and (trigger.hour, trigger.minute,
+                                          trigger.second) == (0, 0, 0))
+            fire_at = dock_midnight_naive(trigger, _wh) if _date_only else trigger
+            if fire_at > now:
                 kept.append(entry)
                 continue
             qty = float(entry.get("qty") or 0)
@@ -1099,9 +1115,14 @@ def _rollover_on_order(inv: dict) -> bool:
             # re-booked with a back-dated ETA: the 2026-08-28 Alcoa re-apply
             # of PO 2055126H posted an ETA of 08-14 that promoted instantly,
             # on top of a count taken 08-24 that already contained it.
-            count_date = (item.get("last_count_at") or "")[:10]
+            # Both days are the DOCK's: a count's stamp is UTC, so a Monday
+            # 6:15 pm CST count reads "Tuesday" and used to absorb a PO that
+            # arrived Tuesday (Houston, 168 cs).
+            count_date = dock_local_day(item.get("last_count_at") or "", _wh)
+            arrival_day = (dock_local_day(trigger.isoformat(), _wh) if _exact
+                           else trigger.date().isoformat())
             miss = missed.get((entry.get("po_number") or "", key))
-            if (count_date and trigger.date().isoformat() <= count_date
+            if (count_date and arrival_day <= count_date
                     and miss is None):
                 rolled_pos.add(_norm_po_key(entry.get("po_number") or ""))
                 _PENDING_ROLLOVER_ABSORBED.append({
