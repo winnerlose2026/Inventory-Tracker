@@ -163,6 +163,7 @@ def datetime_now_iso() -> str:
 
 
 @reporting_bp.route("/api/sales/ingest", methods=["POST"])
+@with_data_lock
 def api_sales_ingest():
     """Accept Toast product-mix rows pushed by an external aggregator.
 
@@ -1143,6 +1144,10 @@ def api_report_plh():
         "offset":           offset,
         "effective_offset": effective_offset,
         "auto_shift":       auto_shift,
+        # The window may have slid back to the last populated period
+        # (auto_shift); say what the newest data actually is so the chart
+        # can show "data through <week>" and go red when it is old.
+        "bakery_data":      bakery_data_status(bsales),
         "window_label":     _plh_window_label(grain, buckets),
         "case_prices": {
             "US Foods": 27.00, "Cheney Brothers": 26.50, "default": 29.50,
@@ -1152,27 +1157,9 @@ def api_report_plh():
     })
 
 
-@reporting_bp.route("/api/admin/labor/ingest", methods=["POST"])
-def api_admin_labor_ingest():
-    """Append or replace bakery labor entries.
-
-    Body:
-      entries:  [{date: YYYY-MM-DD, hours: float, dollars?: float, source?: str}]
-      replace:  bool — when true, REPLACE all entries from the same `source`
-                with the new set; when false (default), append + dedupe by
-                (date, source) keeping the new entry.
-
-    No Toast call here — this is the "feed me labor data from any source"
-    endpoint. A separate script can pull from Toast and POST. CSV upload
-    or manual entry can use this same endpoint.
-    """
+def _ingest_labor(incoming: list, replace: bool) -> dict:
+    """Merge labor entries into labor.json. Caller holds data_lock."""
     from inventory_tracker import load_labor, save_labor
-    body = request.json or {}
-    incoming = body.get("entries") or []
-    replace = bool(body.get("replace", False))
-    if not incoming:
-        return jsonify({"ok": False, "error": "entries required"}), 400
-
     existing = load_labor()
     sources_in_incoming = {(e.get("source") or "manual") for e in incoming}
     if replace:
@@ -1197,36 +1184,13 @@ def api_admin_labor_ingest():
         by_key[(rec["date"], rec["source"])] = rec
     merged = list(by_key.values())
     save_labor(merged)
-    return jsonify({"ok": True, "total_entries": len(merged),
-                    "added_or_updated": len(incoming)})
+    return {"ok": True, "total_entries": len(merged),
+            "added_or_updated": len(incoming)}
 
 
-@reporting_bp.route("/api/admin/bakery-sales/ingest", methods=["POST"])
-def api_admin_bakery_sales_ingest():
-    """Append or replace bakery weekly sales entries.
-
-    Body:
-      entries:  [
-        {
-          week_start:  "YYYY-MM-DD",   # Monday -- required, used as the key
-          week_end:    "YYYY-MM-DD",
-          channels:    {channel: dollars, ...},
-          total:       float,
-          splh:        float | null,
-          source:      str,            # default "bakery-xlsx"
-        }, ...
-      ]
-      replace:  bool -- when true, REPLACE all entries that share a source
-                with the incoming set; when false (default), dedupe by
-                (week_start, source) keeping the new entry.
-    """
+def _ingest_bakery_sales(incoming: list, replace: bool) -> dict:
+    """Merge weekly bakery sales into bakery_sales.json. Caller holds data_lock."""
     from inventory_tracker import load_bakery_sales, save_bakery_sales
-    body = request.json or {}
-    incoming = body.get("entries") or []
-    replace = bool(body.get("replace", False))
-    if not incoming:
-        return jsonify({"ok": False, "error": "entries required"}), 400
-
     existing = load_bakery_sales()
     sources_in_incoming = {(e.get("source") or "bakery-xlsx") for e in incoming}
     if replace:
@@ -1258,8 +1222,237 @@ def api_admin_bakery_sales_ingest():
         added += 1
     merged = sorted(by_key.values(), key=lambda r: r.get("week_start") or "")
     save_bakery_sales(merged)
-    return jsonify({"ok": True, "total_entries": len(merged),
-                    "added_or_updated": added})
+    return {"ok": True, "total_entries": len(merged),
+            "added_or_updated": added}
+
+
+@reporting_bp.route("/api/admin/labor/ingest", methods=["POST"])
+@with_data_lock
+def api_admin_labor_ingest():
+    """Append or replace bakery labor entries.
+
+    Body:
+      entries:  [{date: YYYY-MM-DD, hours: float, dollars?: float, source?: str}]
+      replace:  bool — when true, REPLACE all entries from the same `source`
+                with the new set; when false (default), append + dedupe by
+                (date, source) keeping the new entry.
+
+    No Toast call here — this is the "feed me labor data from any source"
+    endpoint. A separate script can pull from Toast and POST. CSV upload
+    or manual entry can use this same endpoint. Load -> merge -> save runs
+    under data_lock (two overlapping ingests used to lose one).
+    """
+    body = request.json or {}
+    incoming = body.get("entries") or []
+    replace = bool(body.get("replace", False))
+    if not incoming:
+        return jsonify({"ok": False, "error": "entries required"}), 400
+    return jsonify(_ingest_labor(incoming, replace))
+
+
+@reporting_bp.route("/api/admin/bakery-sales/ingest", methods=["POST"])
+@with_data_lock
+def api_admin_bakery_sales_ingest():
+    """Append or replace bakery weekly sales entries.
+
+    Body:
+      entries:  [
+        {
+          week_start:  "YYYY-MM-DD",   # Monday -- required, used as the key
+          week_end:    "YYYY-MM-DD",
+          channels:    {channel: dollars, ...},
+          total:       float,
+          splh:        float | null,
+          source:      str,            # default "bakery-xlsx"
+        }, ...
+      ]
+      replace:  bool -- when true, REPLACE all entries that share a source
+                with the incoming set; when false (default), dedupe by
+                (week_start, source) keeping the new entry.
+    Runs under data_lock.
+    """
+    body = request.json or {}
+    incoming = body.get("entries") or []
+    replace = bool(body.get("replace", False))
+    if not incoming:
+        return jsonify({"ok": False, "error": "entries required"}), 400
+    return jsonify(_ingest_bakery_sales(incoming, replace))
+
+
+# --- Bakery workbook on the server ---------------------------------------------
+#: Largest workbook accepted (the real one is ~1-2 MB).
+BAKERY_WORKBOOK_MAX_BYTES = 30 * 1024 * 1024
+#: The Sales vs Labor chart goes red when its newest week ended this long ago.
+BAKERY_DATA_STALE_DAYS = 10
+
+
+def _bakery_workbook_state_path():
+    from inventory_tracker import DATA_DIR
+    return DATA_DIR / "bakery_workbook_state.json"
+
+
+def _load_bakery_workbook_state() -> dict:
+    from inventory_tracker import _read_json
+    st = _read_json(_bakery_workbook_state_path(), {})
+    return st if isinstance(st, dict) else {}
+
+
+def bakery_data_status(bsales=None) -> dict:
+    """How current the bakery Sales vs Labor data is: the newest week with
+    sales, how long ago it ended (bakery calendar), and the last upload."""
+    from datetime import date as _date
+    if bsales is None:
+        from inventory_tracker import load_bakery_sales
+        bsales = load_bakery_sales() or []
+    weeks = sorted((w for w in bsales if float(w.get("total") or 0) > 0),
+                   key=lambda w: w.get("week_start") or "")
+    last = weeks[-1] if weeks else None
+    through = (last or {}).get("week_start") or ""
+    through_end = (last or {}).get("week_end") or ""
+    age = None
+    if through:
+        try:
+            end = _date.fromisoformat(through_end) if through_end \
+                else _date.fromisoformat(through) + timedelta(days=6)
+            through_end = end.isoformat()
+            age = (business_today() - end).days
+        except ValueError:
+            age = None
+    st = _load_bakery_workbook_state()
+    return {
+        "data_through": through, "data_through_end": through_end,
+        "days_since_data_through": age,
+        "stale_after_days": BAKERY_DATA_STALE_DAYS,
+        "stale": (age is None) or age > BAKERY_DATA_STALE_DAYS,
+        "weeks": len(weeks),
+        "uploaded_at": st.get("uploaded_at") or "",
+        "uploaded_filename": st.get("filename") or "",
+        "uploaded_by": st.get("uploaded_by") or "",
+    }
+
+
+@reporting_bp.route("/api/admin/bakery-workbook/status")
+def api_admin_bakery_workbook_status():
+    """'data through <week>, uploaded <when>' for the Report tab."""
+    return jsonify({"ok": True, **bakery_data_status()})
+
+
+@reporting_bp.route("/api/admin/bakery-workbook/upload", methods=["POST"])
+def api_admin_bakery_workbook_upload():
+    """Ingest the "Bakery Model - Sales v. Labor" workbook on the server.
+
+    Send the .xlsx as multipart form field ``file`` OR as the raw request
+    body. ``force=1`` (query, form field or X-Force header) overrides the two
+    safety stops below. Auth: the usual login session or API token.
+
+    Steps: validate the zip (a truncated Dropbox copy is rejected with a
+    clear message) -> skip when the file's sha256 equals the last ingested
+    one -> parse (no lock held) -> under data_lock, refuse if the sheet dates
+    drift or the workbook holds FEWER weeks than are stored (both replace all
+    stored bakery rows, so a bad file must not overwrite good history) ->
+    apply the same two ingests the laptop script posted (labor + weekly
+    sales, replace=True).
+
+    Returns {ok, weeks, labor_rows, sales_rows, data_through, unchanged}.
+    """
+    import hashlib
+    from datetime import timezone
+    from flask import session
+    from core import feed_health
+    from core.errors import _log_exc
+    from integrations.bakery_workbook import (
+        SOURCE_TAG, WorkbookError, parse_workbook_detailed, validate_xlsx_bytes,
+    )
+    from inventory_tracker import (_write_json, data_lock, load_bakery_sales)
+
+    force = str(request.args.get("force") or request.form.get("force")
+                or request.headers.get("X-Force") or "").strip().lower() \
+        in ("1", "true", "yes", "on")
+    up = request.files.get("file")
+    filename = ""
+    if up is not None:
+        data = up.read(BAKERY_WORKBOOK_MAX_BYTES + 1)
+        filename = (up.filename or "")[:200]
+    else:
+        data = request.get_data(cache=False) or b""
+        filename = (request.headers.get("X-Filename") or "")[:200]
+    if not data:
+        return jsonify({"ok": False, "error": "No file received. Send the .xlsx as "
+                        "form field 'file' or as the request body."}), 400
+    if len(data) > BAKERY_WORKBOOK_MAX_BYTES:
+        return jsonify({"ok": False, "error": "That file is too large to be the "
+                        "bakery workbook."}), 413
+
+    def _fail(msg, code=400, problems=None):
+        feed_health.record("bakery-workbook", False, msg[:300])
+        out = {"ok": False, "error": msg}
+        if problems:
+            out["problems"] = problems[:40]
+        return jsonify(out), code
+
+    try:
+        validate_xlsx_bytes(data)
+    except WorkbookError as exc:
+        return _fail(str(exc))
+    sha = hashlib.sha256(data).hexdigest()
+    state = _load_bakery_workbook_state()
+    if not force and sha == state.get("sha256"):
+        status = bakery_data_status()
+        feed_health.record("bakery-workbook", True, "same file as last upload - nothing to do",
+                           data_through=status["data_through"])
+        return jsonify({"ok": True, "unchanged": True,
+                        "weeks": state.get("weeks") or 0,
+                        "labor_rows": state.get("labor_rows") or 0,
+                        "sales_rows": state.get("sales_rows") or 0,
+                        "data_through": status["data_through"],
+                        "uploaded_at": state.get("uploaded_at") or ""})
+    try:
+        res = parse_workbook_detailed(data, force=force)       # CPU only, no lock
+    except WorkbookError as exc:
+        return _fail(str(exc), problems=exc.problems)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "bakery workbook parse")
+        return _fail("The workbook could not be read (see server log).", 500)
+    labor, weeks = res["labor"], res["weeks"]
+    if not weeks:
+        return _fail("No week with sales or labor was found in this workbook, "
+                     "so nothing was changed.")
+    try:
+        with data_lock():
+            stored = [w for w in (load_bakery_sales() or [])
+                      if (w.get("source") or "bakery-xlsx") == SOURCE_TAG]
+            if len(weeks) < len(stored) and not force:
+                return _fail(
+                    f"This workbook has {len(weeks)} weeks but {len(stored)} are "
+                    f"already stored. Uploading it would delete history, so "
+                    f"nothing was changed. If that is intended, upload again "
+                    f"with force.", 409)
+            labor_out = _ingest_labor(labor, True) if labor else {"added_or_updated": 0}
+            sales_out = _ingest_bakery_sales(weeks, True)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            state = {"sha256": sha, "uploaded_at": now, "filename": filename,
+                     "uploaded_by": str(session.get("user") or "api-token"),
+                     "weeks": len(weeks), "labor_rows": len(labor),
+                     "sales_rows": sales_out.get("added_or_updated") or 0,
+                     "data_through": res["data_through"], "forced": force,
+                     "notes": res["notes"][:20], "problems": res["problems"][:20]}
+            _write_json(_bakery_workbook_state_path(), state)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "bakery workbook ingest")
+        return _fail("The workbook was read but could not be saved (see server log).", 500)
+    feed_health.record("bakery-workbook", True,
+                       f"{len(weeks)} weeks, data through week of {res['data_through']}",
+                       data_through=res["data_through"], weeks=len(weeks),
+                       labor_rows=len(labor))
+    return jsonify({
+        "ok": True, "unchanged": False,
+        "weeks": len(weeks), "labor_rows": len(labor),
+        "sales_rows": sales_out.get("added_or_updated") or 0,
+        "data_through": res["data_through"], "data_through_end": res["data_through_end"],
+        "uploaded_at": state["uploaded_at"], "forced": force,
+        "notes": res["notes"][:20], "problems": res["problems"][:20],
+        "labor_total_entries": labor_out.get("total_entries"),
+    })
 
 
 @reporting_bp.route("/api/report/bakery-sales")
@@ -1335,6 +1528,14 @@ def api_forecast_decrement_daily():
     wh_prefix = (body.get("warehouse_prefix") or "").strip()
     if not date_iso:
         date_iso = datetime.now(timezone.utc).date().isoformat()
+    else:
+        # {"date": "YYYY-MM-DD"} back-fills a missed day. It is the
+        # idempotency key, so it must be a real calendar date.
+        try:
+            date_iso = datetime.strptime(date_iso[:10], "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            return jsonify({"ok": False,
+                            "error": "date must be YYYY-MM-DD"}), 400
 
     inv = load_inventory()
     usage = load_usage()
