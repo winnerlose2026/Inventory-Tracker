@@ -16,6 +16,7 @@ from flask import request, session
 _OPEN_ENDPOINTS = {
     "login", "logout", "static", "api_auth_check",
     "webhooks.graph_webhook_notifications", "health.healthz",
+    "health.readyz",
 }
 
 
