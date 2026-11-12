@@ -1111,6 +1111,26 @@ def _hold_implausible_counts(events: list, inv: dict, report: dict) -> list:
 REPORT_HELD_TEXT = "report held: "
 
 
+def _already_applied_from_message(usage: list, key: str, evt, now: str) -> bool:
+    """Is there a live ledger row for this (source message, SKU, event type)
+    from an EARLIER apply? Rows written in this same apply (timestamp == now)
+    don't count -- one message may legitimately carry two lines for a SKU."""
+    mid = getattr(evt, "source_message_id", "") or ""
+    if not mid:
+        return False       # no key: behaves as before
+    for row in usage:
+        if row.get("source_message_id") != mid or row.get("item_key") != key:
+            continue
+        if row.get("event_type") != evt.event_type:
+            continue
+        if row.get("timestamp") == now:
+            continue
+        if row.get("reversed") or row_superseded(row):
+            continue
+        return True
+    return False
+
+
 def _apply_email_event(evt, inv: dict, usage: list, now: str,
                        report: dict, dry_run: bool) -> None:
     """Apply a single EmailEvent to the inventory/usage log."""
@@ -1337,14 +1357,27 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
             )
         if abs(_moved) >= 1e-9:
             note += f" -{_moved:g} cs used since {_evt_cd}"
-    elif evt.event_type == "restock":
-        new_qty = old_qty + amount
-        delta_usage = -round(amount, 2)  # negative = restock in the log
-        note = f"Email restock (subject: {evt.source_subject[:60]})"
-    elif evt.event_type == "usage":
-        new_qty = max(0.0, old_qty - amount)
-        delta_usage = round(amount, 2)  # positive = consumed
-        note = f"Email usage report (subject: {evt.source_subject[:60]})"
+    elif evt.event_type in ("restock", "usage"):
+        # A plain (non-PO) restock / usage line has no revision logic to make
+        # it idempotent, and the scan re-reads its 14-day window four times a
+        # day: without a key the same CSV or "# event:" mail was added or
+        # subtracted again on every scan. The source message id is the key --
+        # one message moves a SKU once per event type.
+        if _already_applied_from_message(usage, key, evt, now):
+            report.setdefault("replays_skipped", []).append(
+                f"{item['name']}: {evt.event_type} {amount:g} from message "
+                f"{getattr(evt, 'source_message_id', '')} was already applied "
+                "- skipped")
+            report["unchanged"] += 1
+            return
+        if evt.event_type == "restock":
+            new_qty = old_qty + amount
+            delta_usage = -round(amount, 2)  # negative = restock in the log
+            note = f"Email restock (subject: {evt.source_subject[:60]})"
+        else:
+            new_qty = max(0.0, old_qty - amount)
+            delta_usage = round(amount, 2)  # positive = consumed
+            note = f"Email usage report (subject: {evt.source_subject[:60]})"
     else:
         return
 
@@ -1383,6 +1416,13 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         "note": note,
         "timestamp": now,
     }
+    # Which message and which kind of event wrote this row: the idempotency
+    # key for plain restock / usage events (_already_applied_from_message),
+    # and an audit trail for counts.
+    _src_mid = getattr(evt, "source_message_id", "") or ""
+    if _src_mid:
+        entry["source_message_id"] = _src_mid
+        entry["event_type"] = evt.event_type
     # Tag with PO number/revision so a later revision of the same PO can
     # locate and reverse this entry (see _reverse_po_entries).
     po_num = getattr(evt, "po_number", "")
