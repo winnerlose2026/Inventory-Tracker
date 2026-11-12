@@ -58,7 +58,7 @@ def test_dormant_push_to_main_workflow_is_gone():
 def test_deploy_job_is_serialised_and_checks_health():
     text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert "group: deploy-main" in text and "cancel-in-progress: false" in text
-    assert "python-version-file: '.python-version'" in text
+    assert "python-version: '3.14'" in text
     assert "/healthz" in text and "/readyz" in text
     assert "RENDER_CRON_DEPLOY_HOOK_URL" in text
     assert "pyyaml" in text and "SAFE_PUSH_REQUIRE_YAML" in text

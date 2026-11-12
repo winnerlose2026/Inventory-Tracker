@@ -48,6 +48,8 @@ class CallFailed(Exception):
     pass
 
 
+DEFAULT_APP_URL = "https://bagel-inventory.onrender.com"
+
 def _post(opener, url: str, token: str, body: dict, *, sleep=time.sleep,
           timeout: int = TIMEOUT_S) -> dict:
     """POST JSON, retrying 502/503/504 and timeouts twice. Returns the parsed
@@ -95,10 +97,25 @@ def run(env=None, argv=None, opener=None, sleep=time.sleep, out=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     opener = opener or urllib.request.urlopen
     say = out or print
-    app_url = (env.get("APP_URL") or "").rstrip("/")
-    token = (env.get("DELIVERY_API_TOKEN") or env.get("INVENTORY_API_TOKEN") or "").strip()
-    if not app_url or not token:
-        say("lineage-followups: NOT CONFIGURED -- APP_URL and DELIVERY_API_TOKEN "
+    app_url = (env.get("APP_URL") or DEFAULT_APP_URL).rstrip("/")
+    token = ""
+    for name in ("DELIVERY_API_TOKEN", "INVENTORY_API_TOKEN", "DELIVERY_TOKEN",
+                 "API_TOKEN", "INVENTORY_TOKEN", "TOKEN"):
+        token = (env.get(name) or "").strip()
+        if token:
+            break
+    if not token:
+        legacy = env.get("FOLLOWUP_SCRIPT") or ""
+        if legacy.strip():
+            # This cron used to run `python3 -c "$FOLLOWUP_SCRIPT"` with its
+            # settings inside that script. Until DELIVERY_API_TOKEN is set on
+            # the cron, keep doing exactly that rather than skipping a run.
+            say("lineage-followups: no token env var -- running the legacy "
+                "FOLLOWUP_SCRIPT (set DELIVERY_API_TOKEN to retire it)")
+            exec(compile(legacy, "<FOLLOWUP_SCRIPT>", "exec"),  # noqa: S102
+                 {"__name__": "__main__"})
+            return 0
+        say("lineage-followups: NOT CONFIGURED -- DELIVERY_API_TOKEN "
             "(or INVENTORY_API_TOKEN) must be set")
         return 2
     dry_run = "--dry-run" in argv or (env.get("FOLLOWUP_DRY_RUN") or "") in ("1", "true", "yes")

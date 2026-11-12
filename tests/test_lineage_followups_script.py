@@ -75,7 +75,15 @@ def test_falls_back_to_the_main_token_and_needs_configuration():
                           env={"APP_URL": "https://app.example", "INVENTORY_API_TOKEN": "main"})
     assert code == 0 and calls[0]["headers"]["X-inventory-token"] == "main"
     assert _run([], env={"APP_URL": "https://app.example"})[0] == 2
-    assert _run([], env={"DELIVERY_API_TOKEN": "x"})[0] == 2
+    # APP_URL defaults to the production service, so a token alone is enough.
+    code, _, calls = _run([SYNC_OK, SEND_OK], env={"DELIVERY_API_TOKEN": "x"})
+    assert code == 0 and calls[0]["url"].startswith("https://bagel-inventory.onrender.com")
+
+
+def test_runs_the_legacy_env_script_when_no_token_is_set(tmp_path):
+    marker = tmp_path / "ran"
+    code, lines, calls = _run([], env={"FOLLOWUP_SCRIPT": f"open({str(marker)!r}, 'w').write('x')"})
+    assert code == 0 and marker.exists() and not calls
 
 
 def test_dry_run_flag_and_env():
