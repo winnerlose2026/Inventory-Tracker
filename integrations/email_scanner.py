@@ -1468,7 +1468,13 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None,
     # 1a) Cheney per-facility inventory & usage .xlsx (warehouse from the
     #     filename: H&HRVB../H&HOcala../H&HPuntaGorda..). Ross sends one sheet
     #     per FL facility; each mapped row -> on_hand event with weekly_usage.
-    if not events and not cw_pos and distributor == "Cheney Brothers":
+    # The report branches (1a-1c) are gated on "no COUNT read yet", not on
+    # "no events yet": a message carrying both a PO PDF and the weekly report
+    # used to lose the report, because the PO's restock events came first.
+    def _no_count_yet():
+        return not any(e.event_type in ("on_hand", "usage_rate") for e in events)
+
+    if _no_count_yet() and not cw_pos and distributor == "Cheney Brothers":
         from .cheney_inventory_report import parse_report_xlsx as _cheney_report_xlsx
 
         def _cheney_part(payload, fname):
@@ -1503,7 +1509,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None,
     #     "Weekly … Inventory & Usage Report" subject. Only USF senders /
     #     known report reps, only when nothing else produced events.
     report_xlsx_handled = False
-    if not events and not cw_pos:
+    if _no_count_yet() and not cw_pos:
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
                 continue
@@ -1523,7 +1529,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None,
     #      a warehouse rep). Distinct from the report .xlsx above; handled only
     #      if the report parser didn't claim the message. Warehouse keyed off
     #      the sender.
-    if not events and not cw_pos and not report_xlsx_handled:
+    if _no_count_yet() and not cw_pos and not report_xlsx_handled:
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
                 continue
@@ -1542,7 +1548,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None,
     #     event with weekly_usage. Warehouse is keyed off the sending rep.
     #     Only runs when nothing else produced events, and self-detects a
     #     report so unrelated mail stays quiet.
-    if not events and not cw_pos:
+    if _no_count_yet() and not cw_pos:
         got = _guarded(errors, "body report table",
                        lambda: _usfoods_inventory_report_to_events(
                            _html_body(msg), body, from_hdr, msg_id, subject))
