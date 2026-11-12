@@ -263,10 +263,13 @@ def _week_start(d: datetime) -> datetime:
 
 
 def _prod_days(cfg: dict) -> list:
-    names = [str(x)[:3].lower() for x in ((cfg.get("capacity") or {}).get("production_days")
-                                         or ["Mon", "Tue", "Wed", "Thu", "Fri"])]
-    order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    return [order.index(n) for n in names if n in order]
+    from integrations.planning_config import production_weekdays
+    return production_weekdays(cfg)
+
+
+def _cap_day(cfg: dict) -> float:
+    from integrations.planning_config import daily_capacity_cs
+    return daily_capacity_cs(cfg)
 
 
 def _due_for_queue_item(q: dict, ledger_by_po: dict, lead: int, now: datetime) -> datetime:
@@ -304,7 +307,7 @@ def production_load(queue: list, plan: dict, cfg: dict, ledger: list,
     today = _day0(now)
     oc = dict(ORDER_DEFAULTS, **(cfg.get("ordering") or {}))
     pallet = int(cfg.get("pallet_cs") or 56)
-    cap_day = _f((cfg.get("capacity") or {}).get("max_cs_per_day"), 336.0)
+    cap_day = _cap_day(cfg)
     pdays = _prod_days(cfg)
     ledger_by_po = {r.get("po_number") or "": r for r in ledger or []}
     w0 = _week_start(today)
@@ -385,7 +388,7 @@ def daily_schedule(queue: list, plan: dict, cfg: dict, ledger: list,
     now = now or business_now()
     today = _day0(now)
     oc = dict(ORDER_DEFAULTS, **(cfg.get("ordering") or {}))
-    cap_day = _f((cfg.get("capacity") or {}).get("max_cs_per_day"), 336.0)
+    cap_day = _cap_day(cfg)
     pallet = int(cfg.get("pallet_cs") or 56)
     pdays = set(_prod_days(cfg))
     ledger_by_po = {r.get("po_number") or "": r for r in ledger or []}

@@ -2,7 +2,7 @@
 (Phase 1). Read-only for now; planner compute endpoints land here next."""
 from flask import Blueprint, jsonify
 
-from integrations.planning_config import load_planning_config
+from integrations.planning_config import load_planning_config, planning_inventory
 
 planning_bp = Blueprint("planning", __name__)
 
@@ -48,7 +48,7 @@ def api_planning_guide():
     from integrations.demand_model import warehouse_demand, toast_demand_trend
     from blueprints.pos import build_po_ledger
     cfg = load_planning_config()
-    inv = load_inventory()
+    inv = planning_inventory(load_inventory(), cfg)
     guide = build_production_guide(
         inv=inv,
         ledger=build_po_ledger(),
@@ -84,7 +84,7 @@ def api_planning_plan():
             basis = default_basis
         from core.util import business_now
         now = business_now()
-        inv = load_inventory()
+        inv = planning_inventory(load_inventory(), cfg)
         usage = load_usage()
         audit = load_inventory_audit(0)
         ledger = build_po_ledger()
