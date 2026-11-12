@@ -283,8 +283,12 @@ def _run_toast_nightly() -> None:
 
 def _run_backup() -> None:
     """Hourly snapshot of every data file (integrations/backups.py)."""
-    _post("/api/admin/backup/run", timeout=300, payload={"label": "hourly"},
-          feed="backup")
+    # The endpoint records feed "backup" itself (with the snapshot's name);
+    # only a call that never produced an answer is recorded from here.
+    status, res = _post("/api/admin/backup/run", timeout=300,
+                        payload={"label": "hourly"})
+    if status and not isinstance(res, dict):
+        _record("backup", False, f"HTTP {status}")
 
 
 def _run_watchdog() -> None:

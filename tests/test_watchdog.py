@@ -313,3 +313,28 @@ def test_alert_email_goes_through_the_send_route_policy(client, monkeypatch):
     with app_mod.app.app_context():
         ok, detail = watchdog._send_email("s", "b")
     assert ok is False and "not allowed" in detail
+
+
+def test_endpoint_sends_through_the_send_view_inside_its_own_request(client, monkeypatch):
+    """The nested request context used for the send must hand the outer
+    request back intact."""
+    import blueprints.email as email_bp
+    from flask import jsonify, request
+    seen = {}
+
+    def fake_send():
+        seen["path"] = request.path
+        seen["body"] = request.get_json()
+        return jsonify({"ok": True, "sent": True})
+    monkeypatch.setattr(email_bp, "api_email_send", fake_send)
+    monkeypatch.delenv("ALERTS_ENABLED", raising=False)
+    monkeypatch.setenv("ALERT_EMAIL_TO", "jd@hhbagels.com, ops@hhbagels.com")
+    _all_green(datetime.now(timezone.utc))
+    feed_health.raise_issue("po:1", "PO 1 is stuck in transit")
+    r = client.post("/api/watchdog/run", json={}, headers=H)
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert seen["path"] == "/api/email/send"
+    assert seen["body"]["to"] == ["jd@hhbagels.com", "ops@hhbagels.com"]
+    assert seen["body"]["subject"] == "Inventory Tracker: 1 thing(s) need a look"
+    assert "PO 1 is stuck in transit" in seen["body"]["body"]
+    assert feed_health.new_issues() == {}
