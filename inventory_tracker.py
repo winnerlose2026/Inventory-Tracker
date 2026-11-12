@@ -1298,15 +1298,47 @@ def _rebase_ordered_at_from_subject(inv: dict) -> bool:
 
 def _collapse_revision_dupes(inv: dict) -> bool:
     """When the same SKU has multiple pending entries for the same
-    ``po_number`` but different ``po_revision``, keep only the highest
-    revision. The supersede logic in sync_inventory normally handles
+    ``po_number`` but different ``po_revision``, keep only the NEWEST
+    document's. The supersede logic in sync_inventory normally handles
     this at apply time, but legacy data can still carry pre-supersede
     entries (e.g. revision 0000001 + 0000002 of the same line both
     sitting pending). Returns True if anything changed.
 
+    "Newest" is decided by integrations.po_revision.is_newer -- the source
+    email's received time, an internal forward never beating the vendor's
+    copy, the numeric revision only as a tie-break -- the same rule the
+    apply path uses. This used to be "highest revision number, any
+    non-numeric token (REPRINT) highest of all": exactly the ordering
+    po_revision was written to replace (US Foods re-numbers DOWNWARD when a
+    buyer re-cuts a PO, and a REPRINT can be a stale snapshot).
+
     Same SKU + same PO + same revision but different qty (legit
     separate lines on a single PO with repeats) are preserved.
     """
+    from integrations.po_revision import is_newer
+    _REPRINT_SENTINEL = 10_000_000
+
+    def _legacy_rev(e):
+        s = str(e.get("po_revision") or "").strip()
+        if not s:
+            return 0
+        try:
+            return int(s.lstrip("0") or "0")
+        except (TypeError, ValueError):
+            return _REPRINT_SENTINEL
+
+    def _newer_doc(e, best):
+        # Rows from before source_received_at existed carry no date at all;
+        # between two of those the old rule stands (numeric revision, a
+        # non-numeric token such as REPRINT last) -- there is nothing better
+        # to order them by, and it is how such rows have always collapsed.
+        if not (e.get("source_received_at") or best.get("source_received_at")):
+            return _legacy_rev(e) > _legacy_rev(best)
+        return is_newer(e.get("po_revision"), e.get("source_received_at"),
+                        best.get("po_revision"), best.get("source_received_at"),
+                        e.get("source_sender") or "",
+                        best.get("source_sender") or "")
+
     changed = False
     for key, item in inv.items():
         pending = item.get("on_order") or []
@@ -1316,33 +1348,31 @@ def _collapse_revision_dupes(inv: dict) -> bool:
         for entry in pending:
             by_po.setdefault(entry.get("po_number") or "", []).append(entry)
         kept = []
+        item_changed = False
         for po, entries in by_po.items():
             if len(entries) < 2 or not po:
                 kept.extend(entries)
                 continue
-            # Map po_revision -> integer using the same precedence as
-            # sync_inventory._po_rev_int: numeric strings -> their int,
-            # non-numeric tokens like "REPRINT" -> a large sentinel so
-            # they always supersede prior numbered revisions (matches
-            # USF's actual issuing semantics).
-            _REPRINT_SENTINEL = 10_000_000
-            def _rev_int(e):
-                s = str(e.get("po_revision") or "").strip()
-                if not s:
-                    return 0
-                try:
-                    return int(s.lstrip("0") or "0")
-                except (TypeError, ValueError):
-                    return _REPRINT_SENTINEL
-            max_rev = max(_rev_int(e) for e in entries)
-            survivors = [e for e in entries if _rev_int(e) == max_rev]
-            dropped = len(entries) - len(survivors)
-            if dropped:
-                changed = True
+            revs = {str(e.get("po_revision") or "").strip() for e in entries}
+            if len(revs) < 2:
+                kept.extend(entries)
+                continue
+            best = entries[0]
+            for e in entries[1:]:
+                if _newer_doc(e, best):
+                    best = e
+            win = str(best.get("po_revision") or "").strip()
+            survivors = [e for e in entries
+                         if str(e.get("po_revision") or "").strip() == win]
+            if len(survivors) != len(entries):
+                item_changed = True
             kept.extend(survivors)
-        if changed:
+        # Per ITEM: one SKU's collapse used to make every later SKU's
+        # on_order list get re-sorted and rewritten too.
+        if item_changed:
             kept.sort(key=lambda e: (e.get("ordered_at") or ""))
             item["on_order"] = kept
+            changed = True
     return changed
 
 
