@@ -1021,6 +1021,16 @@ def _count_dt(value):
     return _parse_iso_utc(str(value or ""))
 
 
+def _stamp_cmp(a, b) -> int:
+    """-1 / 0 / 1 ordering of two ISO stamps as INSTANTS (UTC). When either
+    will not parse, the old string comparison decides."""
+    da, db = _count_dt(a), _count_dt(b)
+    if da is not None and db is not None:
+        return (da > db) - (da < db)
+    sa, sb = str(a or ""), str(b or "")
+    return (sa > sb) - (sa < sb)
+
+
 def _held_report_releases() -> set:
     """Message ids a person released from the plausibility hold
     (POST /api/email/held-reports/release)."""
@@ -1253,11 +1263,18 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         _cur_rank = item.get("last_count_rank")
         _evt_rcv = getattr(evt, "source_received_at", "") or ""
         _cur_rcv = item.get("last_count_received_at") or ""
+        # Dates are compared as instants, not strings: "…T12:51:00-04:00",
+        # "…T16:51:00Z" and "…T16:51:00+00:00" are one moment but three
+        # different strings, and a string compare ordered them by spelling.
+        # (Falls back to the string compare when a stamp will not parse.)
+        _cd_cmp = _stamp_cmp(_evt_cd, _cur_cd)
+        _rcv_cmp = _stamp_cmp(_evt_rcv, _cur_rcv)
+        _same_cd = bool(_evt_cd) and _cd_cmp == 0
         if _evt_cd and _cur_cd:
-            if _evt_cd < _cur_cd:
+            if _cd_cmp < 0:
                 report["unchanged"] += 1
                 return
-            if _evt_cd == _cur_cd:
+            if _same_cd:
                 if _cur_rank is not None and _evt_rank < int(_cur_rank):
                     report.setdefault("stale_skipped", []).append(
                         f"{item['name']}: on_hand from a lower-trust source "
@@ -1267,7 +1284,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
                     report["unchanged"] += 1
                     return
                 if ((_cur_rank is None or _evt_rank == int(_cur_rank))
-                        and _evt_rcv and _cur_rcv and _evt_rcv < _cur_rcv):
+                        and _evt_rcv and _cur_rcv and _rcv_cmp < 0):
                     report["unchanged"] += 1
                     return
         # An inventory worksheet carries both the on-hand count and the rep's
@@ -1285,9 +1302,9 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # below so a replay can never drift the quantity.
         _cur_qty_at_count = item.get("last_count_qty")
         _is_replay = (
-            _evt_cd and _evt_cd == _cur_cd
+            _evt_cd and _same_cd
             and (_cur_rank is None or _evt_rank == int(_cur_rank))
-            and (not _evt_rcv or not _cur_rcv or _evt_rcv == _cur_rcv)
+            and (not _evt_rcv or not _cur_rcv or _rcv_cmp == 0)
             and _cur_qty_at_count is not None
             and abs(float(_cur_qty_at_count) - amount) < 1e-9
         )
@@ -1335,7 +1352,7 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
             # for this count's date -- on-hand now, less receipts after it, plus
             # the burn / moves after it. Stamped once per NEW count; a same-date
             # correction keeps the original projection.
-            if _evt_cd and _cur_cd and _evt_cd != _cur_cd:
+            if _evt_cd and _cur_cd and not _same_cd:
                 item["count_check"] = {
                     "count_at": _evt_cd,
                     "projected": round(old_qty - _receipts + _moved, 2),

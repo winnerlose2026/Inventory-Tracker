@@ -727,14 +727,23 @@ def _iso_from_usf_date(s: str) -> str:
     falls back to the ingestion timestamp."""
     if not s:
         return ""
-    m = re.match(r"^\s*(\d{2})/(\d{2})/(\d{2})\s*$", s)
+    # 1-2 digit month/day ("6/5/26" as well as "06/05/26") and a 2- or
+    # 4-digit year: a PO printed without the leading zeros used to lose its
+    # order date and fall back to the ingest time.
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})\s*$", s)
     if not m:
         return ""
     mm, dd, yy = m.groups()
-    # 2-digit year window: 00-69 -> 2000s, 70-99 -> 1900s. USF POs are
-    # never going to be from the 1900s but the cutoff is harmless.
-    year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
-    return f"{year:04d}-{int(mm):02d}-{int(dd):02d}"
+    if len(yy) == 4:
+        year = int(yy)
+    else:
+        # 2-digit year window: 00-69 -> 2000s, 70-99 -> 1900s. USF POs are
+        # never going to be from the 1900s but the cutoff is harmless.
+        year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
+    try:
+        return datetime(year, int(mm), int(dd)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
 
 
 def _iso_from_cheney_date(s: str) -> str:

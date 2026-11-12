@@ -222,6 +222,7 @@ def _extract_tables_html(html: str) -> list[list[list[str]]]:
 
 _DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_BARE_DATE_RE = re.compile(r"\s*\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\s*")
 
 
 def _norm(s) -> str:
@@ -316,7 +317,11 @@ def _build_report_from_table(table: list[list[str]],
             col_oh = idx
         elif n.startswith("onorder") and col_oo is None:
             col_oo = idx
-        elif n.startswith("forecast") or _DATE_RE.search(raw):
+        elif n.startswith("forecast") or _BARE_DATE_RE.fullmatch(raw or ""):
+            # A usage week is headed "Forecast <date>" or just the date. Any
+            # other heading that merely CONTAINS a date ("PO due 6/12",
+            # "Updated 6/10/2026") is not a week of usage and used to be
+            # averaged into weekly_usage.
             week_cols.append((idx, _parse_header_date(raw)))
 
     if col_oh is None or (col_item is None and col_mfg is None):
