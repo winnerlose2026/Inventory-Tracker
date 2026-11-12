@@ -840,6 +840,32 @@ def _delivery_gate(entry: dict, tracking: dict):
     return "none", None
 
 
+def _lineage_hold_check(entry: dict, tracking: dict, tracking_ok: bool) -> str:
+    """Keep the ``lineage_hold`` stamp on a pending entry honest, and say
+    whether the entry must stay pending because its hold can't be verified.
+
+    "stamp" -- tracked and held, not yet stamped;  "clear" -- stamped but
+    Lineage tracking released the PO;  "hold" -- stamped (or carrying an
+    arrival Lineage wrote) and its tracking record is unavailable;  "" -- no
+    action. An operator-confirmed arrival always wins (see _delivery_gate).
+    """
+    if ((entry.get("arrival_source") or "") == "operator"
+            and entry.get("arrival_confirmed")):
+        return ""
+    from integrations.po_delivery import HOLD_STATUSES, norm_po
+    flagged = bool(entry.get("lineage_hold")) or str(
+        entry.get("arrival_source") or "").startswith("lineage")
+    rec = tracking.get(norm_po(entry.get("po_number") or "")) if tracking_ok else None
+    if rec is None:
+        return "hold" if flagged else ""
+    st = rec.get("status") or ""
+    if st in HOLD_STATUSES:
+        return "" if entry.get("lineage_hold") else "stamp"
+    if st == "released" and entry.get("lineage_hold"):
+        return "clear"
+    return ""
+
+
 def _delivery_time_known(entry: dict, tracking: dict) -> bool:
     """Did Lineage / the DC state the delivery TIME of this entry's PO?"""
     from integrations.po_delivery import delivered_time_known, norm_po
@@ -1031,10 +1057,19 @@ def _rollover_on_order(inv: dict) -> bool:
     _PENDING_ROLLOVER_ABSORBED = stage["absorbed"]
     now = datetime.now()
     changed = False
+    # tracking_ok False = the Lineage tracking file could not be read. The
+    # hold used to FAIL OPEN: tracking became {} and every held PO fell back
+    # to its date trigger and rolled into stock. Rows known to be under a
+    # Lineage hold (lineage_hold, stamped below / at registration, or an
+    # arrival_source Lineage wrote) now stay pending until it reads again.
+    tracking_ok = True
     try:
         tracking = load_po_delivery()
+        if not isinstance(tracking, dict):
+            raise TypeError("po_delivery.json is not an object")
     except Exception:  # noqa: BLE001 -- a bad tracking file must not stop reads
         tracking = {}
+        tracking_ok = False
     try:
         missed = _counts_that_missed_deliveries(inv, tracking, now) if tracking else {}
     except Exception:  # noqa: BLE001 -- fall back to the plain day rule
@@ -1054,6 +1089,19 @@ def _rollover_on_order(inv: dict) -> bool:
         for entry in pending:
             trigger = _rollover_trigger(entry)
             gate, delivered_at = _delivery_gate(entry, tracking)
+            _hold = _lineage_hold_check(entry, tracking, tracking_ok)
+            if _hold == "stamp":
+                entry["lineage_hold"] = True
+                changed = True
+            elif _hold == "clear":
+                entry.pop("lineage_hold", None)
+                changed = True
+            elif _hold == "hold":
+                # Under a Lineage hold but its tracking record can't be read
+                # (file unreadable, or the record is gone): stay pending.
+                # integrations.po_health raises the issue.
+                kept.append(entry)
+                continue
             if gate == "hold":
                 # Sent to Lineage, not yet confirmed delivered: stays pending
                 # whatever its dates say.
