@@ -155,6 +155,8 @@ _KNOWN_VARIETIES = [
     "Cinnamon Raisin", "Jalapeno Cheddar",
     "Plain", "Everything", "Sesame", "Poppy Seed",
     "Blueberry", "Egg", "Onion", "Asiago",
+    # October LTO (H&H mfg 1154), on the SKU list since 2026-08-28.
+    "Pumpernickel",
 ]
 
 

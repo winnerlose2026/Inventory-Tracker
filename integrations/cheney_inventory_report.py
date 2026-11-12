@@ -111,6 +111,46 @@ def _variety(mfg: str, desc: str, sku: str = "") -> str:
             or canonical_variety(desc) or _desc_keyword(desc))
 
 
+def resolve_variety(mfg: str, desc: str, sku: str = "", *,
+                    has_code_column: bool = True) -> "tuple[str, bool]":
+    """(variety, unmapped) for one grid row.
+
+    A code is an identity; a description is a guess. So:
+      * the row carries an Mfg# or a Cheney item # -> ONLY the crosswalk may
+        resolve it. A code that is not in the crosswalk is an unmapped item
+        (variety "", unmapped True) and the row is skipped -- it used to fall
+        through to the description, where another vendor's "BAGEL PLAIN ..."
+        or a new pack of the same flavour was booked as our Plain.
+      * the grid has a code column but this row's cell is blank -> a total or
+        spacer row: no variety, not an error.
+      * the grid has NO code column at all -> description fallback, as before.
+    """
+    mfg_c, sku_c = _clean_code(mfg), _clean_code(sku)
+    if mfg_c or sku_c:
+        v = (HH_MFG_CODE_TO_VARIETY.get(mfg_c)
+             or HH_MFG_CODE_TO_VARIETY.get(CHENEY_ITEM_NO_TO_MFG.get(sku_c, "")))
+        return (v or "", not v)
+    if has_code_column:
+        return "", False
+    return (canonical_variety(desc) or _desc_keyword(desc)), False
+
+
+def _drop_duplicate_varieties(grid_events: list, errors: list, where: str) -> list:
+    """One grid lists each variety once. Two rows resolving to the same
+    variety (a second pack size, a mis-keyed code) cannot both be the count:
+    drop them all and say so, rather than let whichever is last win."""
+    seen: dict = {}
+    for e in grid_events:
+        seen.setdefault(e["item"]["variety"], []).append(e)
+    dupes = {v for v, es in seen.items() if len(es) > 1}
+    for v in sorted(dupes):
+        qtys = [e["item"].get("quantity") if e["event_type"] == "on_hand"
+                else e["item"].get("weekly_usage") for e in seen[v]]
+        errors.append(f"{where}: duplicate variety {v!r} ({len(seen[v])} rows: "
+                      f"{qtys}) -- none applied, the previous figure stands")
+    return [e for e in grid_events if e["item"]["variety"] not in dupes]
+
+
 # --- header role detection (fuzzy; headers aren't contract-fixed) -----------
 def _is_qty(h: str) -> bool:
     if "order" in h or "usage" in h or "weekly" in h:
@@ -332,7 +372,7 @@ def _parse_case_movement(rows: list, warehouse: str, filename: str,
                               f"(mfg={mfg!r}, item={sku!r})")
             continue
         weekly = weekly_from_period(cases, span)
-        events.append({
+        events.append({  # (duplicates are dropped below)
             "event_type": "usage_rate",
             "item": {
                 "quantity": 0.0,
@@ -348,6 +388,7 @@ def _parse_case_movement(rows: list, warehouse: str, filename: str,
             "po_number": "",
             "po_revision": "",
         })
+    events = _drop_duplicate_varieties(events, errors, f"{warehouse} usage grid")
     return events, errors
 
 
@@ -421,6 +462,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
             j = roles.get(role)
             return r[j] if (j is not None and j < len(r)) else ""
 
+        has_code_col = "mfg" in roles or "distributor_sku" in roles
+        grid_events: list = []
         blanks = 0
         for r in rows[hi + 1:]:
             if not any(r):
@@ -431,10 +474,18 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
             blanks = 0
             mfg = cell("mfg")
             desc = cell("variety")
-            variety = _variety(mfg, desc, cell("distributor_sku"))
+            variety, unmapped = resolve_variety(
+                mfg, desc, cell("distributor_sku"), has_code_column=has_code_col)
             qty = opt_float(cell("quantity"))
+            if unmapped:
+                errors.append(
+                    f"{warehouse}: unmapped item # (mfg={_clean_code(mfg)!r}, "
+                    f"item={_clean_code(cell('distributor_sku'))!r}, "
+                    f"desc={desc!r}) -- row skipped; add the code to "
+                    "hh_mfg_codes (CHENEY_ITEM_NO_TO_MFG / HH_MFG_CODE_TO_VARIETY)")
+                continue
             if not variety:
-                if qty is not None or desc or _clean_code(mfg):
+                if not has_code_col and (qty is not None or desc):
                     errors.append(f"{warehouse}: unmapped row "
                                   f"(mfg={_clean_code(mfg)!r}, desc={desc!r})")
                 continue
@@ -458,7 +509,7 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
             sku = cell("distributor_sku")
             if sku:
                 item["distributor_sku"] = sku
-            events.append({
+            grid_events.append({
                 "event_type": "on_hand",
                 "item": item,
                 "source_message_id": f"cheney-xlsx:{filename}#{idx}",
@@ -466,6 +517,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
                 "po_number": "",
                 "po_revision": "",
             })
+        events.extend(_drop_duplicate_varieties(
+            grid_events, errors, f"{warehouse} on-hand grid"))
 
     # The two grids are dated differently:
     #   - usage_rate: the case-movement period end (the "<= 10/03/2026" of its
@@ -544,4 +597,5 @@ def extract_stock_image(xlsx_bytes: bytes, filename: str):
     return warehouse, count_date, image, ctype
 
 
-__all__ = ["parse_report_xlsx", "warehouse_from_filename", "extract_stock_image", "DISTRIBUTOR"]
+__all__ = ["parse_report_xlsx", "warehouse_from_filename", "extract_stock_image",
+           "resolve_variety", "DISTRIBUTOR"]

@@ -1,15 +1,16 @@
 """Tests for the Cheney daily on-hand CSV parser (SFTP feed).
-Standalone or pytest. Uses descriptions that resolve via the shared variety
-map so it doesn't hard-depend on specific Cheney item numbers."""
+Standalone or pytest. Rows carry real Cheney catalog numbers: since 2026-11-12
+an item # that is not in the crosswalk is unmapped, whatever its description
+says (see test_cheney_unmapped_codes.py)."""
 import sys
 sys.path.insert(0, ".")
 from integrations.cheney_csv_inventory import parse_inventory_csv
 
 CSV = (
     "Cheney Item #,Product Description,DC,On Hand Cases,Case Size,Case Cost,Snapshot Timestamp\n"
-    "100001,Plain Bagel,Riviera Beach,44,60,26.50,2026-07-06\n"
-    "100002,Everything Bagel,Ocala,8,60,26.50,07/06/2026\n"
-    "100003,Sesame Bagel,Punta Gorda,33,60,,2026-07-06\n"
+    "10153018,Plain Bagel,Riviera Beach,44,60,26.50,2026-07-06\n"
+    "10153048,Everything Bagel,Ocala,8,60,26.50,07/06/2026\n"
+    "10153041,Sesame Bagel,Punta Gorda,33,60,,2026-07-06\n"
 )
 
 
@@ -36,7 +37,7 @@ def test_parses_on_hand_events():
 def test_unknown_dc_and_unmapped_variety_flagged():
     csv2 = (
         "Item,Description,Facility,Cases\n"
-        "100001,Plain Bagel,Atlanta,10\n"       # unknown DC
+        "10153018,Plain Bagel,Atlanta,10\n"     # unknown DC
         "999999,Glazed Donut,Ocala,5\n"          # unmapped variety
     )
     events, errors = parse_inventory_csv(csv2)
