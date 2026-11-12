@@ -1931,3 +1931,94 @@ def api_pos_ledger():
     return jsonify({"ok": True, "count": len(ledger),
                     "by_status": by_status, "by_distributor": by_distributor,
                     "pos": ledger})
+
+
+# ---------------------------------------------------------------------------
+# Cheney 810 invoices as an independent usage check
+# ---------------------------------------------------------------------------
+
+@pos_bp.route("/api/ingest/cheney-810", methods=["POST"])
+def api_ingest_cheney_810():
+    """Store the H&H bagel lines of Cheney EDI 810 invoices
+    (integrations/cheney_810_store.py). Idempotent by invoice + line.
+
+    Body: the raw EDI text (text/plain), or JSON {"edi": "<text>"} /
+    {"invoices": [<edi_810.parse_810 output>]}. Query: ?dry_run=1,
+    ?filename=<name>. Token / session gated like every /api/ route. Never
+    touches inventory -- it only feeds GET /api/usage/cheney-crosscheck.
+    """
+    from integrations import cheney_810_store as store
+    from integrations.edi_810 import parse_810, summarize
+    try:
+        dry_run = (request.args.get("dry_run") or "0").lower() in ("1", "true", "yes")
+        filename = (request.args.get("filename") or "").strip()[:200]
+        invoices = None
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            dry_run = dry_run or bool(body.get("dry_run"))
+            filename = filename or str(body.get("filename") or "")[:200]
+            if isinstance(body.get("invoices"), list):
+                invoices = body["invoices"]
+            elif body.get("edi"):
+                invoices = parse_810(str(body["edi"]))
+        else:
+            text = request.get_data(as_text=True) or ""
+            if text.strip():
+                invoices = parse_810(text)
+        if invoices is None:
+            return jsonify({"ok": False, "error": "send EDI 810 text as the body, or "
+                            "JSON {edi: ...} / {invoices: [...]}"}), 400
+        if not invoices:
+            return jsonify({"ok": False, "error": "no invoices found in the EDI "
+                            "(no ST*810 transaction sets)", "filename": filename}), 422
+        s = summarize(invoices)
+        out = store.ingest_invoices(invoices, filename=filename, dry_run=dry_run)
+        return jsonify({"ok": True, "dry_run": dry_run, "filename": filename, **out,
+                        "integrity": {k: s[k] for k in (
+                            "unreconciled", "lines_without_cases",
+                            "lines_with_estimated_pack", "line_count_mismatch",
+                            "unit_count_mismatch")}})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "ingest cheney-810")
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 500
+
+
+@pos_bp.route("/api/usage/cheney-crosscheck")
+def api_usage_cheney_crosscheck():
+    """Per Cheney warehouse + variety: invoiced cases/week over the last 4
+    full weeks (810 feed) vs the rep-reported weekly_usage, with ``diverges``
+    when they differ by > 35% and > 5 cs/wk. Read-only. See
+    integrations/cheney_810_store.py for what the invoices do and do not
+    prove."""
+    from integrations import cheney_810_store as store
+    from inventory_tracker import load_inventory
+    try:
+        out = store.crosscheck(load_inventory())
+        wh = (request.args.get("warehouse") or "").strip().lower()
+        if wh:
+            out["rows"] = [r for r in out["rows"] if r["warehouse"].lower() == wh]
+            out["warehouses"] = [w for w in out["warehouses"]
+                                 if w["warehouse"].lower() == wh]
+        return jsonify({"ok": True, **out})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "cheney crosscheck")
+        return jsonify({"ok": False, "error": _safe_err(exc), "rows": []}), 500
+
+
+@pos_bp.route("/api/feeds/cheney/heartbeat", methods=["POST"])
+def api_feeds_cheney_heartbeat():
+    """The Cheney feed bridge (scripts/sync_cheney_feeds.py) reports each run
+    here -- it runs as a cron with no disk, so it cannot write
+    feed_health itself. Body {ok, detail, files, last_file_at}.
+    ``last_file_at`` (ISO) is only sent when the run handled a file; the
+    stale-feed check (po_health) keys off it, so a feed that has never
+    delivered anything is never called stale."""
+    from core import feed_health
+    body = request.get_json(silent=True) or {}
+    extra = {"files": int(body.get("files") or 0)}
+    last = str(body.get("last_file_at") or "").strip()[:40]
+    if last:
+        extra["last_file_at"] = last
+    feed_health.record("cheney-feed", bool(body.get("ok")),
+                       str(body.get("detail") or "")[:500], **extra)
+    return jsonify({"ok": True})

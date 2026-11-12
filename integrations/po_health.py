@@ -489,6 +489,65 @@ def _check_chase(now: datetime) -> dict:
     return {"needs_human": sorted(k.split(":", 1)[1] for k in keep)}
 
 
+CHENEY_FEED_STALE_HOURS = 36
+
+
+def _check_cheney_feed(now: datetime) -> dict:
+    """cheney-feed-stale: no Cheney file for 36 h -- but ONLY once the feed
+    has delivered a file at least once (it may not be live yet)."""
+    fh = _fh()
+    feed = (fh.snapshot().get("feeds") or {}).get("cheney-feed") or {}
+    last = _parse(feed.get("last_file_at") or "")
+    if last is None:
+        fh.clear_issue("cheney-feed-stale")
+        return {"live": False}
+    hours = (now - last).total_seconds() / 3600.0
+    if hours > CHENEY_FEED_STALE_HOURS:
+        fh.raise_issue(
+            "cheney-feed-stale",
+            f"No file from Cheney's data feed for {hours:.0f} h (last "
+            f"{feed.get('last_file_at')}); last bridge run "
+            f"{feed.get('last_attempt') or 'never'}: {feed.get('detail') or '-'}. "
+            "Check the FTPS drop and the sync_cheney_feeds cron.", "warn")
+    else:
+        fh.clear_issue("cheney-feed-stale")
+    return {"live": True, "hours_since_file": round(hours, 1)}
+
+
+def _check_usage_divergence(now: datetime) -> dict:
+    """usage-diverge:<warehouse> when >= 3 varieties' invoiced cases/week
+    (Cheney 810s) disagree with the rep-reported weekly usage."""
+    import inventory_tracker as it
+    from integrations import cheney_810_store as store
+    fh = _fh()
+    lines = store.load_lines()
+    if not lines:
+        fh.clear_issues_with_prefix("usage-diverge:")
+        return {"stored_lines": 0}
+    res = store.crosscheck(it._read_json(it.INVENTORY_FILE, {}), lines, now.date())
+    keep = set()
+    for w in res["warehouses"]:
+        if len(w["diverging"]) < store.DIVERGE_VARIETIES_FOR_ISSUE:
+            continue
+        k = f"usage-diverge:{w['warehouse']}"
+        keep.add(k)
+        detail = "; ".join(
+            f"{r['variety']} invoiced {r['invoiced_cs_per_week']:g} vs reported "
+            f"{r['reported_weekly_usage']:g} cs/wk"
+            for r in res["rows"]
+            if r["warehouse"] == w["warehouse"] and r["diverges"])[:380]
+        fh.raise_issue(
+            k, f"{w['warehouse']}: Cheney's invoices to H&H stores disagree with "
+               f"the reported weekly usage on {len(w['diverging'])} varieties "
+               f"(last 4 full weeks) -- {detail}. Invoiced above reported means "
+               "the usage figure is too low; below can also mean other customers "
+               "or a store account missing from the feed. See "
+               "/api/usage/cheney-crosscheck.", "warn")
+    fh.clear_issues_with_prefix("usage-diverge:", keep=keep)
+    return {"stored_lines": len(lines),
+            "diverging_warehouses": sorted(k.split(":", 1)[1] for k in keep)}
+
+
 def _check_parse_issues(now: datetime) -> dict:
     _age_out("po-total:", 48, now)
     return {}
@@ -497,7 +556,8 @@ def _check_parse_issues(now: datetime) -> dict:
 CHECKS = [("parse", _check_parse_issues), ("stuck", _check_stuck),
           ("hold", _check_hold_integrity), ("untracked", _check_untracked),
           ("arrived_unconfirmed", _check_arrived_unconfirmed),
-          ("chase", _check_chase)]
+          ("chase", _check_chase), ("cheney_feed", _check_cheney_feed),
+          ("usage_diverge", _check_usage_divergence)]
 
 
 def run_checks() -> dict:
