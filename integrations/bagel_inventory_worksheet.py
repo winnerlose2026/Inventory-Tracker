@@ -90,18 +90,29 @@ class InventoryWorksheet:
     snapshot_label: str = ""        # the column's date label, e.g. "6.1.26"
     lines: list = field(default_factory=list)
     unmapped_codes: list = field(default_factory=list)
+    # Rows skipped because CS OH held something that is not a number.
+    bad_cells: list = field(default_factory=list)
 
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
+_FULL_NUM_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[-+]?\.\d+")
+
+
 def _to_float(v) -> Optional[float]:
-    if v is None:
+    """The cell as a number, or None when it is not exactly one. A cell such
+    as "12 (3 on hold)" used to be read as 12; it is now refused and reported
+    (InventoryWorksheet.bad_cells)."""
+    if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return float(v)
-    m = _NUM_RE.search(str(v).replace(",", ""))
-    return float(m.group(0)) if m else None
+        f = float(v)
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+    s = str(v).strip()
+    if not _FULL_NUM_RE.fullmatch(s):
+        return None
+    return float(s.replace(",", ""))
 
 
 def _parse_date_label(label) -> Optional[date]:
@@ -218,8 +229,12 @@ def parse_worksheet_xlsx(xlsx_bytes: bytes, *, distributor: str,
         mfg_code = str(mfg_raw).strip()
         if mfg_code.endswith(".0"):
             mfg_code = mfg_code[:-2]
-        cs_oh = _to_float(r[cs_col]) if cs_col < len(r) else None
+        raw_oh = r[cs_col] if cs_col < len(r) else None
+        cs_oh = _to_float(raw_oh)
         if cs_oh is None:
+            if raw_oh is not None and str(raw_oh).strip() != "":
+                ws_out.bad_cells.append(
+                    f"{mfg_code}: CS OH {str(raw_oh)[:40]!r}")
             continue
         wkly = _to_float(r[wk_col]) if (wk_col is not None and wk_col < len(r)) else None
         usf_no = ""

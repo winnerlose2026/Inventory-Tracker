@@ -1037,6 +1037,13 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
         )
 
+    if getattr(sheet, "bad_cells", None):
+        errors.append(
+            f"inventory worksheet ({warehouse}): on-hand cell is not a number "
+            f"for {'; '.join(sheet.bad_cells[:8])} -- row(s) skipped, the "
+            "previous count stands for those SKUs"
+        )
+
     for line in sheet.lines:
         if not line.variety:
             continue
@@ -1123,6 +1130,13 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
             f"inventory & usage report ({warehouse}): unmapped MFG codes "
             f"{sorted(set(report.unmapped_codes))} -- add them to "
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
+        )
+
+    if getattr(report, "bad_cells", None):
+        errors.append(
+            f"inventory & usage report ({warehouse}): on-hand cell is not a "
+            f"number for {'; '.join(report.bad_cells[:8])} -- row(s) skipped, "
+            "the previous count stands for those SKUs"
         )
 
     for line in report.lines:

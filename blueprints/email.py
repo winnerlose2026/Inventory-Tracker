@@ -237,7 +237,8 @@ def _api_email_scan_locked():
             except Exception as exc:  # noqa: BLE001 — health is best-effort
                 _log_exc(exc, "scan health persist")
         if not dry_run:
-            _raise_scan_issues(list(getattr(scan, "issues", None) or []))
+            _raise_scan_issues(list(getattr(scan, "issues", None) or [])
+                               + list(report.get("issues") or []))
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "email scan")
         report = {
@@ -1249,6 +1250,7 @@ def _api_email_ingest_events_locked():
             _record_screenshot_hashes(raw_events)
         except Exception as exc:  # noqa: BLE001 -- best-effort bookkeeping
             _log_exc(exc, "record screenshot hashes")
+        _raise_scan_issues(list(report.get("issues") or []))
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
@@ -1329,4 +1331,44 @@ def api_ingest_cheney_inventory_csv():
             "error": _safe_err(exc), "messages_seen": 1, "messages_parsed": 1,
         }]}), 500
 
+    if not dry_run:
+        _raise_scan_issues(list(report.get("issues") or []))
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@email_bp.route("/api/email/held-reports/release", methods=["POST"])
+def api_release_held_report():
+    """Let a report the plausibility hold stopped through on the next scan.
+
+    Body: {"message_id": "<the id named in the report-held issue>"}. The hold
+    (sync_inventory._hold_implausible_counts) refuses a weekly report that
+    mostly repeats the previous count; when a person has checked that it is
+    genuine (a slow week), this records the message id so the next scan
+    applies it. Returns {ok, released: [...ids on file]}.
+    """
+    try:
+        import inventory_tracker as _it
+        from sync_inventory import HELD_RELEASES_FILE_NAME
+        mid = str((request.get_json(silent=True) or {}).get("message_id") or "").strip()
+        if not mid or len(mid) > 400:
+            return jsonify({"ok": False, "error": "message_id is required"}), 400
+        path = _it.DATA_DIR / HELD_RELEASES_FILE_NAME
+        with _it.data_lock():
+            data = _it._read_json(path, {})
+            if not isinstance(data, dict):
+                data = {}
+            data[mid] = datetime.now().isoformat()
+            if len(data) > 200:
+                data = dict(sorted(data.items(), key=lambda kv: kv[1])[-200:])
+            _it._write_json(path, data)
+        try:
+            from core import feed_health
+            for k in list(feed_health.snapshot().get("issues") or {}):
+                if k.startswith("report-held:") and k.endswith(":" + mid):
+                    feed_health.clear_issue(k)
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "release held report: clear issue")
+        return jsonify({"ok": True, "released": sorted(data)})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "release held report")
+        return jsonify({"ok": False, "error": "internal error"}), 500

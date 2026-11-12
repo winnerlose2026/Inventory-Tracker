@@ -954,6 +954,161 @@ def _remove_on_order_by_po(po_number: str, new_rev: str, inv: dict,
             item["updated"] = now
 
 
+# --- on_hand sanity bounds + plausibility hold ------------------------------
+# An on-hand figure is refused (never applied; listed in report["rejected"]
+# and raised as a feed-health issue by the route) when it is negative, not
+# finite, a 7-8 digit number (a catalog item # read from the wrong column), or
+# far above anything this SKU has held:
+#     amount > max(ONHAND_ABS_CEILING, ONHAND_REL_FACTOR x last count + ONHAND_REL_SLACK)
+# The all-time high at any warehouse is a few hundred cases.
+ONHAND_ABS_CEILING = 2000.0
+ONHAND_REL_FACTOR = 10.0
+ONHAND_REL_SLACK = 200.0
+ONHAND_ITEM_NUMBER_FLOOR = 1_000_000.0   # 7+ digits: an item number, not a count
+
+# Plausibility hold: a "new" report that mostly REPEATS the previous count
+# days later is the signature of last week's table being re-read (a quoted
+# thread, a re-attached workbook). Such a report is not applied; it is held
+# and flagged for a person. Thresholds:
+HOLD_MIN_SKUS = 6            # SKUs compared (pairs that are 0 -> 0 don't count)
+HOLD_EQUAL_FRACTION = 0.5    # held when MORE than this share is exactly equal
+HOLD_MIN_GAP_DAYS = 5        # ...and the report is at least this long after
+#                              the previous count
+HELD_RELEASES_FILE_NAME = "held_report_releases.json"
+
+
+def _case_units(unit) -> bool:
+    return str(unit or "cs").strip().lower() in ("cs", "case", "cases", "ca")
+
+
+def _onhand_bound_violation(amount, item: dict) -> str:
+    """Why an on-hand figure cannot be a real count, or "" when it can."""
+    try:
+        f = float(amount)
+    except (TypeError, ValueError):
+        return "is not a number"
+    if f != f or f in (float("inf"), float("-inf")):
+        return "is not a finite number"
+    if f < 0:
+        return "is negative"
+    if f >= ONHAND_ITEM_NUMBER_FLOOR:
+        return "is a 7+ digit number (an item number read as a count?)"
+    scale = 1.0 if _case_units(item.get("unit")) else float(item.get("case_size") or 60)
+    try:
+        last = float(item.get("last_count_qty") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    ceiling = max(ONHAND_ABS_CEILING * scale,
+                  ONHAND_REL_FACTOR * last + ONHAND_REL_SLACK * scale)
+    if f > ceiling:
+        return (f"is above the plausible ceiling of {ceiling:g} "
+                f"(last count {last:g})")
+    return ""
+
+
+def _report_issue(report: dict, key: str, message: str, severity: str = "warn") -> None:
+    """Queue a stable-keyed problem on the report; the route raises it through
+    core.feed_health (this module never writes health state itself)."""
+    report.setdefault("issues", []).append(
+        {"key": key[:200], "message": message[:600], "severity": severity})
+
+
+def _count_dt(value):
+    """A count / received stamp as an aware UTC datetime, or None."""
+    from inventory_tracker import _parse_iso_utc
+    return _parse_iso_utc(str(value or ""))
+
+
+def _held_report_releases() -> set:
+    """Message ids a person released from the plausibility hold
+    (POST /api/email/held-reports/release)."""
+    try:
+        import inventory_tracker as _it
+        data = _it._read_json(_it.DATA_DIR / HELD_RELEASES_FILE_NAME, {})
+        return set(data) if isinstance(data, dict) else set()
+    except Exception:  # noqa: BLE001 -- unreadable: nothing is released
+        return set()
+
+
+def _hold_implausible_counts(events: list, inv: dict, report: dict) -> list:
+    """Return ``events`` without the on_hand events of any report that mostly
+    repeats the previous count (see the HOLD_* constants). Held reports are
+    listed in report["held_reports"] / report["rejected"] and raised as
+    "report-held:<warehouse>:<message id>". PLAUSIBILITY_HOLD=off disables."""
+    import os as _os
+    if _os.environ.get("PLAUSIBILITY_HOLD", "on").strip().lower() in ("off", "0", "false"):
+        return events
+    groups: dict = {}
+    for e in events:
+        if getattr(e, "event_type", "") != "on_hand":
+            continue
+        k = ((e.item.distributor or ""), (e.item.warehouse or ""),
+             getattr(e, "count_date", "") or "")
+        groups.setdefault(k, []).append(e)
+    released = None
+    drop = set()
+    for (dist, wh, cd), grp in groups.items():
+        cd_dt = _count_dt(cd)
+        if cd_dt is None:
+            continue
+        compared = equal = 0
+        newest_prev = None
+        for e in grp:
+            key = _find_local_key(inv, e.item)
+            item = inv.get(key) if key else None
+            if not item or item.get("last_count_qty") is None:
+                continue
+            prev_dt = _count_dt(item.get("last_count_at"))
+            if prev_dt is None:
+                continue
+            if newest_prev is None or prev_dt > newest_prev:
+                newest_prev = prev_dt
+            try:
+                prev_q, new_q = float(item["last_count_qty"]), float(e.item.quantity)
+            except (TypeError, ValueError):
+                continue
+            if prev_q == 0 and new_q == 0:
+                continue   # out of stock both weeks says nothing either way
+            compared += 1
+            if abs(prev_q - new_q) < 1e-9:
+                equal += 1
+        if compared < HOLD_MIN_SKUS or newest_prev is None:
+            continue
+        if equal <= compared * HOLD_EQUAL_FRACTION:
+            continue
+        if (cd_dt - newest_prev).total_seconds() < HOLD_MIN_GAP_DAYS * 86400:
+            continue
+        mids = sorted({getattr(e, "source_message_id", "") or "" for e in grp})
+        if released is None:
+            released = _held_report_releases()
+        if any(m and m in released for m in mids):
+            report.setdefault("warnings", []).append(
+                f"{wh}: report dated {cd[:10]} repeats {equal} of {compared} "
+                "quantities from the previous count; applied because it was "
+                "released by an operator.")
+            continue
+        mid = next((m for m in mids if m), "?")
+        msg = (f"{REPORT_HELD_TEXT}{wh} ({dist}): the report dated {cd[:10]} "
+               f"repeats {equal} of {compared} on-hand quantities from the "
+               f"count of {newest_prev.date().isoformat()} -- NOT applied "
+               "(it looks like the previous report re-sent). If it is "
+               "genuine, release it: POST /api/email/held-reports/release "
+               f"{{\"message_id\": \"{mid}\"}}")
+        report.setdefault("held_reports", []).append(
+            {"distributor": dist, "warehouse": wh, "count_date": cd,
+             "message_id": mid, "equal": equal, "compared": compared,
+             "previous_count_at": newest_prev.isoformat()})
+        report.setdefault("rejected", []).append(msg)
+        _report_issue(report, f"report-held:{wh}:{mid}", msg)
+        drop.update(id(e) for e in grp)
+    if not drop:
+        return events
+    return [e for e in events if id(e) not in drop]
+
+
+REPORT_HELD_TEXT = "report held: "
+
+
 def _apply_email_event(evt, inv: dict, usage: list, now: str,
                        report: dict, dry_run: bool) -> None:
     """Apply a single EmailEvent to the inventory/usage log."""
@@ -1010,6 +1165,20 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         return
 
     if evt.event_type == "on_hand":
+        # Bounds first (they also catch NaN / infinity, which the mfg-code
+        # check below cannot round).
+        _why = _onhand_bound_violation(amount, item)
+        if _why:
+            report.setdefault("rejected", []).append(
+                f"{item['name']}: on_hand {amount!r} {_why} - refused, the "
+                f"previous count stands "
+                f"(source: {getattr(evt, 'source_message_id', '') or '?'})"
+            )
+            _report_issue(
+                report,
+                f"onhand-rejected:{key}:{getattr(evt, 'source_message_id', '') or '?'}",
+                report["rejected"][-1], "error")
+            return
         # Refuse an on-hand figure that is exactly an H&H mfg code -- always a
         # column-mapping fault upstream, never a real count. Rejected loudly so
         # the bad row surfaces instead of landing silently.
@@ -1020,6 +1189,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
                 f"- parser column fault, refused "
                 f"(source: {getattr(evt, 'source_message_id', '') or '?'})"
             )
+            _report_issue(
+                report,
+                f"onhand-rejected:{key}:{getattr(evt, 'source_message_id', '') or '?'}",
+                report["rejected"][-1], "error")
             return
         # Never let an OLDER or LESS TRUSTWORTHY report overwrite a good count.
         # Ordering, in precedence:
@@ -1789,6 +1962,10 @@ def _apply_events(events: list,
 
     # A count that lands just after a confirmed delivery but before the
     # distributor's screen shows it must not swallow the receipt.
+    # A report that mostly repeats the previous count days later is held,
+    # not applied (see _hold_implausible_counts).
+    non_po_events = _hold_implausible_counts(non_po_events, inv, report)
+
     _mark_counts_that_missed_deliveries(non_po_events, inv, usage, report)
 
     # Apply non-PO events (on_hand, usage_rate, body usage) oldest-count

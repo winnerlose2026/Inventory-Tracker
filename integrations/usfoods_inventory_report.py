@@ -164,6 +164,9 @@ class InventoryReport:
     week_label: str = ""            # the forecast column used, e.g. "5/31/2026"
     lines: list = field(default_factory=list)
     unmapped_codes: list = field(default_factory=list)
+    # Rows skipped because the on-hand cell held something that is not a
+    # number ("12 (3 on hold)", "N/A"): ["<item>: on hand '<cell>'", ...].
+    bad_cells: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +230,32 @@ def _norm(s) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s if s is not None else "").lower())
 
 
+# A cell that IS a number, whole: optional sign, digits (thousands commas
+# allowed), optional decimals. Nothing else.
+_FULL_NUM_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[-+]?\.\d+")
+
+
 def _to_float(v) -> Optional[float]:
-    if v is None:
+    """The cell as a number, or None when it is not exactly one.
+
+    This used to take the FIRST number found anywhere in the cell, so
+    "12 (3 on hold)" became 12, "N/A 5" became 5 and "6/10" became 6 --
+    silently. A cell must now be a number and nothing else; callers report a
+    non-blank cell that is not (see InventoryReport.bad_cells).
+    """
+    if v is None or isinstance(v, bool):
         return None
-    m = _NUM_RE.search(str(v).replace(",", ""))
-    return float(m.group(0)) if m else None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+    s = str(v).strip()
+    if not _FULL_NUM_RE.fullmatch(s):
+        return None
+    return float(s.replace(",", ""))
+
+
+def _is_blank(v) -> bool:
+    return v is None or str(v).strip() == ""
 
 
 def _clean_code(v) -> str:
@@ -316,8 +340,12 @@ def _build_report_from_table(table: list[list[str]],
         # numeric on-hand value. Skips header repeats, blank, and total rows.
         if not (re.fullmatch(r"\d{3,}", usf_item) or re.fullmatch(r"\d{3,}", mfg)):
             continue
-        on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
+        raw_oh = r[col_oh] if col_oh < len(r) else None
+        on_hand = _to_float(raw_oh)
         if on_hand is None:
+            if not _is_blank(raw_oh):
+                report.bad_cells.append(
+                    f"{mfg or usf_item}: on hand {str(raw_oh)[:40]!r}")
             continue
         on_order = _to_float(r[col_oo]) if (col_oo is not None and col_oo < len(r)) else None
         # weekly_usage = AVERAGE of all forecast-week columns -- a smoother
@@ -347,7 +375,7 @@ def _build_report_from_table(table: list[list[str]],
             weekly_usage=weekly,
         ))
 
-    return report if report.lines else None
+    return report if (report.lines or report.bad_cells) else None
 
 
 def looks_like_report(subject: str = "", body: str = "") -> bool:
@@ -600,8 +628,12 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         usf_item = _clean_code(r[col_item]) if col_item < len(r) else ""
         if not re.fullmatch(r"\d{3,}", usf_item):
             continue
-        on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
+        raw_oh = r[col_oh] if col_oh < len(r) else None
+        on_hand = _to_float(raw_oh)
         if on_hand is None:
+            if not _is_blank(raw_oh):
+                report.bad_cells.append(
+                    f"{usf_item}: on hand {str(raw_oh)[:40]!r}")
             continue
         on_order = (_to_float(r[col_oo])
                     if (col_oo is not None and col_oo < len(r)) else None)
@@ -630,7 +662,7 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
             weekly_usage=weekly,
         ))
 
-    return report if report.lines else None
+    return report if (report.lines or report.bad_cells) else None
 
 
 __all__ = [

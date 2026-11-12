@@ -217,6 +217,9 @@ def test_a_lagging_count_after_the_rollover_keeps_the_receipt(monkeypatch):
         for v, (hand, order, wk) in SCREEN.items():
             inv[_key(v)]["on_order"] = []
             inv[_key(v)]["quantity"] = float(hand + order)    # rolled in 10/19
+            # Last week's count was a different figure (a week of sales ago);
+            # identical figures 6 days apart would trip the plausibility hold.
+            inv[_key(v)]["last_count_qty"] = float(hand + 7)
             usage.append({"item_key": _key(v), "item_name": inv[_key(v)]["name"],
                           "amount": -float(order), "unit": "cs", "po_number": PO,
                           "po_revision": "0000005", "source": "on_order_rollover",
