@@ -61,16 +61,38 @@ def main() -> int:
         return 1
 
     print(f"HTTP {status} from {endpoint}")
+    rc = 0
     try:
         parsed = json.loads(payload)
-        print(json.dumps(parsed, indent=2))
-        for report in (parsed.get("reports") or []):
-            if report.get("error"):
-                print(f"WARNING: {report['distributor']} reported error: "
-                      f"{report['error']}", file=sys.stderr)
     except ValueError:
+        # A 200 that is not JSON is not a scan report.
         print(payload)
-    return 0
+        print("ERROR: response was not JSON", file=sys.stderr)
+        return 1
+    print(json.dumps(parsed, indent=2))
+    reports = parsed.get("reports") or []
+    if not reports:
+        print("ERROR: response carried no scan report", file=sys.stderr)
+        rc = 1
+    for report in reports:
+        if report.get("error"):
+            print(f"WARNING: {report.get('distributor')} reported error: "
+                  f"{report['error']}", file=sys.stderr)
+        # The scan itself failed, or a whole mailbox could not be read: this
+        # used to print a WARNING and exit 0.
+        if report.get("status") not in (None, "ok", "partial"):
+            print(f"ERROR: scan status={report.get('status')}", file=sys.stderr)
+            rc = 1
+        for mf in (report.get("mailbox_failures") or []):
+            print(f"ERROR: {mf}", file=sys.stderr)
+            rc = 1
+    # A problem the service has not reported before (see /api/email/scan
+    # new_failures): fail this run once.
+    for nf in (parsed.get("new_failures") or []):
+        msg = nf.get("message") if isinstance(nf, dict) else nf
+        print(f"NEW FAILURE: {msg}", file=sys.stderr)
+        rc = 1
+    return rc
 
 
 if __name__ == "__main__":

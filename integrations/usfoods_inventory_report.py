@@ -47,7 +47,8 @@ Two delivery shapes are understood, both handled here:
     handled by ``bagel_inventory_worksheet``.
 
 The report never names the warehouse; the *sending rep's email address*
-identifies it (``REPORT_SENDER_TO_WAREHOUSE``). Add each rep here as they come
+identifies it (``REPORT_SENDER_TO_WAREHOUSE``, derived from
+``integrations/rep_registry.py``). Add each rep to the registry as they come
 online -- an unknown sender is surfaced as an error rather than guessed.
 
 No third-party HTML library is used: the table is extracted with the stdlib
@@ -70,39 +71,16 @@ except ImportError:  # standalone / test use
 
 
 # Report-sender email (lowercased) -> (distributor, canonical warehouse).
-# The canonical warehouse string must match seed_bagels.py exactly. Extend as
-# each US Foods DC rep starts sending the weekly body report.
-REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = {
-    "maria.hernandez@usfoods.com": ("US Foods", "Zebulon, NC"),
-    "kathleen.thompson@usfoods.com": ("US Foods", "Zebulon, NC"),
-    "jasmin.gomez@usfoods.com": ("US Foods", "Manassas, VA"),
-    "thomas.paxson@usfoods.com": ("US Foods", "Manassas, VA"),
-    # Manassas (DC 5O) street-sales shared mailbox, in case the report comes
-    # from the team alias rather than a named coordinator.
-    "5o-dl-streetsalescoordination@usfoods.com": ("US Foods", "Manassas, VA"),
-    # Manassas (MDC) weekly "Product Usage Report" now arrives from the USF
-    # Sales-Coordination customer-contact alias (Salesforce-generated; signed
-    # by Stephanie Warfle, Sales Coordination Manager - AMA/MDC), and Thomas
-    # Paxson forwards it. Route the alias to Manassas so the report ingests.
-    "usfcustomercontact@usfoods.com": ("US Foods", "Manassas, VA"),
-    "sam.travlos@usfoods.com": ("US Foods", "La Mirada, CA"),
-    "ozzy.corut@usfoods.com": ("US Foods", "La Mirada, CA"),
-    # Knoxville market (DC 6H, 2270) -- delivered as the USF "Assortment
-    # Management Tool" .xlsx export. The DC is physically in Alcoa, TN, which is
-    # the seeded warehouse label (seed_bagels.py). Kimberly Cobb is the Alcoa
-    # territory manager who sends the weekly spreadsheet; Christy Dunn is the
-    # Volunteer State area buyer copied on the same standing thread.
-    "kimberly.cobb@usfoods.com": ("US Foods", "Alcoa, TN"),
-    "christy.dunn@usfoods.com": ("US Foods", "Alcoa, TN"),
-    # NW Houston (DC B2, 13400 Hollister Rd). Charles Youngblood is the
-    # major account exec covering the Texas market; Tom Foley is the area
-    # buyer who actually cuts and re-cuts the POs. Either can send the
-    # weekly numbers, so both resolve to the same DC. (Since 2026-09-30 JD
-    # corresponds with Foley only; Youngblood stays mapped so anything he
-    # forwards still lands on Houston instead of erroring as unknown.)
-    "charles.youngblood@usfoods.com": ("US Foods", "Houston, TX"),
-    "tom.foley@usfoods.com": ("US Foods", "Houston, TX"),
-}
+# Derived from the one rep registry (integrations/rep_registry.py) -- add or
+# move a rep THERE, not here. The canonical warehouse string matches
+# seed_bagels.py exactly.
+try:
+    from .rep_registry import sender_map as _registry_sender_map
+except ImportError:  # standalone / test use
+    from rep_registry import sender_map as _registry_sender_map  # type: ignore
+
+REPORT_SENDER_TO_WAREHOUSE: dict[str, tuple[str, str]] = _registry_sender_map(
+    "usf-report")
 
 # Fallback: US Foods catalog item # -> H&H MFG code. Only used when a report
 # arrives WITHOUT the Vendor# column (the original format JD asked the rep to
@@ -164,6 +142,13 @@ class InventoryReport:
     week_label: str = ""            # the forecast column used, e.g. "5/31/2026"
     lines: list = field(default_factory=list)
     unmapped_codes: list = field(default_factory=list)
+    # Rows skipped because the on-hand cell held something that is not a
+    # number ("12 (3 on hold)", "N/A"): ["<item>: on hand '<cell>'", ...].
+    bad_cells: list = field(default_factory=list)
+    # The report parsed only in part -- e.g. on hand was read but no usage /
+    # forecast column was recognised (USF renames columns without notice, and
+    # on-hand alone used to parse with no diagnostic at all).
+    warnings: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +200,7 @@ def _extract_tables_html(html: str) -> list[list[list[str]]]:
 
 _DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{2,4})")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_BARE_DATE_RE = re.compile(r"\s*\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\s*")
 
 
 def _norm(s) -> str:
@@ -227,11 +213,32 @@ def _norm(s) -> str:
     return re.sub(r"[^a-z0-9]", "", str(s if s is not None else "").lower())
 
 
+# A cell that IS a number, whole: optional sign, digits (thousands commas
+# allowed), optional decimals. Nothing else.
+_FULL_NUM_RE = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|[-+]?\.\d+")
+
+
 def _to_float(v) -> Optional[float]:
-    if v is None:
+    """The cell as a number, or None when it is not exactly one.
+
+    This used to take the FIRST number found anywhere in the cell, so
+    "12 (3 on hold)" became 12, "N/A 5" became 5 and "6/10" became 6 --
+    silently. A cell must now be a number and nothing else; callers report a
+    non-blank cell that is not (see InventoryReport.bad_cells).
+    """
+    if v is None or isinstance(v, bool):
         return None
-    m = _NUM_RE.search(str(v).replace(",", ""))
-    return float(m.group(0)) if m else None
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+    s = str(v).strip()
+    if not _FULL_NUM_RE.fullmatch(s):
+        return None
+    return float(s.replace(",", ""))
+
+
+def _is_blank(v) -> bool:
+    return v is None or str(v).strip() == ""
 
 
 def _clean_code(v) -> str:
@@ -288,7 +295,11 @@ def _build_report_from_table(table: list[list[str]],
             col_oh = idx
         elif n.startswith("onorder") and col_oo is None:
             col_oo = idx
-        elif n.startswith("forecast") or _DATE_RE.search(raw):
+        elif n.startswith("forecast") or _BARE_DATE_RE.fullmatch(raw or ""):
+            # A usage week is headed "Forecast <date>" or just the date. Any
+            # other heading that merely CONTAINS a date ("PO due 6/12",
+            # "Updated 6/10/2026") is not a week of usage and used to be
+            # averaged into weekly_usage.
             week_cols.append((idx, _parse_header_date(raw)))
 
     if col_oh is None or (col_item is None and col_mfg is None):
@@ -308,6 +319,11 @@ def _build_report_from_table(table: list[list[str]],
 
     report = InventoryReport(distributor=distributor, warehouse=warehouse,
                              week_label=week_label)
+    if not week_cols:
+        report.warnings.append(
+            "on hand was read but NO usage / forecast column was found -- "
+            "weekly usage not refreshed. Headers seen: "
+            + " | ".join(str(h)[:30] for h in header)[:300])
 
     for r in table[header_idx + 1:]:
         usf_item = _clean_code(r[col_item]) if (col_item is not None and col_item < len(r)) else ""
@@ -316,8 +332,12 @@ def _build_report_from_table(table: list[list[str]],
         # numeric on-hand value. Skips header repeats, blank, and total rows.
         if not (re.fullmatch(r"\d{3,}", usf_item) or re.fullmatch(r"\d{3,}", mfg)):
             continue
-        on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
+        raw_oh = r[col_oh] if col_oh < len(r) else None
+        on_hand = _to_float(raw_oh)
         if on_hand is None:
+            if not _is_blank(raw_oh):
+                report.bad_cells.append(
+                    f"{mfg or usf_item}: on hand {str(raw_oh)[:40]!r}")
             continue
         on_order = _to_float(r[col_oo]) if (col_oo is not None and col_oo < len(r)) else None
         # weekly_usage = AVERAGE of all forecast-week columns -- a smoother
@@ -347,7 +367,7 @@ def _build_report_from_table(table: list[list[str]],
             weekly_usage=weekly,
         ))
 
-    return report if report.lines else None
+    return report if (report.lines or report.bad_cells) else None
 
 
 def looks_like_report(subject: str = "", body: str = "") -> bool:
@@ -364,30 +384,76 @@ def looks_like_report(subject: str = "", body: str = "") -> bool:
     return "current on hand" in b
 
 
-def parse_report_html(html: str, *, distributor: str = "",
-                      warehouse: str = "") -> Optional[InventoryReport]:
-    """Parse the FIRST inventory & usage report table in an HTML body.
+def _own_html(html: str) -> str:
+    """The reply's OWN part of an HTML body: everything above the first
+    reply/forward quote marker (same markers as usf_screenshot.cids_above_quote,
+    imported lazily -- that module imports this one)."""
+    text = html or ""
+    try:
+        from integrations.usf_screenshot import _HTML_QUOTE_MARKERS
+    except ImportError:  # standalone / test use
+        from usf_screenshot import _HTML_QUOTE_MARKERS  # type: ignore
+    m = _HTML_QUOTE_MARKERS.search(text)
+    return text[:m.start()] if m else text
 
-    The latest reply's table comes first in the HTML, so quoted older reports
-    further down the thread are ignored. Returns None if no report table is
-    found.
+
+def _own_text(text: str) -> str:
+    """The reply's own plain text, without the quoted thread below it."""
+    try:
+        from integrations.usf_screenshot import strip_quoted
+    except ImportError:  # standalone / test use
+        from usf_screenshot import strip_quoted  # type: ignore
+    return strip_quoted(text or "")
+
+
+def parse_report_html(html: str, *, distributor: str = "",
+                      warehouse: str = "",
+                      include_quoted: bool = False) -> Optional[InventoryReport]:
+    """Parse the first inventory & usage report table in the reply's OWN part
+    of an HTML body. Returns None if there is none.
+
+    The body is cut at the reply/forward quote marker BEFORE any table is
+    extracted. Taking "the first report table anywhere" used to read the
+    QUOTED previous message whenever the new reply carried no table of its own
+    -- so "running late, will send tomorrow" re-applied last week's count as a
+    fresh one dated today, erasing a week of burn and any receipts since
+    (review 2026-11-12). ``include_quoted=True`` restores the old whole-body
+    read; it exists only so a caller can tell "no report" from "a report that
+    is only in the quote" (see quoted_only_report).
     """
-    for table in _extract_tables_html(html):
+    for table in _extract_tables_html(html if include_quoted else _own_html(html)):
         report = _build_report_from_table(table, distributor, warehouse)
         if report is not None:
             return report
     return None
 
 
+def quoted_only_report(html: str = "", text: str = "") -> bool:
+    """True when the message carries a report table ONLY inside the quoted
+    thread: nothing in the reply's own part, something below the marker."""
+    if parse_report_html(html or "") is not None \
+            or parse_report_text(text or "") is not None:
+        return False
+    return (parse_report_html(html or "", include_quoted=True) is not None
+            or parse_report_text(text or "", include_quoted=True) is not None)
+
+
 def parse_report_text(text: str, *, distributor: str = "",
-                      warehouse: str = "") -> Optional[InventoryReport]:
+                      warehouse: str = "",
+                      include_quoted: bool = False) -> Optional[InventoryReport]:
     """Fallback parser for a plain-text body (no HTML table).
 
     Outlook flattens the table to one cell per line separated by blank lines.
     We rebuild rows by finding the ITEM header, treating every non-empty line
     up to the first all-digit item number as the header, then chunking the
     remaining cells into rows of that width.
+
+    Like parse_report_html, only the reply's own text is read: everything from
+    the first quote marker ("On ... wrote:", "From: ", "-----Original
+    Message-----") down is the previous message, not this week's count.
     """
+    if not include_quoted:
+        text = _own_text(text)
     if not text:
         return None
     cells = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -550,12 +616,22 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
 
     report = InventoryReport(distributor=distributor, warehouse=warehouse,
                              week_label=week_label)
+    if not col_use_list:
+        report.warnings.append(
+            "on hand was read but NO usage column was found (expected Cases / "
+            "Forecast / Weekly Average Demand / <N> Week Average ...) -- "
+            "weekly usage not refreshed. Headers seen: "
+            + " | ".join(str(h)[:30] for h in header if h is not None)[:300])
     for r in rows[header_idx + 1:]:
         usf_item = _clean_code(r[col_item]) if col_item < len(r) else ""
         if not re.fullmatch(r"\d{3,}", usf_item):
             continue
-        on_hand = _to_float(r[col_oh]) if col_oh < len(r) else None
+        raw_oh = r[col_oh] if col_oh < len(r) else None
+        on_hand = _to_float(raw_oh)
         if on_hand is None:
+            if not _is_blank(raw_oh):
+                report.bad_cells.append(
+                    f"{usf_item}: on hand {str(raw_oh)[:40]!r}")
             continue
         on_order = (_to_float(r[col_oo])
                     if (col_oo is not None and col_oo < len(r)) else None)
@@ -584,7 +660,7 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
             weekly_usage=weekly,
         ))
 
-    return report if report.lines else None
+    return report if (report.lines or report.bad_cells) else None
 
 
 __all__ = [
@@ -597,5 +673,6 @@ __all__ = [
     "looks_like_report",
     "parse_report_html",
     "parse_report_text",
+    "quoted_only_report",
     "parse_report_xlsx",
 ]

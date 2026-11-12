@@ -399,6 +399,15 @@ def _post_ingest(app_url: str, token: str, payload: dict,
         return exc.code, body_txt
 
 
+def _plausible_sent(sent_iso: str, received_iso: str) -> str:
+    """sentDateTime unless it is >24 h after / >7 d before receivedDateTime."""
+    from integrations.email_scanner import _trusted_sent_time
+    used, err = _trusted_sent_time(sent_iso, received_iso)
+    if err:
+        print(f"WARNING: {err}", file=sys.stderr)
+    return used or received_iso or ""
+
+
 def _cheney_inventory_report_to_events(xlsx_bytes, filename, mid, subject):
     """Parse a Cheney per-facility inventory .xlsx into on_hand event dicts
     (warehouse keyed off the filename). Returns (events, errors)."""
@@ -454,19 +463,31 @@ def _run_server_mode(args) -> int:
     payload = {"dry_run": bool(args.dry_run),
                "lookback_days": int(args.server_lookback_days),
                "max_messages": int(args.server_max_messages)}
+    #    A dead connection or a gateway error (status 0 / 502 / 503 / 504 --
+    #    a deploy in progress, a cold instance, a worker recycled mid-scan)
+    #    is retried twice after 60 s: the apply path is idempotent, and
+    #    skipping the slot means a 6-hour hole.
     status, body = 0, None
-    for attempt in range(1, 5):
+    busy_tries = net_tries = 0
+    while True:
         try:
             status, body = _post_json(f"{app_url}/api/email/scan", token,
                                       payload, timeout=600)
         except Exception as exc:  # noqa: BLE001 -- network / timeout
-            print(f"ERROR: /api/email/scan attempt {attempt}: "
+            print(f"ERROR: /api/email/scan: "
                   f"{_redact(str(exc), [token])}", file=sys.stderr)
             status, body = 0, None
-        if status == 409 and attempt < 4:
+        if status == 409 and busy_tries < 3:
+            busy_tries += 1
             print(f"email scan busy (409), retrying in 90s "
-                  f"(attempt {attempt}/4)", file=sys.stderr)
+                  f"(attempt {busy_tries}/3)", file=sys.stderr)
             time.sleep(90)
+            continue
+        if status in (0, 502, 503, 504) and net_tries < 2:
+            net_tries += 1
+            print(f"email scan got HTTP {status}, retrying in 60s "
+                  f"(retry {net_tries}/2)", file=sys.stderr)
+            time.sleep(60)
             continue
         break
     rc = 0
@@ -508,6 +529,22 @@ def _run_server_mode(args) -> int:
         # did not exist, so it always logged errors=0.
         if rep.get("status") not in (None, "ok", "partial") \
                 or rep.get("mailbox_failures"):
+            rc = 1
+        # ...and when the scan reports a failure it has NOT reported before
+        # (a dropped PO, an unmapped item #, a held or unreadable report, a
+        # rejected on-hand ...). The service remembers each one by key, so a
+        # given problem fails exactly one run instead of every run for the
+        # two weeks its email stays in the window.
+        new_failures = body.get("new_failures") or rep.get("new_failures") or []
+        if new_failures and not args.dry_run:
+            print(f"NEW FAILURES: {len(new_failures)} problem(s) seen for the "
+                  "first time in this scan:", file=sys.stderr)
+            for nf in new_failures[:25]:
+                if isinstance(nf, dict):
+                    print(f"  - [{nf.get('key')}] {nf.get('message')}",
+                          file=sys.stderr)
+                else:
+                    print(f"  - {nf}", file=sys.stderr)
             rc = 1
 
     # 2) Lineage freight invoices (actual ship dates). Server-side too, so
@@ -637,10 +674,22 @@ def _run_screenshot_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
                   file=sys.stderr)
             rc = 1
             continue
+        # The route answers ok:true even when a Graph call inside it failed
+        # and lists that in "errors". An empty "messages" then does NOT mean
+        # nothing is pending -- it means we could not look. Fail the run.
+        endpoint_errors = [str(e) for e in (data.get("errors") or [])]
+        if endpoint_errors:
+            print(f"ERROR: usf-screenshots {wh}: the mailbox could not be "
+                  f"read completely ({len(endpoint_errors)} error(s)):",
+                  file=sys.stderr)
+            for e in endpoint_errors[:10]:
+                print(f"  - {_redact(e, [token])}", file=sys.stderr)
+            rc = 1
         pending = data.get("messages") or []
         if not pending:
             print(f"usf-screenshots: {wh} nothing pending "
-                  f"(last count {data.get('last_count_at')})")
+                  f"(last count {data.get('last_count_at')})"
+                  + (" -- UNVERIFIED, see errors above" if endpoint_errors else ""))
             continue
         env = _ocr_env(app_url, token)
         if any(m.get("images") for m in pending):
@@ -814,6 +863,10 @@ def run(argv: list[str] | None = None) -> int:
     # ---- discover qualifying messages
     qualifying: list[dict] = []   # [{mailbox, id, subject, sender, distributor}]
     mailbox_diag: list[str] = []  # one line per mailbox, always logged
+    # Mailboxes that could not be listed at all. The run used to print the
+    # error, carry on, and exit 0 ("nothing new") -- a dead mailbox read as a
+    # quiet day.
+    mailbox_failures: list[str] = []
     # --lineage-lookback-hours was parsed and never used: render.yaml passes
     # 2160 believing a 90-day Lineage sweep runs, but every invoice older
     # than --lookback-hours was skipped (and never back-filled). List the
@@ -842,6 +895,7 @@ def run(argv: list[str] | None = None) -> int:
             err_line = f"list_recent_messages({mb}) failed: {msg}"
             print(f"ERROR: {err_line}", file=sys.stderr)
             mailbox_diag.append(f"{mb}: ERROR ({msg[:120]})")
+            mailbox_failures.append(mb)
             continue
         # Count senders we recognise so we can tell "scanner found CW emails
         # but skipped them" from "scanner saw no relevant senders at all".
@@ -876,11 +930,19 @@ def run(argv: list[str] | None = None) -> int:
                 # per-mailbox (JD@ and info@ differ) and lags by seconds to
                 # minutes, so the two paths disagreed about which copy of a
                 # PO was newer.
-                "received": (m.get("sentDateTime")
-                             or m.get("receivedDateTime") or ""),
+                # ...but the send time is written by the sender: believe it
+                # only while it is plausible against the mailbox's own receive
+                # time (email_scanner._trusted_sent_time).
+                "received": _plausible_sent(m.get("sentDateTime") or "",
+                                            m.get("receivedDateTime") or ""),
             })
 
     if not qualifying:
+        if mailbox_failures:
+            print(f"ERROR: could not list {len(mailbox_failures)} mailbox(es): "
+                  f"{', '.join(mailbox_failures)} -- nothing was read from them",
+                  file=sys.stderr)
+            return 1
         print(f"nothing new; seen-set size = {len(seen_ids)}")
         return 0
 
@@ -1222,6 +1284,21 @@ def run(argv: list[str] | None = None) -> int:
         for b in blocked_pos:
             print(f"  - {b}", file=sys.stderr)
         return 2
+    # Anything that means "this run did not read or apply everything" fails
+    # it: a mailbox that would not list, an attachment/body that would not
+    # download, or an apply report that is not ok.
+    fetch_failures = [e for e in error_strs
+                      if "[list-att]" in e or "[fetch-att]" in e
+                      or "[body-fetch]" in e]
+    if mailbox_failures or fetch_failures or rep_status not in ("ok", "partial"):
+        if mailbox_failures:
+            print(f"ERROR: could not list mailbox(es): "
+                  f"{', '.join(mailbox_failures)}", file=sys.stderr)
+        for e in fetch_failures[:10]:
+            print(f"ERROR: {_redact(e, secrets_to_redact)}", file=sys.stderr)
+        if rep_status not in ("ok", "partial"):
+            print(f"ERROR: ingest-events status={rep_status}", file=sys.stderr)
+        return 1
     return 0
 
 

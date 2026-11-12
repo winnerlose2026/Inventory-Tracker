@@ -62,7 +62,11 @@ Configuration
                         Mail.Read application permission granted admin consent.
                         May be a comma-separated list to scan multiple
                         mailboxes, e.g. "ops@foo.com,orders@foo.com".
-  MS365_FOLDER          default "Inbox"
+  MS365_FOLDER          default "Inbox". Left at the default, EVERY folder is
+                        scanned except Sent Items, Drafts, Deleted Items, Junk
+                        Email and Outbox; set to another folder name to scan
+                        just that folder.
+  MS365_SCAN_ALL_FOLDERS  "off" to scan only MS365_FOLDER (default on)
   MS365_FILTER          optional Graph $filter, e.g.
                         "isRead eq false and receivedDateTime ge 2025-01-01T00:00:00Z"
   MS365_MARK_READ       "1" to mark processed messages as read
@@ -118,24 +122,65 @@ from .usfoods_inventory_report import (
     parse_report_html as _parse_report_html,
     parse_report_text as _parse_report_text,
     parse_report_xlsx as _parse_report_xlsx,
+    quoted_only_report as _quoted_only_report,
     warehouse_for_sender as _report_warehouse_for_sender,
 )
 
 
 EventType = Literal["on_hand", "restock", "usage", "usage_rate"]
 
-# Sender-domain -> our canonical distributor name.
-DOMAIN_TO_DISTRIBUTOR = {
-    "cheneybrothers.com": "Cheney Brothers",
-    "cheney.com": "Cheney Brothers",
-    "usfoods.com": "US Foods",
-    "usfood.com": "US Foods",
-    "chefswarehouse.com": "Chefs Warehouse",
-}
+# Sender-domain -> our canonical distributor name. From the one rep registry
+# (integrations/rep_registry.py); the same object, so a domain added there is
+# live here.
+from .rep_registry import DOMAIN_TO_DISTRIBUTOR  # noqa: E402
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_TOKEN_URL_FMT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
+
+
+# Well-known Graph folder names the all-folder scan leaves out, and the ones
+# whose ids must resolve before it will scan anything but the Inbox.
+_EXCLUDED_WELL_KNOWN_FOLDERS = ("sentitems", "drafts", "deleteditems",
+                                "junkemail", "outbox")
+_REQUIRED_EXCLUDED_FOLDERS = ("sentitems", "drafts", "deleteditems")
+
+
+# _graph_get retry policy (see EmailInboxClient._graph_get).
+_GRAPH_GET_RETRIES = 3
+_GRAPH_RETRY_AFTER_CAP_S = 20.0
+_GRAPH_RETRY_BUDGET_S = 60.0
+
+
+def _sleep(seconds: float) -> None:   # module-level so tests can stub it
+    import time as _time
+    _time.sleep(seconds)
+
+
+def _retry_after_seconds(headers) -> Optional[float]:
+    """Seconds Graph asked us to wait (Retry-After), capped; None if absent."""
+    try:
+        raw = (headers.get("Retry-After") if headers is not None else None)
+        if raw is None or str(raw).strip() == "":
+            return None
+        return max(0.0, min(float(str(raw).strip()), _GRAPH_RETRY_AFTER_CAP_S))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+# Listing pages per mailbox per scan (x $top<=50 ~= 4000 messages screened).
+_MAX_LIST_PAGES = 80
+
+
+def _scan_all_folders_enabled() -> bool:
+    """All-folder scanning: on unless MS365_SCAN_ALL_FOLDERS is off, or
+    MS365_FOLDER names a folder other than the default Inbox (an explicit
+    single-folder override)."""
+    if os.environ.get("MS365_SCAN_ALL_FOLDERS", "on").strip().lower() in (
+            "off", "0", "false", "no"):
+        return False
+    folder = (os.environ.get("MS365_FOLDER") or "").strip()
+    return folder == "" or folder.lower() == "inbox"
 
 
 def _graph_error(verb: str, url: str, exc: "urllib.error.HTTPError") -> RuntimeError:
@@ -207,6 +252,11 @@ class EmailEvent:
     # sync_inventory._onhand_source_rank uses this to stop a low-confidence
     # extraction overwriting a high-confidence one for the same count_date.
     parser_source: str = ""
+    # Cases the distributor's own report shows ON ORDER for this SKU (the USF
+    # weekly report's "ON ORDER" column). NEVER applied -- the PO is booked
+    # from its own confirmation. Kept on the item (reported_on_order) so
+    # integrations/ingest_health can cross-check it against our pending POs.
+    reported_on_order: Optional[float] = None
 
 
 @dataclass
@@ -227,6 +277,13 @@ class ScanResult:
     # parser gap. Surfaced on /api/scan/health so a silent miss can't hide.
     # Each entry: {id, mailbox, sender, subject, received}.
     unparsed: list[dict] = field(default_factory=list)
+    # Problems a person must look at, each with a STABLE key so it alerts once
+    # (core.feed_health.raise_issue): {key, message, severity}. The route
+    # raises them; the scanner itself never writes health state.
+    issues: list[dict] = field(default_factory=list)
+    # Mailboxes whose listing stopped at the message budget or the page cap
+    # with mail in the window still unread.
+    truncated: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +306,101 @@ _PO_FAILURE_RE = re.compile(
     r"|did not resolve -- \d+ line\(s\) skipped"
     r"|no PO# found in PDF -- skipped"
     r"|^PO PDF '.*': could not be read")
+
+# Scan errors a PERSON must act on, by class. /api/email/scan turns each into
+# a feed-health issue keyed "<class>:<hash of the text>" so it alerts ONCE
+# (the cron exits non-zero only when a scan reports a failure it has not seen
+# before), however many 6-hour scans re-read the same message. Errors that
+# match nothing here are informational: returned and logged, never alerted.
+_FAILURE_CLASSES = (
+    ("po-failure", _PO_FAILURE_RE),
+    ("report-held", re.compile(r"^report held: ")),
+    ("unmapped", re.compile(r"\bunmapped\b", re.I)),
+    ("unknown-rep", re.compile(r"\bunknown rep\b", re.I)),
+    ("fetch-failed", re.compile(r"fetch failed|ms365 parse failed for", re.I)),
+    ("truncated", re.compile(r"^scan truncated", re.I)),
+    ("partial-parse", re.compile(r"^partial parse|NOT emitted", re.I)),
+    ("bad-cell", re.compile(r"is not a number", re.I)),
+    ("date-header", re.compile(r"Date header .* is implausible", re.I)),
+    ("junk-mail", re.compile(r"is in the Junk Email folder", re.I)),
+    ("folders", re.compile(r"scanned the Inbox only", re.I)),
+    ("unreadable", re.compile(
+        r"could not be read|parse failed|cannot open xlsx"
+        r"|no recognizable inventory grid|could not determine Cheney warehouse",
+        re.I)),
+)
+
+
+def failure_class(err) -> Optional[str]:
+    """The alert class of a scan error, or None when it is informational.
+    Mailbox failures are not classed here -- they fail every run on their own
+    (is_mailbox_failure)."""
+    text = str(err or "")
+    if is_mailbox_failure(text):
+        return None
+    for slug, rx in _FAILURE_CLASSES:
+        if rx.search(text):
+            return slug
+    return None
+
+
+# A PDF that is a purchase order by its name / subject / own text. Used to
+# tell a PO the parser read NOTHING from (must be flagged) from the invoices,
+# statements and delivery paperwork the same senders also attach as PDFs.
+_PO_HINT_RE = re.compile(
+    r"(?<![A-Za-z])P\.?O\.?(?![A-Za-z])|purchase\s*order", re.I)
+_NOT_PO_HINT_RE = re.compile(
+    r"\b(invoice|statement|remittance|credit memo|past due|affidavit)", re.I)
+_PO_TEXT_RE = re.compile(r"purchase\s+order|\bPO\s+request\b|\bP\.?O\.?\s*(#|number|no\.?)",
+                         re.I)
+
+
+def _pdf_text_looks_like_po(pdf_bytes) -> bool:
+    """Does the PDF's own first-page text call itself a purchase order?
+    Best-effort: an unreadable PDF is simply "can't tell" (False)."""
+    try:
+        import io as _io
+        from pypdf import PdfReader  # type: ignore
+        reader = PdfReader(_io.BytesIO(pdf_bytes))
+        text = ""
+        for page in list(reader.pages)[:2]:
+            text += (page.extract_text() or "") + "\n"
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_PO_TEXT_RE.search(text))
+
+
+def _zero_line_po_error(po, pdf_bytes, subject, filename="") -> Optional[str]:
+    """Error text when a distributor PDF that IS a purchase order produced no
+    line at all, else None.
+
+    Before 2026-11-12 such a PDF returned events=[] errors=[] and was queued
+    nowhere: a layout change at US Foods or Cheney would have dropped every
+    PO with status "ok". The wording matches _PO_FAILURE_RE, so the scan goes
+    "partial", the cron reports it and the message enters the unparsed queue.
+    """
+    if getattr(po, "lines", None):
+        return None
+    blob = f"{subject or ''} {filename or ''}"
+    is_po = bool(getattr(po, "po_number", "")) or (
+        bool(_PO_HINT_RE.search(blob)) and not _NOT_PO_HINT_RE.search(blob)
+    ) or _pdf_text_looks_like_po(pdf_bytes)
+    if not is_po:
+        return None
+    label = (subject or filename or "?").replace("'", "`")[:120]
+    return (f"PO PDF '{label}': could not be read -- 0 lines "
+            f"(PO# {getattr(po, 'po_number', '') or 'not found'}). The PDF "
+            "layout may have changed; this order is NOT on the Pending POs tab.")
+
+
+# A report that was recognised but deliberately NOT applied (its table is only
+# in the quoted thread; an implausible repeat of the last count). The scan
+# turns each into a "report-held:<warehouse>:<message id>" issue.
+REPORT_HELD_PREFIX = "report held: "
+
+
+def is_report_held(err) -> bool:
+    return str(err or "").startswith(REPORT_HELD_PREFIX)
 
 
 def is_mailbox_failure(err) -> bool:
@@ -336,29 +488,49 @@ def _msg_event_candidate(m: dict) -> bool:
     Warehouse, Lineage) OR a mapped inventory-report / worksheet rep.
 
     Used by _scan_ms365_mailbox to bound MIME downloads on a wide lookback:
-    only candidates get their full body fetched and parsed. Checks the sender
-    plus every To/Cc recipient, so a distributor PDF riding along on an H&H
-    reply still qualifies. Attachment-agnostic by design, so a DC rep's
+    only candidates get their full body fetched and parsed. Checks the sender,
+    and -- only when the sender is @hhbagels.com -- every To/Cc recipient, so
+    a distributor PDF riding along on an H&H reply still qualifies. Attachment-agnostic by design, so a DC rep's
     body-pasted weekly inventory report (no data attachment -- e.g. Zebulon)
     qualifies exactly like an attachment-bearing PO.
     """
-    addresses = []
     sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "")
-    if sender:
-        addresses.append(sender)
-    for collection in ("toRecipients", "ccRecipients"):
-        for r in (m.get(collection) or []):
-            a = ((r.get("emailAddress") or {}).get("address") or "")
-            if a:
-                addresses.append(a)
+    addresses = [sender] if sender else []
+    # To/Cc only counts on mail WE sent (an H&H reply carrying a distributor
+    # PDF along). From anyone else, addressing or cc'ing a rep used to be
+    # enough to have the message downloaded and its CSV / "# event:" lines
+    # applied (review 2026-11-12).
+    from .rep_map import sender_address as _real
+    if _is_internal_address(_real(sender)):
+        for collection in ("toRecipients", "ccRecipients"):
+            for r in (m.get(collection) or []):
+                a = ((r.get("emailAddress") or {}).get("address") or "")
+                if a:
+                    addresses.append(a)
     for a in addresses:
-        if _distributor_from_sender(a):
-            return True
-        if _report_warehouse_for_sender(a)[1]:
-            return True
-        if _worksheet_warehouse_for_sender(a)[1]:
+        if _sender_is_known_source(a):
             return True
     return False
+
+
+def _sender_is_known_source(from_header: str) -> bool:
+    """A distributor domain or a mapped inventory-report / worksheet rep."""
+    return bool(_distributor_from_sender(from_header)
+                or _report_warehouse_for_sender(from_header)[1]
+                or _worksheet_warehouse_for_sender(from_header)[1])
+
+
+def _sender_may_send_raw_events(from_header: str) -> bool:
+    """May this sender's CSV attachment / "# event:" body lines be applied?
+
+    Those two formats carry no structure of their own -- any CSV with a
+    quantity column, any line "Plain @ Ocala, FL: 480" -- so they are honoured
+    only from @hhbagels.com (hand-keyed corrections, backfills) or from a
+    known distributor / mapped rep address.
+    """
+    from .rep_map import sender_address as _real
+    return bool(_is_internal_address(_real(from_header))
+                or _sender_is_known_source(from_header))
 
 
 # Data-file extensions that could plausibly carry a distributor report or PO.
@@ -556,14 +728,23 @@ def _iso_from_usf_date(s: str) -> str:
     falls back to the ingestion timestamp."""
     if not s:
         return ""
-    m = re.match(r"^\s*(\d{2})/(\d{2})/(\d{2})\s*$", s)
+    # 1-2 digit month/day ("6/5/26" as well as "06/05/26") and a 2- or
+    # 4-digit year: a PO printed without the leading zeros used to lose its
+    # order date and fall back to the ingest time.
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})\s*$", s)
     if not m:
         return ""
     mm, dd, yy = m.groups()
-    # 2-digit year window: 00-69 -> 2000s, 70-99 -> 1900s. USF POs are
-    # never going to be from the 1900s but the cutoff is harmless.
-    year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
-    return f"{year:04d}-{int(mm):02d}-{int(dd):02d}"
+    if len(yy) == 4:
+        year = int(yy)
+    else:
+        # 2-digit year window: 00-69 -> 2000s, 70-99 -> 1900s. USF POs are
+        # never going to be from the 1900s but the cutoff is harmless.
+        year = 2000 + int(yy) if int(yy) < 70 else 1900 + int(yy)
+    try:
+        return datetime(year, int(mm), int(dd)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
 
 
 def _iso_from_cheney_date(s: str) -> str:
@@ -608,7 +789,7 @@ def _received_at_from_message(msg) -> str:
 
 
 def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                          received_at="", sender=""):
+                          received_at="", sender="", filename=""):
     """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
 
     Returns (events, errors). Errors are strings suitable for
@@ -625,9 +806,14 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
         errors.append(f"usfoods PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
+    _zero = _zero_line_po_error(po, pdf_bytes, subject, filename)
+    if _zero:
+        errors.append(_zero)
+        return events, errors
     from .po_health import po_integrity_gate as _gate
     if _bad := _gate("usfoods", po, subject):   # lines != printed TOTALS: hold
         return events, errors + [_bad]
+
     if po.unmapped_items:
         errors.append(
             f"usfoods PO {po.po_number or '?'}: unmapped USF item #s "
@@ -710,7 +896,7 @@ def _sum_split_lines(lines):
 
 
 def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                         received_at="", sender=""):
+                         received_at="", sender="", filename=""):
     """Parse a Cheney Brothers PO PDF and convert each line to a restock
     EmailEvent.
 
@@ -730,9 +916,14 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
         errors.append(f"cheney PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
+    _zero = _zero_line_po_error(po, pdf_bytes, subject, filename)
+    if _zero:
+        errors.append(_zero)
+        return events, errors
     from .po_health import po_integrity_gate as _gate
     if _bad := _gate("cheney", po, subject):    # unreadable item rows: hold
         return events, errors + [_bad]
+
     if po.unmapped_items:
         errors.append(
             f"cheney PO {po.po_number or '?'}: unmapped Mfg# codes "
@@ -950,6 +1141,15 @@ def _inventory_worksheet_to_events(xlsx_bytes, sender, msg_id, subject):
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
         )
 
+    for w in getattr(sheet, "warnings", None) or []:
+        errors.append(f"partial parse: inventory worksheet ({warehouse}): {w}")
+    if getattr(sheet, "bad_cells", None):
+        errors.append(
+            f"inventory worksheet ({warehouse}): on-hand cell is not a number "
+            f"for {'; '.join(sheet.bad_cells[:8])} -- row(s) skipped, the "
+            "previous count stands for those SKUs"
+        )
+
     for line in sheet.lines:
         if not line.variety:
             continue
@@ -987,6 +1187,8 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
     The ``ON ORDER`` column is intentionally NOT emitted as a restock: the open
     PO is ingested separately from its own confirmation, and the report body
     excludes it from CURRENT ON HAND, so applying it here would double count.
+    It rides along as ``reported_on_order`` for the read-only cross-check in
+    integrations/ingest_health.
 
     The warehouse is resolved from the sending rep. This function self-detects
     a report (returns no events for unrelated mail) and only surfaces an
@@ -1012,6 +1214,16 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
                 text or "", distributor=distributor or "", warehouse=warehouse or "",
             )
     if report is None:
+        # A mapped rep's reply whose ONLY report table sits in the quoted
+        # thread ("running late, will send tomorrow"): that is last week's
+        # count, not a new one. Hold it and say so. Other senders (JD's own
+        # replies quote the table too) stay quiet.
+        if warehouse and xlsx is None and _quoted_only_report(html or "", text or ""):
+            errors.append(
+                f"{REPORT_HELD_PREFIX}{warehouse} ({subject!r}): the only "
+                "inventory table is in the QUOTED thread below the reply -- "
+                "not applied (it is the previous report riding on a reply)"
+            )
         return events, errors  # not an inventory & usage report
 
     if not warehouse:
@@ -1026,6 +1238,15 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
             f"inventory & usage report ({warehouse}): unmapped MFG codes "
             f"{sorted(set(report.unmapped_codes))} -- add them to "
             "hh_mfg_codes.HH_MFG_CODE_TO_VARIETY"
+        )
+
+    for w in getattr(report, "warnings", None) or []:
+        errors.append(f"partial parse: inventory & usage report ({warehouse}): {w}")
+    if getattr(report, "bad_cells", None):
+        errors.append(
+            f"inventory & usage report ({warehouse}): on-hand cell is not a "
+            f"number for {'; '.join(report.bad_cells[:8])} -- row(s) skipped, "
+            "the previous count stands for those SKUs"
         )
 
     for line in report.lines:
@@ -1045,6 +1266,7 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
             ),
             source_message_id=msg_id,
             source_subject=subject,
+            reported_on_order=line.on_order,
         ))
 
     return events, errors
@@ -1136,12 +1358,53 @@ def _log_scan_exc(exc, ctx: str = "") -> None:
           file=_sys.stderr)
 
 
-def parse_message_with_errors(msg, sender_address: Optional[str] = None):
+# The MIME Date header is written by the SENDER. It dates every count
+# (count_date) and orders two copies of a PO (source_received_at), so a wrong
+# clock -- or a deliberate one -- could post-date a count past every later one
+# or make a stale PO copy the newest. When the caller knows when the mailbox
+# actually RECEIVED the message (Graph receivedDateTime), a Date outside this
+# window around it is not believed.
+DATE_HEADER_MAX_AHEAD = timedelta(hours=24)
+DATE_HEADER_MAX_BEHIND = timedelta(days=7)
+
+
+def _iso_utc(value: str):
+    try:
+        from datetime import timezone as _tz
+        dt = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=_tz.utc) if dt.tzinfo is None else dt.astimezone(_tz.utc)
+
+
+def _trusted_sent_time(date_iso: str, received_iso: str):
+    """(iso to use, error or None). ``date_iso`` is the Date header normalised
+    to UTC, ``received_iso`` the mailbox's own receive time (may be "")."""
+    recv = _iso_utc(received_iso) if received_iso else None
+    if recv is None:
+        return date_iso, None
+    recv_iso = recv.isoformat().replace("+00:00", "Z")
+    sent = _iso_utc(date_iso) if date_iso else None
+    if sent is None:
+        return recv_iso, None          # no usable Date header: use receipt
+    if sent - recv > DATE_HEADER_MAX_AHEAD or recv - sent > DATE_HEADER_MAX_BEHIND:
+        return recv_iso, (
+            f"Date header {date_iso} is implausible against the mailbox "
+            f"receive time {recv_iso}; using the receive time.")
+    return date_iso, None
+
+
+def parse_message_with_errors(msg, sender_address: Optional[str] = None,
+                              received_at: Optional[str] = None):
     """Extract events + CW POs from an email message, surfacing non-fatal issues.
 
     ``sender_address`` -- when the caller has Graph's ``from.emailAddress``
     (the server-side scan does), pass it: it is authoritative over the MIME
     From: header for every sender -> distributor / rep / warehouse decision.
+
+    ``received_at`` -- Graph's ``receivedDateTime`` for the message, when the
+    caller has it. The sender-written Date header is used for count dates and
+    PO ordering only while it is plausible against this (_trusted_sent_time).
 
     Attachment precedence:
       1. Distributor PO PDF attachment routed by sender domain:
@@ -1164,7 +1427,8 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     from_hdr = (str(sender_address).strip() if sender_address
                 else str(msg.get("From", "")))
     from .rep_map import sender_address as _real_address
-    sent_iso = _msg_date_iso(msg)
+    _mailbox_received = str(received_at or "").strip()
+    sent_iso, _date_err = _trusted_sent_time(_msg_date_iso(msg), _mailbox_received)
 
     body = _text_body(msg)
     body_tags = {m.group(1).lower(): m.group(2).strip()
@@ -1188,21 +1452,24 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     # bumping the revision number (see integrations/po_revision).
     # Every part below runs through _guarded(): one unreadable attachment
     # records an error for itself and the rest of the message still parses.
-    received_at = _received_at_from_message(msg)
+    received_at, _ = _trusted_sent_time(_received_at_from_message(msg),
+                                        _mailbox_received)
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".pdf"):
             continue
         if distributor == "US Foods":
             got = _guarded(errors, f"PO PDF {fname!r}", _usfoods_po_to_events,
                            payload, distributor, msg_id, subject,
-                           received_at=received_at, sender=from_hdr)
+                           received_at=received_at, sender=from_hdr,
+                           filename=fname)
             if got:
                 events.extend(got[0])
                 errors.extend(got[1])
         elif distributor == "Cheney Brothers":
             got = _guarded(errors, f"PO PDF {fname!r}", _cheney_po_to_events,
                            payload, distributor, msg_id, subject,
-                           received_at=received_at, sender=from_hdr)
+                           received_at=received_at, sender=from_hdr,
+                           filename=fname)
             if got:
                 events.extend(got[0])
                 errors.extend(got[1])
@@ -1223,7 +1490,13 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     # 1a) Cheney per-facility inventory & usage .xlsx (warehouse from the
     #     filename: H&HRVB../H&HOcala../H&HPuntaGorda..). Ross sends one sheet
     #     per FL facility; each mapped row -> on_hand event with weekly_usage.
-    if not events and not cw_pos and distributor == "Cheney Brothers":
+    # The report branches (1a-1c) are gated on "no COUNT read yet", not on
+    # "no events yet": a message carrying both a PO PDF and the weekly report
+    # used to lose the report, because the PO's restock events came first.
+    def _no_count_yet():
+        return not any(e.event_type in ("on_hand", "usage_rate") for e in events)
+
+    if _no_count_yet() and not cw_pos and distributor == "Cheney Brothers":
         from .cheney_inventory_report import parse_report_xlsx as _cheney_report_xlsx
 
         def _cheney_part(payload, fname):
@@ -1258,7 +1531,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     #     "Weekly … Inventory & Usage Report" subject. Only USF senders /
     #     known report reps, only when nothing else produced events.
     report_xlsx_handled = False
-    if not events and not cw_pos:
+    if _no_count_yet() and not cw_pos:
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
                 continue
@@ -1278,7 +1551,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     #      a warehouse rep). Distinct from the report .xlsx above; handled only
     #      if the report parser didn't claim the message. Warehouse keyed off
     #      the sender.
-    if not events and not cw_pos and not report_xlsx_handled:
+    if _no_count_yet() and not cw_pos and not report_xlsx_handled:
         for fname, payload in _attachments(msg):
             if not fname.lower().endswith(".xlsx"):
                 continue
@@ -1297,7 +1570,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
     #     event with weekly_usage. Warehouse is keyed off the sending rep.
     #     Only runs when nothing else produced events, and self-detects a
     #     report so unrelated mail stays quiet.
-    if not events and not cw_pos:
+    if _no_count_yet() and not cw_pos:
         got = _guarded(errors, "body report table",
                        lambda: _usfoods_inventory_report_to_events(
                            _html_body(msg), body, from_hdr, msg_id, subject))
@@ -1307,8 +1580,17 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
 
     # 2) CSV attachments. Read from memory (no /tmp file) through the
     #    encoding- and ragged-row-tolerant reader; one bad CSV only costs itself.
+    #    Steps 2 and 3 run only for an internal or known-distributor sender
+    #    (see _sender_may_send_raw_events).
+    _raw_ok = _sender_may_send_raw_events(from_hdr)
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".csv"):
+            continue
+        if not _raw_ok:
+            errors.append(
+                f"csv {fname!r} ({subject[:80]!r}): ignored -- sender "
+                f"{_real_address(from_hdr) or '?'} is not internal or a "
+                "known distributor/rep")
             continue
         event_type = _infer_event_type_from_filename(fname)
         items = _guarded(errors, f"csv {fname!r}",
@@ -1323,7 +1605,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
             ))
 
     # 3) Structured body (only if no attachment produced events or CW POs)
-    if body and not events and not cw_pos:
+    if body and not events and not cw_pos and _raw_ok:
         got = _guarded(errors, "body tag lines", _parse_body_items,
                        body, distributor, "on_hand")
         event_type, _, items = got if got else ("on_hand", "", [])
@@ -1363,6 +1645,10 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
         for _e in events:
             if _e.event_type in ("on_hand", "usage_rate") and not _e.count_date:
                 _e.count_date = _count_iso
+
+    # Only worth saying when the message actually produced something dated.
+    if _date_err and (events or cw_pos):
+        errors.append(f"{subject[:80]!r}: {_date_err}")
 
     return events, errors, cw_pos
 
@@ -1465,16 +1751,49 @@ class EmailInboxClient:
         return token
 
     def _graph_get(self, url, token, accept="application/json"):
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": accept},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read(), resp.headers
-        except urllib.error.HTTPError as exc:
-            raise _graph_error("GET", url, exc) from exc
+        """GET a Graph URL, retrying a throttle or a transient failure.
+
+        Up to _GRAPH_GET_RETRIES retries on 429 / 5xx / a network error or
+        timeout, waiting Retry-After when Graph sends it (capped) and 1-2-4 s
+        otherwise. One 503 on a message download used to cost that message
+        for the whole scan -- and with nothing queued, for good if it was at
+        the edge of the window. Retrying is bounded per client by
+        _GRAPH_RETRY_BUDGET_S so a Graph outage cannot run the scan past the
+        gunicorn worker timeout: once the budget is spent, calls fail fast.
+        """
+        import time as _time
+        attempt = 0
+        while True:
+            attempt += 1
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {token}", "Accept": accept},
+                method="GET",
+            )
+            started = _time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read(), resp.headers
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                delay = _retry_after_seconds(exc.headers) if retryable else None
+                err = _graph_error("GET", url, exc)
+                cause = exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                retryable, delay = True, None
+                err = RuntimeError(
+                    f"Microsoft Graph GET {url.split('?', 1)[0]} failed "
+                    f"({type(exc).__name__})")
+                cause = exc
+            spent = getattr(self, "_retry_spent_s", 0.0) + (_time.monotonic() - started)
+            if delay is None:
+                delay = float(2 ** (attempt - 1))
+            if (not retryable or attempt > _GRAPH_GET_RETRIES
+                    or spent + delay > _GRAPH_RETRY_BUDGET_S):
+                self._retry_spent_s = spent
+                raise err from cause
+            self._retry_spent_s = spent + delay
+            _sleep(delay)
 
     def _graph_patch(self, url, token, body):
         req = urllib.request.Request(
@@ -1506,7 +1825,15 @@ class EmailInboxClient:
                 "MS365_USER is empty. Set it to a mailbox UPN, or a comma-"
                 "separated list of UPNs to scan multiple mailboxes."
             )
-        folder = urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox"))
+        # Default: every folder except Sent Items / Drafts / Deleted Items /
+        # Junk / Outbox (folder=None) -- an Outlook rule or a drag into a
+        # subfolder used to hide a report or PO from the scan for good.
+        # MS365_FOLDER set to anything but "Inbox" is an explicit override and
+        # scans that one folder, as before; MS365_SCAN_ALL_FOLDERS=off
+        # restores Inbox-only.
+        folder = (None if _scan_all_folders_enabled()
+                  else urllib.parse.quote(os.environ.get("MS365_FOLDER", "Inbox")
+                                          or "Inbox"))
         mark_read = os.environ.get("MS365_MARK_READ") == "1"
         # Default: no $filter at all, so both read and unread messages are
         # returned (bounded by max_messages and $orderby desc). Set
@@ -1528,13 +1855,72 @@ class EmailInboxClient:
                 result.errors.append(f"{MAILBOX_FAILURE_PREFIX}ms365 {upn} -- "
                                      "see server log")
 
+    def _excluded_folder_ids(self, user, token):
+        """(excluded ids, junk ids) for one mailbox, resolved from Graph's
+        well-known folder names, including their subfolders.
+
+        Sent Items, Drafts and Deleted Items MUST resolve -- scanning our own
+        sent mail would apply JD's outgoing CSVs -- so a failure there raises
+        and the caller falls back to Inbox-only. Junk and Outbox are optional.
+        Junk is excluded on purpose: it is where spoofed "from a rep" mail
+        lands; a known sender's message found there is flagged, not applied.
+        """
+        def _one(name):
+            raw, _ = self._graph_get(
+                f"{GRAPH_BASE}/users/{user}/mailFolders/{name}"
+                "?$select=id,childFolderCount", token)
+            return json.loads(raw.decode("utf-8"))
+
+        def _children(fid, depth=0):
+            out = set()
+            if depth >= 3:
+                return out
+            raw, _ = self._graph_get(
+                f"{GRAPH_BASE}/users/{user}/mailFolders/{urllib.parse.quote(fid)}"
+                "/childFolders?$select=id,childFolderCount&$top=200", token)
+            for c in json.loads(raw.decode("utf-8")).get("value", []):
+                if c.get("id"):
+                    out.add(c["id"])
+                    if int(c.get("childFolderCount") or 0) > 0:
+                        out |= _children(c["id"], depth + 1)
+            return out
+
+        excluded, junk = set(), set()
+        for name in _EXCLUDED_WELL_KNOWN_FOLDERS:
+            required = name in _REQUIRED_EXCLUDED_FOLDERS
+            try:
+                f = _one(name)
+                ids = {f["id"]}
+                if int(f.get("childFolderCount") or 0) > 0:
+                    ids |= _children(f["id"])
+            except Exception:  # noqa: BLE001
+                if required:
+                    raise
+                continue
+            excluded |= ids
+            if name == "junkemail":
+                junk |= ids
+        return excluded, junk
+
     def _scan_ms365_mailbox(self, result, token, upn, folder, filt, mark_read,
                             max_messages):
         user = urllib.parse.quote(upn)
         top = min(max_messages, 50)
+        excluded_ids, junk_ids = set(), set()
+        if folder is None:
+            try:
+                excluded_ids, junk_ids = self._excluded_folder_ids(user, token)
+            except Exception as exc:  # noqa: BLE001
+                _log_scan_exc(exc, f"ms365 folder ids {upn}")
+                result.errors.append(
+                    f"ms365 {upn}: could not resolve the Sent / Drafts / "
+                    "Deleted folder ids -- scanned the Inbox only (see server log)")
+                folder = "Inbox"
         q = {
             "$top": str(top),
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments",
+            "$select": ("id,internetMessageId,parentFolderId,subject,from,"
+                        "toRecipients,ccRecipients,receivedDateTime,isRead,"
+                        "hasAttachments"),
             "$orderby": "receivedDateTime desc",
         }
         if filt:
@@ -1544,24 +1930,40 @@ class EmailInboxClient:
             # sort — pages still come back, just not strictly date-ordered.
             if "hasAttachments" in filt:
                 q.pop("$orderby", None)
-        list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
-                    f"?{urllib.parse.urlencode(q)}")
+        # NB: never put `hasAttachments eq true` in this $filter -- Graph
+        # answers 504 on it for these mailboxes.
+        if folder is None:
+            list_url = (f"{GRAPH_BASE}/users/{user}/messages"
+                        f"?{urllib.parse.urlencode(q)}")
+        else:
+            list_url = (f"{GRAPH_BASE}/users/{user}/mailFolders/{folder}/messages"
+                        f"?{urllib.parse.urlencode(q)}")
 
         fetched = 0
         pages = 0
         # Page ceiling so a date-only lookback over a high-volume mailbox can't
         # walk unbounded metadata pages (80 * $top<=50 ~= 4000 messages
         # screened per mailbox, well beyond any real lookback window).
-        while list_url and fetched < max_messages and pages < 80:
+        cut_mid_page = False
+        while list_url and fetched < max_messages and pages < _MAX_LIST_PAGES:
             pages += 1
             raw, _ = self._graph_get(list_url, token)
             page = json.loads(raw.decode("utf-8"))
             messages = page.get("value", [])
-            for m in messages:
+            for _i, m in enumerate(messages):
                 if fetched >= max_messages:
+                    # Budget spent with listed messages left on this page.
+                    cut_mid_page = any(
+                        not filt or _msg_event_candidate(x) for x in messages[_i:]
+                        if not (excluded_ids
+                                and x.get("parentFolderId") in excluded_ids))
                     break
                 mid = m.get("id")
                 if not mid:
+                    continue
+                if excluded_ids and m.get("parentFolderId") in excluded_ids:
+                    if m.get("parentFolderId") in junk_ids:
+                        self._flag_junk(result, m, upn)
                     continue
                 result.messages_seen += 1
                 # Pre-qualify each listed message by sender/recipient before
@@ -1590,9 +1992,37 @@ class EmailInboxClient:
                                .get("address") or "")
                 try:
                     mime_bytes, _ = self._graph_get(mime_url, token, accept="text/plain")
+                except Exception as exc:  # noqa: BLE001
+                    # Retries are spent. Not a parser gap -- but the message
+                    # was NOT read, so queue it: if it never downloads, it
+                    # must not simply age out of the window unseen.
+                    _log_scan_exc(exc, f"ms365 fetch {upn}")
+                    _fid = m.get("internetMessageId") or mid
+                    _fsubj = m.get("subject") or ""
+                    result.errors.append(
+                        f"fetch failed: {upn}:{_fsubj[:80]!r} from "
+                        f"{_graph_from or '?'} could not be downloaded -- "
+                        "see server log")
+                    result.unparsed.append({
+                        "kind": "fetch", "reason": "fetch failed", "id": _fid,
+                        "mailbox": upn, "sender": _graph_from,
+                        "subject": _fsubj, "filenames": [],
+                        "received": m.get("receivedDateTime") or "", "sent": "",
+                    })
+                    result.issues.append({
+                        "key": f"fetch-failed:{_fid}",
+                        "message": (f"{_fsubj[:120]!r} from {_graph_from or '?'} "
+                                    f"({upn}) could not be downloaded from "
+                                    "Microsoft Graph after retries -- it has "
+                                    "not been read"),
+                        "severity": "error",
+                    })
+                    continue
+                try:
                     msg = email.message_from_bytes(mime_bytes)
                     events, errs, cw_pos = parse_message_with_errors(
-                        msg, sender_address=_graph_from or None)
+                        msg, sender_address=_graph_from or None,
+                        received_at=m.get("receivedDateTime") or None)
                 except Exception as exc:  # noqa: BLE001
                     _log_scan_exc(exc, f"ms365 message {upn}")
                     result.errors.append(
@@ -1639,9 +2069,40 @@ class EmailInboxClient:
                         # a known sender's unreadable mail is queued instead.
                         _log_scan_exc(exc, "unparsed check")
                         _fnames, _queue = [], bool(_known)
-                    if _queue:
+                    # A purchase order that was dropped WHOLE (zero lines, no
+                    # PO number, unknown ship-to, unreadable PDF): distributor
+                    # sender + a .pdf + no events. The report gate above keeps
+                    # PO mail out of the queue on purpose, so admit it here.
+                    _po_errs = [e for e in errs if is_po_failure(e)]
+                    _po_dropped = bool(
+                        _po_errs and _distributor_from_sender(_snd)
+                        and any((f or "").lower().endswith(".pdf")
+                                for f in _fnames))
+                    _ukey = m.get("internetMessageId") or mid
+                    _held = [e for e in errs if is_report_held(e)]
+                    if _held:
+                        _queue = True
+                        _hwh = (_report_warehouse_for_sender(_snd)[1]
+                                or _worksheet_warehouse_for_sender(_snd)[1] or "?")
+                        result.issues.append({
+                            "key": f"report-held:{_hwh}:{_ukey}",
+                            "message": f"{_held[0]} -- from {_snd} ({upn})",
+                            "severity": "warn",
+                        })
+                    if _po_dropped:
+                        result.issues.append({
+                            "key": f"po-parse:{_ukey}",
+                            "message": (f"{_subj[:120]!r} from {_snd} "
+                                        f"({upn}): {_po_errs[0]}"),
+                            "severity": "error",
+                        })
+                    if _queue or _po_dropped:
                         result.unparsed.append({
-                            "id": m.get("internetMessageId") or mid,
+                            "kind": "po" if (_po_dropped and not _queue) else "report",
+                            "reason": (_po_errs[0][:200] if _po_dropped
+                                       else _held[0][:200] if _held
+                                       else "no events parsed"),
+                            "id": _ukey,
                             "mailbox": upn,
                             "sender": _snd,
                             "subject": m.get("subject") or "",
@@ -1657,6 +2118,36 @@ class EmailInboxClient:
                             "sent": _msg_date_iso(msg),
                         })
             list_url = page.get("@odata.nextLink")
+
+        # The loop stopped with more of the window unread: the message budget
+        # ran out, or the page cap did. Older mail in the lookback was NOT
+        # looked at -- say so instead of reporting a clean scan. (Only for a
+        # bounded window; an unfiltered scan is "the newest N" by design.)
+        if filt and (list_url or cut_mid_page):
+            why = (f"the {max_messages}-message budget" if fetched >= max_messages
+                   else f"the {_MAX_LIST_PAGES}-page listing cap")
+            result.truncated.append(upn)
+            result.errors.append(
+                f"scan truncated: {upn} stopped at {why} with older mail in "
+                "the window unread -- raise max_messages or shorten "
+                "lookback_days")
+
+    @staticmethod
+    def _flag_junk(result, m, upn):
+        """A known distributor / rep sender's message sitting in Junk Email:
+        not applied (Junk is where spoofed mail goes), but a person should
+        look -- it may be this week's report."""
+        snd = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "")
+        if not _sender_is_known_source(snd):
+            return
+        key = m.get("internetMessageId") or m.get("id")
+        text = (f"mail from {snd} ({(m.get('subject') or '')[:80]!r}, received "
+                f"{m.get('receivedDateTime') or '?'}) is in the Junk Email "
+                f"folder of {upn} -- NOT scanned. Move it to the Inbox if it "
+                "is genuine.")
+        result.errors.append(text)
+        result.issues.append({"key": f"junk-mail:{key}", "message": text,
+                              "severity": "warn"})
 
     def _scan_imap(self, result, max_messages):
         host = os.environ["EMAIL_IMAP_HOST"]

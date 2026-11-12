@@ -37,7 +37,7 @@ from datetime import datetime
 
 try:  # package import
     from .cheney_inventory_report import (
-        _variety, warehouse_from_filename, _clean_code, _build_name,
+        _variety, resolve_variety, warehouse_from_filename, _clean_code, _build_name,
         DEFAULT_CASE_SIZE,
     )
     from .cheney_po_parser import CHENEY_CASE_COST
@@ -46,7 +46,7 @@ try:  # package import
     from .parsers._common import opt_float, opt_int
 except ImportError:  # standalone (tests / CLI)
     from cheney_inventory_report import (  # type: ignore
-        _variety, warehouse_from_filename, _clean_code, _build_name,
+        _variety, resolve_variety, warehouse_from_filename, _clean_code, _build_name,
         DEFAULT_CASE_SIZE,
     )
     from cheney_po_parser import CHENEY_CASE_COST  # type: ignore
@@ -233,11 +233,18 @@ def parse_inventory_csv(csv_text: str, *, filename: str = "cheney_inventory.csv"
         item_no = cell(row, "item")
         desc = cell(row, "desc")
         wh_raw = cell(row, "warehouse")
-        variety = _variety("", desc, item_no)
+        # An item # that is not in the crosswalk is NOT resolved from its
+        # description (another vendor's plain bagel is not ours); the
+        # description is used only when the file has no item column.
+        variety, unmapped = resolve_variety(
+            "", desc, item_no, has_code_column="item" in roles)
         warehouse = warehouse_from_filename(wh_raw)
         qty = opt_float(cell(row, "qty"))
+        if unmapped:
+            errors.append(f"cheney csv: unmapped item # (item={_clean_code(item_no)!r}, desc={desc!r})")
+            continue
         if not variety:
-            if qty is not None or desc or _clean_code(item_no):
+            if qty is not None or desc:
                 errors.append(f"cheney csv: unmapped row (item={_clean_code(item_no)!r}, desc={desc!r})")
             continue
         if not warehouse:

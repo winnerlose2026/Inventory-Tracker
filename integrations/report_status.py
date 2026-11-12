@@ -35,74 +35,24 @@ from html.parser import HTMLParser as _HTMLParser
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
-# Warehouse -> covering reps. Warehouse labels match seed_bagels.py exactly.
-# Multiple reps can cover one warehouse; any one of them sending a genuine
-# report clears it. Cheney: Michael Ross sends ONE report (per-facility sheets)
-# covering all three FL facilities, so his address is listed against each.
+# Warehouse -> covering reps, and warehouse -> distributor. Both are derived
+# from the one rep registry (integrations/rep_registry.py) -- add or change a
+# rep THERE, not here; the scanner's sender maps come from the same table, so
+# the two can no longer drift apart.
 #
 # ``no_chase: True`` means "still watch this rep, never nudge them." Their mail
 # is searched exactly as before and still clears the warehouse, but the weekly
 # chaser must not email them. Used for reps who manage their own send reminder.
 # A warehouse whose every rep is no_chase is watch-only: it can still read
 # MISSING on the status page, and JD follows up by hand.
-WAREHOUSE_REPS: "dict[str, list[dict]]" = {
-    "Manassas, VA": [
-        {"name": "Thomas Paxson", "email": "thomas.paxson@usfoods.com"},
-        {"name": "Jasmin Gomez", "email": "jasmin.gomez@usfoods.com"},
-        {"name": "USF Manassas coordination", "email": "5o-dl-streetsalescoordination@usfoods.com"},
-        # The weekly "Product Usage Report" itself now comes from USF's
-        # Salesforce customer-contact alias (Stephanie Warfle, MDC); the
-        # scanner already maps it to Manassas
-        # (usfoods_inventory_report.REPORT_SENDER_TO_WAREHOUSE). Without it here
-        # the page read MISSING the weeks Paxson didn't forward it. Never
-        # chased -- it's a no-reply system alias.
-        {"name": "USF Customer Contact (Sales Coordination)",
-         "email": "usfcustomercontact@usfoods.com", "no_chase": True},
-    ],
-    "Zebulon, NC": [
-        {"name": "Maria Hernandez", "email": "maria.hernandez@usfoods.com"},
-        {"name": "Kathleen Thompson", "email": "kathleen.thompson@usfoods.com"},
-    ],
-    "La Mirada, CA": [
-        {"name": "Sam Travlos", "email": "sam.travlos@usfoods.com"},
-        {"name": "Ozzy Corut", "email": "ozzy.corut@usfoods.com"},
-    ],
-    "Chicago, IL": [
-        {"name": "Michael Via", "email": "michael.via@usfoods.com"},
-    ],
-    # Alcoa is watch-only. Kim asked on 2026-08-03 to stop receiving the
-    # automated chasers -- she has her own Monday reminder to send the report --
-    # so we keep reading her mail but never nudge her. Christy Dunn was never a
-    # covering rep (Kim owns Alcoa, per her 2026-07-07 note); she stays listed
-    # only so a report forwarded by her still clears the warehouse.
-    "Alcoa, TN": [
-        {"name": "Kim Cobb", "email": "kimberly.cobb@usfoods.com", "no_chase": True},
-        {"name": "Christy Dunn", "email": "christy.dunn@usfoods.com", "no_chase": True},
-    ],
-    "Houston, TX": [
-        # NW Houston, DC B2. Foley is the area buyer at 13400 Hollister Rd who
-        # cuts the POs and holds the DC on-hand -- he is the ONLY Houston rep we
-        # chase. JD took Youngblood (major account exec) off Houston
-        # correspondence on 2026-09-30 ("just correspond with Tom Foley for
-        # now"); he stays listed no_chase only so a report he forwards still
-        # clears the warehouse. Houston was live in inventory since 2026-08-03
-        # but had no reps here until 325a84fd, so it sat permanently stale.
-        {"name": "Tom Foley", "email": "tom.foley@usfoods.com"},
-        {"name": "Charles Youngblood", "email": "charles.youngblood@usfoods.com",
-         "no_chase": True},
-    ],
-    "Riviera Beach, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
-    "Ocala, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
-    "Punta Gorda, FL": [{"name": "Michael Ross", "email": "mross@cheneybrothers.com"}],
-}
+try:
+    from . import rep_registry as _registry
+except ImportError:  # standalone / test use
+    import rep_registry as _registry  # type: ignore
 
-DISTRIBUTOR_OF = {
-    "Manassas, VA": "US Foods", "Zebulon, NC": "US Foods", "La Mirada, CA": "US Foods",
-    "Chicago, IL": "US Foods", "Alcoa, TN": "US Foods",
-    "Houston, TX": "US Foods",
-    "Riviera Beach, FL": "Cheney Brothers", "Ocala, FL": "Cheney Brothers",
-    "Punta Gorda, FL": "Cheney Brothers",
-}
+WAREHOUSE_REPS: "dict[str, list[dict]]" = _registry.warehouse_reps()
+
+DISTRIBUTOR_OF = _registry.distributor_of()
 
 # A genuine body report lists many SKUs. Count distinct variety names; a real
 # report hits the whole order guide, while a prose "out of Everything & Plain"

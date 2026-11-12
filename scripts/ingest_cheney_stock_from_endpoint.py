@@ -74,9 +74,18 @@ def main(argv=None):
         print(f"endpoint error: {data.get('error')}", file=sys.stderr)
         return 2
     facilities = data.get("facilities", [])
-    for e in (data.get("errors") or []):
-        print("  endpoint note:", e)
+    # The endpoint answers ok:true even when a Graph list / attachment call
+    # inside it failed, and reports that in "errors". "No images found" is
+    # then not a fact -- we could not look -- so the run must fail (rc 1).
+    endpoint_errors = [str(e) for e in (data.get("errors") or [])]
+    for e in endpoint_errors:
+        print("  endpoint ERROR:", e, file=sys.stderr)
     if not facilities:
+        if endpoint_errors:
+            print("Could not read the mailbox completely -- no images "
+                  "retrieved; NOT treating this as 'nothing to ingest'.",
+                  file=sys.stderr)
+            return 1
         print("No Cheney stock images found in the lookback window "
               f"({a.lookback_days}d) -- nothing to ingest.")
         return 0
@@ -107,10 +116,10 @@ def main(argv=None):
         print(f"\nDRY-RUN. {len(commit_events)} events ready across "
               f"{len({e['item']['warehouse'] for e in commit_events})} clean facility(ies). "
               f"Re-run with --commit to apply.")
-        return 0
+        return 1 if endpoint_errors else 0
     if not commit_events:
         print("\nNothing clean to commit.", file=sys.stderr)
-        return 2 if blocked else 0
+        return 2 if blocked else (1 if endpoint_errors else 0)
     payload = {"dry_run": False, "source": "cheney-stock-ocr/endpoint",
                "messages_seen": len(facilities), "messages_parsed": len(facilities),
                "events": [{k: v for k, v in e.items() if not k.startswith("_")} for e in commit_events]}
@@ -118,9 +127,19 @@ def main(argv=None):
     rep = (resp.get("reports") or [{}])[0]
     print(f"\nCOMMITTED: {rep.get('by_event_type')} updated={rep.get('updated')} "
           f"unchanged={rep.get('unchanged')}")
+    rc = 0
+    if rep.get("status") not in (None, "ok", "partial") or rep.get("rejected"):
+        print(f"ERROR: ingest report status={rep.get('status')} "
+              f"rejected={rep.get('rejected')}", file=sys.stderr)
+        rc = 1
     if blocked:
-        print("NOTE: one or more facilities were blocked and NOT committed -- review above.")
-    return 0
+        # Some facilities committed, some did not: that is not a clean run.
+        print("ERROR: one or more facilities were blocked and NOT committed "
+              "-- review above.", file=sys.stderr)
+        rc = 1
+    if endpoint_errors:
+        rc = 1
+    return rc
 
 
 if __name__ == "__main__":

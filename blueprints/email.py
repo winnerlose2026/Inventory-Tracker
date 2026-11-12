@@ -74,19 +74,126 @@ def _busy_response(what):
     }), 409
 
 
+# What a caller that names no window gets (the UI "Scan now" button sends
+# only {dry_run}); the cron passes the same values explicitly.
+DEFAULT_SCAN_LOOKBACK_DAYS = 14
+DEFAULT_SCAN_MAX_MESSAGES = 200
+# Issue-key prefixes that are re-derived from scratch by every full mailbox
+# scan: one that a full, clean scan does not report again is resolved.
+_SCAN_OWNED_ISSUE_PREFIXES = (
+    "po-parse:", "po-failure:", "junk-mail:", "unmapped:", "unknown-rep:",
+    "fetch-failed:", "truncated:", "partial-parse:", "bad-cell:",
+    "date-header:", "folders:", "unreadable:", "unparsed:", "unmatched:",
+)
+
+
 @email_bp.route("/api/email/scan", methods=["POST"])
 def api_email_scan():
+    body = request.get_json(silent=True) or {}
+    payload, status = run_mailbox_scan(body, trigger=str(body.get("trigger") or "api"))
+    return jsonify(payload), status
+
+
+def run_mailbox_scan(body: dict, trigger: str = "api"):
+    """Run one mailbox scan under the ingest lock. Returns (payload, http
+    status). The single code path behind POST /api/email/scan, the 6-hour
+    cron and the scan-on-notification trigger; needs no request context."""
     with _ingest_lock() as got:
         if not got:
-            return _busy_response("/api/email/scan")
-        return _api_email_scan_locked()
+            return {
+                "ok": False, "status": "busy",
+                "error": "another ingest is already running; retry shortly",
+                "endpoint": "/api/email/scan", "reports": [],
+            }, 409
+        return _api_email_scan_locked(body or {}, trigger), 200
 
 
-def _api_email_scan_locked():
+def _error_report(source, status, error):
+    return {
+        "distributor": "Email Inbox", "source": source, "status": status,
+        "fetched": 0, "updated": 0, "unchanged": 0,
+        "unmatched": [], "changes": [], "error": error, "traceback": "",
+        "messages_seen": 0, "messages_parsed": 0,
+        "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
+    }
+
+
+def _record_scan_attempt(report: dict, trigger: str, *, failed: bool) -> None:
+    """Stamp scan_health.last_attempt and the shared feed record for EVERY
+    real attempt. A scan that failed outright used to return before any
+    health write, so "last scan" kept showing the last good one."""
+    try:
+        from inventory_tracker import (load_scan_health, save_scan_health,
+                                       data_lock)
+        mailbox_failures = list(report.get("mailbox_failures") or [])
+        ok = (not failed and report.get("status") in ("ok", "partial")
+              and not mailbox_failures)
+        attempt = {
+            "ts": datetime.now().isoformat(),
+            "status": report.get("status"),
+            "ok": ok,
+            "trigger": trigger,
+            "error": (report.get("error") or "") if not ok else "",
+            "mailbox_failures": mailbox_failures[:10],
+        }
+        with data_lock():
+            rec = load_scan_health() or {}
+            if not isinstance(rec, dict):
+                rec = {}
+            rec["last_attempt"] = attempt
+            save_scan_health(rec)
+        detail = ("; ".join(mailbox_failures)[:300] if mailbox_failures
+                  else (attempt["error"] or
+                        f"seen={report.get('messages_seen')} "
+                        f"parsed={report.get('messages_parsed')} "
+                        f"updated={report.get('updated')}"))
+        from core import feed_health
+        feed_health.record("mailbox-scan", ok, detail, trigger=trigger,
+                           status=report.get("status"))
+    except Exception as exc:  # noqa: BLE001 -- health is best-effort
+        _log_exc(exc, "scan attempt record")
+
+
+def _collect_scan_issues(report: dict, scan) -> list:
+    """Every problem of this scan a person must look at, as stable-keyed
+    issues: the scanner's and the apply path's own structured ones, each
+    alert-class error (integrations.email_scanner.failure_class), unmatched
+    lines, and new unparsed-queue entries."""
+    import hashlib
+    from integrations.email_scanner import failure_class
+    issues = list(getattr(scan, "issues", None) or []) \
+        + list(report.get("issues") or [])
+    covered = " ".join(str(i.get("message") or "") for i in issues)
+    covered_keys = " ".join(str(i.get("key") or "") for i in issues)
+    for err in (report.get("errors") or []):
+        text = str(err)
+        slug = failure_class(text)
+        if not slug or text[:150] in covered:
+            continue
+        digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]
+        issues.append({"key": f"{slug}:{digest}", "message": text,
+                       "severity": "error" if slug in ("po-failure", "fetch-failed")
+                       else "warn"})
+    for name in sorted({str(n) for n in (report.get("unmatched") or []) if n}):
+        issues.append({"key": f"unmatched:{name[:120]}",
+                       "message": f"a parsed line for {name!r} matches no SKU "
+                                  "on file -- not applied", "severity": "warn"})
+    for u in (getattr(scan, "unparsed", None) or []):
+        uid = str(u.get("id") or "")
+        if not uid or uid in covered_keys:
+            continue   # already a po-parse / report-held issue
+        issues.append({"key": f"unparsed:{uid}",
+                       "message": (f"could not read {u.get('subject')!r} from "
+                                   f"{u.get('sender')} ({u.get('mailbox')}): "
+                                   f"{u.get('reason') or 'no events parsed'}"),
+                       "severity": "warn"})
+    return issues
+
+
+def _api_email_scan_locked(body: dict, trigger: str = "api"):
     # The whole route runs inside one try block so that ANY failure (import,
     # JSON parse, scan_email itself) becomes a structured 200 with status:
-    # "error" + a traceback excerpt -- never a generic Flask 500. That's a
-    # lot easier to debug from the client side when there are no logs handy.
+    # "error" -- never a generic Flask 500.
     #
     # Bound the work so we don't blow past gunicorn's worker timeout. The
     # original default (300 messages * N mailboxes, each pulling full MIME
@@ -94,18 +201,25 @@ def _api_email_scan_locked():
     # plan, which surfaced as a generic 500 at the edge regardless of the
     # try/except below. Callers can override `max_messages` in the body or
     # set MS365_FILTER for a wider sweep done out of band.
-    import traceback as _tb
     dry_run = False
+    new_failures: list = []
     try:
         from integrations.email_scanner import EmailInboxClient
         from sync_inventory import _apply_events
-        body = request.json or {}
         dry_run = bool(body.get("dry_run", False))
         # Default keeps within gunicorn's 180s budget (60 messages * 2
         # mailboxes is comfortable). The hard cap of 2000 lets ad-hoc deep
         # sweeps go further when paired with a narrowing MS365_FILTER; the
         # 180s worker timeout still binds, so callers requesting more than a
         # few hundred without a filter should expect a 504.
+        # A caller that names NO window (the UI "Scan now" button posts only
+        # {dry_run}) gets the cron's: 14 days / 200 per mailbox. It used to
+        # get "the newest 60 messages", which on a busy day missed a report
+        # that the next cron run then had to pick up.
+        if body.get("lookback_days") in (None, "") and \
+                body.get("max_messages") in (None, ""):
+            body = {**body, "lookback_days": DEFAULT_SCAN_LOOKBACK_DAYS,
+                    "max_messages": DEFAULT_SCAN_MAX_MESSAGES}
         try:
             max_messages = int(body.get("max_messages") or 60)
         except (TypeError, ValueError):
@@ -123,7 +237,7 @@ def _api_email_scan_locked():
         except (TypeError, ValueError):
             lookback_days = 0
         if lookback_days > 0:
-            from datetime import datetime, timezone, timedelta
+            from datetime import timezone
             since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             # Graph wants ISO 8601 with a Z suffix, no microseconds.
             iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -144,19 +258,15 @@ def _api_email_scan_locked():
             scan = client.scan(max_messages=max_messages,
                                filter_override=filter_override)
         except Exception as exc:  # noqa: BLE001 — surface NotConfigured + transport
-            report = {
-                "distributor": "Email Inbox",
-                "source": client.source(),
-                "status": ("not_configured" if type(exc).__name__ == "NotConfiguredError"
-                           else "error"),
-                "fetched": 0, "updated": 0, "unchanged": 0,
-                "unmatched": [], "changes": [],
-                "error": _safe_err(exc),
-                "traceback": "",
-                "messages_seen": 0, "messages_parsed": 0,
-                "by_event_type": {"on_hand": 0, "restock": 0, "usage": 0},
-            }
-            return jsonify({"dry_run": dry_run, "reports": [report]})
+            report = _error_report(
+                client.source(),
+                "not_configured" if type(exc).__name__ == "NotConfiguredError"
+                else "error",
+                _safe_err(exc))
+            if not dry_run:
+                _record_scan_attempt(report, trigger, failed=True)
+            return {"dry_run": dry_run, "reports": [report],
+                    "new_failures": []}
 
         report = _apply_events(
             events=list(scan.events),
@@ -183,8 +293,12 @@ def _api_email_scan_locked():
         # Until 2026-10-22 a mailbox that stopped answering, or a PO dropped
         # whole for an unknown ship-to DC, left status "ok" and the cron log
         # said errors=0. Mailbox-level and whole-PO failures make the scan
-        # "partial"; the cron exits non-zero on mailbox failures only.
+        # "partial"; the cron exits non-zero on mailbox failures and on any
+        # failure it has not reported before (new_failures).
         _scan_errors_summarize(report, list(scan.errors or []))
+        report["truncated"] = list(getattr(scan, "truncated", None) or [])
+        if report["truncated"] and report.get("status") == "ok":
+            report["status"] = "partial"
         # Persist a scan-health heartbeat + capture recognized-but-unparsed
         # distributor mail (real runs only) so a missed warehouse or parser
         # gap is observable on /api/scan/health (roadmap #2/#5/#6).
@@ -192,13 +306,22 @@ def _api_email_scan_locked():
             try:
                 from inventory_tracker import (
                     save_scan_health, record_unparsed_reports,
-                    prune_unparsed_reports, data_lock,
+                    prune_unparsed_reports, data_lock, load_scan_health,
                 )
                 _unparsed = list(getattr(scan, "unparsed", []) or [])
+                # PO-kind entries are recorded AFTER the prune below: the
+                # prune re-judges every entry as a weekly REPORT (and retires
+                # it when the sender's warehouse has counted since), which
+                # says nothing about whether a dropped PO was ever booked.
+                # (Same for messages that could not be downloaded.)
+                _unparsed_po = [u for u in _unparsed
+                                if u.get("kind") in _NON_REPORT_QUEUE_KINDS]
+                _unparsed_rep = [u for u in _unparsed
+                                 if u.get("kind") not in _NON_REPORT_QUEUE_KINDS]
                 # Local file writes only (no network I/O) -> under data_lock.
                 with data_lock():
-                    if _unparsed:
-                        record_unparsed_reports(_unparsed)
+                    if _unparsed_rep:
+                        record_unparsed_reports(_unparsed_rep)
                     # Retire entries whose gap has closed (the warehouse
                     # counted after the message we couldn't read) or that have
                     # aged out, so the queue stays a live to-do list instead
@@ -206,6 +329,11 @@ def _api_email_scan_locked():
                     # after this scan's events are applied, so a report
                     # ingested just now clears its own earlier failures.
                     prune_unparsed_reports()
+                    _retire_non_report_entries(
+                        {u.get("id") for u in _unparsed_po},
+                        full_clean=_scan_was_full_and_clean(report, lookback_days))
+                    if _unparsed_po:
+                        record_unparsed_reports(_unparsed_po)
                     save_scan_health({
                         "ts": datetime.now().isoformat(),
                         "source": report.get("source"),
@@ -222,28 +350,36 @@ def _api_email_scan_locked():
                         "errors": (report.get("errors") or [])[:_HEALTH_MAX_LINES],
                         "mailbox_failures": report.get("mailbox_failures") or [],
                         "po_failures": report.get("po_failures") or [],
+                        "truncated": report.get("truncated") or [],
                         "warnings": ((report.get("warnings") or [])
                                      + (report.get("rejected") or [])
                                      )[:_HEALTH_MAX_LINES],
                     })
             except Exception as exc:  # noqa: BLE001 — health is best-effort
                 _log_exc(exc, "scan health persist")
+        # Failures: raise each as a feed-health issue (once per key) and tell
+        # the caller which ones are NEW. A dry run raises nothing and reports
+        # what would be new.
+        issues = _collect_scan_issues(report, scan)
+        if dry_run:
+            try:
+                from core import feed_health
+                known = feed_health.snapshot().get("issues") or {}
+            except Exception:  # noqa: BLE001
+                known = {}
+            new_failures = [{"key": i["key"], "message": str(i["message"])[:400],
+                             "severity": i.get("severity") or "warn"}
+                            for i in issues if i.get("key") not in known]
+        else:
+            new_failures = _raise_scan_issues(issues)
+            _clear_resolved_scan_issues(report, issues, lookback_days)
+            _record_scan_attempt(report, trigger, failed=False)
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "email scan")
-        report = {
-            "distributor": "Email Inbox",
-            "source": "unknown",
-            "status": "error",
-            "fetched": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "unmatched": [],
-            "changes": [],
-            "error": "internal error",
-            "traceback": "",
-            "messages_seen": 0,
-            "messages_parsed": 0,
-        }
+        report = _error_report("unknown", "error", "internal error")
+        report.pop("by_event_type", None)
+        if not dry_run:
+            _record_scan_attempt(report, trigger, failed=True)
     # Strip any exception-derived text the scanner surfaced into report["error"]
     # before returning; full detail is in the server log. Keeps exception text
     # out of the HTTP response (CodeQL py/stack-trace-exposure, inline barrier).
@@ -255,7 +391,79 @@ def _api_email_scan_locked():
             "scan completed with errors (see server log)"
             if report.get("status") in ("ok", "partial") else "internal error"
         )
-    return jsonify({"dry_run": dry_run, "reports": [report]})
+    report["new_failures"] = new_failures
+    return {"dry_run": dry_run, "reports": [report],
+            "new_failures": new_failures}
+
+
+# Unparsed-queue entries that are not weekly reports (a dropped PO, a message
+# that would not download). prune_unparsed_reports knows nothing about them.
+_NON_REPORT_QUEUE_KINDS = ("po", "fetch")
+
+
+def _scan_was_full_and_clean(report: dict, lookback_days: int) -> bool:
+    """Did this scan read the whole default window of every mailbox? Only then
+    does "not reported again" mean "resolved"."""
+    if report.get("mailbox_failures") or report.get("status") not in ("ok", "partial"):
+        return False
+    if lookback_days < DEFAULT_SCAN_LOOKBACK_DAYS:
+        return False
+    return not report.get("truncated")
+
+
+def _retire_non_report_entries(current_ids: set, *, full_clean: bool) -> None:
+    """Drop stored PO / fetch-failure queue entries that a full, clean scan no
+    longer reports (the PO now parses, the message downloaded, or it left the
+    window). Caller holds data_lock."""
+    if not full_clean:
+        return
+    import inventory_tracker as _it
+    entries = _it.load_unparsed_reports()
+    kept = [e for e in entries
+            if e.get("kind") not in _NON_REPORT_QUEUE_KINDS
+            or e.get("id") in current_ids]
+    if len(kept) != len(entries):
+        _it._write_json(_it.UNPARSED_REPORTS_FILE, kept)
+
+
+def _clear_resolved_scan_issues(report: dict, issues: list, lookback_days: int) -> None:
+    """Close scan-derived issues that a FULL, clean scan no longer reports
+    (the parser learned the code, the message was fixed or aged out). Skipped
+    when a mailbox failed or the window was narrower than the default -- an
+    issue the scan could not have re-seen is not resolved."""
+    if not _scan_was_full_and_clean(report, lookback_days):
+        return
+    try:
+        from core import feed_health
+        keep = {str(i.get("key") or "") for i in issues}
+        for prefix in _SCAN_OWNED_ISSUE_PREFIXES:
+            feed_health.clear_issues_with_prefix(prefix, keep)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "clear resolved scan issues")
+
+
+def _raise_scan_issues(issues: list) -> list:
+    """Open a feed-health issue for each problem the scan found. Returns the
+    ones that are NEW ([{key, message, severity}]) -- raise_issue is idempotent
+    per key, so a problem that is re-seen on every 6-hour scan alerts once.
+    Never raises."""
+    fresh = []
+    try:
+        from core import feed_health
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "feed health import")
+        return fresh
+    seen = set()
+    for it in issues or []:
+        key = str((it or {}).get("key") or "").strip()[:200]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        msg = str(it.get("message") or "").replace("\r", " ").replace("\n", " ")
+        sev = it.get("severity") or "warn"
+        if feed_health.raise_issue(key, msg, sev):
+            fresh.append({"key": key, "message": msg[:400], "severity": sev})
+    return fresh
 
 
 # Cap on error/warning lines kept on the scan report and in scan_health.json.
@@ -396,8 +604,21 @@ def api_scan_health():
                     (datetime.now() - dt).total_seconds() / 3600.0, 1)
             except ValueError:
                 pass
+        # The latest ATTEMPT, which may be newer than last_scan when a scan
+        # failed outright. ok is false when it failed or could not read a
+        # mailbox: on 2026-11-12 this endpoint answered ok=true while both
+        # mailboxes were failing.
+        last_attempt = (health or {}).get("last_attempt") or None
+        scan_ok = True
+        if last_attempt is not None:
+            scan_ok = bool(last_attempt.get("ok"))
+        elif health and (health.get("mailbox_failures")
+                         or health.get("status") not in (None, "ok", "partial")):
+            scan_ok = False       # record written before last_attempt existed
         return jsonify({
-            "ok": inventory_error is None,
+            "ok": inventory_error is None and scan_ok,
+            "scan_ok": scan_ok,
+            "last_attempt": last_attempt,
             "inventory_sku_count": sku_count,
             "inventory_empty": sku_count == 0,
             "inventory_error": inventory_error,
@@ -466,6 +687,91 @@ def _send_recipient_allowed(addr: str) -> bool:
     return any(dom == d or dom.endswith("." + d) for d in _send_allowed_domains())
 
 
+# --- /api/email/send duplicate protection ------------------------------------
+SEND_DEDUP_TTL = timedelta(hours=24)
+_SENT_LOG_NAME = "sent_log.json"
+_SENT_LOG_MAX = 2000
+
+
+def _send_dedup_key(sender, to, subject, content, idempotency_key="") -> str:
+    import hashlib
+    if idempotency_key:
+        return "key:" + hashlib.sha256(
+            idempotency_key.encode("utf-8", "replace")).hexdigest()
+    blob = "\x1f".join([
+        (sender or "").strip().lower(),
+        ",".join(sorted(a.strip().lower() for a in (to or []))),
+        (subject or "").strip(),
+        str(content or ""),
+    ])
+    return "msg:" + hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def _sent_log_load(_it, now):
+    """The log with expired entries dropped. Caller holds data_lock."""
+    data = _it._read_json(_it.DATA_DIR / _SENT_LOG_NAME, {})
+    if not isinstance(data, dict):
+        data = {}
+    cutoff = (now - SEND_DEDUP_TTL).isoformat()
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and str(v.get("at") or "") >= cutoff}
+
+
+def _sent_log_peek(key):
+    try:
+        import inventory_tracker as _it
+        with _it.data_lock():
+            return _sent_log_load(_it, datetime.now()).get(key)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log peek")
+        return None
+
+
+def _sent_log_reserve(key, sender, to, subject):
+    """None when this send may go ahead (and is now reserved, so a concurrent
+    identical request on the other worker is refused); the earlier entry when
+    it is a duplicate. A log that cannot be read or written never blocks a
+    send -- it is logged and the send proceeds."""
+    try:
+        import inventory_tracker as _it
+        now = datetime.now()
+        with _it.data_lock():
+            log = _sent_log_load(_it, now)
+            if key in log:
+                return log[key]
+            log[key] = {"at": now.isoformat(), "status": "sending",
+                        "from": sender, "to": list(to or []),
+                        "subject": (subject or "")[:200]}
+            if len(log) > _SENT_LOG_MAX:
+                log = dict(sorted(log.items(),
+                                  key=lambda kv: kv[1].get("at") or "")[-_SENT_LOG_MAX:])
+            _it._write_json(_it.DATA_DIR / _SENT_LOG_NAME, log)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log reserve")
+        return None
+
+
+def _sent_log_finish(key, *, sent, force=False, sender="", to=None, subject=""):
+    """Mark a reserved send as sent, or release it when it failed. A forced
+    send records itself too, so the NEXT unforced identical send is caught."""
+    try:
+        import inventory_tracker as _it
+        now = datetime.now()
+        with _it.data_lock():
+            log = _sent_log_load(_it, now)
+            if sent:
+                cur = dict(log.get(key) or {"from": sender, "to": list(to or []),
+                                            "subject": (subject or "")[:200]})
+                cur.update(at=cur.get("at") or now.isoformat(), status="sent")
+                log[key] = cur
+            elif not force:
+                log.pop(key, None)
+            _it._write_json(_it.DATA_DIR / _SENT_LOG_NAME, log)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "sent log finish")
+
+
 @email_bp.route("/api/email/send", methods=["POST"])
 def api_email_send():
     """Send an email from the configured M365 mailbox via Microsoft Graph.
@@ -493,8 +799,17 @@ def api_email_send():
              "content_type": "image/png",          # png / jpeg / gif only
              "content_b64": "<base64>"}            # max 24 images, 3 MB total
           ],
-          "dry_run": false                         # optional; build, don't send
+          "dry_run": false,                        # optional; build, don't send
+          "idempotency_key": "chaser-2026-11-09-zeb", # optional; a second send
+                                                   #   with the same key within
+                                                   #   24 h is not sent
+          "force": false                           # optional; true sends even
+                                                   #   if it is a duplicate
         }
+
+    Duplicate protection: without idempotency_key, a send identical in
+    (from, to, subject, body) to one made in the last 24 h returns
+    {"ok": true, "sent": false, "duplicate": true, "first_sent_at": ...}.
 
     Always returns a structured 200 (never a bare 500):
       {"ok": true, "sent": true, ...} or {"ok": false, "error": "..."} --
@@ -600,11 +915,32 @@ def api_email_send():
         if not sender:
             return jsonify({"ok": False, "error": "no sender configured (set MS365_SEND_AS or MS365_USER, or pass 'from')"}), 200
 
+        # Duplicate protection. A retried task, a double click or two tasks
+        # with the same job used to send the same chaser twice. The send is
+        # keyed by the caller's idempotency_key when given, else by a hash of
+        # (from, sorted to, subject, body); an identical send inside
+        # SEND_DEDUP_TTL answers sent:false duplicate:true. "force": true
+        # bypasses. The recipient / from policy above is untouched.
+        idem = str(body.get("idempotency_key") or "").strip()[:200]
+        force = bool(body.get("force", False))
+        send_key = _send_dedup_key(sender, to, subject, content, idem)
+
         if dry_run:
             return jsonify({"ok": True, "sent": False, "dry_run": True,
                             "from": sender, "from_overridden": from_overridden,
                             "to": to, "cc": cc, "inline_images": len(attachments),
-                            "subject": subject, "threaded": bool(reply_to)})
+                            "subject": subject, "threaded": bool(reply_to),
+                            "duplicate": _sent_log_peek(send_key) is not None})
+
+        if not force:
+            prior = _sent_log_reserve(send_key, sender, to, subject)
+            if prior is not None:
+                return jsonify({"ok": True, "sent": False, "duplicate": True,
+                                "dry_run": False,
+                                "first_sent_at": prior.get("at") or "",
+                                "from": sender, "from_overridden": from_overridden,
+                                "to": to, "cc": cc, "subject": subject,
+                                "threaded": bool(reply_to)})
 
         client = EmailInboxClient()
         token = client._ms365_token()
@@ -633,6 +969,7 @@ def api_email_send():
                 draft = _json.loads(draft_raw or "{}")
                 draft_id = draft.get("id")
                 if not draft_id:
+                    _sent_log_finish(send_key, sent=False, force=force)
                     return jsonify({"ok": False, "error": f"createReply returned no draft id: {draft_raw[:300]}"}), 200
                 patch = {"body": {"contentType": content_type, "content": content},
                          "toRecipients": _recips(to)}
@@ -657,11 +994,19 @@ def api_email_send():
                 detail = exc.read().decode("utf-8", "replace")[:500]
             except Exception:  # noqa: BLE001
                 detail = ""
+            _sent_log_finish(send_key, sent=False, force=force)
             return jsonify({"ok": False,
                             "error": _safe_err(exc, "graph send"),
                             "detail": ""}), 200
+        except Exception:
+            # Not sent: release the reservation so a retry is not a "duplicate".
+            _sent_log_finish(send_key, sent=False, force=force)
+            raise
 
+        _sent_log_finish(send_key, sent=True, force=force,
+                         sender=sender, to=to, subject=subject)
         return jsonify({"ok": True, "sent": True, "dry_run": False,
+                        "duplicate": False,
                         "from": sender, "from_overridden": from_overridden,
                         "to": to, "cc": cc, "inline_images": len(attachments),
                         "subject": subject, "threaded": bool(reply_to)})
@@ -785,8 +1130,11 @@ def api_cheney_stock_images():
                             "received": recv, "image_content_type": ctype,
                             "image_b64": base64.b64encode(img).decode("ascii"),
                         }
+        # "complete": false = a Graph call failed, so an empty list does not
+        # mean nothing is there. Callers must treat errors as a failed run.
         return jsonify({"ok": True, "lookback_days": lookback, "sender": sender,
-                        "facilities": list(facilities.values()), "errors": errors})
+                        "facilities": list(facilities.values()), "errors": errors,
+                        "complete": not errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "cheney-stock-images")
         return jsonify({"ok": False, "error": _safe_err(exc), "facilities": []}), 200
@@ -1030,7 +1378,8 @@ def api_usf_screenshots():
         return jsonify({"ok": True, "warehouse": warehouse,
                         "last_count_at": last_count or None,
                         "lookback_days": lookback, "pending_only": pending_only,
-                        "messages": out, "errors": errors})
+                        "messages": out, "errors": errors,
+                        "complete": not errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "usf-screenshots")
         return jsonify({"ok": False, "error": _safe_err(exc), "messages": []}), 200
@@ -1178,6 +1527,9 @@ def _api_email_ingest_events_locked():
                 source_sender=str(e.get("source_sender") or ""),
                 count_date=str(e.get("count_date") or ""),
                 parser_source=str(e.get("parser_source") or ""),
+                reported_on_order=(float(e["reported_on_order"])
+                                   if e.get("reported_on_order") is not None
+                                   else None),
             ))
         except (TypeError, ValueError, KeyError) as exc:
             build_errors.append(f"events[{idx}]: error")
@@ -1215,6 +1567,7 @@ def _api_email_ingest_events_locked():
             _record_screenshot_hashes(raw_events)
         except Exception as exc:  # noqa: BLE001 -- best-effort bookkeeping
             _log_exc(exc, "record screenshot hashes")
+        _raise_scan_issues(list(report.get("issues") or []))
     return jsonify({"dry_run": dry_run, "reports": [report]})
 
 
@@ -1295,4 +1648,71 @@ def api_ingest_cheney_inventory_csv():
             "error": _safe_err(exc), "messages_seen": 1, "messages_parsed": 1,
         }]}), 500
 
+    if not dry_run:
+        _raise_scan_issues(list(report.get("issues") or []))
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+@email_bp.route("/api/reps", methods=["GET"])
+def api_reps():
+    """The rep registry: warehouse -> distributor -> covering reps.
+
+    The single source the weekly chaser tasks read instead of carrying their
+    own copy (integrations/rep_registry.py). Token / session gated by the
+    global auth hook like every other /api/ route. Read-only.
+
+    Returns {ok, warehouses: [{warehouse, distributor, watch_only,
+    chase_variant ("standard" | "houston-screenshot"), reps: [{name, email,
+    aliases, no_chase, parser}], chase_to: [emails the chaser may write to]}],
+    never_email: [addresses no automated task may email], domains: {sender
+    domain: distributor}, chase_variants, overrides: {email: [distributor,
+    warehouse]} from data/rep_warehouse_map.json (scanner-only additions)}.
+    """
+    try:
+        from integrations import rep_registry
+        from integrations.rep_map import sender_overrides
+        out = rep_registry.as_dict()
+        out["overrides"] = {k: list(v) for k, v in sorted(sender_overrides().items())}
+        out["ok"] = True
+        return jsonify(out)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "api reps")
+        return jsonify({"ok": False, "error": "internal error"}), 500
+
+
+@email_bp.route("/api/email/held-reports/release", methods=["POST"])
+def api_release_held_report():
+    """Let a report the plausibility hold stopped through on the next scan.
+
+    Body: {"message_id": "<the id named in the report-held issue>"}. The hold
+    (sync_inventory._hold_implausible_counts) refuses a weekly report that
+    mostly repeats the previous count; when a person has checked that it is
+    genuine (a slow week), this records the message id so the next scan
+    applies it. Returns {ok, released: [...ids on file]}.
+    """
+    try:
+        import inventory_tracker as _it
+        from sync_inventory import HELD_RELEASES_FILE_NAME
+        mid = str((request.get_json(silent=True) or {}).get("message_id") or "").strip()
+        if not mid or len(mid) > 400:
+            return jsonify({"ok": False, "error": "message_id is required"}), 400
+        path = _it.DATA_DIR / HELD_RELEASES_FILE_NAME
+        with _it.data_lock():
+            data = _it._read_json(path, {})
+            if not isinstance(data, dict):
+                data = {}
+            data[mid] = datetime.now().isoformat()
+            if len(data) > 200:
+                data = dict(sorted(data.items(), key=lambda kv: kv[1])[-200:])
+            _it._write_json(path, data)
+        try:
+            from core import feed_health
+            for k in list(feed_health.snapshot().get("issues") or {}):
+                if k.startswith("report-held:") and k.endswith(":" + mid):
+                    feed_health.clear_issue(k)
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "release held report: clear issue")
+        return jsonify({"ok": True, "released": sorted(data)})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "release held report")
+        return jsonify({"ok": False, "error": "internal error"}), 500
