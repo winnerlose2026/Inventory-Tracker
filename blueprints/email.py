@@ -196,9 +196,15 @@ def _api_email_scan_locked():
                 )
                 _unparsed = list(getattr(scan, "unparsed", []) or [])
                 # Local file writes only (no network I/O) -> under data_lock.
+                # PO-kind entries are recorded AFTER the prune below: the
+                # prune re-judges every entry as a weekly REPORT (and retires
+                # it when the sender's warehouse has counted since), which
+                # says nothing about whether a dropped PO was ever booked.
+                _unparsed_po = [u for u in _unparsed if u.get("kind") == "po"]
+                _unparsed_rep = [u for u in _unparsed if u.get("kind") != "po"]
                 with data_lock():
-                    if _unparsed:
-                        record_unparsed_reports(_unparsed)
+                    if _unparsed_rep:
+                        record_unparsed_reports(_unparsed_rep)
                     # Retire entries whose gap has closed (the warehouse
                     # counted after the message we couldn't read) or that have
                     # aged out, so the queue stays a live to-do list instead
@@ -206,6 +212,8 @@ def _api_email_scan_locked():
                     # after this scan's events are applied, so a report
                     # ingested just now clears its own earlier failures.
                     prune_unparsed_reports()
+                    if _unparsed_po:
+                        record_unparsed_reports(_unparsed_po)
                     save_scan_health({
                         "ts": datetime.now().isoformat(),
                         "source": report.get("source"),
@@ -228,6 +236,8 @@ def _api_email_scan_locked():
                     })
             except Exception as exc:  # noqa: BLE001 — health is best-effort
                 _log_exc(exc, "scan health persist")
+        if not dry_run:
+            _raise_scan_issues(list(getattr(scan, "issues", None) or []))
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "email scan")
         report = {
@@ -256,6 +266,30 @@ def _api_email_scan_locked():
             if report.get("status") in ("ok", "partial") else "internal error"
         )
     return jsonify({"dry_run": dry_run, "reports": [report]})
+
+
+def _raise_scan_issues(issues: list) -> list:
+    """Open a feed-health issue for each problem the scan found. Returns the
+    ones that are NEW ([{key, message, severity}]) -- raise_issue is idempotent
+    per key, so a problem that is re-seen on every 6-hour scan alerts once.
+    Never raises."""
+    fresh = []
+    try:
+        from core import feed_health
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "feed health import")
+        return fresh
+    seen = set()
+    for it in issues or []:
+        key = str((it or {}).get("key") or "").strip()[:200]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        msg = str(it.get("message") or "").replace("\r", " ").replace("\n", " ")
+        sev = it.get("severity") or "warn"
+        if feed_health.raise_issue(key, msg, sev):
+            fresh.append({"key": key, "message": msg[:400], "severity": sev})
+    return fresh
 
 
 # Cap on error/warning lines kept on the scan report and in scan_health.json.

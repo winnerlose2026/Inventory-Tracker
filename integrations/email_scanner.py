@@ -227,6 +227,10 @@ class ScanResult:
     # parser gap. Surfaced on /api/scan/health so a silent miss can't hide.
     # Each entry: {id, mailbox, sender, subject, received}.
     unparsed: list[dict] = field(default_factory=list)
+    # Problems a person must look at, each with a STABLE key so it alerts once
+    # (core.feed_health.raise_issue): {key, message, severity}. The route
+    # raises them; the scanner itself never writes health state.
+    issues: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +253,54 @@ _PO_FAILURE_RE = re.compile(
     r"|did not resolve -- \d+ line\(s\) skipped"
     r"|no PO# found in PDF -- skipped"
     r"|^PO PDF '.*': could not be read")
+
+# A PDF that is a purchase order by its name / subject / own text. Used to
+# tell a PO the parser read NOTHING from (must be flagged) from the invoices,
+# statements and delivery paperwork the same senders also attach as PDFs.
+_PO_HINT_RE = re.compile(
+    r"(?<![A-Za-z])P\.?O\.?(?![A-Za-z])|purchase\s*order", re.I)
+_NOT_PO_HINT_RE = re.compile(
+    r"\b(invoice|statement|remittance|credit memo|past due|affidavit)", re.I)
+_PO_TEXT_RE = re.compile(r"purchase\s+order|\bPO\s+request\b|\bP\.?O\.?\s*(#|number|no\.?)",
+                         re.I)
+
+
+def _pdf_text_looks_like_po(pdf_bytes) -> bool:
+    """Does the PDF's own first-page text call itself a purchase order?
+    Best-effort: an unreadable PDF is simply "can't tell" (False)."""
+    try:
+        import io as _io
+        from pypdf import PdfReader  # type: ignore
+        reader = PdfReader(_io.BytesIO(pdf_bytes))
+        text = ""
+        for page in list(reader.pages)[:2]:
+            text += (page.extract_text() or "") + "\n"
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_PO_TEXT_RE.search(text))
+
+
+def _zero_line_po_error(po, pdf_bytes, subject, filename="") -> Optional[str]:
+    """Error text when a distributor PDF that IS a purchase order produced no
+    line at all, else None.
+
+    Before 2026-11-12 such a PDF returned events=[] errors=[] and was queued
+    nowhere: a layout change at US Foods or Cheney would have dropped every
+    PO with status "ok". The wording matches _PO_FAILURE_RE, so the scan goes
+    "partial", the cron reports it and the message enters the unparsed queue.
+    """
+    if getattr(po, "lines", None):
+        return None
+    blob = f"{subject or ''} {filename or ''}"
+    is_po = bool(getattr(po, "po_number", "")) or (
+        bool(_PO_HINT_RE.search(blob)) and not _NOT_PO_HINT_RE.search(blob)
+    ) or _pdf_text_looks_like_po(pdf_bytes)
+    if not is_po:
+        return None
+    label = (subject or filename or "?").replace("'", "`")[:120]
+    return (f"PO PDF '{label}': could not be read -- 0 lines "
+            f"(PO# {getattr(po, 'po_number', '') or 'not found'}). The PDF "
+            "layout may have changed; this order is NOT on the Pending POs tab.")
 
 
 def is_mailbox_failure(err) -> bool:
@@ -608,7 +660,7 @@ def _received_at_from_message(msg) -> str:
 
 
 def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                          received_at="", sender=""):
+                          received_at="", sender="", filename=""):
     """Parse a US Foods PO PDF and convert each line to a restock EmailEvent.
 
     Returns (events, errors). Errors are strings suitable for
@@ -623,6 +675,11 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
     except Exception as exc:  # noqa: BLE001
         _log_scan_exc(exc, "usfoods PO PDF")
         errors.append(f"usfoods PO PDF parse failed ({subject!r}) -- see server log")
+        return events, errors
+
+    _zero = _zero_line_po_error(po, pdf_bytes, subject, filename)
+    if _zero:
+        errors.append(_zero)
         return events, errors
 
     if po.unmapped_items:
@@ -707,7 +764,7 @@ def _sum_split_lines(lines):
 
 
 def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
-                         received_at="", sender=""):
+                         received_at="", sender="", filename=""):
     """Parse a Cheney Brothers PO PDF and convert each line to a restock
     EmailEvent.
 
@@ -725,6 +782,11 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
     except Exception as exc:  # noqa: BLE001
         _log_scan_exc(exc, "cheney PO PDF")
         errors.append(f"cheney PO PDF parse failed ({subject!r}) -- see server log")
+        return events, errors
+
+    _zero = _zero_line_po_error(po, pdf_bytes, subject, filename)
+    if _zero:
+        errors.append(_zero)
         return events, errors
 
     if po.unmapped_items:
@@ -1189,14 +1251,16 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
         if distributor == "US Foods":
             got = _guarded(errors, f"PO PDF {fname!r}", _usfoods_po_to_events,
                            payload, distributor, msg_id, subject,
-                           received_at=received_at, sender=from_hdr)
+                           received_at=received_at, sender=from_hdr,
+                           filename=fname)
             if got:
                 events.extend(got[0])
                 errors.extend(got[1])
         elif distributor == "Cheney Brothers":
             got = _guarded(errors, f"PO PDF {fname!r}", _cheney_po_to_events,
                            payload, distributor, msg_id, subject,
-                           received_at=received_at, sender=from_hdr)
+                           received_at=received_at, sender=from_hdr,
+                           filename=fname)
             if got:
                 events.extend(got[0])
                 errors.extend(got[1])
@@ -1630,9 +1694,29 @@ class EmailInboxClient:
                         # a known sender's unreadable mail is queued instead.
                         _log_scan_exc(exc, "unparsed check")
                         _fnames, _queue = [], bool(_known)
-                    if _queue:
+                    # A purchase order that was dropped WHOLE (zero lines, no
+                    # PO number, unknown ship-to, unreadable PDF): distributor
+                    # sender + a .pdf + no events. The report gate above keeps
+                    # PO mail out of the queue on purpose, so admit it here.
+                    _po_errs = [e for e in errs if is_po_failure(e)]
+                    _po_dropped = bool(
+                        _po_errs and _distributor_from_sender(_snd)
+                        and any((f or "").lower().endswith(".pdf")
+                                for f in _fnames))
+                    _ukey = m.get("internetMessageId") or mid
+                    if _po_dropped:
+                        result.issues.append({
+                            "key": f"po-parse:{_ukey}",
+                            "message": (f"{_subj[:120]!r} from {_snd} "
+                                        f"({upn}): {_po_errs[0]}"),
+                            "severity": "error",
+                        })
+                    if _queue or _po_dropped:
                         result.unparsed.append({
-                            "id": m.get("internetMessageId") or mid,
+                            "kind": "po" if (_po_dropped and not _queue) else "report",
+                            "reason": (_po_errs[0][:200] if _po_dropped
+                                       else "no events parsed"),
+                            "id": _ukey,
                             "mailbox": upn,
                             "sender": _snd,
                             "subject": m.get("subject") or "",
