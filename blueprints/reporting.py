@@ -244,6 +244,63 @@ def _save_toast_empty_days(marks: dict) -> None:
     _write_json(_toast_empty_days_path(), marks)
 
 
+def _toast_fetch_log_path():
+    from inventory_tracker import DATA_DIR
+    return DATA_DIR / "toast_fetch_log.json"
+
+
+def _load_toast_fetch_log() -> dict:
+    """{"<restaurant_guid>|<YYYY-MM-DD>": "<UTC ISO when that day was last
+    pulled from Toast>"} -- how old each stored day is, and which days were
+    pulled before Toast had finalised them."""
+    from inventory_tracker import _read_json
+    data = _read_json(_toast_fetch_log_path(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_toast_fetch_log(log: dict) -> None:
+    from inventory_tracker import _write_json
+    _write_json(_toast_fetch_log_path(), log)
+
+
+def _merge_toast_pull(new_rows: list, ok_pairs, fetched_at: str, final_before: str):
+    """Merge one Toast pull into sales.json under data_lock. Returns the
+    merged rows.
+
+    * a day that came back with rows is REPLACED wholesale;
+    * a completed pull with no rows keeps what was stored, and is remembered
+      as empty only when the day is older than ``final_before``;
+    * every completed (guid, date) gets its fetched_at stamped;
+    * failed pairs are simply absent from ``ok_pairs`` -- nothing changes.
+    """
+    from inventory_tracker import data_lock, load_sales, save_sales
+    got_keys = {(r.get("restaurant_guid") or "", r.get("business_date") or "")
+                for r in new_rows or []}
+    newly_empty = {f"{g}|{d}" for (g, d) in (ok_pairs or set())
+                   if (g, d) not in got_keys and d < final_before}
+    with data_lock():
+        # Re-read under the lock: another view / the nightly pull may have
+        # merged meanwhile.
+        merged = load_sales() or []
+        if new_rows:
+            merged = [r for r in merged
+                      if ((r.get("restaurant_guid") or ""),
+                          (r.get("business_date") or "")) not in got_keys]
+            merged.extend(new_rows)
+            save_sales(merged)
+        if newly_empty:
+            marks = _load_toast_empty_days()
+            for k in newly_empty:
+                marks.setdefault(k, fetched_at)
+            _save_toast_empty_days(marks)
+        if ok_pairs:
+            log = _load_toast_fetch_log()
+            for (g, d) in ok_pairs:
+                log[f"{g}|{d}"] = fetched_at
+            _save_toast_fetch_log(log)
+    return merged
+
+
 @reporting_bp.route("/api/report/toast-sales")
 def api_report_toast_sales():
     """Top-selling items aggregated by week or month, optionally by
@@ -279,10 +336,12 @@ def api_report_toast_sales():
     # one-window-at-a-time semantics). When absent we fall back to
     # returning the most recent N buckets that have data.
     end_date_q = (args.get("end_date") or "").strip()
-    # When True (default) a cache miss for the picked bucket triggers a
-    # live Toast pull. The client can pass live=0 to force cache-only
-    # behavior (e.g. for fast retries while a fetch is in flight).
-    live_q = (args.get("live") or "1").strip() not in ("0", "false", "no")
+    # The Report tab is served from the store (the nightly pull keeps it
+    # current). A live Toast pull happens ONLY when the caller asks with
+    # live=1 -- the tab's "Refresh from Toast" button. Opening the tab used
+    # to fan out up to 17 locations x 7 days of Toast calls inside the page
+    # load.
+    live_q = (args.get("live") or "0").strip().lower() in ("1", "true", "yes")
 
     # Bucket each row.
     def _bucket_key(date_iso: str) -> str:
@@ -351,7 +410,8 @@ def api_report_toast_sales():
             re-requested on every view; a FAILED fetch is not marked and is
             retried next time.
         """
-        meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None}
+        meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None,
+                "live": bool(live_q), "requested": 0, "failed": 0}
         if not live_q:
             return all_rows, meta
         try:
@@ -404,51 +464,72 @@ def api_report_toast_sales():
         except Exception as ex:
             meta["fetch_error"] = _safe_err(ex, "toast fetch")
             return all_rows, meta
-        meta["fetched_at"] = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        from datetime import timezone as _tz
+        meta["fetched_at"] = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _now_m = _time.monotonic()
         for (g, d) in (ok_pairs or set()):
             if d >= fresh_from:
                 _TOAST_REFRESHED[(g, d)] = _now_m
-        got_keys = {(r.get("restaurant_guid") or "", r.get("business_date") or "")
-                    for r in new_rows or []}
-        newly_empty = {f"{g}|{d}" for (g, d) in (ok_pairs or set())
-                       if (g, d) not in got_keys and d < fresh_from}
-        if not new_rows and not newly_empty:
-            # No orders for any of the missing (guid, date) pairs is a
-            # legitimate response -- still record the attempt so the UI
-            # knows a fetch ran.
+        # Say so when location-days failed. All-failed used to come back as
+        # no rows + no error, and the tab said "no new orders found".
+        meta["requested"] = len(missing)
+        meta["failed"] = len({(g, d) for (g, d, _n) in missing} - set(ok_pairs or ()))
+        if meta["failed"]:
+            meta["fetch_error"] = (f"{meta['failed']} of {meta['requested']} "
+                                   f"location-days failed")
+        if not new_rows and not ok_pairs:
             return all_rows, meta
-        from inventory_tracker import data_lock, load_sales, save_sales
-        with data_lock():
-            # Re-read under the lock: another view may have merged meanwhile.
-            merged = load_sales() or []
-            if new_rows:
-                # A day that came back with rows is REPLACED wholesale (fresh
-                # totals, and items no longer sold that day drop out). Days
-                # whose fetch failed or came back empty keep what they had.
-                merged = [r for r in merged
-                          if ((r.get("restaurant_guid") or ""),
-                              (r.get("business_date") or "")) not in got_keys]
-                merged.extend(new_rows)
-                save_sales(merged)
-            if newly_empty:
-                marks = _load_toast_empty_days()
-                for k in newly_empty:
-                    marks.setdefault(k, meta["fetched_at"])
-                _save_toast_empty_days(marks)
+        merged = _merge_toast_pull(new_rows, ok_pairs, meta["fetched_at"], fresh_from)
         meta["rows_fetched"] = len(new_rows or [])
         return merged, meta
+
+    def _store_age(anchor_iso: str, loc_q: str) -> dict:
+        """How current the stored rows for this bucket are."""
+        try:
+            start_iso, end_iso = _bucket_range(anchor_iso)
+        except ValueError:
+            return {}
+        log = _load_toast_fetch_log()
+        empty_days = _load_toast_empty_days()
+        have = {((r.get("restaurant_guid") or ""), (r.get("business_date") or ""))
+                for r in rows_all if start_iso <= (r.get("business_date") or "") <= end_iso}
+        stamps, missing_n, pairs_n = [], 0, 0
+        d_cursor = _dt.strptime(start_iso, "%Y-%m-%d")
+        e = _dt.strptime(end_iso, "%Y-%m-%d")
+        targets = _target_locations(loc_q)
+        while d_cursor <= e:
+            d_iso = d_cursor.strftime("%Y-%m-%d")
+            for (guid, _name) in targets:
+                pairs_n += 1
+                st = log.get(f"{guid}|{d_iso}")
+                if st:
+                    stamps.append(st)
+                elif (guid, d_iso) not in have and f"{guid}|{d_iso}" not in empty_days:
+                    missing_n += 1
+            d_cursor += _td(days=1)
+        return {"oldest_fetched_at": min(stamps) if stamps else None,
+                "newest_fetched_at": max(stamps) if stamps else None,
+                "location_days": pairs_n, "location_days_not_pulled": missing_n,
+                "start": start_iso, "end": end_iso}
 
     # Load the full row set ONCE. If an anchor date is set we may
     # mutate this with a Toast fetch before bucketing.
     rows = load_sales() or []
-    fetch_meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None}
+    fetch_meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None,
+                  "live": bool(live_q), "requested": 0, "failed": 0}
     if end_date_q:
         try:
             rows, fetch_meta = _ensure_bucket_cached(rows, end_date_q,
                                                     location_q)
         except Exception as ex:
             fetch_meta["fetch_error"] = _safe_err(ex, "toast fetch")
+    rows_all = rows
+    store_meta = {}
+    if end_date_q:
+        try:
+            store_meta = _store_age(end_date_q, location_q)
+        except Exception as ex:  # noqa: BLE001 -- informational only
+            store_meta = {"error": _safe_err(ex, "toast store age")}
 
     # Apply the location filter (after the live fetch so newly-pulled
     # rows are visible).
@@ -540,6 +621,7 @@ def api_report_toast_sales():
                             "anchor":      anchor,
                             "anchor_date": end_date_q,
                             "total_rows":  len(rows),
+                            "store":       store_meta,
                             "fetch":       fetch_meta})
         except ValueError:
             pass
@@ -551,6 +633,173 @@ def api_report_toast_sales():
     return jsonify({"ok": True, "period": period,
                     "buckets": out_buckets,
                     "total_rows": len(rows)})
+
+
+# --- Nightly Toast pull --------------------------------------------------------
+#: Business dates re-pulled every night (yesterday back this many days): Toast
+#: keeps revising a day for ~4 days after it closes.
+TOAST_NIGHTLY_DAYS = 4
+#: A day is final this many days after it closes; a day last pulled before
+#: that is pulled once more.
+TOAST_FINAL_AFTER_DAYS = 4
+#: How far back the nightly pull looks for days that were never pulled, or
+#: were pulled before they were final.
+TOAST_REPULL_LOOKBACK_DAYS = 21
+#: Hard time budget. Gunicorn kills a request at 180 s; stop well inside it
+#: and leave the rest for the next run.
+TOAST_NIGHTLY_BUDGET_S = 120.0
+_TOAST_NIGHTLY_BATCH = 24
+_TOAST_NIGHTLY_LOCK = __import__("threading").Lock()
+
+
+def toast_nightly_targets(today, sales_rows, fetch_log, *, days=TOAST_NIGHTLY_DAYS,
+                          now_utc=None):
+    """[(guid, date_iso, name, status)] the nightly pull should fetch, most
+    urgent first: the trailing ``days`` business dates for every registry
+    store (active and pre-launch), then older days inside the look-back that
+    were never pulled or were last pulled before they were final. A pair
+    pulled in the last 30 minutes is skipped (a second worker's scheduler
+    firing the same job)."""
+    from datetime import timezone
+    from inventory_tracker import TOAST_RETAIL_LOCATIONS
+    now_utc = now_utc or datetime.now(timezone.utc)
+    recent = (now_utc - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stores = [(L["restaurant_guid"], L.get("location") or "", (L.get("status") or "active"))
+              for L in TOAST_RETAIL_LOCATIONS
+              if (L.get("status") or "active") in ("active", "pre_launch")
+              and L.get("restaurant_guid")]
+    have = {((r.get("restaurant_guid") or ""), (r.get("business_date") or ""))
+            for r in sales_rows or []}
+    trailing, older = [], []
+    for back in range(1, TOAST_REPULL_LOOKBACK_DAYS + 1):
+        d = today - timedelta(days=back)
+        d_iso = d.isoformat()
+        final_on = (d + timedelta(days=1 + TOAST_FINAL_AFTER_DAYS)).isoformat()
+        for (guid, name, status) in stores:
+            stamp = str(fetch_log.get(f"{guid}|{d_iso}") or "")
+            if stamp and stamp >= recent:
+                continue
+            if back <= days:
+                trailing.append((guid, d_iso, name, status))
+            elif not stamp:
+                # Never pulled by us. Pre-launch stores have no history worth
+                # chasing; an active store's unstamped day is pulled once.
+                if status == "active" or (guid, d_iso) in have:
+                    older.append((guid, d_iso, name, status))
+            elif stamp[:10] < final_on:
+                older.append((guid, d_iso, name, status))   # pulled before final
+    return trailing + older
+
+
+@reporting_bp.route("/api/toast/nightly-pull", methods=["POST"])
+def api_toast_nightly_pull():
+    """Pull Toast product mix into the store so the Report tab and the
+    Planner's trend note never depend on someone opening a page.
+
+    Called daily at 08:15 UTC by the in-process scheduler with an empty JSON
+    body. Optional body: {"days": 4, "max_seconds": 120, "dry_run": false}.
+
+    Pulls the trailing 4 business dates for every registry store (active and
+    pre-launch), plus any day in the last 21 that was never pulled or was
+    pulled before it was final (close + 4 days). Stops at ~120 s and reports
+    what is left; the next run picks it up. Each completed (store, day) gets
+    a fetched_at stamp (data/toast_fetch_log.json). Network I/O happens
+    outside data_lock; each merge is one locked read-modify-write.
+    """
+    from datetime import timezone
+    from core import feed_health
+    from core.errors import _log_exc
+    from inventory_tracker import load_sales
+    body = request.get_json(silent=True) or {}
+    try:
+        days = max(1, min(int(body.get("days") or TOAST_NIGHTLY_DAYS), 14))
+    except (TypeError, ValueError):
+        days = TOAST_NIGHTLY_DAYS
+    try:
+        budget = max(5.0, min(float(body.get("max_seconds") or TOAST_NIGHTLY_BUDGET_S), 150.0))
+    except (TypeError, ValueError):
+        budget = TOAST_NIGHTLY_BUDGET_S
+    dry_run = bool(body.get("dry_run"))
+
+    from integrations import toast_api
+    if not toast_api.is_configured():
+        feed_health.record("toast-nightly", False, "Toast credentials are not set on the server")
+        return jsonify({"ok": False, "error": "toast_not_configured"}), 503
+    if not _TOAST_NIGHTLY_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "a Toast pull is already running"}), 409
+    try:
+        started = _time.monotonic()
+        today = business_today()
+        pending = toast_nightly_targets(today, load_sales() or [], _load_toast_fetch_log(),
+                                        days=days)
+        requested = len(pending)
+        if dry_run:
+            return jsonify({"ok": True, "dry_run": True, "requested": requested,
+                            "pairs": [list(p[:3]) for p in pending[:60]]})
+        fresh_from = (today - timedelta(days=1)).isoformat()
+        fetched = rows_n = 0
+        failed, not_live = [], []
+        while pending:
+            left = budget - (_time.monotonic() - started)
+            if left < 8:
+                break
+            batch, pending = pending[:_TOAST_NIGHTLY_BATCH], pending[_TOAST_NIGHTLY_BATCH:]
+            status_of = {(g, d): st for (g, d, _n, st) in batch}
+            name_of = {(g, d): n for (g, d, n, _st) in batch}
+            try:
+                # Network I/O -- deliberately OUTSIDE data_lock.
+                new_rows, ok_pairs = toast_api.fetch_product_mix_batch_with_status(
+                    [(g, d, n) for (g, d, n, _st) in batch],
+                    max_workers=6, timeout_s=max(5.0, min(40.0, left - 5)))
+            except Exception as ex:  # noqa: BLE001
+                _log_exc(ex, "toast nightly batch")
+                new_rows, ok_pairs = [], set()
+            ok_pairs = set(ok_pairs or ())
+            # Only rows for pairs that completed are merged.
+            new_rows = [r for r in (new_rows or [])
+                        if ((r.get("restaurant_guid") or ""),
+                            (r.get("business_date") or "")) in ok_pairs]
+            for key in status_of:
+                if key in ok_pairs:
+                    continue
+                # A store that is not open yet has nothing to pull; that is
+                # not a failure of the feed.
+                (not_live if status_of[key] == "pre_launch" else failed).append(
+                    {"restaurant_guid": key[0], "location": name_of[key], "date": key[1]})
+            if ok_pairs:
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _merge_toast_pull(new_rows, ok_pairs, stamp, fresh_from)
+                fetched += len(ok_pairs)
+                rows_n += len(new_rows)
+        remaining = len(pending)
+        elapsed = round(_time.monotonic() - started, 1)
+        ok = not failed
+        detail = (f"{fetched} of {requested} location-days pulled, {rows_n} rows"
+                  + (f"; {len(failed)} failed" if failed else "")
+                  + (f"; {remaining} left for the next run" if remaining else ""))
+        feed_health.record("toast-nightly", ok, detail, requested=requested,
+                           fetched=fetched, failed=len(failed), remaining=remaining,
+                           rows=rows_n, prelaunch_unavailable=len(not_live),
+                           elapsed_s=elapsed,
+                           data_through=(today - timedelta(days=1)).isoformat()
+                           if ok and not remaining else "")
+        return jsonify({
+            "ok": ok, "requested": requested, "fetched": fetched, "rows": rows_n,
+            "failed": len(failed), "failed_pairs": failed[:25],
+            "fetch_error": (f"{len(failed)} of {requested} location-days failed"
+                            if failed else None),
+            "prelaunch_unavailable": len(not_live),
+            "remaining": remaining,
+            "remaining_pairs": [{"restaurant_guid": g, "date": d, "location": n}
+                                for (g, d, n, _st) in pending[:25]],
+            "elapsed_s": elapsed, "budget_s": budget, "days": days,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "toast nightly pull")
+        feed_health.record("toast-nightly", False, "the pull crashed (see server log)")
+        return jsonify({"ok": False, "error": "internal error"}), 500
+    finally:
+        _TOAST_NIGHTLY_LOCK.release()
 
 
 @reporting_bp.route("/api/sales/locations")

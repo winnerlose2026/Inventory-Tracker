@@ -120,47 +120,82 @@ def pool_demand(rows: list) -> list:
     return out
 
 
-def toast_demand_trend(sales_rows: list, window_days: int = 14) -> dict:
+#: The trend is only stated when at least this share of the (store, day)
+#: slots in the recent window can be matched to the same store a window
+#: earlier, over at least TREND_MIN_DAYS different days.
+TREND_MIN_COVERAGE = 0.6
+TREND_MIN_DAYS = 7
+
+
+def toast_demand_trend(sales_rows: list, window_days: int = 14,
+                       today: str = "") -> dict:
     """Coarse chain-level bagel-demand TREND from Toast retail rows -- a
-    leading indicator, not per-SKU demand. Compares the most recent
-    ``window_days`` of bagel-related qty against the prior window. Anchored
-    to the latest business_date present (Toast ingest can lag)."""
-    bagel = []
+    leading indicator, not per-SKU demand.
+
+    Compares the most recent ``window_days`` with the window before it, LIKE
+    FOR LIKE: a (store, day) counts only when the same store also has data
+    exactly ``window_days`` earlier. Summing whatever happened to be stored
+    in each window made a store whose pulls were missing from one window
+    read as a 30% swing in demand. ``today`` (YYYY-MM-DD), when given,
+    leaves out the still-open day and anything after it. Below the minimum
+    coverage no trend is stated at all.
+    """
+    from datetime import timedelta
+    qty_by: dict = {}          # (store, date) -> bagel qty
+    has_data: set = set()      # (store, date) with ANY Toast row
     for r in sales_rows or []:
+        d = (r.get("business_date") or "")[:10]
+        if not d or (today and d >= today):
+            continue
+        store = r.get("restaurant_guid") or r.get("location") or ""
+        has_data.add((store, d))
         mg = (r.get("menu_group") or "").lower()
         item = (r.get("item") or "").lower()
         if "bagel" in mg or "bagel" in item:
-            d = (r.get("business_date") or "")[:10]
             try:
                 qty = float(r.get("qty") or 0)
             except (TypeError, ValueError):
                 qty = 0.0
-            if d:
-                bagel.append((d, qty))
-    if not bagel:
+            qty_by[(store, d)] = qty_by.get((store, d), 0.0) + qty
+    if not qty_by:
         return {"available": False, "reason": "no bagel-related Toast rows"}
-    latest = max(d for d, _ in bagel)
+    latest = max(d for _s, d in qty_by)
     anchor = _parse_iso(latest)
+    if anchor is None:
+        return {"available": False, "reason": "Toast dates unreadable"}
+    stores_all = {s for s, _d in has_data}
     recent = prior = 0.0
-    for d, qty in bagel:
-        dt = _parse_iso(d)
-        if dt is None:
-            continue
-        age = (anchor - dt).days
-        if 0 <= age < window_days:
-            recent += qty
-        elif window_days <= age < 2 * window_days:
-            prior += qty
+    matched, days, stores = 0, set(), set()
+    for age in range(window_days):
+        d = (anchor - timedelta(days=age)).date().isoformat()
+        d_prior = (anchor - timedelta(days=age + window_days)).date().isoformat()
+        for store in stores_all:
+            if (store, d) in has_data and (store, d_prior) in has_data:
+                recent += qty_by.get((store, d), 0.0)
+                prior += qty_by.get((store, d_prior), 0.0)
+                matched += 1
+                days.add(d)
+                stores.add(store)
+    recent_slots = sum(1 for (s, d) in has_data
+                       if 0 <= (anchor - _parse_iso(d)).days < window_days)
+    possible = max(recent_slots, 1)
+    coverage = matched / possible
+    base = {"anchored_to": latest, "as_of": latest, "window_days": window_days,
+            "stores": len(stores), "matched_location_days": matched,
+            "coverage_pct": round(coverage * 100, 0)}
+    if coverage < TREND_MIN_COVERAGE or len(days) < TREND_MIN_DAYS or prior <= 0:
+        return {**base, "available": False,
+                "reason": (f"not enough comparable Toast days to state a trend "
+                           f"({matched} of {possible} store-days match the prior "
+                           f"{window_days} days)")}
     rpd = recent / window_days
     ppd = prior / window_days
-    pct = ((rpd - ppd) / ppd * 100.0) if ppd > 0 else None
-    direction = "flat"
-    if pct is not None:
-        direction = "rising" if pct > 10 else ("falling" if pct < -10 else "flat")
+    pct = (recent - prior) / prior * 100.0
+    direction = "rising" if pct > 10 else ("falling" if pct < -10 else "flat")
     return {
-        "available": True, "anchored_to": latest, "window_days": window_days,
+        **base, "available": True,
         "recent_per_day": round(rpd, 1), "prior_per_day": round(ppd, 1),
-        "pct_change": (round(pct, 1) if pct is not None else None),
+        "pct_change": round(pct, 1),
         "direction": direction,
         "note": "Leading indicator (H&H retail bagel demand); not per-SKU wholesale demand.",
     }

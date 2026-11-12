@@ -2,6 +2,8 @@
 (Phase 1). Read-only for now; planner compute endpoints land here next."""
 from flask import Blueprint, jsonify
 
+from core.util import business_today
+
 from integrations.planning_config import load_planning_config, planning_inventory
 
 planning_bp = Blueprint("planning", __name__)
@@ -31,7 +33,8 @@ def api_planning_demand():
         "ok": True,
         "warehouse_demand": wd,
         "pool_demand": pool_demand(wd),
-        "toast_trend": toast_demand_trend(load_sales() or []),
+        "toast_trend": toast_demand_trend(load_sales() or [],
+                                          today=business_today().isoformat()),
         "stale_count": sum(1 for r in wd if r.get("stale")),
         "sku_count": len(wd),
     })
@@ -54,7 +57,8 @@ def api_planning_guide():
         ledger=build_po_ledger(),
         demand_rows=warehouse_demand(inv),
         config=cfg,
-        toast_trend=toast_demand_trend(load_sales() or []),
+        toast_trend=toast_demand_trend(load_sales() or [],
+                                       today=business_today().isoformat()),
     )
     return jsonify({"ok": True, **guide})
 

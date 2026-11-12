@@ -322,10 +322,15 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     toast_note = None
     if tt.get("available"):
         d = tt.get("direction")
-        toast_note = (f"Retail bagel demand {d} ({tt.get('pct_change')}% vs prior "
-                      f"{tt.get('window_days')}d) -- "
+        pct = tt.get("pct_change")
+        sign = "+" if (pct or 0) > 0 else ""
+        toast_note = (f"Retail bagel demand {d} ({sign}{pct}% vs prior "
+                      f"{tt.get('window_days')}d; as of {tt.get('as_of') or tt.get('anchored_to')}, "
+                      f"{tt.get('stores')} stores, same stores and days compared) -- "
                       + ("distributor reorders likely to rise; pull build-ahead forward."
                          if d == "rising" else "no action from Toast."))
+    elif tt.get("reason") and tt.get("matched_location_days") is not None:
+        toast_note = f"Toast trend not shown: {tt['reason']}."
 
     return {
         "generated_at": now.isoformat(),
