@@ -78,20 +78,40 @@ _STATE_FILE = _DATA_DIR / "graph_subscriptions.json"
 # --------------------------------------------------------------------------- #
 
 def _load_state() -> dict:
-    if not _STATE_FILE.exists():
-        return {"subscriptions": []}
+    """The subscription state, read through inventory_tracker._read_json (so a
+    torn file is recovered from its .bak).
+
+    A state file that EXISTS but will not parse used to be swallowed here and
+    read as "no subscriptions"; the next _save_state then wrote that empty
+    state over it with a non-atomic write_text -- the same pattern that
+    blanked inventory.json on 2026-09-17. Now an unreadable file is reported:
+    the returned state is empty but carries ``state_error``, which renew
+    records (and which makes it recreate every subscription).
+    """
+    import inventory_tracker as _it
+    empty = {"subscriptions": []}
     try:
-        return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {"subscriptions": []}
+        st = _it._read_json(_STATE_FILE, empty)
+    except Exception as exc:  # noqa: BLE001 -- DataFileCorrupt and friends
+        _log_exc_gs(exc, "load_state")
+        return {"subscriptions": [],
+                "state_error": "subscription state file was unreadable "
+                               f"({type(exc).__name__}); subscriptions unknown"}
+    if not isinstance(st, dict):
+        return {"subscriptions": [],
+                "state_error": "subscription state file did not hold an object"}
+    if not isinstance(st.get("subscriptions"), list):
+        st["subscriptions"] = []
+    return st
 
 
 def _save_state(state: dict) -> None:
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _STATE_FILE.write_text(
-        json.dumps(state, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    """Atomic write (temp file + os.replace, previous copy kept as .bak) via
+    inventory_tracker._write_json."""
+    import inventory_tracker as _it
+    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state = {k: v for k, v in (state or {}).items() if k != "state_error"}
+    _it._write_json(_STATE_FILE, state)
 
 
 def _update_state(fn) -> dict:
@@ -101,6 +121,12 @@ def _update_state(fn) -> dict:
     from inventory_tracker import data_lock
     with data_lock():
         state = _load_state()
+        # An unreadable file is about to be replaced by what we know now:
+        # keep the fact that it was lost on the record.
+        err = state.pop("state_error", "")
+        if err:
+            state["last_state_error"] = err
+            state["last_state_error_at"] = datetime.now(timezone.utc).isoformat()
         fn(state)
         _save_state(state)
     return state
@@ -145,6 +171,8 @@ def subscription_health(now: Optional[datetime] = None) -> dict:
         "last_error": st.get("last_error") or "",
         "last_error_at": st.get("last_error_at") or "",
         "last_renew_error": st.get("last_renew_error") or "",
+        # The state file could not be read (now, or at the last renew).
+        "state_error": st.get("state_error") or st.get("last_state_error") or "",
     }
 
 
@@ -319,6 +347,16 @@ def renew_subscriptions() -> dict:
     tracked_users = {s.get("user") for s in subs}
     missing_users = [u for u in _users() if u not in tracked_users]
 
+    # No tracked subscription at all although mailboxes are configured: the
+    # state was lost (unreadable file, wiped disk) or never created. Either
+    # way every mailbox is recreated below -- and it is SAID, because the old
+    # subscriptions (if any) are now untracked and real-time ingest may have
+    # been dead since the state went.
+    state_error = state.get("state_error") or ""
+    if not subs and _users() and not state_error:
+        state_error = ("no subscription was on file for the configured "
+                       "mailboxes; recreated")
+
     new_expiration = _expiration_iso()
     results = []
     by_user = {s.get("user"): s for s in subs}
@@ -424,12 +462,43 @@ def renew_subscriptions() -> dict:
     renew_err = ("; ".join(f"{r.get('user')}: {r.get('error')}" for r in failed)
                  if failed else "")
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     def _apply(st):
         st["subscriptions"] = new_subs
-        st["last_renew_at"] = datetime.now(timezone.utc).isoformat()
+        st["last_renew_at"] = now_iso
         st["last_renew_error"] = renew_err
+        if state_error:
+            st["last_state_error"] = state_error
+            st["last_state_error_at"] = now_iso
     state = _update_state(_apply)
-    return {"ok": not failed, "results": results, "subscriptions": state["subscriptions"]}
+    _report_renew_health(not failed, renew_err, state_error, len(new_subs))
+    out = {"ok": not failed, "results": results,
+           "subscriptions": state["subscriptions"]}
+    if state_error:
+        out["state_error"] = state_error
+    return out
+
+
+def _report_renew_health(ok: bool, renew_err: str, state_error: str, n: int) -> None:
+    """Shared feed record + issues for the daily renew. Never raises."""
+    try:
+        from core import feed_health
+        feed_health.record(
+            "graph-subscriptions", ok,
+            renew_err or state_error or f"{n} subscription(s) renewed")
+        if state_error:
+            feed_health.raise_issue(
+                "graph-subscriptions:state-lost",
+                "Graph mail subscriptions: " + state_error, "warn")
+        if renew_err:
+            feed_health.raise_issue(
+                "graph-subscriptions:renew",
+                "Graph mail subscription renew failed: " + renew_err, "error")
+        else:
+            feed_health.clear_issue("graph-subscriptions:renew")
+    except Exception as exc:  # noqa: BLE001
+        _log_exc_gs(exc, "renew health")
 
 
 def delete_subscription(sub_id: str) -> dict:
