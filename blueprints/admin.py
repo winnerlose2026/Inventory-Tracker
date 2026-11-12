@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request
 
 from core.auth import admin_required, is_admin
 from core.errors import _safe_err
-from core.util import with_data_lock
+from core.util import append_audit_safely, with_data_lock
 from inventory_tracker import load_inventory, save_inventory
 
 admin_bp = Blueprint("admin", __name__)
@@ -164,10 +164,7 @@ def api_admin_remove_po():
             "removed_rows":    removed_rows,
         }
         save_canceled_pos(canceled)
-        try:
-            append_inventory_audit(audit)
-        except Exception:  # noqa: BLE001 -- audit is best-effort
-            pass
+        append_audit_safely(audit, "admin-remove-po")
     return jsonify({
         "ok": True,
         "dry_run": dry_run,
@@ -302,10 +299,7 @@ def api_admin_restore_absorbed_po():
     if not dry_run:
         # One commit: the on-hand change and the ledger row that explains it.
         save_inventory_and_usage(inv, usage)
-        try:
-            append_inventory_audit(audit)
-        except Exception:  # noqa: BLE001 -- audit is best-effort
-            pass
+        append_audit_safely(audit, "admin-restore-absorbed-po")
     return jsonify({"ok": True, "dry_run": dry_run, "po_number": po_number,
                     "count_at": count_at, "delivery_confirmed": confirmed,
                     "hours_after_delivery": round(hrs, 2),
@@ -423,10 +417,7 @@ def api_admin_absorb_po_into_count():
     if not dry_run:
         # One commit: the on-hand change and the ledger row that explains it.
         save_inventory_and_usage(inv, usage)
-        try:
-            append_inventory_audit(audit)
-        except Exception:  # noqa: BLE001 -- audit is best-effort
-            pass
+        append_audit_safely(audit, "admin-absorb-po-into-count")
     return jsonify({"ok": True, "dry_run": dry_run, "po_number": po_number,
                     "count_at": count_at, "arrived_on": arrived_on,
                     "hours_before_count": round(hrs, 2), "forced": bool(force and missed),
@@ -490,10 +481,7 @@ def api_admin_uncancel_po():
             save_inventory(inv)
     save_canceled_pos(canceled)
     if audit:
-        try:
-            append_inventory_audit(audit)
-        except Exception:  # noqa: BLE001 -- audit is best-effort
-            pass
+        append_audit_safely(audit, "admin-uncancel-po")
     return jsonify({
         "ok": True,
         "po_number": po_number,
@@ -539,7 +527,9 @@ def api_seed():
     try:
         summary = seed(reset=reset)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": _safe_err(exc)}), 200
+        # Was HTTP 200: a failed seed looked like a success to anything that
+        # checked the status code.
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 500
     return jsonify({"ok": True, **summary,
                     **({"snapshot": snapshot} if snapshot else {})})
 
@@ -695,6 +685,6 @@ def api_migrate_units():
     try:
         summary = migrate_units_to_case(inv)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": _safe_err(exc)}), 200
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 500
     save_inventory(inv)
     return jsonify({"ok": True, **summary})

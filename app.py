@@ -216,8 +216,9 @@ def _record_activity(response):
                        path=request.path, status=response.status_code,
                        actor=actor, body=request.get_json(silent=True),
                        payload=payload)
-    except Exception:  # noqa: BLE001 -- logging must never fail a request
-        pass
+    except Exception as exc:  # noqa: BLE001 -- logging must never fail a request
+        from core.util import note_audit_failure
+        note_audit_failure("activity-log", exc)
     return response
 
 

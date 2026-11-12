@@ -192,8 +192,9 @@ def record(entry: dict) -> None:
                     os.replace(tmp, path)
             except OSError:
                 pass
-    except Exception:  # noqa: BLE001 -- logging must never fail a request
-        pass
+    except Exception as exc:  # noqa: BLE001 -- logging must never fail a request
+        from core.util import note_audit_failure
+        note_audit_failure("activity-log", exc)
 
 
 def record_request(*, endpoint: str, method: str, path: str, status: int,

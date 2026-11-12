@@ -209,3 +209,53 @@ def with_data_lock(fn):
         with data_lock():
             return fn(*args, **kwargs)
     return _inner
+
+
+# ---------------------------------------------------------------------------
+# Audit-write failures
+# ---------------------------------------------------------------------------
+_AUDIT_FAIL_LAST: dict = {}
+_AUDIT_FAIL_MIN_GAP_S = 60
+
+
+def note_audit_failure(where: str, exc: BaseException) -> None:
+    """An audit-trail / activity-log write failed. The change it describes
+    has already been saved, so the caller carries on -- but it is no longer
+    silent: logged, counted in feed health ("audit-write") and raised as the
+    "audit-write-failed" issue so the watchdog tells someone. At most one
+    report a minute per call site. Never raises."""
+    import sys
+    import time
+    try:
+        print("[audit] write failed in %s: %s: %s"
+              % (where, type(exc).__name__, exc), file=sys.stderr)
+        now = time.monotonic()
+        last = _AUDIT_FAIL_LAST.get(where)
+        if last is not None and now - last < _AUDIT_FAIL_MIN_GAP_S:
+            return
+        _AUDIT_FAIL_LAST[where] = now
+        from core import feed_health
+        prev = (feed_health.snapshot()["feeds"].get("audit-write") or {})
+        count = int(prev.get("failures") or 0) + 1
+        feed_health.record("audit-write", False,
+                           "%s: %s" % (where, type(exc).__name__),
+                           failures=count)
+        feed_health.raise_issue(
+            "audit-write-failed",
+            "A change was saved but its audit record could not be written "
+            "(%s, %d time(s)). The history for that change is incomplete."
+            % (where, count), "warn")
+    except Exception:  # noqa: BLE001 -- reporting a failure must not fail
+        pass
+
+
+def append_audit_safely(entries, where: str) -> bool:
+    """inventory_tracker.append_inventory_audit that reports a failure
+    (note_audit_failure) instead of swallowing it. Returns True when written."""
+    try:
+        from inventory_tracker import append_inventory_audit
+        append_inventory_audit(entries)
+        return True
+    except Exception as exc:  # noqa: BLE001 -- the change itself is saved
+        note_audit_failure(where, exc)
+        return False
