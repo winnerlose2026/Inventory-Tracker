@@ -72,6 +72,7 @@ def _read_json(path: Path, default):
         if recovered:
             print("[data] %s unreadable (%s); recovered from %s"
                   % (path.name, type(exc).__name__, bak.name), file=sys.stderr)
+            _quarantine_corrupt(path, bak, exc)
             return copy.deepcopy(recovered)
         if st.st_size == 0:
             # A zero-byte file is not evidence of loss: it is what a
@@ -106,6 +107,125 @@ def _load(path: Path) -> "dict | list":
     return _read_json(path, {} if path == INVENTORY_FILE else [])
 
 
+# Main files known (in this process) to be unparseable while their .bak is
+# good. _write_json must not copy such a file over the .bak -- that was the
+# one step that turned a recoverable torn file into two bad copies.
+_CORRUPT_MAIN: set = set()
+
+
+def _raise_issue_safely(key: str, message: str, severity: str = "error") -> None:
+    """Open a core.feed_health issue from inside the storage layer. Lazy
+    import (feed_health imports this module) and guarded against re-entry,
+    because raising an issue itself reads and writes a data file."""
+    if getattr(_LOCK_STATE, "in_issue", False):
+        return
+    _LOCK_STATE.in_issue = True
+    try:
+        from core import feed_health
+        feed_health.raise_issue(key, message, severity)
+    except Exception as exc:  # noqa: BLE001 -- reporting must never break I/O
+        print("[data] could not raise issue %s: %s" % (key, type(exc).__name__),
+              file=sys.stderr)
+    finally:
+        _LOCK_STATE.in_issue = False
+
+
+def _fsync_dir(dirpath: Path) -> None:
+    """Flush a directory entry (the rename itself) to disk. Best-effort: not
+    every platform lets a directory be opened."""
+    try:
+        fd = os.open(str(dirpath), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _has_nonfinite(obj) -> bool:
+    if isinstance(obj, float):
+        return obj != obj or obj in (float("inf"), float("-inf"))
+    if isinstance(obj, dict):
+        return any(_has_nonfinite(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_nonfinite(v) for v in obj)
+    return False
+
+
+def _dump_to_temp(path: Path, data):
+    """Write `data` to a fresh temp file beside `path`, fsync it, and return
+    (temp path, cache signature). The signature is taken with fstat on the
+    temp file itself: os.replace keeps the inode, so it is exactly what
+    path.stat() will report once the file is in place -- a stat AFTER the
+    replace could instead see a newer file written by the other worker and
+    pair its signature with this (older) data in the cache.
+
+    NaN / Infinity are refused (allow_nan=False): they are not JSON, the
+    browser's JSON.parse rejects the whole document, and one bad number made
+    every page blank. The single exception is a file that ALREADY holds such
+    a value on disk -- refusing then would block every later write of that
+    file, so it is written as before and an issue is raised instead.
+    """
+    DATA_DIR.mkdir(exist_ok=True)
+    # One temp file PER CALL. The name used to be <file>.tmp.<pid>, which the
+    # 4 threads of a gunicorn worker share: two concurrent load_inventory()
+    # calls on a rollover day both opened the same temp file, one os.replace
+    # won and the other raised FileNotFoundError (a 500), and the two writers
+    # could interleave into one inode -- the torn write this path exists to
+    # prevent.
+    try:
+        text = json.dumps(data, indent=2, allow_nan=False)
+    except ValueError:
+        if not _has_nonfinite(data):
+            raise
+        already_bad = False
+        try:
+            with open(path) as f:
+                already_bad = _has_nonfinite(json.load(f))
+        except Exception:  # noqa: BLE001
+            already_bad = False
+        if not already_bad:
+            raise ValueError(
+                "refusing to write NaN/Infinity into %s" % path.name) from None
+        _raise_issue_safely(
+            "data-nonfinite:%s" % path.name,
+            "%s holds a NaN/Infinity number; find and correct it" % path.name)
+        text = json.dumps(data, indent=2)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".tmp.")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+            st = os.fstat(f.fileno())
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return tmp, (st.st_mtime_ns, st.st_size)
+
+
+def _keep_backup(path: Path) -> None:
+    """Copy the current file to <name>.bak (fsynced) before it is replaced.
+    Skipped when the current file is known to be corrupt: the .bak is then
+    the only good copy and must survive."""
+    if str(path) in _CORRUPT_MAIN or not path.exists():
+        return
+    bak = _backup_path(path)
+    try:
+        shutil.copyfile(path, bak)
+        with open(bak, "rb") as bf:
+            os.fsync(bf.fileno())
+    except OSError:
+        pass
+
+
 def _write_json(path: Path, data):
     """Write JSON atomically and refresh the cache entry, so any reader in this
     process sees the new data immediately regardless of filesystem mtime
@@ -115,7 +235,8 @@ def _write_json(path: Path, data):
     place with os.replace(), which is atomic: a concurrent reader sees either
     the whole old file or the whole new one, never a half-written one. The
     previous contents are kept beside it as <name>.bak so a bad write is one
-    step from recovery.
+    step from recovery. The temp file, the .bak and the directory entry are
+    all fsynced, so a power cut cannot leave a renamed-but-empty file.
 
     This used to be a plain open(path, "w") -- truncate, then write. With
     gunicorn running 2 workers x 4 threads, two scans landing at the same
@@ -123,36 +244,231 @@ def _write_json(path: Path, data):
     they interleaved and left the file unparseable, which then read back as {}
     and was saved over. Atomicity removes the torn-file half of that.
     """
-    DATA_DIR.mkdir(exist_ok=True)
-    # One temp file PER CALL. The name used to be <file>.tmp.<pid>, which the
-    # 4 threads of a gunicorn worker share: two concurrent load_inventory()
-    # calls on a rollover day both opened the same temp file, one os.replace
-    # won and the other raised FileNotFoundError (a 500), and the two writers
-    # could interleave into one inode -- the torn write this path exists to
-    # prevent.
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".tmp.")
-    tmp = Path(tmp_name)
+    tmp, sig = _dump_to_temp(path, data)
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        if path.exists():
-            try:
-                shutil.copyfile(path, _backup_path(path))
-            except OSError:
-                pass
+        _keep_backup(path)
         os.replace(tmp, path)
     finally:
         try:
             tmp.unlink()
         except OSError:
             pass
+    _CORRUPT_MAIN.discard(str(path))
+    _fsync_dir(path.parent)
+    _FILE_CACHE[str(path)] = (sig, _copy_out(data))
+
+
+def _quarantine_corrupt(path: Path, bak: Path, exc: Exception) -> None:
+    """A main file would not parse and its .bak did. Move the bad file aside
+    as <name>.corrupt-<UTC ts> (kept for diagnosis), put the .bak's contents
+    in its place, and raise an issue. Only done while holding data_lock and
+    after re-checking under it, so a file another worker has just rewritten
+    is never moved away; if the lock is busy the file is only remembered as
+    corrupt so the next write here will not copy it over the .bak."""
+    _CORRUPT_MAIN.add(str(path))
+    moved = ""
     try:
-        st = path.stat()
-        _FILE_CACHE[str(path)] = ((st.st_mtime_ns, st.st_size), copy.deepcopy(data))
+        with data_lock(blocking=False) as held:
+            if held:
+                try:
+                    with open(path) as f:
+                        json.load(f)
+                    still_bad = False
+                except FileNotFoundError:
+                    still_bad = False
+                except Exception:  # noqa: BLE001
+                    still_bad = True
+                if still_bad:
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    dest = path.with_name("%s.corrupt-%s" % (path.name, ts))
+                    fd, tmp_name = tempfile.mkstemp(
+                        dir=path.parent, prefix=path.name + ".tmp.")
+                    with os.fdopen(fd, "wb") as out, open(bak, "rb") as src:
+                        shutil.copyfileobj(src, out)
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.replace(path, dest)
+                    os.replace(tmp_name, path)
+                    _fsync_dir(path.parent)
+                    moved = dest.name
+                _CORRUPT_MAIN.discard(str(path))
+    except Exception as exc2:  # noqa: BLE001 -- recovery already succeeded
+        print("[data] could not quarantine %s: %s"
+              % (path.name, type(exc2).__name__), file=sys.stderr)
+    _raise_issue_safely(
+        "data-corrupt:%s" % path.name,
+        "%s was unreadable (%s) and was recovered from its backup copy%s. "
+        "Check the most recent changes are still there."
+        % (path.name, type(exc).__name__,
+           "; the bad file was kept as %s" % moved if moved else ""))
+
+
+# ---------------------------------------------------------------------------
+# Multi-file commit
+# ---------------------------------------------------------------------------
+# inventory.json (on-hand) and usage.json (the ledger that explains it) used
+# to be saved as two independent writes. A crash, a deploy or a worker timeout
+# between them left stock that had moved with no ledger row -- or a ledger row
+# for stock that never moved. commit_state() stages every file, records the
+# set in a small journal (data/.txn), then renames them into place; a journal
+# found later (the process died mid-commit) is rolled forward under the lock.
+
+def _journal_path() -> Path:
+    return DATA_DIR / ".txn"
+
+
+def commit_state(files: dict) -> None:
+    """Persist several data files as one unit: {path: data, ...}.
+
+    All temp files are written and fsynced first, so by the time the journal
+    exists every new file is complete on disk; from then on the commit can
+    only go forward. Runs inside data_lock (re-entrant)."""
+    if not files:
+        return
+    with data_lock():
+        staged = []
+        try:
+            for path, data in files.items():
+                tmp, sig = _dump_to_temp(Path(path), data)
+                staged.append((Path(path), data, tmp, sig))
+            journal = _journal_path()
+            jtmp = journal.with_name(".txn.tmp")
+            with open(jtmp, "w") as jf:
+                json.dump({"at": datetime.now(timezone.utc).isoformat(),
+                           "files": [{"dest": p.name, "tmp": t.name,
+                                      "size": sig[1]}
+                                     for p, _d, t, sig in staged]}, jf)
+                jf.flush()
+                os.fsync(jf.fileno())
+            os.replace(jtmp, journal)
+            _fsync_dir(DATA_DIR)
+        except BaseException:
+            for _p, _d, tmp, _s in staged:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            raise
+        for path, data, tmp, sig in staged:
+            _keep_backup(path)
+            os.replace(tmp, path)
+            _CORRUPT_MAIN.discard(str(path))
+            _FILE_CACHE[str(path)] = (sig, _copy_out(data))
+        _fsync_dir(DATA_DIR)
+        try:
+            journal.unlink()
+        except OSError:
+            pass
+        _fsync_dir(DATA_DIR)
+
+
+def _recover_journal() -> str:
+    """Finish (or abandon) a commit a dead process left behind. Called with
+    data_lock held, so a journal seen here cannot belong to a live commit.
+    Returns "", "forward" or "back"."""
+    journal = _journal_path()
+    try:
+        with open(journal) as jf:
+            rec = json.load(jf)
+        entries = [(DATA_DIR / e["dest"], DATA_DIR / e["tmp"], int(e["size"]))
+                   for e in rec["files"]]
+    except FileNotFoundError:
+        return ""
+    except Exception:  # noqa: BLE001 -- a torn journal names nothing usable
+        entries = None
+    outcome = "forward"
+    if entries is None:
+        outcome = "back"
+        entries = []
+    else:
+        # A temp that is gone was already renamed into place. One that is
+        # still here must be the complete file the journal recorded.
+        for _dest, tmp, size in entries:
+            if not tmp.exists():
+                continue
+            try:
+                if tmp.stat().st_size != size:
+                    raise ValueError("size")
+                with open(tmp) as tf:
+                    json.load(tf)
+            except Exception:  # noqa: BLE001
+                outcome = "back"
+                break
+    for dest, tmp, _size in entries:
+        if not tmp.exists():
+            continue
+        try:
+            if outcome == "forward":
+                _keep_backup(dest)
+                os.replace(tmp, dest)
+                _FILE_CACHE.pop(str(dest), None)
+            else:
+                tmp.unlink()
+        except OSError as exc:
+            print("[data] journal recovery: %s: %s" % (dest.name, exc),
+                  file=sys.stderr)
+    try:
+        journal.unlink()
     except OSError:
-        _FILE_CACHE.pop(str(path), None)
+        pass
+    _fsync_dir(DATA_DIR)
+    print("[data] unfinished commit found at start-up; rolled %s" % outcome,
+          file=sys.stderr)
+    if outcome == "back":
+        _raise_issue_safely(
+            "data-commit-rolled-back",
+            "A save was interrupted and could not be completed; the previous "
+            "data was kept. Check the last change made before the restart.")
+    return outcome
+
+
+_BOOT_SWEPT = False
+_ORPHAN_TEMP_MAX_AGE_S = 3600
+
+
+def _reset_boot_state() -> None:
+    """Tests: make the next lock acquisition run the boot-time sweep again."""
+    global _BOOT_SWEPT
+    _BOOT_SWEPT = False
+
+
+def _sweep_orphan_temps(max_age_s: int = _ORPHAN_TEMP_MAX_AGE_S) -> int:
+    """Delete <file>.tmp.* leftovers older than an hour (a writer that was
+    killed between mkstemp and os.replace). Returns how many were removed."""
+    import time as _time
+    cutoff = _time.time() - max_age_s
+    removed = 0
+    try:
+        candidates = list(DATA_DIR.glob("*.tmp.*"))
+    except OSError:
+        return 0
+    for p in candidates:
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        print("[data] removed %d orphaned temp file(s)" % removed,
+              file=sys.stderr)
+    return removed
+
+
+def _on_lock_acquired() -> None:
+    """Housekeeping run each time a thread takes the lock from outside: finish
+    an interrupted commit (one stat when there is none) and, once per
+    process, sweep orphaned temp files. Never raises."""
+    global _BOOT_SWEPT
+    try:
+        if _journal_path().exists():
+            _recover_journal()
+        if not _BOOT_SWEPT:
+            _BOOT_SWEPT = True
+            _sweep_orphan_temps()
+    except Exception as exc:  # noqa: BLE001
+        print("[data] lock housekeeping failed: %s: %s"
+              % (type(exc).__name__, exc), file=sys.stderr)
 
 
 def _save(path: Path, data):
@@ -190,6 +506,7 @@ def data_lock(blocking: bool = True):
     except ImportError:          # Windows desktop GUI -- single process
         _LOCK_STATE.depth = 1
         try:
+            _on_lock_acquired()
             yield True
         finally:
             _LOCK_STATE.depth = 0
@@ -205,6 +522,7 @@ def data_lock(blocking: bool = True):
             return
         _LOCK_STATE.depth = 1
         try:
+            _on_lock_acquired()
             yield True
         finally:
             _LOCK_STATE.depth = 0
@@ -241,9 +559,11 @@ def reconcile_inventory() -> dict:
             usage = _load(USAGE_FILE) if rolled else None
             if rolled:
                 _append_rollover_usage(inv, usage)
-            _save(INVENTORY_FILE, inv)
             if rolled:
-                _save(USAGE_FILE, usage)
+                # On-hand and the ledger rows that explain it land together.
+                commit_state({INVENTORY_FILE: inv, USAGE_FILE: usage})
+            else:
+                _save(INVENTORY_FILE, inv)
     return inv
 
 
@@ -255,15 +575,8 @@ def load_inventory() -> dict:
     return reconcile_inventory()
 
 
-def save_inventory(inv: dict, *, allow_empty: bool = False):
-    """Persist inventory, refusing to replace a populated file with an empty
-    one unless the caller explicitly opts in (seeding, a deliberate reset).
-
-    save_inventory() is where every scan and every ingest ends, so it is what
-    amplified the 2026-09-17 read failure into data loss: once a corrupt read
-    had handed the caller {}, the next scan wrote {} back and the SKUs were
-    gone. An empty inventory is now something a caller has to ask for.
-    """
+def _check_inventory_write(inv: dict, *, allow_empty: bool = False) -> None:
+    """Raise ValueError when `inv` must not replace the stored inventory."""
     if not inv and not allow_empty:
         try:
             existing = _read_json(INVENTORY_FILE, {})
@@ -277,7 +590,31 @@ def save_inventory(inv: dict, *, allow_empty: bool = False):
                 "refusing to overwrite %d SKUs with an empty inventory; pass "
                 "allow_empty=True for a deliberate reset" % len(existing)
             )
+
+
+def save_inventory(inv: dict, *, allow_empty: bool = False):
+    """Persist inventory, refusing to replace a populated file with an empty
+    one unless the caller explicitly opts in (seeding, a deliberate reset).
+
+    save_inventory() is where every scan and every ingest ends, so it is what
+    amplified the 2026-09-17 read failure into data loss: once a corrupt read
+    had handed the caller {}, the next scan wrote {} back and the SKUs were
+    gone. An empty inventory is now something a caller has to ask for.
+    """
+    _check_inventory_write(inv, allow_empty=allow_empty)
     _save(INVENTORY_FILE, inv)
+
+
+def save_inventory_and_usage(inv: dict, usage: list, *,
+                             allow_empty: bool = False):
+    """Persist on-hand and the ledger as ONE commit (see commit_state).
+
+    Use this wherever a change moves stock and writes the ledger row that
+    explains it; save_inventory() followed by save_usage() could be cut in
+    half by a crash or a deploy. Applies the same refusals as the two
+    single-file savers."""
+    _check_inventory_write(inv, allow_empty=allow_empty)
+    commit_state({INVENTORY_FILE: inv, USAGE_FILE: usage})
 
 
 def load_usage() -> list:
@@ -556,16 +893,14 @@ LABOR_FILE = DATA_DIR / "labor.json"
 
 
 def load_labor() -> list:
-    if LABOR_FILE.exists():
-        with open(LABOR_FILE) as f:
-            return json.load(f)
-    return []
+    # Through _read_json / _write_json like every other data file: this used
+    # to be a raw json.load and a truncate-then-write, so a crash mid-save
+    # left a torn labor.json that then failed every Report page load.
+    return _read_json(LABOR_FILE, [])
 
 
 def save_labor(entries: list):
-    DATA_DIR.mkdir(exist_ok=True)
-    with open(LABOR_FILE, "w") as f:
-        json.dump(entries, f, indent=2)
+    _write_json(LABOR_FILE, entries)
 
 
 # Canceled POs — when a distributor cancels an order, we record the PO

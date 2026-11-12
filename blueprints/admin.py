@@ -206,8 +206,8 @@ def api_admin_restore_absorbed_po():
     """
     from core.util import (absorbed_row_live, absorbed_row_qty,
                            count_missed_delivery, naive_local_dt)
-    from inventory_tracker import (load_usage, save_usage, load_po_delivery,
-                                   append_inventory_audit)
+    from inventory_tracker import (load_usage, save_inventory_and_usage,
+                                   load_po_delivery, append_inventory_audit)
     from integrations.po_delivery import norm_po
     body = request.json or {}
     po_number = (body.get("po_number") or "").strip()
@@ -299,8 +299,8 @@ def api_admin_restore_absorbed_po():
                       "new_quantity": old_q + qty, "delta": qty,
                       "po_number": po_number})
     if not dry_run:
-        save_inventory(inv)
-        save_usage(usage)
+        # One commit: the on-hand change and the ledger row that explains it.
+        save_inventory_and_usage(inv, usage)
         try:
             append_inventory_audit(audit)
         except Exception:  # noqa: BLE001 -- audit is best-effort
@@ -334,7 +334,8 @@ def api_admin_absorb_po_into_count():
     delivery (core.util.count_missed_delivery), unless force=true.
     """
     from core.util import count_missed_delivery, naive_local_dt, rollover_row_live
-    from inventory_tracker import load_usage, save_usage, append_inventory_audit
+    from inventory_tracker import (load_usage, save_inventory_and_usage,
+                                   append_inventory_audit)
     body = request.json or {}
     po_number = (body.get("po_number") or "").strip()
     count_at = (body.get("count_at") or "").strip()
@@ -419,8 +420,8 @@ def api_admin_absorb_po_into_count():
                       "new_quantity": old_q - qty, "delta": -qty,
                       "po_number": po_number})
     if not dry_run:
-        save_inventory(inv)
-        save_usage(usage)
+        # One commit: the on-hand change and the ledger row that explains it.
+        save_inventory_and_usage(inv, usage)
         try:
             append_inventory_audit(audit)
         except Exception:  # noqa: BLE001 -- audit is best-effort
