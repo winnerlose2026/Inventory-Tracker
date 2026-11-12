@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, jsonify, request
 
+from core.auth import admin_required, is_admin
 from core.errors import _safe_err
 from core.util import with_data_lock
 from inventory_tracker import load_inventory, save_inventory
@@ -519,6 +520,8 @@ def api_seed():
     body = request.json or {}
     reset = bool(body.get("reset", False))
     snapshot = None
+    if reset and not is_admin():
+        return jsonify({"ok": False, "error": "admin only"}), 403
     if reset:
         # reset=true replaces every SKU -- counts, on-hand, pending POs. It
         # used to need nothing but the flag, and the per-SKU saves that
@@ -567,6 +570,7 @@ _DERIVED_FIELDS = ("on_order_qty", "on_order_next_eta",
 
 
 @admin_bp.route("/api/admin/restore-inventory", methods=["POST"])
+@admin_required
 @with_data_lock
 def api_admin_restore_inventory():
     """Restore inventory from a snapshot taken off /api/inventory.

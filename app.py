@@ -49,11 +49,17 @@ app.register_blueprint(insights_bp)
 # Session config — 30-day signed cookies. SECRET_KEY should come from Render's
 # environment (otherwise sessions reset on every redeploy when the random
 # fallback regenerates).
-app.config["SECRET_KEY"] = (
-    os.environ.get("FLASK_SECRET_KEY")
-    or os.environ.get("SECRET_KEY")
-    or secrets.token_hex(32)
-)
+from core.auth import derive_secret_key  # noqa: E402
+app.config["SECRET_KEY"], _SECRET_KEY_SOURCE = derive_secret_key()
+if _SECRET_KEY_SOURCE not in ("FLASK_SECRET_KEY", "SECRET_KEY"):
+    import sys as _sys
+    print("[auth] WARNING: FLASK_SECRET_KEY is not set; session key source is "
+          "%s. Set FLASK_SECRET_KEY in the Render dashboard (changing it signs "
+          "everyone out once)." % _SECRET_KEY_SOURCE, file=_sys.stderr)
+# Largest request body accepted (ingest payloads with attachments run a few
+# MB). Without a cap one oversized POST could exhaust the worker's memory.
+app.config["MAX_CONTENT_LENGTH"] = int(
+    float(os.environ.get("MAX_UPLOAD_MB") or 25) * 1024 * 1024)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # HTTPS-only cookie in production; on localhost dev we'd lock ourselves out.
@@ -121,6 +127,7 @@ def _cors_preflight(_any):
 from core.auth import (  # noqa: E402
     _user_logged_in, _has_valid_api_token, _is_authenticated, _OPEN_ENDPOINTS,
     DELIVERY_TOKEN_ENDPOINTS, _has_valid_delivery_token,
+    _allowed_users, password_version, scope_allows, token_identity,
 )
 from core.errors import _log_exc, _safe_err  # noqa: E402
 
@@ -150,12 +157,24 @@ def _gate_requests():
         return
     # Everything else -- pages plus /api/* reads and writes -- requires a
     # logged-in session or a valid API token.
-    if _is_authenticated():
+    if _user_logged_in():
+        return
+    ident = token_identity()
+    if ident and "full" in ident[1]:
+        g.auth_token_name = ident[0]
         return
     # The Lineage check's limited token: its few delivery routes only.
     if request.endpoint in DELIVERY_TOKEN_ENDPOINTS and _has_valid_delivery_token():
         g.auth_scope = "delivery"
         return
+    # A named, scoped token (INVENTORY_API_TOKENS): only its own routes.
+    if ident:
+        if scope_allows(ident[1], request.method, request.path):
+            g.auth_token_name = ident[0]
+            g.auth_scope = "+".join(sorted(ident[1]))
+            return
+        return jsonify({"ok": False, "error": "forbidden",
+                        "detail": "this key is not allowed to do that"}), 403
     if request.path.startswith("/api/"):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     # Unauthenticated browser hitting an HTML page -> the login screen,
@@ -181,6 +200,8 @@ def _record_activity(response):
             actor = str(session.get("user") or "user")
         elif getattr(g, "auth_scope", "") == "delivery":
             actor = "Lineage task (delivery key)"
+        elif getattr(g, "auth_token_name", ""):
+            actor = "token:" + str(g.auth_token_name)
         else:
             ua = (request.headers.get("User-Agent") or "").lower()
             actor = ("cron / script" if any(t in ua for t in
@@ -279,10 +300,7 @@ def login():
         # Allowed users come from INVENTORY_USERNAMES (comma-separated) with
         # backward-compat fallback to the legacy single INVENTORY_USERNAME.
         # All comparisons are case-insensitive so "jd" / "JD" / "Jd" all match.
-        users_raw = (os.environ.get("INVENTORY_USERNAMES")
-                     or os.environ.get("INVENTORY_USERNAME", ""))
-        allowed = {u.strip().lower()
-                   for u in users_raw.split(",") if u.strip()}
+        allowed = _allowed_users()
         expected_pass = os.environ.get("INVENTORY_PASSWORD", "")
 
         # Both the user list and password must be set for login to be
@@ -297,6 +315,9 @@ def login():
             # Preserve the casing the user typed so the header chip reads
             # "Jay" / "JD" the way they signed in, not the env-var spelling.
             session["user"] = username
+            # Fingerprint of the password this session was issued under, so a
+            # password change (or removal from the allowlist) ends it.
+            session["pwv"] = password_version()
             return redirect(next_url)
         _login_record_fail(ip)
         error = "Invalid username or password."
@@ -306,8 +327,12 @@ def login():
 
 @app.route("/logout", methods=["GET", "POST"])
 def logout():
-    session.clear()
-    return redirect(url_for("login"))
+    # Only the Sign out button (a POST form) ends the session. A GET used to
+    # as well, so any page could sign a user out with an <img src="/logout">.
+    if request.method == "POST":
+        session.clear()
+        return redirect(url_for("login"))
+    return redirect(url_for("index"))
 
 
 # ---------------------------------------------------------------------------
