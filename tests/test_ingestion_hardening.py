@@ -196,7 +196,9 @@ def test_distributor_body_tag_only_from_hhbagels():
     ext = _report_mail(sender="Someone <someone@gmail.com>", body_text=body, html=False,
                        subject="numbers")
     ev, _, _ = ES.parse_message_with_errors(ext)
-    assert ev and all(e.item.distributor == "Unassigned" for e in ev)
+    # Since 2026-11-12 "# event:" body lines are not applied at all from a
+    # sender that is neither internal nor a known distributor/rep.
+    assert ev == []
     internal = _report_mail(sender="JD <jd@hhbagels.com>", body_text=body, html=False,
                             subject="numbers")
     ev, _, _ = ES.parse_message_with_errors(internal)

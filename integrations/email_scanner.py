@@ -399,29 +399,49 @@ def _msg_event_candidate(m: dict) -> bool:
     Warehouse, Lineage) OR a mapped inventory-report / worksheet rep.
 
     Used by _scan_ms365_mailbox to bound MIME downloads on a wide lookback:
-    only candidates get their full body fetched and parsed. Checks the sender
-    plus every To/Cc recipient, so a distributor PDF riding along on an H&H
-    reply still qualifies. Attachment-agnostic by design, so a DC rep's
+    only candidates get their full body fetched and parsed. Checks the sender,
+    and -- only when the sender is @hhbagels.com -- every To/Cc recipient, so
+    a distributor PDF riding along on an H&H reply still qualifies. Attachment-agnostic by design, so a DC rep's
     body-pasted weekly inventory report (no data attachment -- e.g. Zebulon)
     qualifies exactly like an attachment-bearing PO.
     """
-    addresses = []
     sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "")
-    if sender:
-        addresses.append(sender)
-    for collection in ("toRecipients", "ccRecipients"):
-        for r in (m.get(collection) or []):
-            a = ((r.get("emailAddress") or {}).get("address") or "")
-            if a:
-                addresses.append(a)
+    addresses = [sender] if sender else []
+    # To/Cc only counts on mail WE sent (an H&H reply carrying a distributor
+    # PDF along). From anyone else, addressing or cc'ing a rep used to be
+    # enough to have the message downloaded and its CSV / "# event:" lines
+    # applied (review 2026-11-12).
+    from .rep_map import sender_address as _real
+    if _is_internal_address(_real(sender)):
+        for collection in ("toRecipients", "ccRecipients"):
+            for r in (m.get(collection) or []):
+                a = ((r.get("emailAddress") or {}).get("address") or "")
+                if a:
+                    addresses.append(a)
     for a in addresses:
-        if _distributor_from_sender(a):
-            return True
-        if _report_warehouse_for_sender(a)[1]:
-            return True
-        if _worksheet_warehouse_for_sender(a)[1]:
+        if _sender_is_known_source(a):
             return True
     return False
+
+
+def _sender_is_known_source(from_header: str) -> bool:
+    """A distributor domain or a mapped inventory-report / worksheet rep."""
+    return bool(_distributor_from_sender(from_header)
+                or _report_warehouse_for_sender(from_header)[1]
+                or _worksheet_warehouse_for_sender(from_header)[1])
+
+
+def _sender_may_send_raw_events(from_header: str) -> bool:
+    """May this sender's CSV attachment / "# event:" body lines be applied?
+
+    Those two formats carry no structure of their own -- any CSV with a
+    quantity column, any line "Plain @ Ocala, FL: 480" -- so they are honoured
+    only from @hhbagels.com (hand-keyed corrections, backfills) or from a
+    known distributor / mapped rep address.
+    """
+    from .rep_map import sender_address as _real
+    return bool(_is_internal_address(_real(from_header))
+                or _sender_is_known_source(from_header))
 
 
 # Data-file extensions that could plausibly carry a distributor report or PO.
@@ -1383,8 +1403,17 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
 
     # 2) CSV attachments. Read from memory (no /tmp file) through the
     #    encoding- and ragged-row-tolerant reader; one bad CSV only costs itself.
+    #    Steps 2 and 3 run only for an internal or known-distributor sender
+    #    (see _sender_may_send_raw_events).
+    _raw_ok = _sender_may_send_raw_events(from_hdr)
     for fname, payload in _attachments(msg):
         if not fname.lower().endswith(".csv"):
+            continue
+        if not _raw_ok:
+            errors.append(
+                f"csv {fname!r} ({subject[:80]!r}): ignored -- sender "
+                f"{_real_address(from_hdr) or '?'} is not internal or a "
+                "known distributor/rep")
             continue
         event_type = _infer_event_type_from_filename(fname)
         items = _guarded(errors, f"csv {fname!r}",
@@ -1399,7 +1428,7 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
             ))
 
     # 3) Structured body (only if no attachment produced events or CW POs)
-    if body and not events and not cw_pos:
+    if body and not events and not cw_pos and _raw_ok:
         got = _guarded(errors, "body tag lines", _parse_body_items,
                        body, distributor, "on_hand")
         event_type, _, items = got if got else ("on_hand", "", [])
