@@ -2896,6 +2896,10 @@ function _deliveryStatusHtml(d) {
   const who = (d.last_event && d.last_event.sender) ? d.last_event.sender : '';
   const tip = escAttr(q ? `"${q}" (${who})` : `${d.carrier || 'Lineage'} delivery tracking`);
   const st = 'font-size:11px;white-space:normal;line-height:1.3;cursor:help';
+  if (d.status === 'delivered' && d.delivered_date_estimated) {
+    // Confirmed with no delivery date: dated to the confirmation email (the latest it can have arrived)
+    return `<div title="${tip}" style="${st};color:var(--green);font-weight:600">&#10003; Delivered by ${formatDate(d.delivered_local)} (confirmed &middot; no delivery date given)</div>`;
+  }
   if (d.status === 'delivered') {
     return `<div title="${tip}" style="${st};color:var(--green);font-weight:600">&#10003; Delivered ${formatDate(d.delivered_local)}${_deliveryTime(d.delivered_local)} (confirmed)</div>`;
   }

@@ -96,6 +96,13 @@ def collect_samples(tracking: dict, po_meta: dict, freight_idx: dict,
         if not meta.get("warehouse"):
             excluded.append({**base, "reason": "PO not in the ledger"})
             continue
+        from integrations.po_delivery import delivered_date_estimated
+        if delivered_date_estimated(rec):
+            # "9314683Y-delivered": arrived, but dated to the day the email
+            # was sent -- the latest it could have landed, not a transit sample
+            excluded.append({**base, "reason": "delivery date not given (dated to "
+                                               "the confirmation email)"})
+            continue
         if dd is None or sd is None:
             excluded.append({**base, "reason": "no ship date"})
             continue

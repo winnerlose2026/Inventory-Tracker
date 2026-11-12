@@ -763,10 +763,17 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
     one per held PO, from the oldest plain confirmation (Lineage or the DC,
     after the PO was sent) that names that PO -- on its line, in the message,
     or by answering an H&H message that asked about it alone. Each is then
-    verified and applied exactly like one the task posts."""
+    verified and applied exactly like one the task posts.
+
+    A confirmation that says no day ("9314683Y-delivered") and has no passed
+    appointment to fall back on still marks the PO arrived, dated to the day
+    it was sent (po_delivery.delivered_by_sent_day, flagged estimated). A PO
+    delivered on such an estimate stays readable here, so the first later
+    message that states the day corrects it. Lines that state a day go first."""
     from integrations.po_delivery import (
         HOLD_STATUSES, apply_event, confirmation_lines, delivered_at_from,
-        dock_zone, names_po, own_text, parse_dt, sender_may_report,
+        delivered_by_sent_day, delivered_date_estimated, dock_zone, names_po,
+        own_text, parse_dt, sender_may_report, states_a_day, wall_time,
     )
     threads = cache.get("threads") or {}
     by_conv: dict = {}
@@ -774,8 +781,11 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
         by_conv.setdefault(m.get("conversation_id") or "", []).append({**m, "_id": mid})
     events = []
     for key, rec in tracking.items():
-        if rec.get("status") not in HOLD_STATUSES or rec.get("closed_reason"):
+        correcting = delivered_date_estimated(rec)
+        if ((rec.get("status") not in HOLD_STATUSES and not correcting)
+                or rec.get("closed_reason")):
             continue
+        estimate_day = wall_time(rec.get("delivered_at") or "")[:10] if correcting else ""
         req = parse_dt(rec.get("requested_at") or "")
         lr = ledger.get(key) or {}
         zone = dock_zone((rec.get("request") or {}).get("address", ""),
@@ -804,15 +814,26 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                         continue
                     at = delivered_at_from(line, m.get("sent") or "", zone,
                                            rec.get("delivery_appt") or "")
-                    if at is None:
+                    stated = states_a_day(line)
+                    estimated = False
+                    if at is None and not stated:
+                        day = delivered_by_sent_day(m.get("sent") or "", zone)
+                        at, estimated = ((day, False), True) if day else (None, False)
+                    if at is None or (estimated and correcting):
                         continue
-                    cands.append((sent, not at[1], {
-                        "po_number": rec.get("po_number") or key, "event": "delivered",
-                        "delivered_at": at[0], "time_known": at[1], "source": "server",
-                        "evidence": {"message_id": m["_id"], "sender": m.get("from"),
-                                     "sent": m.get("sent"), "quote": line}}))
-        # oldest message first; within it, a line with a time before one without
-        for _sent, _no_time, ev in sorted(cands, key=lambda c: (c[0], c[1])):
+                    if correcting and at[0][:10] > estimate_day:
+                        continue      # it had arrived by the estimate: never later
+                    ev = {"po_number": rec.get("po_number") or key, "event": "delivered",
+                          "delivered_at": at[0], "time_known": at[1], "source": "server",
+                          "evidence": {"message_id": m["_id"], "sender": m.get("from"),
+                                       "sent": m.get("sent"), "quote": line}}
+                    if estimated:
+                        ev["date_estimated"] = True
+                    cands.append((not stated, sent, not at[1], ev))
+        # a line that states the day first; then the oldest message (an
+        # undated "delivered" is dated by it: the earliest is the tightest);
+        # within a message, a line with a time before one without
+        for _undated, _sent, _no_time, ev in sorted(cands, key=lambda c: (c[0], c[1], c[2])):
             ev2, why = _verify_evidence(ev, key, cache)
             if why:
                 continue

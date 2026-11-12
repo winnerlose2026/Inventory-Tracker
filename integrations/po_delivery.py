@@ -324,6 +324,7 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     old = {k: rec.get(k, "") for k in
            ("status", "delivery_appt", "pickup_at", "delivered_at", "confirmation_no",
             "delivered_time_known")}
+    old["delivered_date_estimated"] = delivered_date_estimated(rec)
 
     if kind == "picked_up" and not rec_in:
         return rec_in, None, ("PO isn't tracked yet -- a pickup is recorded on a PO "
@@ -401,6 +402,12 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
                 and not ev.get("force")):
             return rec, None, ("an operator reopened this PO after that confirmation "
                                "-- only a newer message can confirm it again")
+        # A date estimated from the confirmation's send day (delivered_by_sent_day)
+        # marks a PO arrived; it never moves the date of one already confirmed.
+        estimated = bool(ev.get("date_estimated"))
+        if estimated and rec_in and rec_in.get("status") == "delivered":
+            return rec, None, ("already confirmed delivered -- a confirmation with no "
+                               "delivery date doesn't move its date")
         # The date posted must be a date the quote states (when it states
         # any): the evidence check proves the line exists, not that the event
         # carries its date.
@@ -421,9 +428,11 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
         rec["status"] = "delivered"
         rec["delivered_at"] = str(ev["delivered_at"]).strip()
         rec["delivered_time_known"] = bool(tk) and bool(
-            re.search(r"T\d{2}:\d{2}", rec["delivered_at"]))
+            re.search(r"T\d{2}:\d{2}", rec["delivered_at"])) and not estimated
+        rec["delivered_date_estimated"] = estimated     # a stated date clears it
 
     new = {k: rec.get(k, "") for k in old}
+    new["delivered_date_estimated"] = delivered_date_estimated(rec)
     entry = {"event": kind, "at": now.isoformat(), **{k: new[k] for k in new
              if new[k] != old[k]}, "evidence": evid}
     if ev.get("source"):
@@ -823,6 +832,7 @@ def summary(rec: dict, now: datetime) -> dict:
         "delivered_local": delivered_local(rec),
         "delivered_time_known": (delivered_time_known(rec)
                                  if rec.get("delivered_at") else None),
+        "delivered_date_estimated": delivered_date_estimated(rec),
         "closed_reason": rec.get("closed_reason") or "",
         "confirmation_no": rec.get("confirmation_no") or "",
         "awaiting_confirmation": awaiting_confirmation(rec, now),
@@ -1013,6 +1023,52 @@ def delivered_at_from(line: str, sent: str, zone: str,
     if local > sent_local + DELIVERED_FUTURE_SLACK:
         return None
     return local.isoformat(timespec="seconds"), True
+
+
+def states_a_day(line: str) -> bool:
+    """Does a confirmation line say WHEN it delivered (a date, "today",
+    "yesterday")? "9314683Y-delivered" doesn't."""
+    part = delivery_part(line) or line or ""
+    return bool(quote_dates(part)) or bool(
+        re.search(r"\b(?:today|yesterday)\b", part, re.I))
+
+
+def delivered_by_sent_day(sent: str, zone: str) -> Optional[str]:
+    """For a confirmation that gives no delivery day and has no passed
+    appointment to fall back on: the day (dock zone) the confirmation was
+    sent -- the LATEST the PO can have arrived. The record is flagged
+    delivered_date_estimated.
+
+    JD 11/12: "it's more important that it's marked as arrived than getting
+    the exact arrival date correct, which can always be corrected later."
+    Before this, Belinda's "9314683Y-delivered" (Chicago, no appointment ever
+    booked) left the PO held in Pending with nothing left to chase.
+
+    Late, not early: a count taken before the truck could have arrived must
+    never look like it already holds the PO (it would swallow the receipt).
+    A later message that states the day replaces it (_server_confirmations),
+    and the Freight tab doesn't learn transit from it (lead_times)."""
+    from zoneinfo import ZoneInfo
+    sent_dt = parse_dt(sent)
+    if sent_dt is None:
+        return None
+    return sent_dt.astimezone(ZoneInfo(zone)).strftime("%Y-%m-%d")
+
+
+def delivered_date_estimated(rec: dict) -> bool:
+    """Is the record's delivery DAY an estimate (delivered_by_sent_day) rather
+    than one Lineage / the DC stated? The stored flag wins. A record confirmed
+    before the flag existed is read off its quote (no migration), like
+    delivered_time_known: no day stated and no appointment to have dated it
+    -- 9314683Y, posted by hand 11/12 off "9314683Y-delivered"."""
+    rec = rec or {}
+    if rec.get("status") != "delivered" or not rec.get("delivered_at"):
+        return False
+    flag = rec.get("delivered_date_estimated")
+    if isinstance(flag, bool):
+        return flag
+    q = _last_delivered_quote(rec)
+    return bool(q) and not states_a_day(q) and not rec.get("delivery_appt")
 
 
 # ---------------------------------------------------------------------------
