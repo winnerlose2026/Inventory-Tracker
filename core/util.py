@@ -137,17 +137,91 @@ def naive_local_dt(raw):
     return dt
 
 
-def receipt_inside_count(row: dict, count_at: str, arrival_day: str) -> bool:
+def _dock_tz(warehouse: str):
+    """ZoneInfo of a warehouse's receiving dock, or None when the warehouse is
+    unknown (callers then keep the stamp's own calendar day)."""
+    if not str(warehouse or "").strip():
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        from integrations.po_delivery import dock_zone
+        return ZoneInfo(dock_zone(warehouse))
+    except Exception:  # noqa: BLE001 -- no tz database: fall back to the stamp
+        return None
+
+
+def dock_local_day(stamp, warehouse: str = "") -> str:
+    """The calendar day (YYYY-MM-DD) of an ISO stamp AT THE WAREHOUSE'S DOCK.
+
+    Counts are stamped from an email's sent time in UTC and the server clock
+    is UTC, but a delivery's arrival day is the day the dock wrote down. A
+    Houston count sent Mon 6:15 pm CST is "Tuesday" in UTC, and comparing
+    that with a Tuesday delivery called the delivery already counted (168 cs
+    dropped). This gives the day both sides mean.
+
+      * a bare date, or a naive stamp at exactly 00:00 -> the date as written
+        (it already IS a local date: a report's as-of date, an ETA);
+      * a tz-aware stamp -> that instant in the dock's zone;
+      * a naive stamp with a time -> read as server-local (the data files'
+        convention, see naive_local_dt) and converted to the dock's zone;
+      * no warehouse / unparseable -> the stamp's first 10 characters.
+    """
+    from datetime import datetime
+    s = str(stamp or "").strip()
+    if not s:
+        return ""
+    if "T" not in s and " " not in s:
+        return s[:10]
+    tz = _dock_tz(warehouse)
+    if tz is None:
+        return s[:10]
+    t = s[:-1] + "+00:00" if s[-1:] in ("Z", "z") else s
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return s[:10]
+    if dt.tzinfo is None:
+        if (dt.hour, dt.minute, dt.second, dt.microsecond) == (0, 0, 0, 0):
+            return s[:10]
+        dt = dt.astimezone()            # naive = server-local
+    return dt.astimezone(tz).strftime("%Y-%m-%d")
+
+
+def dock_midnight_naive(day, warehouse: str = ""):
+    """Naive server-local datetime of 00:00 AT THE DOCK on ``day`` (a date or
+    a datetime whose date is used). A date-only arrival used to fire at 00:00
+    UTC -- 6-8 pm the evening BEFORE at the dock. Unknown warehouse -> the
+    day's own 00:00 (the old behaviour)."""
+    from datetime import datetime
+    base = datetime(day.year, day.month, day.day)
+    tz = _dock_tz(warehouse)
+    if tz is None:
+        return base
+    return base.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
+
+
+def receipt_inside_count(row: dict, count_at: str, arrival_day: str,
+                         warehouse: str = "") -> bool:
     """Is this receipt row already inside the count stamped ``count_at``?
 
     ``arrival_day`` is the row's arrival date (YYYY-MM-DD), resolved by the
     caller (sync_inventory._rollover_arrival handles legacy rows). An empty
     ``count_at`` means never counted -> False.
+
+    The count's DAY is taken at the warehouse's dock (``warehouse``, else the
+    row's own ``warehouse``) -- see dock_local_day. With no warehouse known
+    the stamp's own date is used, as before.
     """
     count_at = str(count_at or "")
-    cd = count_at[:10]
+    wh = warehouse or (row.get("warehouse") or "")
+    cd = dock_local_day(count_at, wh)
     if not cd or not arrival_day:
         return False
+    # A confirmed delivery with a real time is stored as a naive server-local
+    # instant; its DAY for the by-day fallback below is the dock's.
+    if (wh and row.get("delivery_confirmed")
+            and row.get("delivery_time_known") is not False):
+        arrival_day = dock_local_day(row.get("arrival_date") or "", wh) or arrival_day
     nic = row.get("not_in_count_at") or ""
     if nic:
         c, n = naive_local_dt(count_at), naive_local_dt(nic)

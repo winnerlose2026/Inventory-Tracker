@@ -81,6 +81,13 @@ def _is_open(ledger_rec, trk) -> bool:
     from integrations.po_delivery import HOLD_STATUSES
     if _closed_reason(ledger_rec):
         return False
+    # The ledger says ARRIVED only when nothing of the PO is still pending
+    # (an operator marked it arrived, or it was absorbed into a count). A
+    # tracking record nobody ever confirmed used to keep such a PO "open",
+    # and Lineage kept getting "can you confirm it delivered" about stock
+    # already on the shelf.
+    if (ledger_rec.get("status") or "") == "arrived":
+        return False
     if trk and trk.get("status") in HOLD_STATUSES:
         return True
     return (ledger_rec.get("status") or "") not in ("arrived", "canceled", "cancelled")
@@ -180,10 +187,44 @@ def api_delivery_list():
         except Exception:  # noqa: BLE001
             labels_status = {}
         return jsonify({"ok": True, "count": len(out), "pos": out,
+                        "needs_human": [r["po_number"] for r in out
+                                        if r.get("needs_human")],
+                        **_sync_report(now),
                         "mailbox_labels": labels_status})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-list")
         return jsonify({"ok": False, "error": _safe_err(exc), "pos": []}), 200
+
+
+def _load_thread_cache() -> dict:
+    """The thread cache, or {} when it can't be read. It is a MIRROR of the
+    mailbox (rebuilt by every sync), so an unreadable copy is discarded
+    rather than failing the sync that would replace it."""
+    from inventory_tracker import load_po_delivery_threads
+    try:
+        cache = load_po_delivery_threads()
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "delivery thread cache unreadable -- starting empty")
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def _sync_report(now) -> dict:
+    """What the last sync-threads left for people to see: how old it is, its
+    errors, the PO numbers on Quote and Schedule threads that the tracker
+    never booked (the lost-PO detector) and the ones requested from Lineage
+    although the ledger already says arrived."""
+    from integrations.po_delivery import parse_dt
+    cache = _load_thread_cache()
+    synced = parse_dt(cache.get("synced_at") or "")
+    return {
+        "synced_at": cache.get("synced_at") or "",
+        "synced_age_minutes": (round((now - synced).total_seconds() / 60.0, 1)
+                               if synced else None),
+        "sync_errors": list(cache.get("errors") or []),
+        "not_in_tracker": list(cache.get("not_in_tracker") or []),
+        "requested_but_arrived": list(cache.get("requested_but_arrived") or []),
+    }
 
 
 def _is_evidence_subject(subject: str) -> bool:
@@ -192,6 +233,9 @@ def _is_evidence_subject(subject: str) -> bool:
     s = (subject or "").lower()
     return ("delivery" in s and THREAD_SUBJECT.lower() not in s
             and bool(_re.search(r"\bpo\b|po#|h&h", s)))
+
+
+_MAX_THREAD_PAGES = 6
 
 
 def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
@@ -219,7 +263,14 @@ def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
                "sentDateTime,from,toRecipients,ccRecipients,internetMessageId,"
                "uniqueBody,categories")
         pages = 0
-        while url and pages < 6:
+        while url:
+            if pages >= _MAX_THREAD_PAGES:
+                # More mail than we read. Silently stopping here hid replies;
+                # as an error it marks the read partial (which already blocks
+                # follow-ups, see send-followups).
+                errors.append(f"{user}: list: truncated after {pages} pages x 100 "
+                              f"messages for {subject!r} -- older messages not read")
+                break
             pages += 1
             try:
                 page = _graph_json(url, token, {
@@ -297,12 +348,13 @@ def api_delivery_sync_threads():
             # What this read saw -- the events route checks quotes against it and
             # send-followups replies off it. A mirror of the mailbox, not tracker
             # state, so it is refreshed even on a dry run.
-            cache = load_po_delivery_threads() or {}
+            cache = _load_thread_cache()
             cutoff = now - timedelta(days=MESSAGE_CACHE_DAYS)
             cached_msgs = {k: v for k, v in (cache.get("messages") or {}).items()
                            if (parse_dt(v.get("sent") or "") or now) >= cutoff}
             cache_threads = {}
             threads, registered, not_in_tracker = [], [], []
+            untracked, requested_arrived = {}, {}
             for conv, ms in convs.items():
                 ms.sort(key=lambda m: m["sent"])
                 for m in ms:
@@ -334,10 +386,25 @@ def api_delivery_sync_threads():
                 for blk in requested:
                     key = norm_po(blk["po_number"])
                     lr, trk = ledger.get(key), tracking.get(key)
+                    _seen = {"po_number": blk["po_number"], "conversation_id": conv,
+                             "subject": ms[0]["subject"],
+                             "request_sent": blk.get("request_sent") or "",
+                             "address": blk.get("address", ""),
+                             "quantity": blk.get("quantity", "")}
                     if lr is None and trk is None:
                         not_in_tracker.append(blk["po_number"])
+                        untracked[key] = _seen
                         continue
                     if not _is_open(lr, trk):
+                        # Sent to Lineage, never confirmed -- yet the ledger
+                        # already says arrived: it rolled in on a date, or a
+                        # count absorbed it, with no delivery on record.
+                        if ((trk is None or trk.get("status") in ("requested", "scheduled"))
+                                and lr is not None
+                                and (lr.get("status") or "") == "arrived"):
+                            requested_arrived[key] = {
+                                **_seen, "arrival_date": lr.get("arrival_date") or "",
+                                "arrival_kind": lr.get("arrival_kind") or ""}
                         continue
                     if trk is None:
                         rec, change, err = apply_event(None, {
@@ -417,7 +484,13 @@ def api_delivery_sync_threads():
             # off it: a reply in the mailbox we couldn't read might answer the ask.
             new_cache = {"synced_at": now.isoformat(), "lookback_days": lookback,
                          "errors": list(errors), "messages": cached_msgs,
-                         "threads": cache_threads}
+                         "threads": cache_threads,
+                         # Kept for GET /api/pos/delivery and po_health: these
+                         # used to be computed here and dropped.
+                         "not_in_tracker": sorted(untracked.values(),
+                                                  key=lambda u: u["po_number"]),
+                         "requested_but_arrived": sorted(
+                             requested_arrived.values(), key=lambda u: u["po_number"])}
             # Which PO(s) each message is about (mailbox labels) and the
             # Lineage / DC dates no PO could be matched to (Pending tab).
             try:
@@ -455,7 +528,13 @@ def api_delivery_sync_threads():
                         if rk in fresh:
                             op["tracking"] = summary(fresh[rk], now)
             threads.sort(key=lambda t: t["messages"][-1]["sent"], reverse=True)
+            _record_sync(True, f"{len(threads)} open thread(s), {len(registered)} "
+                               f"registered, {len(untracked)} not in tracker"
+                               + (f"; PARTIAL read: {errors[0]}" if errors else ""),
+                         partial=bool(errors), synced_at=now.isoformat())
             return jsonify({"ok": True, "lookback_days": lookback, "dry_run": dry_run,
+                            "synced_at": now.isoformat(),
+                            "requested_but_arrived": sorted(requested_arrived),
                             "confirmed_by_server": confirmed,
                             "rescheduled_by_server": rescheduled,
                             "threads": threads, "registered": registered,
@@ -467,7 +546,32 @@ def api_delivery_sync_threads():
                             "errors": errors})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-sync-threads")
-        return jsonify({"ok": False, "error": _safe_err(exc), "threads": []}), 200
+        # 500, not 200: the scheduler and the follow-up cron only look at the
+        # HTTP status, and a sync that failed every 20 minutes looked healthy.
+        _record_sync(False, _safe_err(exc))
+        return jsonify({"ok": False, "error": _safe_err(exc), "threads": [],
+                        **_safe_sync_age()}), 500
+
+
+def _record_feed(feed: str, ok: bool, detail: str, **extra) -> None:
+    try:
+        from core import feed_health
+        feed_health.record(feed, ok, detail, **extra)
+    except Exception:  # noqa: BLE001 -- health must never break the job
+        pass
+
+
+def _record_sync(ok: bool, detail: str, **extra) -> None:
+    _record_feed("delivery-sync", ok, detail, **extra)
+
+
+def _safe_sync_age() -> dict:
+    try:
+        rep = _sync_report(_now())
+        return {"synced_at": rep["synced_at"],
+                "synced_age_minutes": rep["synced_age_minutes"]}
+    except Exception:  # noqa: BLE001
+        return {"synced_at": "", "synced_age_minutes": None}
 
 
 def _answers_only(msg: dict, po_key: str, pos_on_thread: list, cache: dict) -> bool:
@@ -1098,10 +1202,14 @@ def api_delivery_send_followups():
             cache = load_po_delivery_threads() or {}
             synced = parse_dt(cache.get("synced_at") or "")
             if synced is None or now - synced > SYNC_FRESH_FOR:
+                _record_feed("lineage-followups", False,
+                             "refused: threads not synced recently")
                 return jsonify({"ok": False, "error": "threads not synced in the last "
                                 f"{int(SYNC_FRESH_FOR.total_seconds() // 60)} min -- "
                                 "run sync-threads first", "emails": []}), 200
             if cache.get("errors"):
+                _record_feed("lineage-followups", False,
+                             "refused: the last sync was a partial read")
                 return jsonify({"ok": False, "error": "the last sync couldn't read every "
                                 "mailbox; not following up off a partial read",
                                 "sync_errors": cache["errors"], "emails": []}), 200
@@ -1240,6 +1348,12 @@ def api_delivery_send_followups():
             out["send_state"] = "sent"
             out["sent"] = True
             emails.append(out)
+        _n_sent = sum(1 for e in emails if e.get("sent"))
+        _n_err = sum(1 for e in emails if e.get("error"))
+        if not dry_run:
+            _record_feed("lineage-followups", _n_err == 0 and not no_thread,
+                         f"sent {_n_sent}, {_n_err} failed, "
+                         f"{len(no_thread)} due with no thread", sent=_n_sent)
         return jsonify({"ok": True, "dry_run": dry_run,
                         "synced_at": cache.get("synced_at"),
                         "emails": emails,
@@ -1251,4 +1365,5 @@ def api_delivery_send_followups():
                         "due_without_thread": no_thread})
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "delivery-send-followups")
+        _record_feed("lineage-followups", False, _safe_err(exc))
         return jsonify({"ok": False, "error": _safe_err(exc), "emails": []}), 200

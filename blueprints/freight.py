@@ -123,13 +123,11 @@ def api_freight_ingest():
     if not isinstance(raw, list):
         return jsonify({"ok": False, "error": "invoices must be a list"}), 400
 
-    existing = load_freight_invoices()
-    by_inv = {str(r.get("invoice_number") or ""): r for r in existing if r.get("invoice_number")}
-
     added = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    accepted: list = []
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for idx, rec in enumerate(raw):
@@ -155,26 +153,16 @@ def api_freight_ingest():
         # Stamp ingest source + time
         rec.setdefault("source", source)
         rec["ingested_at"] = rec.get("ingested_at") or now
+        accepted.append(rec)
 
-        if inv_no in by_inv:
-            by_inv[inv_no] = rec
-            updated += 1
-        else:
-            by_inv[inv_no] = rec
-            added += 1
-
-    if not dry_run:
-        merged = sorted(by_inv.values(),
-                        key=lambda x: (x.get("ship_date") or "",
-                                       x.get("invoice_number") or ""))
-        try:
-            save_freight_invoices(merged)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({
-                "ok": False,
-                "error": _safe_err(exc, "save"),
-                "traceback": "",
-            }), 500
+    try:
+        added, updated, total_after = _merge_freight_invoices(accepted, dry_run)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False,
+            "error": _safe_err(exc, "save"),
+            "traceback": "",
+        }), 500
 
     ship_dates = {}
     if not dry_run and (added or updated):
@@ -191,7 +179,7 @@ def api_freight_ingest():
             "added": added,
             "updated": updated,
             "skipped": skipped,
-            "total_after": len(by_inv),
+            "total_after": total_after,
             "errors": errors,
             "ship_dates_stamped": ship_dates.get("stamped", 0),
         },
@@ -494,6 +482,7 @@ def api_freight_scan():
                 list_url = page.get("@odata.nextLink")
     except urllib.error.HTTPError as exc:
         _log_exc(exc, "freight graph")
+        _record_freight_scan(False, f"graph error: {_safe_err(exc)}")
         return jsonify({
             "ok": False,
             "error": "internal error (graph)",
@@ -501,6 +490,7 @@ def api_freight_scan():
         }), 200
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "freight scan")
+        _record_freight_scan(False, _safe_err(exc))
         return jsonify({
             "ok": False,
             "error": "internal error",
@@ -508,10 +498,7 @@ def api_freight_scan():
         }), 200
 
     # Merge into freight_invoices.json
-    existing = load_freight_invoices()
-    by_inv = {str(r.get("invoice_number") or ""): r
-              for r in existing if r.get("invoice_number")}
-    added = updated = 0
+    accepted = []
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     for rec in parsed_invoices:
         ino = str(rec.get("invoice_number") or "").strip()
@@ -526,19 +513,22 @@ def api_freight_scan():
         rec["cost_per_pallet"] = round(t / pl, 2) if pl else 0
         rec["cost_per_case"]   = round(t / cs, 4) if cs else 0
         rec["ingested_at"]     = rec.get("ingested_at") or now
-        if ino in by_inv:
-            by_inv[ino] = rec; updated += 1
-        else:
-            by_inv[ino] = rec; added += 1
+        accepted.append(rec)
+    try:
+        added, updated, total_after = _merge_freight_invoices(accepted, dry_run)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "freight merge")
+        _record_freight_scan(False, f"save failed: {_safe_err(exc)}")
+        return jsonify({"ok": False, "error": "internal error (save)",
+                        "errors": errors}), 500
     if not dry_run:
-        merged = sorted(by_inv.values(),
-                        key=lambda x: (x.get("ship_date") or "",
-                                       x.get("invoice_number") or ""))
-        save_freight_invoices(merged)
         try:
             apply_freight_ship_dates()
         except Exception as exc:  # noqa: BLE001
             _log_exc(exc, "freight apply ship dates")
+        _record_freight_scan(
+            True, f"{len(parsed_invoices)} parsed, {added} added, {updated} "
+                  f"updated, {len(errors)} error(s)", invoices_total=total_after)
 
     # Trim domain_seen to top 25 for log readability
     top_domains = dict(sorted(domain_seen.items(), key=lambda x: -x[1])[:25])
@@ -552,7 +542,7 @@ def api_freight_scan():
             "invoices_parsed":  len(parsed_invoices),
             "invoices_added":   added,
             "invoices_updated": updated,
-            "total_after":      len(by_inv),
+            "total_after":      total_after,
             "errors":           errors[:50],
             "error_count":      len(errors),
             "top_sender_domains": top_domains,
@@ -738,6 +728,33 @@ def rederive_estimated_arrivals(dry_run: bool = False, model: dict = None) -> di
                 save_inventory(inv)
             if cw_changed:
                 save_chefs_warehouse_pos(cw)
+            if changes:
+                # Moving an arrival moves WHEN the PO is credited to on-hand;
+                # it used to happen with no trace anywhere.
+                try:
+                    from inventory_tracker import append_inventory_audit
+                    ts = now.isoformat(timespec="seconds")
+                    seen_a = set()
+                    rows = []
+                    for c in changes:
+                        k = (c["po_number"], c["where"])
+                        if k in seen_a:
+                            continue
+                        seen_a.add(k)
+                        rows.append({
+                            "ts": ts, "source": "rederive-estimated-arrivals",
+                            "event_type": "arrival_rederived",
+                            "name": f"PO {c['po_number']}",
+                            "warehouse": c["warehouse"], "po_number": c["po_number"],
+                            "old_quantity": None, "new_quantity": None, "delta": 0,
+                            "old_arrival": c["old_arrival"],
+                            "new_arrival": c["new_arrival"],
+                            "ship_date": c["ship_date"],
+                            "transit_days": c["transit_days"], "basis": c["basis"],
+                            "where": c["where"]})
+                    append_inventory_audit(rows)
+                except Exception as exc:  # noqa: BLE001 -- audit is best-effort
+                    _log_exc(exc, "rederive audit")
     # One line per PO (an inventory PO has a row per SKU).
     seen, per_po = set(), []
     for c in changes:
@@ -761,13 +778,109 @@ def api_freight_apply_ship_dates():
         return jsonify({"ok": False, "error": _safe_err(exc)}), 500
 
 
+_FREIGHT_KEEP_IF_BLANK = ("ship_date", "po_number")
+
+
+def _merge_freight_invoices(records: list, dry_run: bool) -> tuple:
+    """Merge validated invoice dicts into freight_invoices.json by invoice
+    number, under the data lock. Returns (added, updated, total_after).
+
+    The load -> merge -> save used to run with no lock: a scan and an ingest
+    (or two workers) interleaving lost one side's invoices. And a re-read
+    that failed to parse a field REPLACED the good record: a blank ship_date
+    or po_number on the new copy now keeps the stored value.
+    """
+    from inventory_tracker import (data_lock, load_freight_invoices,
+                                   save_freight_invoices)
+    added = updated = 0
+    with data_lock():
+        existing = load_freight_invoices()
+        by_inv = {str(r.get("invoice_number") or ""): r
+                  for r in existing if r.get("invoice_number")}
+        for rec in records:
+            ino = str(rec.get("invoice_number") or "").strip()
+            if not ino:
+                continue
+            old = by_inv.get(ino)
+            if old is not None:
+                for fld in _FREIGHT_KEEP_IF_BLANK:
+                    if not str(rec.get(fld) or "").strip() and str(old.get(fld) or "").strip():
+                        rec[fld] = old[fld]
+                        rec.setdefault("kept_from_prior", [])
+                        if fld not in rec["kept_from_prior"]:
+                            rec["kept_from_prior"].append(fld)
+                updated += 1
+            else:
+                added += 1
+            by_inv[ino] = rec
+        if not dry_run and records:
+            merged = sorted(by_inv.values(),
+                            key=lambda x: (x.get("ship_date") or "",
+                                           x.get("invoice_number") or ""))
+            save_freight_invoices(merged)
+        return added, updated, len(by_inv)
+
+
+def _record_freight_scan(ok: bool, detail: str, **extra) -> None:
+    try:
+        from core import feed_health
+        feed_health.record("freight-scan", ok, detail, **extra)
+    except Exception:  # noqa: BLE001 -- health must never break the scan
+        pass
+
+
+def _dist_family(name: str) -> str:
+    n = str(name or "").lower()
+    for fam, needles in (("usf", ("us foods", "usf", "u.s. foods")),
+                         ("cheney", ("cheney",)), ("cw", ("chef",))):
+        if any(x in n for x in needles):
+            return fam
+    return ""
+
+
+def _tracker_po_distributors() -> dict:
+    """{normalised PO key: distributor family} for every PO the tracker knows
+    (pending rows, arrived rows, the CW store). Raw file reads -- no rollover."""
+    import inventory_tracker as it
+    out: dict = {}
+    try:
+        inv = it._read_json(it.INVENTORY_FILE, {})
+        for item in inv.values():
+            fam = _dist_family(item.get("distributor"))
+            for e in (item.get("on_order") or []):
+                k = _norm_po_key(e.get("po_number") or "")
+                if k and fam:
+                    out.setdefault(k, fam)
+        for e in it._read_json(it.USAGE_FILE, []):
+            if (e.get("source") or "") not in ("on_order_rollover", "on_order_absorbed"):
+                continue
+            k = _norm_po_key(e.get("po_number") or "")
+            fam = _dist_family((inv.get(e.get("item_key") or "") or {}).get("distributor"))
+            if k and fam:
+                out.setdefault(k, fam)
+        for r in it.load_chefs_warehouse_pos() or []:
+            k = _norm_po_key(r.get("po_number") or "")
+            if k:
+                out.setdefault(k, "cw")
+    except Exception as exc:  # noqa: BLE001 -- auxiliary: no ref matches then
+        _log_exc(exc, "freight ref distributors")
+    return out
+
+
 def _freight_ship_date_index() -> dict:
-    """Map normalized PO/order/shipper-ref key -> earliest freight ship_date.
+    """Map normalized PO key -> earliest freight ship_date.
 
     Built from data/freight_invoices.json. When several invoices reference
     the same PO (split shipments), the earliest non-empty ship_date wins —
     that's when the order actually left the origin DC. Freight is auxiliary,
     so any load failure yields an empty index rather than an error.
+
+    Keyed by the invoice's PO NUMBER. order_number / shipper_ref used to be
+    indexed too, always: a Lineage order number that happened to equal
+    another customer's PO number stamped that PO "shipped" (and ship+transit
+    then rolled it into on-hand). They are used only when the invoice has NO
+    PO number, and only for a PO the tracker holds for the same distributor
+    as the invoice's consignee.
     """
     try:
         from inventory_tracker import load_freight_invoices
@@ -775,17 +888,32 @@ def _freight_ship_date_index() -> dict:
     except Exception:  # noqa: BLE001
         return {}
     idx: dict = {}
+    tracker = None
+
+    def _put(key, sd):
+        prev = idx.get(key)
+        if prev is None or sd < prev:
+            idx[key] = sd
+
     for inv in invoices or []:
         sd = (inv.get("ship_date") or "").strip()
         if not sd:
             continue
-        for fld in ("po_number", "order_number", "shipper_ref"):
-            key = _norm_po_key(inv.get(fld) or "")
-            if not key:
+        key = _norm_po_key(inv.get("po_number") or "")
+        if key:
+            _put(key, sd)
+            continue
+        fam = _dist_family(inv.get("distributor")) or _dist_family(inv.get("consignee_name"))
+        if not fam:
+            continue
+        for fld in ("order_number", "shipper_ref"):
+            ref = _norm_po_key(inv.get(fld) or "")
+            if not ref:
                 continue
-            prev = idx.get(key)
-            if prev is None or sd < prev:
-                idx[key] = sd
+            if tracker is None:
+                tracker = _tracker_po_distributors()
+            if tracker.get(ref) == fam:
+                _put(ref, sd)
     return idx
 
 

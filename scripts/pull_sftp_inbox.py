@@ -42,6 +42,8 @@ def main() -> int:
             "files_skipped": r.files_skipped,
             "files_ingested": r.files_ingested,
             "files_failed": r.files_failed,
+            "files_deferred": getattr(r, "files_deferred", 0),
+            "deferred": getattr(r, "deferred", []),
             "errors": r.errors,
             "server_reports": r.server_reports,
         }

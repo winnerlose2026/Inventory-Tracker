@@ -1256,6 +1256,32 @@ def _delivery_gate(entry: dict, tracking: dict):
     return "none", None
 
 
+def _lineage_hold_check(entry: dict, tracking: dict, tracking_ok: bool) -> str:
+    """Keep the ``lineage_hold`` stamp on a pending entry honest, and say
+    whether the entry must stay pending because its hold can't be verified.
+
+    "stamp" -- tracked and held, not yet stamped;  "clear" -- stamped but
+    Lineage tracking released the PO;  "hold" -- stamped (or carrying an
+    arrival Lineage wrote) and its tracking record is unavailable;  "" -- no
+    action. An operator-confirmed arrival always wins (see _delivery_gate).
+    """
+    if ((entry.get("arrival_source") or "") == "operator"
+            and entry.get("arrival_confirmed")):
+        return ""
+    from integrations.po_delivery import HOLD_STATUSES, norm_po
+    flagged = bool(entry.get("lineage_hold")) or str(
+        entry.get("arrival_source") or "").startswith("lineage")
+    rec = tracking.get(norm_po(entry.get("po_number") or "")) if tracking_ok else None
+    if rec is None:
+        return "hold" if flagged else ""
+    st = rec.get("status") or ""
+    if st in HOLD_STATUSES:
+        return "" if entry.get("lineage_hold") else "stamp"
+    if st == "released" and entry.get("lineage_hold"):
+        return "clear"
+    return ""
+
+
 def _delivery_time_known(entry: dict, tracking: dict) -> bool:
     """Did Lineage / the DC state the delivery TIME of this entry's PO?"""
     from integrations.po_delivery import delivered_time_known, norm_po
@@ -1379,7 +1405,8 @@ def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
     still showed all 1,120 cs on order and 404 cs on hand; the day rule
     zeroed the receipt and the PO vanished from the ledger.
     """
-    from core.util import CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery
+    from core.util import (CONFIRMED_DELIVERY_WINDOW_HOURS, count_missed_delivery,
+                           dock_local_day as _dock_local_day)
     missed: dict = {}
     groups: dict = {}
     for key, item in inv.items():
@@ -1393,7 +1420,11 @@ def _counts_that_missed_deliveries(inv: dict, tracking: dict, now) -> dict:
             gate, delivered_at = _delivery_gate(entry, tracking)
             if gate != "delivered" or delivered_at is None or delivered_at > now:
                 continue
-            if delivered_at.date().isoformat() > count_at[:10]:
+            _wh = item.get("warehouse") or ""
+            _d_day = (_dock_local_day(delivered_at.isoformat(), _wh)
+                      if _delivery_time_known(entry, tracking)
+                      else delivered_at.date().isoformat())
+            if _d_day > _dock_local_day(count_at, _wh):
                 continue            # arrives after the count by day anyway
             po = entry.get("po_number") or ""
             # Exact-time rule only for a REAL delivery time; a date-only
@@ -1442,10 +1473,19 @@ def _rollover_on_order(inv: dict) -> bool:
     _PENDING_ROLLOVER_ABSORBED = stage["absorbed"]
     now = datetime.now()
     changed = False
+    # tracking_ok False = the Lineage tracking file could not be read. The
+    # hold used to FAIL OPEN: tracking became {} and every held PO fell back
+    # to its date trigger and rolled into stock. Rows known to be under a
+    # Lineage hold (lineage_hold, stamped below / at registration, or an
+    # arrival_source Lineage wrote) now stay pending until it reads again.
+    tracking_ok = True
     try:
         tracking = load_po_delivery()
+        if not isinstance(tracking, dict):
+            raise TypeError("po_delivery.json is not an object")
     except Exception:  # noqa: BLE001 -- a bad tracking file must not stop reads
         tracking = {}
+        tracking_ok = False
     try:
         missed = _counts_that_missed_deliveries(inv, tracking, now) if tracking else {}
     except Exception:  # noqa: BLE001 -- fall back to the plain day rule
@@ -1454,7 +1494,8 @@ def _rollover_on_order(inv: dict) -> bool:
         overrides = load_status_overrides() or {}
     except Exception:  # noqa: BLE001 -- a bad overrides file must not stop reads
         overrides = {}
-    from core.util import NOT_ARRIVED_STATUSES, _norm_po_key
+    from core.util import (NOT_ARRIVED_STATUSES, _norm_po_key, dock_local_day,
+                           dock_midnight_naive)
     rolled_pos: set = set()
     for key, item in inv.items():
         pending = item.get("on_order") or []
@@ -1464,6 +1505,19 @@ def _rollover_on_order(inv: dict) -> bool:
         for entry in pending:
             trigger = _rollover_trigger(entry)
             gate, delivered_at = _delivery_gate(entry, tracking)
+            _hold = _lineage_hold_check(entry, tracking, tracking_ok)
+            if _hold == "stamp":
+                entry["lineage_hold"] = True
+                changed = True
+            elif _hold == "clear":
+                entry.pop("lineage_hold", None)
+                changed = True
+            elif _hold == "hold":
+                # Under a Lineage hold but its tracking record can't be read
+                # (file unreadable, or the record is gone): stay pending.
+                # integrations.po_health raises the issue.
+                kept.append(entry)
+                continue
             if gate == "hold":
                 # Sent to Lineage, not yet confirmed delivered: stays pending
                 # whatever its dates say.
@@ -1497,7 +1551,17 @@ def _rollover_on_order(inv: dict) -> bool:
                 # can correct it (typically via /api/on-order/ship-date).
                 kept.append(entry)
                 continue
-            if trigger > now:
+            # The day the dock means, and the moment it starts there. A
+            # date-only trigger (an ETA, a ship-date arrival, a date-only
+            # Lineage confirmation) used to fire at 00:00 SERVER time (UTC):
+            # 6-8 pm the evening before at the dock.
+            _wh = item.get("warehouse") or ""
+            _exact = (gate == "delivered" and delivered_at is not None
+                      and _delivery_time_known(entry, tracking))
+            _date_only = (not _exact and (trigger.hour, trigger.minute,
+                                          trigger.second) == (0, 0, 0))
+            fire_at = dock_midnight_naive(trigger, _wh) if _date_only else trigger
+            if fire_at > now:
                 kept.append(entry)
                 continue
             qty = float(entry.get("qty") or 0)
@@ -1515,9 +1579,14 @@ def _rollover_on_order(inv: dict) -> bool:
             # re-booked with a back-dated ETA: the 2026-08-28 Alcoa re-apply
             # of PO 2055126H posted an ETA of 08-14 that promoted instantly,
             # on top of a count taken 08-24 that already contained it.
-            count_date = (item.get("last_count_at") or "")[:10]
+            # Both days are the DOCK's: a count's stamp is UTC, so a Monday
+            # 6:15 pm CST count reads "Tuesday" and used to absorb a PO that
+            # arrived Tuesday (Houston, 168 cs).
+            count_date = dock_local_day(item.get("last_count_at") or "", _wh)
+            arrival_day = (dock_local_day(trigger.isoformat(), _wh) if _exact
+                           else trigger.date().isoformat())
             miss = missed.get((entry.get("po_number") or "", key))
-            if (count_date and trigger.date().isoformat() <= count_date
+            if (count_date and arrival_day <= count_date
                     and miss is None):
                 rolled_pos.add(_norm_po_key(entry.get("po_number") or ""))
                 _PENDING_ROLLOVER_ABSORBED.append({
@@ -1645,15 +1714,47 @@ def _rebase_ordered_at_from_subject(inv: dict) -> bool:
 
 def _collapse_revision_dupes(inv: dict) -> bool:
     """When the same SKU has multiple pending entries for the same
-    ``po_number`` but different ``po_revision``, keep only the highest
-    revision. The supersede logic in sync_inventory normally handles
+    ``po_number`` but different ``po_revision``, keep only the NEWEST
+    document's. The supersede logic in sync_inventory normally handles
     this at apply time, but legacy data can still carry pre-supersede
     entries (e.g. revision 0000001 + 0000002 of the same line both
     sitting pending). Returns True if anything changed.
 
+    "Newest" is decided by integrations.po_revision.is_newer -- the source
+    email's received time, an internal forward never beating the vendor's
+    copy, the numeric revision only as a tie-break -- the same rule the
+    apply path uses. This used to be "highest revision number, any
+    non-numeric token (REPRINT) highest of all": exactly the ordering
+    po_revision was written to replace (US Foods re-numbers DOWNWARD when a
+    buyer re-cuts a PO, and a REPRINT can be a stale snapshot).
+
     Same SKU + same PO + same revision but different qty (legit
     separate lines on a single PO with repeats) are preserved.
     """
+    from integrations.po_revision import is_newer
+    _REPRINT_SENTINEL = 10_000_000
+
+    def _legacy_rev(e):
+        s = str(e.get("po_revision") or "").strip()
+        if not s:
+            return 0
+        try:
+            return int(s.lstrip("0") or "0")
+        except (TypeError, ValueError):
+            return _REPRINT_SENTINEL
+
+    def _newer_doc(e, best):
+        # Rows from before source_received_at existed carry no date at all;
+        # between two of those the old rule stands (numeric revision, a
+        # non-numeric token such as REPRINT last) -- there is nothing better
+        # to order them by, and it is how such rows have always collapsed.
+        if not (e.get("source_received_at") or best.get("source_received_at")):
+            return _legacy_rev(e) > _legacy_rev(best)
+        return is_newer(e.get("po_revision"), e.get("source_received_at"),
+                        best.get("po_revision"), best.get("source_received_at"),
+                        e.get("source_sender") or "",
+                        best.get("source_sender") or "")
+
     changed = False
     for key, item in inv.items():
         pending = item.get("on_order") or []
@@ -1663,33 +1764,31 @@ def _collapse_revision_dupes(inv: dict) -> bool:
         for entry in pending:
             by_po.setdefault(entry.get("po_number") or "", []).append(entry)
         kept = []
+        item_changed = False
         for po, entries in by_po.items():
             if len(entries) < 2 or not po:
                 kept.extend(entries)
                 continue
-            # Map po_revision -> integer using the same precedence as
-            # sync_inventory._po_rev_int: numeric strings -> their int,
-            # non-numeric tokens like "REPRINT" -> a large sentinel so
-            # they always supersede prior numbered revisions (matches
-            # USF's actual issuing semantics).
-            _REPRINT_SENTINEL = 10_000_000
-            def _rev_int(e):
-                s = str(e.get("po_revision") or "").strip()
-                if not s:
-                    return 0
-                try:
-                    return int(s.lstrip("0") or "0")
-                except (TypeError, ValueError):
-                    return _REPRINT_SENTINEL
-            max_rev = max(_rev_int(e) for e in entries)
-            survivors = [e for e in entries if _rev_int(e) == max_rev]
-            dropped = len(entries) - len(survivors)
-            if dropped:
-                changed = True
+            revs = {str(e.get("po_revision") or "").strip() for e in entries}
+            if len(revs) < 2:
+                kept.extend(entries)
+                continue
+            best = entries[0]
+            for e in entries[1:]:
+                if _newer_doc(e, best):
+                    best = e
+            win = str(best.get("po_revision") or "").strip()
+            survivors = [e for e in entries
+                         if str(e.get("po_revision") or "").strip() == win]
+            if len(survivors) != len(entries):
+                item_changed = True
             kept.extend(survivors)
-        if changed:
+        # Per ITEM: one SKU's collapse used to make every later SKU's
+        # on_order list get re-sorted and rewritten too.
+        if item_changed:
             kept.sort(key=lambda e: (e.get("ordered_at") or ""))
             item["on_order"] = kept
+            changed = True
     return changed
 
 

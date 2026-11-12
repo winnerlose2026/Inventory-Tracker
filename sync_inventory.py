@@ -94,7 +94,8 @@ def _rollover_arrival(e: dict) -> str:
     return m.group(1) if m else (e.get("timestamp") or "")[:10]
 
 
-def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
+def _receipts_after_count(usage: list, item_key: str, count_date: str,
+                          warehouse: str = "") -> float:
     """Cases received for this SKU whose ARRIVAL postdates ``count_date``.
 
     A reported on-hand figure is the truth at the moment it was counted -- it
@@ -125,7 +126,8 @@ def _receipts_after_count(usage: list, item_key: str, count_date: str) -> float:
             continue
         # By day, refined for confirmed deliveries (exact time, and a count
         # proven to have missed the receipt) -- core.util.receipt_inside_count.
-        if not receipt_inside_count(e, count_date, _rollover_arrival(e)):
+        if not receipt_inside_count(e, count_date, _rollover_arrival(e),
+                                    warehouse=warehouse):
             total += abs(float(e.get("amount") or 0))
     return total
 
@@ -209,7 +211,8 @@ _POST_COUNT_MOVEMENT_SOURCES = ("forecast-daily", "manual-use", "manual-restock"
                                 "manual-correction")
 
 
-def _movement_after_count(usage: list, item_key: str, count_date: str) -> float:
+def _movement_after_count(usage: list, item_key: str, count_date: str,
+                          warehouse: str = "") -> float:
     """Net cases consumed for this SKU by movements dated AFTER ``count_date``
     (positive = consumed; a manual restock counts negative).
 
@@ -221,7 +224,10 @@ def _movement_after_count(usage: list, item_key: str, count_date: str) -> float:
     +0.45 forecast-daily at 05:05 and -0.45 "Email on-hand sync" at 10:12,
     three days running -- on-hand never moved between weekly counts.
     """
-    cd = (count_date or "")[:10]
+    # The count's day AT THE DOCK (a Monday-evening count is stamped Tuesday
+    # in UTC and used to reset Tuesday's burn). Rows carry their own day.
+    from core.util import dock_local_day
+    cd = dock_local_day(count_date or "", warehouse)
     if not cd or not item_key:
         return 0.0
     total = 0.0
@@ -528,11 +534,14 @@ def _reverse_po_entries(po_number: str, new_rev: str, active_indices: list[int],
         # same reason _receipts_after_count is: a wide-lookback backfill
         # posts long-past arrivals "now". Same-day counts as absorbed.
         if item is not None:
-            _count_date = (item.get("last_count_at") or "")[:10]
+            from core.util import (dock_local_day as _dld,
+                                   receipt_inside_count as _inside)
+            _wh = item.get("warehouse") or ""
+            _count_date = _dld(item.get("last_count_at") or "", _wh)
             _arrival = _rollover_arrival(entry)
-            from core.util import receipt_inside_count as _inside
             if _count_date and _arrival and _inside(
-                    entry, item.get("last_count_at") or "", _arrival):
+                    entry, item.get("last_count_at") or "", _arrival,
+                    warehouse=_wh):
                 report.setdefault("reversals_absorbed", []).append(
                     f"PO {po_number} rev {new_rev_tag}: kept "
                     f"{abs(float(entry.get('amount') or 0)):g} cs of "
@@ -1100,8 +1109,10 @@ def _apply_email_event(evt, inv: dict, usage: list, now: str,
         # dated after it, so they are not reset either. Derived from the
         # reported count plus recorded ledger rows, so re-applying the same
         # report lands on the same number.
-        _receipts = _receipts_after_count(usage, key, _evt_cd)
-        _moved = _movement_after_count(usage, key, _evt_cd)
+        _receipts = _receipts_after_count(usage, key, _evt_cd,
+                                          warehouse=item.get("warehouse") or "")
+        _moved = _movement_after_count(usage, key, _evt_cd,
+                                       warehouse=item.get("warehouse") or "")
         _target_qty = amount + _receipts - _moved
         qty_changed = abs(_target_qty - old_qty) >= 1e-9
         # Record that a fresh count was received for this warehouse today,
@@ -1252,8 +1263,17 @@ def _apply_cw_pos(cw_pos: list,
     except Exception:
         canceled = {}
 
+    # Same normalised match every other canceled-PO check uses (an exact
+    # string compare let "HHB-1226111" / " 1226111." back in).
+    from core.util import _norm_po_key
+    canceled_keys = {_norm_po_key(k) for k in (canceled or {})}
+    from integrations.po_revision import is_newer as _doc_is_newer
+    from integrations.chefs_warehouse_po_parser import record_integrity_errors
+
     lead_days = _po_lead_days()
     now_iso = datetime.now().isoformat()
+    report.setdefault("skipped_stale", 0)
+    report.setdefault("needs_review", [])
 
     def _parse_cw_date(s: str):
         """Accept MM-DD-YYYY or YYYY-MM-DD."""
@@ -1273,7 +1293,7 @@ def _apply_cw_pos(cw_pos: list,
         if not po_num:
             report["skipped_invalid"] += 1
             continue
-        if po_num in canceled:
+        if _norm_po_key(po_num) in canceled_keys:
             report["skipped_canceled"] += 1
             continue
 
@@ -1289,6 +1309,27 @@ def _apply_cw_pos(cw_pos: list,
         eta = ""
 
         existing_rec = by_po.get(po_num)
+        # Document ordering. Graph lists the mailbox newest first and every
+        # record used to overwrite the one before it, so the OLDEST copy of a
+        # re-sent PO in the scan window won every scan. A stored copy that is
+        # strictly newer than the incoming one is kept; a stored record with
+        # no stamp (everything saved before 2026-11) counts as oldest, and
+        # two undated copies keep the old last-writer-wins behaviour.
+        if existing_rec is not None and existing_rec.get("source_received_at"):
+            from integrations.po_revision import parse_dt as _pdt
+            _ex_at = _pdt(existing_rec.get("source_received_at"))
+            _in_at = _pdt(record.get("source_received_at") or "")
+            _same_doc = _ex_at is not None and _ex_at == _in_at
+            if not _same_doc and not _doc_is_newer(
+                    record.get("po_revision"),
+                    record.get("source_received_at") or "",
+                    existing_rec.get("po_revision"),
+                    existing_rec.get("source_received_at") or "",
+                    record.get("source_sender") or "",
+                    existing_rec.get("source_sender") or ""):
+                report["skipped_stale"] += 1
+                report["unchanged"] += 1
+                continue
         # Preserve operator-set fields on re-ingest: ship_date,
         # arrival_date, and the ingested_at of the first booking.
         ship_date    = ""
@@ -1317,6 +1358,17 @@ def _apply_cw_pos(cw_pos: list,
             "last_synced":  now_iso,
             "last_synced_from": source,
         }
+        # Lines that don't add up to the PDF's Total USD, a line with no
+        # quantity, a non-H&H item: keep the record (it is what was read) but
+        # say so, instead of quietly booking short.
+        _review = record_integrity_errors(normalized)
+        normalized["needs_review"] = bool(_review)
+        normalized["integrity_errors"] = _review
+        if _review:
+            report["needs_review"].append(f"PO {po_num}: " + "; ".join(_review))
+            if not dry_run:
+                from integrations.po_health import flag_cw_review
+                flag_cw_review(po_num, _review)
 
         if existing_rec is None:
             report["added"] += 1
@@ -1678,7 +1730,9 @@ def _apply_events(events: list,
                     report["unmatched"].append(
                         evt.item.name or f"{evt.item.variety}@{evt.item.warehouse}")
                     continue
-                count_date = (item.get("last_count_at") or "")[:10]
+                from core.util import dock_local_day as _dld2
+                count_date = _dld2(item.get("last_count_at") or "",
+                                   item.get("warehouse") or "")
                 qty = float(evt.item.quantity or 0)
                 if _arrival and count_date and _arrival <= count_date:
                     report.setdefault("gained_absorbed", []).append(

@@ -625,6 +625,9 @@ def _usfoods_po_to_events(pdf_bytes, distributor, msg_id, subject,
         errors.append(f"usfoods PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
+    from .po_health import po_integrity_gate as _gate
+    if _bad := _gate("usfoods", po, subject):   # lines != printed TOTALS: hold
+        return events, errors + [_bad]
     if po.unmapped_items:
         errors.append(
             f"usfoods PO {po.po_number or '?'}: unmapped USF item #s "
@@ -727,6 +730,9 @@ def _cheney_po_to_events(pdf_bytes, distributor, msg_id, subject,
         errors.append(f"cheney PO PDF parse failed ({subject!r}) -- see server log")
         return events, errors
 
+    from .po_health import po_integrity_gate as _gate
+    if _bad := _gate("cheney", po, subject):    # unreadable item rows: hold
+        return events, errors + [_bad]
     if po.unmapped_items:
         errors.append(
             f"cheney PO {po.po_number or '?'}: unmapped Mfg# codes "
@@ -1206,6 +1212,9 @@ def parse_message_with_errors(msg, sender_address: Optional[str] = None):
             if got:
                 record, d_errs = got
                 if record is not None:
+                    # document identity, so an older copy can't replace a newer
+                    record.setdefault("source_received_at", received_at or "")
+                    record.setdefault("source_sender", from_hdr or "")
                     cw_pos.append(record)
                 errors.extend(d_errs)
         else:

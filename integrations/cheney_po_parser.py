@@ -117,6 +117,12 @@ class CheneyPO:
     lines: list = field(default_factory=list)
     unmapped_items: list = field(default_factory=list)  # mfg codes not in HH_MFG_CODE_TO_VARIETY
     warnings: list = field(default_factory=list)        # resolved, but worth a look
+    # Non-empty when the PDF shows item rows the parser could not read, or a
+    # row whose qty x unit price is not its printed net amount: the PO must
+    # NOT be booked (it would book short) -- see check_integrity.
+    integrity_error: str = ""
+    net_amount_total: Optional[float] = None   # sum of printed line net amounts
+    printed_total: Optional[float] = None      # "Total ..." line, where printed
 
     @property
     def total_cases(self) -> float:
@@ -159,18 +165,50 @@ _SHIP_BLOCK_RE = re.compile(
 # price/unit-price-UM/net-amount triple ("... 40 CS 26.50 CS 1060.00").
 # Both layouts are accepted; the price columns are captured but not used
 # downstream (CHENEY_CASE_COST is applied per line regardless).
+# Since 2026-11 the head no longer needs exactly-two leading spaces or the
+# exact brand spelling ("H & H", "H&H", "H AND H BAGELS", or none): a row that
+# did not match used to be skipped without a word.
 _LINE_HEAD_RE = re.compile(
-    r"^\s{2,}(?P<pos>\d+)\s+"
+    r"^\s*(?P<pos>\d+)\s+"
     r"(?P<cheney>\d{6,10})\s+"
     r"(?P<desc>.+?)\s+"
-    r"(?P<brand>H\s*&\s*H)\s+"
-    r"(?P<pack>\d{3}/\d+)\s+"
+    r"(?:(?P<brand>H\s*(?:&|AND)?\s*H(?:\s+BAGELS?)?)\s+)?"
+    r"(?P<pack>\d{1,3}/\d+)\s+"
     r"(?P<pack_um>[A-Z]{2,4})\s+"
     r"(?P<qty>[\d,.]+)\s+"
     r"(?P<qty_um>[A-Z]{2,4})"
-    r"(?:\s+[\d,.]+\s+[A-Z]{2,4}\s+[\d,.]+)?"
-    r"\s*$"
+    r"(?:\s+(?P<price>[\d,.]+)\s+[A-Z]{2,4}\s+(?P<net>[\d,.]+))?"
+    r"\s*$",
+    re.IGNORECASE,
 )
+# Anything that LOOKS like an item row (position + Cheney catalog number +
+# text), read or not.
+_ITEM_ROW_RE = re.compile(
+    r"^\s*\d{1,4}\s+\d{6,10}\s+[A-Za-z].*?\s\d{1,3}/\d+\s")   # ... a pack size too
+_TOTAL_RE = re.compile(
+    r"^\s*(?:Grand\s+)?Total(?:\s+(?:net\s+)?(?:value|amount))?[^\d\n]*?"
+    r"(?P<total>[\d,]+\.\d{2})\s*(?:USD)?\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _f(s) -> Optional[float]:
+    try:
+        return float(str(s).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def check_integrity(po: "CheneyPO", text: str, unread_rows: list,
+                    bad_math: list) -> str:
+    """Why this parse must not be booked, or ""."""
+    if unread_rows:
+        return (f"{len(unread_rows)} item row(s) on the PDF could not be read: "
+                + "; ".join(r.strip()[:60] for r in unread_rows[:3]))
+    if bad_math:
+        return "quantity x unit price is not the printed net amount on " \
+               + "; ".join(bad_math[:3])
+    if po.po_number and not po.lines:
+        return "PO header found but no line items could be read"
+    return ""
 
 # Mfg# line follows the head line (may have trailing GTIN#).
 _MFG_RE = re.compile(r"Mfg#\s+(?P<mfg>\S+)(?:\s+GTIN#:\s*(?P<gtin>\S*))?")
@@ -225,10 +263,22 @@ def parse_po_text(text: str) -> CheneyPO:
     # Line items: iterate lines, on each head match, look ahead up to 3 lines
     # for a Mfg# anchor (usually the next line).
     lines = text.splitlines()
+    unread_rows: list = []
+    bad_math: list = []
+    net_sum, net_seen = 0.0, 0
     for idx, raw in enumerate(lines):
         head = _LINE_HEAD_RE.match(raw)
         if not head:
+            if _ITEM_ROW_RE.match(raw):
+                unread_rows.append(raw)
             continue
+        _q, _p, _n = _f(head.group("qty")), _f(head.group("price")), _f(head.group("net"))
+        if _n is not None:
+            net_sum += _n
+            net_seen += 1
+            if _q is not None and _p is not None and abs(_q * _p - _n) > 0.011:
+                bad_math.append(f"line {head.group('pos')} "
+                                f"({_q:g} x {_p:.2f} != {_n:.2f})")
         mfg_code, gtin = "", ""
         for j in range(idx + 1, min(idx + 4, len(lines))):
             if _LINE_HEAD_RE.match(lines[j]):
@@ -259,9 +309,9 @@ def parse_po_text(text: str) -> CheneyPO:
             description  = head.group("desc").strip(),
             brand        = "H & H",
             pack         = head.group("pack"),
-            pack_um      = head.group("pack_um"),
+            pack_um      = head.group("pack_um").upper(),
             quantity     = float(head.group("qty").replace(",", "")),
-            quantity_um  = head.group("qty_um"),
+            quantity_um  = head.group("qty_um").upper(),
             mfg_code     = mfg_code,
             gtin         = gtin,
             case_size    = _case_size_from_pack(head.group("pack")),
@@ -288,6 +338,19 @@ def parse_po_text(text: str) -> CheneyPO:
                 mfg_code or f"{head.group('cheney')}:{line.description}")
         po.lines.append(line)
 
+    if net_seen and net_seen == len(po.lines):
+        po.net_amount_total = round(net_sum, 2)
+        totals = [_f(m.group("total")) for m in _TOTAL_RE.finditer(text)]
+        totals = [t for t in totals if t is not None]
+        if totals:
+            po.printed_total = totals[-1]
+            if abs(totals[-1] - net_sum) > 0.011:
+                # Not a hard stop: the total line's wording varies by facility
+                # and may include freight. Surfaced as a scan warning.
+                po.warnings.append(
+                    f"line net amounts add up to {net_sum:,.2f} but the PDF "
+                    f"prints a total of {totals[-1]:,.2f} -- check the PO.")
+    po.integrity_error = check_integrity(po, text, unread_rows, bad_math)
     return po
 
 

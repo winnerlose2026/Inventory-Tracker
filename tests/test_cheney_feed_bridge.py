@@ -180,6 +180,7 @@ def test_order_guides_are_never_posted_to_the_on_hand_endpoint():
     assert sum(1 for n in files if n.startswith("OrderGuide")) == 2, files.keys()
     rc, posts, conn = _run(files, ["--commit"])
     assert rc == 0
+    posts = [p for p in posts if "/api/ingest/cheney-inventory-csv" in p[0]]
     assert posts == [], f"order guide reached the on-hand endpoint: {posts}"
     print("ok: zeroed order guides are reported, never POSTed as on-hand")
 
@@ -210,6 +211,7 @@ def test_a_genuine_on_hand_csv_does_get_posted():
     files = {ON_HAND_EXAMPLE.name: ON_HAND_EXAMPLE}
     rc, posts, conn = _run(files, ["--commit"])
     assert rc == 0
+    posts = [p for p in posts if "/api/ingest/cheney-inventory-csv" in p[0]]
     assert len(posts) == 1, posts
     assert "dry_run=0" in posts[0][0] and ON_HAND_EXAMPLE.name in posts[0][0]
     print("ok: a real headed on-hand CSV is POSTed to the tracker")

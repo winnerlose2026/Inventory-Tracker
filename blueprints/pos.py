@@ -119,6 +119,34 @@ def _booked_eta(entry: dict, distributor: str) -> str:
     return (anchor + timedelta(days=lead)).isoformat()
 
 
+SHIP_DATE_MAX_PAST_DAYS = 60
+SHIP_DATE_MAX_FUTURE_DAYS = 180
+
+
+def _implausible_dates(ship_dt, arrival_dt, now=None) -> str:
+    """Why an operator-typed ship / arrival date looks like a typo, or "".
+    A wrong year (2025 for 2026) or a swapped pair silently moves stock: a
+    ship date far in the past derives an arrival in the past and the PO rolls
+    into on-hand on the next read. ``force`` on the request skips this."""
+    from datetime import timedelta
+    now = now or datetime.now()
+    for label, dt in (("ship_date", ship_dt), ("arrival_date", arrival_dt)):
+        if dt is None:
+            continue
+        if dt < now - timedelta(days=SHIP_DATE_MAX_PAST_DAYS):
+            return (f"{label} {dt.date().isoformat()} is more than "
+                    f"{SHIP_DATE_MAX_PAST_DAYS} days in the past -- check the "
+                    "year; send force=true if it is right")
+        if dt > now + timedelta(days=SHIP_DATE_MAX_FUTURE_DAYS):
+            return (f"{label} {dt.date().isoformat()} is more than "
+                    f"{SHIP_DATE_MAX_FUTURE_DAYS} days in the future -- check "
+                    "the year; send force=true if it is right")
+    if ship_dt is not None and arrival_dt is not None and arrival_dt.date() < ship_dt.date():
+        return (f"arrival_date {arrival_dt.date().isoformat()} is before ship_date "
+                f"{ship_dt.date().isoformat()}; send force=true if it is right")
+    return ""
+
+
 @pos_bp.route("/api/on-order/ship-date", methods=["POST"])
 @with_data_lock
 def api_on_order_ship_date():
@@ -187,6 +215,12 @@ def api_on_order_ship_date():
                     "error": "arrival_date must be ISO 8601 (YYYY-MM-DD or full datetime)",
                 }), 400
             arrival_explicit = True
+        if not body.get("force"):
+            why = _implausible_dates(
+                ship_dt, _naive_dt(arrival_iso) if arrival_explicit else None)
+            if why:
+                return jsonify({"ok": False, "error": why,
+                                "needs_force": True}), 400
 
     # No explicit arrival: estimate it from this location's learned transit
     # (integrations/lead_times.py) instead of a flat 7 days.
@@ -209,7 +243,9 @@ def api_on_order_ship_date():
             continue
         pending = item.get("on_order") or []
         for entry in pending:
-            if (entry.get("po_number") or "") != po_number:
+            # Normalised, like every other PO match ("hhb-7500000o" used to
+            # update nothing and still answer ok).
+            if _norm_po_key(entry.get("po_number") or "") != _norm_po_key(po_number):
                 continue
             entry["ship_date"] = ship_iso
             if ship_iso:
@@ -250,6 +286,13 @@ def api_on_order_ship_date():
             updated += 1
             if item.get("name") not in touched_items:
                 touched_items.append(item.get("name") or key)
+    if not updated:
+        # Nothing matched: saying ok with entries_updated 0 read as "saved".
+        return jsonify({"ok": False, "po_number": po_number, "entries_updated": 0,
+                        "error": f"no pending lines found for PO {po_number}"
+                                 + (f" on {item_key}" if item_key else "")
+                                 + " -- it may have arrived already (use Adjust) "
+                                   "or the number is wrong"}), 404
     save_inventory(inv)
     return jsonify({
         "ok": True,
@@ -282,7 +325,8 @@ def _rollover_still_in_onhand(row: dict, item: dict) -> bool:
     count_at = item.get("last_count_at") or ""
     if not count_at[:10]:
         return True          # never counted -> the rollover is all on-hand has
-    return not receipt_inside_count(row, count_at, _rollover_arrival(row))
+    return not receipt_inside_count(row, count_at, _rollover_arrival(row),
+                                    warehouse=item.get("warehouse") or "")
 
 
 def _future_iso(raw: str, now: datetime) -> str:
@@ -325,6 +369,7 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
     restored = 0
     removed_cs = 0.0
     new_rows, lines = [], []
+    warnings: list = []
     model = None
     for e in usage:
         absorbed = include_absorbed and absorbed_row_live(e)
@@ -346,9 +391,16 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
         # rollover, on-hand already excludes these cases and subtracting would
         # remove them twice. See _rollover_still_in_onhand.
         still_in_onhand = (not absorbed) and _rollover_still_in_onhand(e, item)
+        taken = 0.0
         if still_in_onhand:
-            item["quantity"] = max(0.0, float(item.get("quantity") or 0) - qty)
-            removed_cs += qty
+            # On-hand can't go below zero, so what actually comes out may be
+            # less than the PO line. The audit row used to record the FULL
+            # quantity, and the ledger then no longer added up to on-hand.
+            before_q = float(item.get("quantity") or 0)
+            item["quantity"] = max(0.0, before_q - qty)
+            taken = round(before_q - item["quantity"], 4)
+            removed_cs += taken
+        clamped = still_in_onhand and taken + 1e-9 < qty
         item["updated"] = now_iso
         entry = {
             "qty":          qty,
@@ -406,9 +458,15 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
         new_rows.append({
             "item_key":   ik,
             "item_name":  e.get("item_name") or item.get("name") or ik,
-            "amount":     qty if still_in_onhand else 0.0,
+            "amount":     taken if still_in_onhand else 0.0,
+            **({"clamped_at_zero": True, "requested_amount": qty,
+                "warning": (f"only {taken:g} of {qty:g} cs were on hand to take "
+                            f"back -- on-hand stopped at 0; reconcile this SKU")}
+               if clamped else {}),
             "unit":       e.get("unit") or item.get("unit") or "",
-            "note":       ((f"{label} -- un-rolled from Arrived")
+            "note":       ((f"{label} -- un-rolled from Arrived"
+                            + (f" (only {taken:g} of {qty:g} cs were on hand; "
+                               f"on-hand stopped at 0)" if clamped else ""))
                            if still_in_onhand else
                            (f"{label} -- on-hand left on the "
                             f"{(item.get('last_count_at') or '')[:10]} count, "
@@ -419,9 +477,12 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
             "warehouse":  item.get("warehouse") or "",
             "reverses_timestamp": e.get("timestamp") or "",
         })
+        if clamped:
+            warnings.append(f"{item.get('name') or ik}: only {taken:g} of {qty:g} cs "
+                            f"were on hand to take back -- on-hand stopped at 0")
         lines.append({"item_key": ik, "name": item.get("name") or ik,
                       "warehouse": item.get("warehouse") or "",
-                      "qty": qty, "onhand_delta": -qty if still_in_onhand else 0.0,
+                      "qty": qty, "onhand_delta": -taken if still_in_onhand else 0.0,
                       "ship_date": entry["ship_date"],
                       "arrival_date": entry["arrival_date"]})
         restored += 1
@@ -449,7 +510,8 @@ def _unroll_po(po_number: str, inv: dict, usage: list, *, now_iso: str,
             delivery_status = tracking[norm_po(po_number)].get("status")
             save_po_delivery(tracking)
     return {"restored_lines": restored, "removed_cs": round(removed_cs, 2),
-            "lines": lines, "delivery_reopened": delivery_status}
+            "lines": lines, "delivery_reopened": delivery_status,
+            "warnings": warnings}
 
 
 @pos_bp.route("/api/pending/reopen", methods=["POST"])
@@ -513,8 +575,172 @@ def api_pending_reopen():
         "restored_lines": restored,
         "removed_cs": round(removed_cs, 2),
         "delivery_reopened": delivery_status,
+        "warnings": un.get("warnings") or [],
         "error": None if restored else "No rolled-over lines found for this PO",
     })
+
+
+@pos_bp.route("/api/pos/absorb-pending", methods=["POST"])
+@with_data_lock
+def api_pos_absorb_pending():
+    """A PO still PENDING (held for a Lineage confirmation that never came,
+    or with no date) whose cases the last count already contains: record it
+    as arrived-and-absorbed WITHOUT touching on-hand.
+
+    The sibling of /api/admin/absorb-po-into-count, which handles a PO that
+    already rolled into on-hand on top of such a count (cases come OFF).
+    Here on-hand is already right -- the count is the shelf -- so each
+    pending line just becomes the ``on_order_absorbed`` row the rollover
+    would have written had the delivery been confirmed on time.
+
+    Body: {po_number, count_at, arrived_on (YYYY-MM-DD, on/before the count's
+           day at the dock), reason, dry_run=true, force=false}
+    Only lines whose SKU still carries last_count_at == count_at are
+    absorbed. Refused (409) unless the ledger row carries ``suggest_absorb``
+    for that count (the figures say the count contains the PO) or force=true.
+    Undo: /api/pending/reopen brings absorbed lines back with
+    include_absorbed (admin restore-absorbed-po).
+    """
+    from datetime import timezone as _tz
+    from core.util import dock_local_day
+    from inventory_tracker import (
+        _po_doc_identity, append_inventory_audit, load_inventory, load_po_delivery,
+        load_usage, save_inventory, save_po_delivery, save_usage,
+    )
+    from integrations import po_delivery as _pd
+    body = request.json or {}
+    po_number = (body.get("po_number") or "").strip()
+    count_at = (body.get("count_at") or "").strip()
+    arrived_on = (body.get("arrived_on") or "").strip()[:10]
+    reason = (body.get("reason") or "").strip()
+    dry_run = body.get("dry_run", True) is not False
+    force = bool(body.get("force"))
+    if not po_number or not count_at or not arrived_on:
+        return jsonify({"ok": False,
+                        "error": "po_number, count_at and arrived_on required"}), 400
+    try:
+        datetime.strptime(arrived_on, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"ok": False, "error": "arrived_on must be YYYY-MM-DD"}), 400
+    if not dry_run and not reason:
+        return jsonify({"ok": False, "error": "reason required for a live run"}), 400
+
+    key_norm = _norm_po_key(po_number)
+    row = next((r for r in build_po_ledger()
+                if _norm_po_key(r.get("po_number") or "") == key_norm), None)
+    sug = (row or {}).get("suggest_absorb")
+    supported = bool(sug) and sug.get("count_at") == count_at
+    inv = load_inventory()
+    usage = load_usage()
+    picked, skipped = [], []
+    for key, item in inv.items():
+        for e in (item.get("on_order") or []):
+            if _norm_po_key(e.get("po_number") or "") != key_norm:
+                continue
+            if (item.get("last_count_at") or "") != count_at:
+                skipped.append(f"{item.get('name', key)}: last count is "
+                               f"{item.get('last_count_at') or 'none'}, not {count_at}")
+                continue
+            wh = item.get("warehouse") or ""
+            if arrived_on > dock_local_day(count_at, wh):
+                skipped.append(f"{item.get('name', key)}: arrived_on {arrived_on} is "
+                               f"after the count's day -- it could not contain it")
+                continue
+            picked.append((key, item, e))
+    if not picked:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": "no pending lines of this PO on that count",
+                        "skipped": skipped}), 404
+    if not supported and not force:
+        return jsonify({"ok": False, "po_number": po_number,
+                        "error": "the counted figures do not show that this count "
+                                 "contains the PO (no suggest_absorb for it); pass "
+                                 "force=true to absorb anyway",
+                        "suggest_absorb": sug}), 409
+
+    now = datetime.now().isoformat()
+    lines, audit = [], []
+    for key, item, e in picked:
+        qty = float(e.get("qty") or 0)
+        lines.append({"name": item.get("name", key), "item_key": key, "qty": qty,
+                      "counted": item.get("last_count_qty"),
+                      "quantity": item.get("quantity")})
+        if dry_run:
+            continue
+        item["on_order"] = [o for o in (item.get("on_order") or []) if o is not e]
+        item["updated"] = now
+        usage.append({
+            "item_key": key, "item_name": item.get("name", key), "amount": 0,
+            "unit": item.get("unit", "") or e.get("unit") or "cs",
+            "note": (f"PO {e.get('po_number') or po_number} arrived {arrived_on} - "
+                     f"absorbed by the {dock_local_day(count_at, item.get('warehouse') or '')} "
+                     f"count - {qty:g} cs already on hand, not re-added "
+                     f"(operator {now[:10]}: {reason})"),
+            "timestamp": now,
+            "po_number": e.get("po_number") or po_number,
+            "po_revision": e.get("po_revision", "") or "",
+            "ordered_at": e.get("ordered_at", "") or "",
+            "ship_date": e.get("ship_date", "") or "",
+            "arrival_date": arrived_on + "T00:00:00",
+            "source": "on_order_absorbed",
+            "absorbed_qty": qty,
+            "absorbed_into_count_at": count_at,
+            "absorbed_at": now,
+            "absorbed_reason": reason,
+            "absorbed_from": "pending",
+            **_po_doc_identity(e, item),
+        })
+        audit.append({"ts": now, "source": "absorb-pending-po",
+                      "name": item.get("name", key),
+                      "warehouse": item.get("warehouse", ""),
+                      "event_type": "po_absorbed",
+                      "old_quantity": item.get("quantity"),
+                      "new_quantity": item.get("quantity"), "delta": 0,
+                      "absorbed_cs": qty, "po_number": po_number,
+                      "count_at": count_at, "reason": reason})
+    delivery_released = False
+    if not dry_run:
+        save_inventory(inv)
+        save_usage(usage)
+        try:
+            append_inventory_audit(audit)
+        except Exception:  # noqa: BLE001 -- audit is best-effort
+            pass
+        # Nothing left pending -> stop holding / chasing it with Lineage.
+        still = any(_norm_po_key(o.get("po_number") or "") == key_norm
+                    for it_ in inv.values() for o in (it_.get("on_order") or []))
+        if not still:
+            try:
+                tracking = load_po_delivery() or {}
+                tk = _pd.norm_po(po_number)
+                trk = tracking.get(tk)
+                if trk and trk.get("status") in _pd.HOLD_STATUSES:
+                    rec, _chg, err = _pd.apply_event(trk, {
+                        "po_number": trk.get("po_number") or po_number,
+                        "event": "released",
+                        "evidence": {"quote": f"absorbed into the {count_at} count "
+                                              f"by an operator: {reason}"[:600]}},
+                        datetime.now(_tz.utc))
+                    if not err:
+                        rec["closed_reason"] = "absorbed into a count (operator)"
+                        rec["closed_at"] = datetime.now(_tz.utc).isoformat()
+                        tracking[tk] = rec
+                        save_po_delivery(tracking)
+                        delivery_released = True
+            except Exception as exc:  # noqa: BLE001 -- the absorb itself stands
+                _log_exc(exc, "absorb-pending: po_delivery")
+        try:
+            from core import feed_health
+            feed_health.clear_issue(f"po-stuck:{po_number}")
+        except Exception:  # noqa: BLE001
+            pass
+    return jsonify({"ok": True, "dry_run": dry_run, "po_number": po_number,
+                    "count_at": count_at, "arrived_on": arrived_on,
+                    "forced": bool(force and not supported),
+                    "absorbed_cs": round(sum(l["qty"] for l in lines), 2),
+                    "lines": lines, "skipped": skipped,
+                    "delivery_released": delivery_released,
+                    "suggest_absorb": sug})
 
 
 def _naive_dt(raw: str) -> datetime:
@@ -876,7 +1102,32 @@ def api_pending_set_status():
         arrival_iso, err = _parse_iso_date(body["arrival_date"], "arrival_date")
         if err:
             return err
+        if not body.get("force"):
+            why = _implausible_dates(None, _naive_dt(arrival_iso))
+            if why:
+                return jsonify({"ok": False, "error": why, "needs_force": True}), 400
     key = _norm_po_key(po_number)
+    if status == "cancelled":
+        # "Cancelled" was a label only: the PO's pending lines stayed on
+        # order and still rolled into on-hand on their date. Cancelling a PO
+        # that has pending lines has to remove them and put the PO on the
+        # ignore list (so a re-scan can't re-book it) -- that is
+        # /api/admin/remove-po, which records what it removed and can be
+        # undone with /api/admin/uncancel-po. Refuse here rather than leave a
+        # cancelled PO that silently becomes stock.
+        pending_cs = sum(float(e.get("qty") or 0)
+                         for item in load_inventory().values()
+                         for e in (item.get("on_order") or [])
+                         if _norm_po_key(e.get("po_number") or "") == key)
+        if pending_cs > 0:
+            return jsonify({
+                "ok": False, "po_number": po_number,
+                "error": (f"PO {po_number} still has {pending_cs:g} cs on order; "
+                          "marking it Cancelled would leave them to roll into "
+                          "on-hand. Use Cancel PO (POST /api/admin/remove-po "
+                          "{po_number, reason}) to remove them."),
+                "use_endpoint": "/api/admin/remove-po",
+                "pending_cs": round(pending_cs, 2)}), 400
     overrides = load_status_overrides()
     if status:
         overrides[key] = status
@@ -903,6 +1154,7 @@ def api_pending_set_status():
                 "onhand_removed_cs": un["removed_cs"],
                 "delivery_reopened": un["delivery_reopened"],
                 "detail": un["lines"],
+                "warnings": un.get("warnings") or [],
             }
     elif arrival_iso:
         inv = load_inventory()
@@ -1083,6 +1335,11 @@ def api_chefs_warehouse_ship_date():
                 return jsonify({"ok": False,
                                 "error": "arrival_date must be YYYY-MM-DD"}), 400
             arrival_source, transit_days, transit_basis = "operator", None, ""
+        if not body.get("force"):
+            why = _implausible_dates(
+                ship_dt, _naive_dt(arrival_iso) if arrival_raw else None)
+            if why:
+                return jsonify({"ok": False, "error": why, "needs_force": True}), 400
     else:
         ship_iso = ""
         arrival_iso = ""
@@ -1615,6 +1872,24 @@ def build_po_ledger() -> list:
                              else "arrived" if ("usage_rollover" in _ss and "on_order" not in _ss)
                              else "inventory")
         r["transfer_group"] = transfer_group_for(r.get("warehouse") or "")
+        # How long it has been held, whether a person needs to look, and
+        # whether the last count already contains it (integrations/po_health).
+        try:
+            from datetime import timezone as _tz2
+            from integrations import po_health as _ph
+            _now_utc = datetime.now(_tz2.utc)
+            _live_trk = trk if (trk and trk.get("status") != "released") else None
+            r.update(_ph.hold_state(r, _live_trk, _now_utc,
+                                    pending=r["_pending"] or not r["_arrived"]))
+            r["suggest_absorb"] = (_ph.suggest_absorb(r, inv, _live_trk, _now_utc)
+                                   if r["_pending"] else None)
+        except Exception as exc:  # noqa: BLE001 -- an overlay; never fatal
+            _log_exc(exc, "ledger hold_state")
+            r.setdefault("held_days", 0)
+            r.setdefault("stuck", False)
+            r.setdefault("stuck_reason", "")
+            r.setdefault("hold_kind", "")
+            r["suggest_absorb"] = None
         r["total_cs"] = round(float(r.get("total_cs") or 0), 2)
         r["sources"] = sorted(r["sources"])
         for k in ("_pending", "_arrived", "_canceled"):
@@ -1656,3 +1931,94 @@ def api_pos_ledger():
     return jsonify({"ok": True, "count": len(ledger),
                     "by_status": by_status, "by_distributor": by_distributor,
                     "pos": ledger})
+
+
+# ---------------------------------------------------------------------------
+# Cheney 810 invoices as an independent usage check
+# ---------------------------------------------------------------------------
+
+@pos_bp.route("/api/ingest/cheney-810", methods=["POST"])
+def api_ingest_cheney_810():
+    """Store the H&H bagel lines of Cheney EDI 810 invoices
+    (integrations/cheney_810_store.py). Idempotent by invoice + line.
+
+    Body: the raw EDI text (text/plain), or JSON {"edi": "<text>"} /
+    {"invoices": [<edi_810.parse_810 output>]}. Query: ?dry_run=1,
+    ?filename=<name>. Token / session gated like every /api/ route. Never
+    touches inventory -- it only feeds GET /api/usage/cheney-crosscheck.
+    """
+    from integrations import cheney_810_store as store
+    from integrations.edi_810 import parse_810, summarize
+    try:
+        dry_run = (request.args.get("dry_run") or "0").lower() in ("1", "true", "yes")
+        filename = (request.args.get("filename") or "").strip()[:200]
+        invoices = None
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            dry_run = dry_run or bool(body.get("dry_run"))
+            filename = filename or str(body.get("filename") or "")[:200]
+            if isinstance(body.get("invoices"), list):
+                invoices = body["invoices"]
+            elif body.get("edi"):
+                invoices = parse_810(str(body["edi"]))
+        else:
+            text = request.get_data(as_text=True) or ""
+            if text.strip():
+                invoices = parse_810(text)
+        if invoices is None:
+            return jsonify({"ok": False, "error": "send EDI 810 text as the body, or "
+                            "JSON {edi: ...} / {invoices: [...]}"}), 400
+        if not invoices:
+            return jsonify({"ok": False, "error": "no invoices found in the EDI "
+                            "(no ST*810 transaction sets)", "filename": filename}), 422
+        s = summarize(invoices)
+        out = store.ingest_invoices(invoices, filename=filename, dry_run=dry_run)
+        return jsonify({"ok": True, "dry_run": dry_run, "filename": filename, **out,
+                        "integrity": {k: s[k] for k in (
+                            "unreconciled", "lines_without_cases",
+                            "lines_with_estimated_pack", "line_count_mismatch",
+                            "unit_count_mismatch")}})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "ingest cheney-810")
+        return jsonify({"ok": False, "error": _safe_err(exc)}), 500
+
+
+@pos_bp.route("/api/usage/cheney-crosscheck")
+def api_usage_cheney_crosscheck():
+    """Per Cheney warehouse + variety: invoiced cases/week over the last 4
+    full weeks (810 feed) vs the rep-reported weekly_usage, with ``diverges``
+    when they differ by > 35% and > 5 cs/wk. Read-only. See
+    integrations/cheney_810_store.py for what the invoices do and do not
+    prove."""
+    from integrations import cheney_810_store as store
+    from inventory_tracker import load_inventory
+    try:
+        out = store.crosscheck(load_inventory())
+        wh = (request.args.get("warehouse") or "").strip().lower()
+        if wh:
+            out["rows"] = [r for r in out["rows"] if r["warehouse"].lower() == wh]
+            out["warehouses"] = [w for w in out["warehouses"]
+                                 if w["warehouse"].lower() == wh]
+        return jsonify({"ok": True, **out})
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "cheney crosscheck")
+        return jsonify({"ok": False, "error": _safe_err(exc), "rows": []}), 500
+
+
+@pos_bp.route("/api/feeds/cheney/heartbeat", methods=["POST"])
+def api_feeds_cheney_heartbeat():
+    """The Cheney feed bridge (scripts/sync_cheney_feeds.py) reports each run
+    here -- it runs as a cron with no disk, so it cannot write
+    feed_health itself. Body {ok, detail, files, last_file_at}.
+    ``last_file_at`` (ISO) is only sent when the run handled a file; the
+    stale-feed check (po_health) keys off it, so a feed that has never
+    delivered anything is never called stale."""
+    from core import feed_health
+    body = request.get_json(silent=True) or {}
+    extra = {"files": int(body.get("files") or 0)}
+    last = str(body.get("last_file_at") or "").strip()[:40]
+    if last:
+        extra["last_file_at"] = last
+    feed_health.record("cheney-feed", bool(body.get("ok")),
+                       str(body.get("detail") or "")[:500], **extra)
+    return jsonify({"ok": True})

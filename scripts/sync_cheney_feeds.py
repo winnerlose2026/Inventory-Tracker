@@ -7,9 +7,15 @@ Runs equally well as a Render Cron Job or a scheduled Cowork routine.
 
 Feeds (agreed with Walt Wilcox / Cheney, 2026-07-06):
   * Daily on-hand inventory CSV  -> POSTed to the tracker (applied as on_hand)
-  * Daily EDI 810 invoices       -> parsed + summarized (WHERE the 810 lands in
-                                    the tracker is still a modelling decision;
-                                    the field semantics are settled)
+  * Daily EDI 810 invoices       -> parsed + summarized, and POSTed to
+                                    /api/ingest/cheney-810, which keeps the H&H
+                                    bagel lines as an independent check on the
+                                    reported usage (never applied to inventory)
+
+Exit status: 0 when everything pulled was handled; 1 when any POST came back
+non-200 / ok:false or a handled file could not be filed away. Files still
+being uploaded (size changing, or modified under 2 minutes ago) are left for
+the next run and are not a failure.
 
 2026-08-04 -- the first real CSV drop was an "OrderGuide" export, NOT the
 on-hand snapshot: catalog + case cost, with the on-hand column zero on every
@@ -61,12 +67,15 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import posixpath
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -132,14 +141,20 @@ class _FtpsTransport:
         from integrations.sftp_inbox import list_remote_files
         return [rf.name for rf in list_remote_files(self._ftp, path)]
 
+    def stat(self, path: str) -> dict:
+        """{name: (size, mtime as naive UTC datetime | None)}"""
+        from integrations.sftp_inbox import list_remote_files, parse_mtime
+        return {rf.name: (rf.size, parse_mtime(rf.mtime))
+                for rf in list_remote_files(self._ftp, path)}
+
     def download(self, remote_path: str) -> bytes:
         from integrations.sftp_inbox import download_bytes
         return download_bytes(self._ftp, remote_path)
 
-    def file_away(self, remote_dir: str, name: str, processed_dir: str) -> None:
+    def file_away(self, remote_dir: str, name: str, processed_dir: str) -> bool:
         from integrations.sftp_inbox import move_to_processed
-        move_to_processed(self._ftp, posixpath.join(remote_dir, name),
-                          processed_dir, name)
+        return move_to_processed(self._ftp, posixpath.join(remote_dir, name),
+                                 processed_dir, name)
 
     def close(self) -> None:
         try:
@@ -177,12 +192,19 @@ class _SftpTransport:
     def listdir(self, path: str) -> list[str]:
         return list(self._client.listdir(path))
 
+    def stat(self, path: str) -> dict:
+        out = {}
+        for a in self._client.listdir_attr(path):
+            mt = (datetime.utcfromtimestamp(a.st_mtime)
+                  if getattr(a, "st_mtime", None) else None)
+            out[a.filename] = (getattr(a, "st_size", None), mt)
+        return out
+
     def download(self, remote_path: str) -> bytes:
         with self._client.open(remote_path, "rb") as fh:
             return fh.read()
 
-    def file_away(self, remote_dir: str, name: str, processed_dir: str) -> None:
-        from datetime import datetime
+    def file_away(self, remote_dir: str, name: str, processed_dir: str) -> bool:
         try:
             self._client.mkdir(processed_dir)
         except OSError:
@@ -191,8 +213,13 @@ class _SftpTransport:
         try:
             self._client.rename(posixpath.join(remote_dir, name),
                                 posixpath.join(processed_dir, f"{stamp}_{name}"))
-        except OSError:
-            pass  # leave in place; a re-read is harmless
+            return True
+        except OSError as exc:
+            # Not swallowed any more: with no cursor, a file left in the drop
+            # is re-read and re-posted on every run.
+            print(f"  ! could not move {name} to {processed_dir}/: {exc}",
+                  file=sys.stderr)
+            return False
 
     def close(self) -> None:
         for closer in (getattr(self, "_client", None), getattr(self, "_transport", None)):
@@ -227,6 +254,46 @@ def _post(url, data_bytes, token, content_type="text/csv"):
         return e.code, e.read().decode("utf-8", "replace")
 
 
+def _response_ok(status: int, body: str) -> bool:
+    """HTTP 200 AND not a JSON body saying ok:false (several routes answer
+    200 with ok:false)."""
+    if status != 200:
+        return False
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return True
+    return not (isinstance(parsed, dict) and parsed.get("ok") is False)
+
+
+def _settle_listing(conn, remote_dir: str) -> tuple:
+    """(names safe to read, [(name, why)] left for the next run).
+
+    A file Cheney is still uploading was read half-written. Two listings a
+    few seconds apart: a file whose size moved, or that was modified under
+    two minutes ago, waits. Transports without stat() are read as before."""
+    if not hasattr(conn, "stat"):
+        return sorted(conn.listdir(remote_dir)), []
+    from integrations.sftp_inbox import (_min_age_seconds, _settle_seconds,
+                                         unstable_reason)
+    first = conn.stat(remote_dir)
+    settle = _settle_seconds()
+    if first and settle:
+        time.sleep(settle)
+        second = conn.stat(remote_dir)
+    else:
+        second = first
+    now = datetime.utcnow()
+    ready, deferred = [], []
+    for name in sorted(first):
+        why = unstable_reason(name, first, second, now, _min_age_seconds())
+        if why:
+            deferred.append((name, why))
+        else:
+            ready.append(name)
+    return ready, deferred
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--api-base", default=DEFAULT_API)
@@ -256,9 +323,14 @@ def main() -> int:
     csv_files: list[Path] = []
     edi_files: list[Path] = []
     handled: list[str] = []
+    failures: list[str] = []
     try:
         print(f"Connected to {conn.label}, scanning {remote_dir!r}")
-        for name in sorted(conn.listdir(remote_dir)):
+        ready, deferred = _settle_listing(conn, remote_dir)
+        for name, why in deferred:
+            if _matches(name, csv_globs) or _matches(name, edi_globs):
+                print(f"  WAIT {name}: {why} -- left for the next run")
+        for name in ready:
             if _matches(name, csv_globs):
                 bucket = csv_files
             elif _matches(name, edi_globs):
@@ -305,18 +377,32 @@ def main() -> int:
             url = f"{args.api_base}/api/ingest/cheney-inventory-csv?dry_run={dry}&filename={lp.name}"
             status, resp = _post(url, lp.read_bytes(), args.token, "text/csv")
             print(f"  CSV {lp.name}: POST -> HTTP {status}  {resp[:200]}")
-            if status == 200:
+            if _response_ok(status, resp):
                 handled.append(lp.name)
+            else:
+                failures.append(f"{lp.name}: on-hand POST HTTP {status}")
 
         # --- EDI 810 -> parse + summarize only (tracker routing still deferred) ---
         if edi_files:
             from integrations.edi_810 import parse_810, summarize as edi_summarize
             invoices: list[dict] = []
             for lp in sorted(edi_files):
-                inv = parse_810(lp.read_text(encoding="utf-8", errors="replace"))
+                text = lp.read_text(encoding="utf-8", errors="replace")
+                inv = parse_810(text)
                 invoices.extend(inv)
-                handled.append(lp.name)
-                print(f"  810 {lp.name}: {len(inv)} invoice(s) parsed (not yet applied)")
+                # The H&H bagel lines are kept by the tracker as an
+                # independent check on reported usage
+                # (/api/usage/cheney-crosscheck). Nothing touches inventory.
+                url = f"{args.api_base}/api/ingest/cheney-810?dry_run={dry}&filename={lp.name}"
+                status, resp = _post(url, text.encode("utf-8"), args.token, "text/plain")
+                if _response_ok(status, resp):
+                    handled.append(lp.name)
+                    print(f"  810 {lp.name}: {len(inv)} invoice(s) parsed; "
+                          f"POST -> HTTP {status}  {resp[:160]}")
+                else:
+                    failures.append(f"{lp.name}: 810 POST HTTP {status}")
+                    print(f"  810 {lp.name}: {len(inv)} invoice(s) parsed; "
+                          f"POST FAILED -> HTTP {status}  {resp[:200]}")
             s = edi_summarize(invoices)
             print(f"  810 batch: {s['invoices']} invoice(s) ({s['credits']} credit), "
                   f"net ${s['net_total']:,.2f}, net {s['net_cases']:g} case(s)")
@@ -331,9 +417,14 @@ def main() -> int:
 
         # --- file handled files away so the drop doesn't grow without bound ---
         if handled and processed_dir and not args.dry_run:
+            filed = 0
             for name in handled:
-                conn.file_away(remote_dir, name, processed_dir)
-            print(f"  filed {len(handled)} handled file(s) into {processed_dir}/")
+                if conn.file_away(remote_dir, name, processed_dir) is False:
+                    failures.append(f"{name}: handled but could not be moved "
+                                    f"to {processed_dir}/ (it will be re-read)")
+                else:
+                    filed += 1
+            print(f"  filed {filed} of {len(handled)} handled file(s) into {processed_dir}/")
         elif handled and not processed_dir:
             print("  NOTE: no processed dir configured -- files stay in the drop "
                   "and will be re-read on every run.")
@@ -346,8 +437,27 @@ def main() -> int:
         if args.dry_run:
             print("\nDRY RUN -- CSV feed parsed but not applied, drop left "
                   "untouched. Re-run with --commit to apply.")
+        else:
+            # This cron has no disk: tell the web service how the run went so
+            # the watchdog can see a feed that stopped (core.feed_health
+            # "cheney-feed"). last_file_at only when a file was handled.
+            beat = {"ok": not failures, "files": len(handled),
+                    "detail": (f"{len(csv_files)} CSV + {len(edi_files)} EDI pulled, "
+                               f"{len(handled)} handled, {len(deferred)} waiting"
+                               + (f"; FAILED: {'; '.join(failures)[:300]}" if failures else ""))}
+            if handled:
+                beat["last_file_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            status, resp = _post(f"{args.api_base}/api/feeds/cheney/heartbeat",
+                                 json.dumps(beat).encode("utf-8"), args.token,
+                                 "application/json")
+            if not _response_ok(status, resp):
+                print(f"  NOTE: heartbeat POST -> HTTP {status} (run result not "
+                      f"recorded on the tracker)")
     finally:
         conn.close()
+    if failures:
+        print("\nFAILED -- " + "; ".join(failures), file=sys.stderr)
+        return 1
     return 0
 
 

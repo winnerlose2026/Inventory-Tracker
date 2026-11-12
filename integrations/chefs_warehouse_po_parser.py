@@ -233,6 +233,46 @@ class ChefsWarehousePO:
     total_usd: Optional[float] = None
     lines: list = field(default_factory=list)
     unmapped_descriptions: list = field(default_factory=list)
+    # Set by parse_po_text when the lines do not add up to "Total USD", a
+    # line has no quantity, or an item row is not an H&H (105...) SKU.
+    integrity_errors: list = field(default_factory=list)
+
+    @property
+    def needs_review(self) -> bool:
+        return bool(self.integrity_errors)
+
+
+def record_integrity_errors(record: dict) -> list:
+    """Why a CW PO record (parser output as a dict, see
+    email_scanner._chefs_warehouse_po_to_record) cannot be trusted as read.
+
+    Works off the record so the check also runs on records posted through
+    /api/email/ingest-events. Empty list = the lines reconcile.
+    """
+    errs = []
+    lines = record.get("lines") or []
+    if not lines:
+        return ["no line items could be read"]
+    zero = [str(l.get("description") or l.get("cw_item") or "?") for l in lines
+            if float(l.get("qty") or 0) <= 0]
+    if zero:
+        errs.append(f"{len(zero)} line(s) with no quantity read: "
+                    + ", ".join(zero[:4]))
+    total = record.get("total_usd")
+    ext = [l.get("ext_cost") for l in lines]
+    if total is not None and all(e is not None for e in ext):
+        s = round(sum(float(e) for e in ext), 2)
+        if abs(s - float(total)) > 0.01:
+            errs.append(f"lines add up to ${s:,.2f} but the PDF prints "
+                        f"Total USD ${float(total):,.2f}")
+    elif total is not None and any(e is None for e in ext):
+        errs.append("a line's extended cost could not be read, so the "
+                    "Total USD cannot be checked")
+    foreign = [str(l.get("cw_item") or "") for l in lines
+               if not str(l.get("cw_item") or "").startswith("105")]
+    if foreign:
+        errs.append("item(s) that are not H&H 105... SKUs: " + ", ".join(foreign[:4]))
+    return errs
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +384,14 @@ def parse_po_text(text: str, dc_code: str = "") -> ChefsWarehousePO:
         # (CW H&H bagel SKU prefix; observed: 1050xxxx whole catalog +
         # 10531083 Whole Wheat) -- filters out anything else that
         # happens to match the LN/spaces pattern.
-        if head_m and head_m.group(2).startswith("105"):
+        # Anything else is taken as an item ONLY when its detail line follows
+        # (pack / CS qty / costs) -- it is then kept, unmapped, so the PO is
+        # flagged instead of booking short.
+        _is_item = bool(head_m) and head_m.group(2).startswith("105")
+        if head_m and not _is_item and re.match(r"^\d{6,}", head_m.group(2)):
+            _is_item = any(_LINE_DETAIL_RE.match(lines[j].strip())
+                           for j in range(i + 1, min(i + 3, len(lines))))
+        if _is_item:
             prefix  = head_m.group(1)
             cw_item = head_m.group(2)
             desc    = head_m.group(3).strip()
@@ -391,7 +438,10 @@ def parse_po_text(text: str, dc_code: str = "") -> ChefsWarehousePO:
 
             variety = CW_DESCRIPTION_TO_VARIETY.get(desc.upper(), "")
             sliced = desc.upper().endswith(" SLICED") or cw_item.endswith("SLD")
-            if not variety:
+            if not cw_item.startswith("105"):
+                variety = ""
+                po.unmapped_descriptions.append(f"{cw_item} {desc}")
+            elif not variety:
                 po.unmapped_descriptions.append(desc)
 
             po.lines.append(ChefsWarehousePOLine(
@@ -412,6 +462,11 @@ def parse_po_text(text: str, dc_code: str = "") -> ChefsWarehousePO:
             expected_ln = line_no + 1
         i += 1
 
+    po.integrity_errors = record_integrity_errors({
+        "total_usd": po.total_usd,
+        "lines": [{"qty": l.quantity, "ext_cost": l.ext_cost,
+                   "cw_item": l.cw_item, "description": l.description}
+                  for l in po.lines]})
     return po
 
 
@@ -442,6 +497,7 @@ __all__ = [
     "CW_DESCRIPTION_TO_VARIETY",
     "CW_SHIP_TO_TO_DC_CODE",
     "cw_dc_code",
+    "record_integrity_errors",
     "parse_po_pdf",
     "parse_po_text",
     "total_cs",

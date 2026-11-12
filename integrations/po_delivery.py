@@ -494,6 +494,44 @@ def _last_chase(rec: dict) -> Optional[datetime]:
     return max(ts) if ts else None
 
 
+# Follow-ups used to repeat every 16 h for as long as the PO stayed held --
+# for weeks, to the same three people. After this many asks, or this long
+# since the first unanswered one, the emails stop and a person takes over.
+MAX_CHASES = 6
+MAX_CHASE_DAYS = 21
+_CHASE_RESET_EVENTS = ("scheduled", "rescheduled", "reopened")
+
+
+def chase_exhausted(rec: dict, now: datetime) -> str:
+    """Why automatic follow-ups on this PO have stopped, or "".
+
+    Counts the asks sent since Lineage last moved the PO (a schedule /
+    reschedule, or an operator reopen): MAX_CHASES of them, or
+    MAX_CHASE_DAYS since the first, is enough -- another email will not
+    help; someone has to call."""
+    if rec.get("status") not in HOLD_STATUSES:
+        return ""
+    base = max([t for t in (parse_dt(e.get("at") or "")
+                            for e in rec.get("events") or []
+                            if e.get("event") in _CHASE_RESET_EVENTS) if t],
+               default=None)
+    ts = sorted(t for t in (parse_dt(c.get("at") or "")
+                            for c in rec.get("chases") or []
+                            if c.get("ask") in ("schedule", "confirm_delivery"))
+                if t and (base is None or t >= base))
+    if len(ts) >= MAX_CHASES:
+        return (f"{len(ts)} follow-ups sent since "
+                f"{ts[0].strftime('%Y-%m-%d')} with no answer")
+    if ts and now - ts[0] >= timedelta(days=MAX_CHASE_DAYS):
+        return (f"following up since {ts[0].strftime('%Y-%m-%d')} "
+                f"({len(ts)} sent) with no answer")
+    return ""
+
+
+def needs_human(rec: dict, now: datetime) -> bool:
+    return bool(chase_exhausted(rec, now))
+
+
 def chase_due(rec: dict, now: datetime) -> Optional[str]:
     """'schedule' | 'confirm_delivery' | None for one PO record.
 
@@ -501,11 +539,14 @@ def chase_due(rec: dict, now: datetime) -> Optional[str]:
                         delivery appointment.
     confirm_delivery -- the appointment passed 3+ hours ago and nobody has
                         confirmed it delivered.
-    Never twice within REPEAT_ASK_AFTER.
+    Never twice within REPEAT_ASK_AFTER, and never once the follow-ups are
+    exhausted (chase_exhausted -> needs_human).
     """
     st = rec.get("status")
     last = _last_chase(rec)
     if last and now - last < REPEAT_ASK_AFTER:
+        return None
+    if chase_exhausted(rec, now):
         return None
     if st == "requested":
         since = max([t for t in (parse_dt(rec.get("requested_at") or ""), last) if t],
@@ -837,6 +878,10 @@ def summary(rec: dict, now: datetime) -> dict:
         "confirmation_no": rec.get("confirmation_no") or "",
         "awaiting_confirmation": awaiting_confirmation(rec, now),
         "chase_due": chase_due(rec, now),
+        # Follow-ups exhausted (MAX_CHASES / MAX_CHASE_DAYS): no more emails
+        # go out; a person has to call Lineage or the DC.
+        "needs_human": needs_human(rec, now),
+        "needs_human_reason": chase_exhausted(rec, now),
         "last_chased_at": lc.isoformat() if lc else "",
         "chase_count": len(rec.get("chases") or []),
         "last_event": {"event": last.get("event", ""),
@@ -871,7 +916,19 @@ _HEDGE = re.compile(
 # Words that put the whole message beyond a plain confirmation.
 _PROBLEM = re.compile(
     r"\b(?:partial\w*|short\w*|damag\w*|refus\w*|reject\w*|overage|missing|"
-    r"not\s+delivered|undeliver\w*|returned|claim)\b", re.I)
+    r"not\s+delivered|undeliver\w*|returned|claim|wrong|remaining|left\s+on)\b",
+    re.I)
+# A "delivered" that is not a delivery to the receiving dock, or not all of it
+# (2026-11 review: any unhedged "delivered" sentence released the WHOLE PO):
+#   "delivered to our terminal / the cross-dock / the carrier / a driver"
+#   "delivered 18 of 20 pallets", "only 18 pallets delivered",
+#   "delivered, but ..."
+_NOT_FULL = re.compile(
+    r"\bdelivered\s+to\s+(?:our|the|a)\s+(?:terminal|cross.?dock|carrier|driver)\b|"
+    r"\b\d+\s+of\s+\d+\b|\bonly\b|\bbut\b", re.I)
+# Not a delivery at all yet -- and it holds back the rest of the message the
+# way a hedged "delivered" line does.
+_NOT_YET = re.compile(r"\bout\s+for\s+delivery\b", re.I)
 _ARRIVAL = re.compile(r"^\s*Arrival\s+Time\s*:\s*(\S.*?)\s*$", re.I | re.M)
 _DEPARTURE = re.compile(r"^\s*Departure\s+Time\s*:\s*\S", re.I | re.M)
 _SENTENCE = re.compile(r"[^\n.!?]+(?:[.!](?!\d)|$)", re.M)
@@ -891,10 +948,17 @@ _STATE_ZONES = {
 }
 
 
+_EAST_TN = re.compile(r"\b(?:alcoa|knoxville|maryville|chattanooga)\b", re.I)
+
+
 def dock_zone(*places: str) -> str:
     """IANA zone of the receiving dock from an address or a "City, ST"
     warehouse label; Eastern when nothing says."""
     for p in places:
+        # East Tennessee (Alcoa / Knoxville) keeps Eastern time; the state
+        # table below would put it an hour off.
+        if _EAST_TN.search(str(p or "")):
+            return "America/New_York"
         for st in re.findall(r"\b([A-Z]{2})\b\.?\s*(?:\d{5})?\s*$|,\s*([A-Z]{2})\b",
                              str(p or "")):
             for s in st:
@@ -980,9 +1044,9 @@ def confirmation_lines(text: str) -> list:
     scoped_hedge = False
     for raw in _SENTENCE.findall(own):
         line = raw.strip().strip(".!").strip()
-        if not line or not _CONFIRM.search(line):
+        if not line or not (_CONFIRM.search(line) or _NOT_YET.search(line)):
             continue
-        if _HEDGE.search(line):
+        if _HEDGE.search(line) or _NOT_FULL.search(line) or _NOT_YET.search(line):
             if _PO_LED.match(line):
                 scoped_hedge = True   # that PO is left to a reader; the rest stand
                 continue
