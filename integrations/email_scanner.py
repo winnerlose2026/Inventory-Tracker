@@ -118,6 +118,7 @@ from .usfoods_inventory_report import (
     parse_report_html as _parse_report_html,
     parse_report_text as _parse_report_text,
     parse_report_xlsx as _parse_report_xlsx,
+    quoted_only_report as _quoted_only_report,
     warehouse_for_sender as _report_warehouse_for_sender,
 )
 
@@ -301,6 +302,16 @@ def _zero_line_po_error(po, pdf_bytes, subject, filename="") -> Optional[str]:
     return (f"PO PDF '{label}': could not be read -- 0 lines "
             f"(PO# {getattr(po, 'po_number', '') or 'not found'}). The PDF "
             "layout may have changed; this order is NOT on the Pending POs tab.")
+
+
+# A report that was recognised but deliberately NOT applied (its table is only
+# in the quoted thread; an implausible repeat of the last count). The scan
+# turns each into a "report-held:<warehouse>:<message id>" issue.
+REPORT_HELD_PREFIX = "report held: "
+
+
+def is_report_held(err) -> bool:
+    return str(err or "").startswith(REPORT_HELD_PREFIX)
 
 
 def is_mailbox_failure(err) -> bool:
@@ -1068,6 +1079,16 @@ def _usfoods_inventory_report_to_events(html, text, sender, msg_id, subject,
                 text or "", distributor=distributor or "", warehouse=warehouse or "",
             )
     if report is None:
+        # A mapped rep's reply whose ONLY report table sits in the quoted
+        # thread ("running late, will send tomorrow"): that is last week's
+        # count, not a new one. Hold it and say so. Other senders (JD's own
+        # replies quote the table too) stay quiet.
+        if warehouse and xlsx is None and _quoted_only_report(html or "", text or ""):
+            errors.append(
+                f"{REPORT_HELD_PREFIX}{warehouse} ({subject!r}): the only "
+                "inventory table is in the QUOTED thread below the reply -- "
+                "not applied (it is the previous report riding on a reply)"
+            )
         return events, errors  # not an inventory & usage report
 
     if not warehouse:
@@ -1704,6 +1725,16 @@ class EmailInboxClient:
                         and any((f or "").lower().endswith(".pdf")
                                 for f in _fnames))
                     _ukey = m.get("internetMessageId") or mid
+                    _held = [e for e in errs if is_report_held(e)]
+                    if _held:
+                        _queue = True
+                        _hwh = (_report_warehouse_for_sender(_snd)[1]
+                                or _worksheet_warehouse_for_sender(_snd)[1] or "?")
+                        result.issues.append({
+                            "key": f"report-held:{_hwh}:{_ukey}",
+                            "message": f"{_held[0]} -- from {_snd} ({upn})",
+                            "severity": "warn",
+                        })
                     if _po_dropped:
                         result.issues.append({
                             "key": f"po-parse:{_ukey}",
@@ -1715,6 +1746,7 @@ class EmailInboxClient:
                         result.unparsed.append({
                             "kind": "po" if (_po_dropped and not _queue) else "report",
                             "reason": (_po_errs[0][:200] if _po_dropped
+                                       else _held[0][:200] if _held
                                        else "no events parsed"),
                             "id": _ukey,
                             "mailbox": upn,

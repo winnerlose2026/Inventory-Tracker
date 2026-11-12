@@ -364,30 +364,76 @@ def looks_like_report(subject: str = "", body: str = "") -> bool:
     return "current on hand" in b
 
 
-def parse_report_html(html: str, *, distributor: str = "",
-                      warehouse: str = "") -> Optional[InventoryReport]:
-    """Parse the FIRST inventory & usage report table in an HTML body.
+def _own_html(html: str) -> str:
+    """The reply's OWN part of an HTML body: everything above the first
+    reply/forward quote marker (same markers as usf_screenshot.cids_above_quote,
+    imported lazily -- that module imports this one)."""
+    text = html or ""
+    try:
+        from integrations.usf_screenshot import _HTML_QUOTE_MARKERS
+    except ImportError:  # standalone / test use
+        from usf_screenshot import _HTML_QUOTE_MARKERS  # type: ignore
+    m = _HTML_QUOTE_MARKERS.search(text)
+    return text[:m.start()] if m else text
 
-    The latest reply's table comes first in the HTML, so quoted older reports
-    further down the thread are ignored. Returns None if no report table is
-    found.
+
+def _own_text(text: str) -> str:
+    """The reply's own plain text, without the quoted thread below it."""
+    try:
+        from integrations.usf_screenshot import strip_quoted
+    except ImportError:  # standalone / test use
+        from usf_screenshot import strip_quoted  # type: ignore
+    return strip_quoted(text or "")
+
+
+def parse_report_html(html: str, *, distributor: str = "",
+                      warehouse: str = "",
+                      include_quoted: bool = False) -> Optional[InventoryReport]:
+    """Parse the first inventory & usage report table in the reply's OWN part
+    of an HTML body. Returns None if there is none.
+
+    The body is cut at the reply/forward quote marker BEFORE any table is
+    extracted. Taking "the first report table anywhere" used to read the
+    QUOTED previous message whenever the new reply carried no table of its own
+    -- so "running late, will send tomorrow" re-applied last week's count as a
+    fresh one dated today, erasing a week of burn and any receipts since
+    (review 2026-11-12). ``include_quoted=True`` restores the old whole-body
+    read; it exists only so a caller can tell "no report" from "a report that
+    is only in the quote" (see quoted_only_report).
     """
-    for table in _extract_tables_html(html):
+    for table in _extract_tables_html(html if include_quoted else _own_html(html)):
         report = _build_report_from_table(table, distributor, warehouse)
         if report is not None:
             return report
     return None
 
 
+def quoted_only_report(html: str = "", text: str = "") -> bool:
+    """True when the message carries a report table ONLY inside the quoted
+    thread: nothing in the reply's own part, something below the marker."""
+    if parse_report_html(html or "") is not None \
+            or parse_report_text(text or "") is not None:
+        return False
+    return (parse_report_html(html or "", include_quoted=True) is not None
+            or parse_report_text(text or "", include_quoted=True) is not None)
+
+
 def parse_report_text(text: str, *, distributor: str = "",
-                      warehouse: str = "") -> Optional[InventoryReport]:
+                      warehouse: str = "",
+                      include_quoted: bool = False) -> Optional[InventoryReport]:
     """Fallback parser for a plain-text body (no HTML table).
 
     Outlook flattens the table to one cell per line separated by blank lines.
     We rebuild rows by finding the ITEM header, treating every non-empty line
     up to the first all-digit item number as the header, then chunking the
     remaining cells into rows of that width.
+
+    Like parse_report_html, only the reply's own text is read: everything from
+    the first quote marker ("On ... wrote:", "From: ", "-----Original
+    Message-----") down is the previous message, not this week's count.
     """
+    if not include_quoted:
+        text = _own_text(text)
     if not text:
         return None
     cells = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -597,5 +643,6 @@ __all__ = [
     "looks_like_report",
     "parse_report_html",
     "parse_report_text",
+    "quoted_only_report",
     "parse_report_xlsx",
 ]
