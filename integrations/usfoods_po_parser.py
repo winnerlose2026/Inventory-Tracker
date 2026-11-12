@@ -147,6 +147,11 @@ class UsFoodsPO:
     lines: list = field(default_factory=list)
     unmapped_items: list = field(default_factory=list)   # USF item #s not in USF_ITEM_TO_VARIETY
     raw_text: str = ""            # retained for debugging
+    # Printed "**** TOTALS **** N UNITS" (None when the PDF has no such line)
+    total_units: Optional[float] = None
+    # Non-empty when the parsed lines do not add up to what the PDF prints:
+    # the PO must NOT be booked (it would book short) -- see check_integrity.
+    integrity_error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +213,60 @@ _CITY_ST_ZIP_RE = re.compile(
 # permitting an optional uppercase-letter run after the pack triple — it
 # lives outside the pack capture group so case_size_from_pack still sees
 # just the numbers.
+# Tolerated since 2026-11: a space before the unit ("4.06 OZ"), a label with
+# a space in it, no leading indent. A line that does not match is no longer
+# skipped silently -- check_integrity compares against the printed total.
 _ITEM_LINE1_RE = re.compile(
-    r"^\s+(?P<scc>\d{12,14})\s+(?P<pack>\d+/\d+/[\d.]+)[A-Z]*\s+-\S+\s+(?P<mfr>\d+)\s*$"
+    r"^\s*(?P<scc>\d{12,14})\s+(?P<pack>\d+/\d+/[\d.]+)\s*[A-Z]*\s+-\S.*?\s+(?P<mfr>\d+)\s*$"
 )
 # Line 2 of an item block:
 #   "    8 CASES   1184            BAGEL, EGG 4.06 Z UNSL HEAT &        27.00                          27.00"
+# "1,168 CASES" (thousands separator) and "1 CASE" (singular) are accepted.
 _ITEM_LINE2_RE = re.compile(
-    r"^\s*(?P<qty>\d+(?:\.\d+)?)\s+(?P<unit>CASES|EACH|LBS|CS)\s+"
+    r"^\s*(?P<qty>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s+"
+    r"(?P<unit>CASES?|EACH|LBS?|CS)\s+"
     r"(?P<item>\d+)\s+(?P<desc>.+?)\s+"
-    r"(?P<list>\d+\.\d+)"
-    r"(?:\s+(?P<off>\d+\.\d+))?"
-    r"(?:\s+(?P<frt>\d+\.\d+))?"
-    r"\s+(?P<net>\d+\.\d+)\s*$",
+    r"(?P<list>[\d,]+\.\d+)"
+    r"(?:\s+(?P<off>[\d,]+\.\d+))?"
+    r"(?:\s+(?P<frt>[\d,]+\.\d+))?"
+    r"\s+(?P<net>[\d,]+\.\d+)\s*$",
     re.IGNORECASE,
 )
+# Anything that LOOKS like the quantity row of an item, parsed or not.
+_QTY_ROW_RE = re.compile(
+    r"^\s*[\d,]+(?:\.\d+)?\s+(?:CASES?|EACH|LBS?|CS)\s+\d+\s+\S", re.IGNORECASE)
+_TOTALS_RE = re.compile(
+    r"\*+\s*TOTALS?\s*\*+\s*(?P<units>[\d,]+(?:\.\d+)?)\s+UNITS?", re.IGNORECASE)
+
+
+def _num(s) -> float:
+    return float(str(s).replace(",", ""))
+
+
+def check_integrity(po: "UsFoodsPO", text: str) -> str:
+    """Why this parse must not be booked, or "".
+
+    The parser pairs two lines per item and used to skip, silently, any pair
+    it could not read -- the PO then booked short and nothing said so. The
+    PDF prints its own total ("**** TOTALS **** 1120 UNITS"); the parsed
+    lines have to add up to it.
+    """
+    totals = [_num(m.group("units")) for m in _TOTALS_RE.finditer(text or "")]
+    po.total_units = totals[-1] if totals else None
+    parsed = sum(float(l.quantity or 0) for l in po.lines)
+    seen_rows = sum(1 for ln in (text or "").splitlines() if _QTY_ROW_RE.match(ln))
+    if po.po_number and not po.lines:
+        return ("PO header found but no line items could be read"
+                + (f" (the PDF totals {po.total_units:g} units)"
+                   if po.total_units is not None else ""))
+    if totals and abs(parsed - totals[-1]) > 1e-6 \
+            and abs(parsed - sum(totals)) > 1e-6:
+        return (f"parsed lines add up to {parsed:g} cs but the PDF prints "
+                f"TOTALS {totals[-1]:g} UNITS ({len(po.lines)} line(s) read)")
+    if seen_rows > len(po.lines):
+        return (f"{seen_rows} item rows on the PDF but only {len(po.lines)} "
+                f"could be read")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -294,8 +339,9 @@ def parse_po_text(text: str) -> UsFoodsPO:
         pack = m1.group("pack")
         po.lines.append(UsFoodsPOLine(
             usf_item_no=usf_item,
-            quantity=float(m2.group("qty")),
-            unit=m2.group("unit").upper(),
+            quantity=_num(m2.group("qty")),
+            unit={"CASE": "CASES", "LB": "LBS"}.get(m2.group("unit").upper(),
+                                                    m2.group("unit").upper()),
             description=m2.group("desc").strip(),
             list_cost=_opt_float(m2.group("list")),
             net_cost=_opt_float(m2.group("net")),
@@ -307,6 +353,7 @@ def parse_po_text(text: str) -> UsFoodsPO:
         ))
         i = j + 1
 
+    po.integrity_error = check_integrity(po, text)
     return po
 
 
@@ -328,7 +375,7 @@ def _opt_float(v):
     if not v:
         return None
     try:
-        return float(v)
+        return float(str(v).replace(",", ""))
     except ValueError:
         return None
 

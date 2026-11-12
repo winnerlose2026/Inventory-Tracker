@@ -1263,8 +1263,11 @@ def _apply_cw_pos(cw_pos: list,
     except Exception:
         canceled = {}
 
+    from integrations.chefs_warehouse_po_parser import record_integrity_errors
+
     lead_days = _po_lead_days()
     now_iso = datetime.now().isoformat()
+    report.setdefault("needs_review", [])
 
     def _parse_cw_date(s: str):
         """Accept MM-DD-YYYY or YYYY-MM-DD."""
@@ -1328,6 +1331,17 @@ def _apply_cw_pos(cw_pos: list,
             "last_synced":  now_iso,
             "last_synced_from": source,
         }
+        # Lines that don't add up to the PDF's Total USD, a line with no
+        # quantity, a non-H&H item: keep the record (it is what was read) but
+        # say so, instead of quietly booking short.
+        _review = record_integrity_errors(normalized)
+        normalized["needs_review"] = bool(_review)
+        normalized["integrity_errors"] = _review
+        if _review:
+            report["needs_review"].append(f"PO {po_num}: " + "; ".join(_review))
+            if not dry_run:
+                from integrations.po_health import flag_cw_review
+                flag_cw_review(po_num, _review)
 
         if existing_rec is None:
             report["added"] += 1
