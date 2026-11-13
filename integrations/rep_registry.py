@@ -193,6 +193,16 @@ def sender_map(parser: str) -> "dict[str, tuple[str, str]]":
     return out
 
 
+def warehouses_for_address(address: str) -> "list[str]":
+    """Every warehouse the address reports for (Ross -> all three Cheney FL
+    facilities). Empty for an unknown address."""
+    a = (address or "").strip().lower()
+    if not a:
+        return []
+    return [wh for wh, rec in WAREHOUSES.items()
+            if any(a == r["email"] or a in r["aliases"] for r in rec["reps"])]
+
+
 def warehouse_reps() -> "dict[str, list[dict]]":
     """warehouse -> [{name, email[, no_chase: True]}] -- the report-status
     page's WAREHOUSE_REPS shape (no_chase present only when true)."""

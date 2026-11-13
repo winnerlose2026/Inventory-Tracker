@@ -155,13 +155,17 @@ def _record_scan_attempt(report: dict, trigger: str, *, failed: bool) -> None:
         _log_exc(exc, "scan attempt record")
 
 
-def _collect_scan_issues(report: dict, scan) -> list:
+def _collect_scan_issues(report: dict, scan, queued_ids=None) -> list:
     """Every problem of this scan a person must look at, as stable-keyed
     issues: the scanner's and the apply path's own structured ones, each
     alert-class error (integrations.email_scanner.failure_class), unmatched
-    lines, and new unparsed-queue entries."""
-    import hashlib
-    from integrations.email_scanner import failure_class
+    lines, and new unparsed-queue entries.
+
+    ``queued_ids`` -- the unparsed-queue ids still stored after this scan's
+    prune. A weekly-report entry the prune just retired (the warehouse has
+    counted since -- Tom's Houston screenshot reply, read by the picture
+    reader, 2026-11-13) is not raised. None = no filter (dry run)."""
+    from integrations.email_scanner import failure_class, scan_error_issue_key
     issues = list(getattr(scan, "issues", None) or []) \
         + list(report.get("issues") or [])
     covered = " ".join(str(i.get("message") or "") for i in issues)
@@ -171,8 +175,12 @@ def _collect_scan_issues(report: dict, scan) -> list:
         slug = failure_class(text)
         if not slug or text[:150] in covered:
             continue
-        digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]
-        issues.append({"key": f"{slug}:{digest}", "message": text,
+        # The scanner raises a structured, message-keyed issue for every
+        # download failure; the error line is the same event said twice.
+        if slug == "fetch-failed" and text.startswith("fetch failed: ") \
+                and "fetch-failed:" in covered_keys:
+            continue
+        issues.append({"key": scan_error_issue_key(text), "message": text,
                        "severity": "error" if slug in ("po-failure", "fetch-failed")
                        else "warn"})
     for name in sorted({str(n) for n in (report.get("unmatched") or []) if n}):
@@ -183,6 +191,9 @@ def _collect_scan_issues(report: dict, scan) -> list:
         uid = str(u.get("id") or "")
         if not uid or uid in covered_keys:
             continue   # already a po-parse / report-held issue
+        if queued_ids is not None and u.get("kind") not in _NON_REPORT_QUEUE_KINDS \
+                and uid not in queued_ids:
+            continue   # retired by the prune: its warehouse counted since
         issues.append({"key": f"unparsed:{uid}",
                        "message": (f"could not read {u.get('subject')!r} from "
                                    f"{u.get('sender')} ({u.get('mailbox')}): "
@@ -204,6 +215,7 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
     # set MS365_FILTER for a wider sweep done out of band.
     dry_run = False
     new_failures: list = []
+    _queued_ids = None   # set after the prune on a real run
     try:
         from integrations.email_scanner import EmailInboxClient
         from sync_inventory import _apply_events
@@ -335,6 +347,10 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
                         full_clean=_scan_was_full_and_clean(report, lookback_days))
                     if _unparsed_po:
                         record_unparsed_reports(_unparsed_po)
+                    _retire_fetched_entries(
+                        set(getattr(scan, "fetched_ids", None) or []))
+                    from inventory_tracker import load_unparsed_reports as _lur
+                    _queued_ids = {str(e.get("id") or "") for e in _lur()}
                     save_scan_health({
                         "ts": datetime.now().isoformat(),
                         "source": report.get("source"),
@@ -361,7 +377,7 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
         # Failures: raise each as a feed-health issue (once per key) and tell
         # the caller which ones are NEW. A dry run raises nothing and reports
         # what would be new.
-        issues = _collect_scan_issues(report, scan)
+        issues = _collect_scan_issues(report, scan, queued_ids=_queued_ids)
         if dry_run:
             try:
                 from core import feed_health
@@ -374,6 +390,7 @@ def _api_email_scan_locked(body: dict, trigger: str = "api"):
         else:
             new_failures = _raise_scan_issues(issues)
             _clear_resolved_scan_issues(report, issues, lookback_days)
+            _clear_proved_resolved(scan, issues)
             _record_scan_attempt(report, trigger, failed=False)
     except Exception as exc:  # noqa: BLE001
         _log_exc(exc, "email scan")
@@ -425,6 +442,38 @@ def _retire_non_report_entries(current_ids: set, *, full_clean: bool) -> None:
             or e.get("id") in current_ids]
     if len(kept) != len(entries):
         _it._write_json(_it.UNPARSED_REPORTS_FILE, kept)
+
+
+def _retire_fetched_entries(fetched_ids: set) -> None:
+    """Drop "could not be downloaded" queue entries for messages this scan
+    did download, whatever its window. Caller holds data_lock."""
+    if not fetched_ids:
+        return
+    import inventory_tracker as _it
+    entries = _it.load_unparsed_reports()
+    kept = [e for e in entries
+            if not (e.get("kind") == "fetch" and e.get("id") in fetched_ids)]
+    if len(kept) != len(entries):
+        _it._write_json(_it.UNPARSED_REPORTS_FILE, kept)
+
+
+def _clear_proved_resolved(scan, issues: list) -> None:
+    """Close the issues the scanner proved resolved (ScanResult.resolved_keys)
+    unless this same scan raised them again. Runs on every real scan, short
+    windows included: a mailbox whose folder ids resolved, or a message that
+    finally downloaded, is resolved no matter how far back the scan looked."""
+    keys = set(getattr(scan, "resolved_keys", None) or [])
+    if not keys:
+        return
+    raised = {str(i.get("key") or "") for i in issues}
+    try:
+        from core import feed_health
+        open_now = feed_health.snapshot().get("issues") or {}
+        for k in keys - raised:
+            if k in open_now:
+                feed_health.clear_issue(k)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc(exc, "clear proved-resolved issues")
 
 
 def _clear_resolved_scan_issues(report: dict, issues: list, lookback_days: int) -> None:

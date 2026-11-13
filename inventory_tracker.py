@@ -819,6 +819,33 @@ def _unparsed_sender_warehouse(sender: str):
     return None, None
 
 
+def _all_counted_since(sender: str, entry: dict, latest_count: dict) -> bool:
+    """A rep who covers SEVERAL warehouses (Michael Ross: one Cheney workbook
+    for all three FL facilities) has no single warehouse to self-heal on, so
+    his entries never cleared -- two chit-chat replies from 1-2 Nov were still
+    in the queue on 13 Nov although every facility had counted on 9 Nov.
+    True when each covered warehouse has a count at/after the message."""
+    try:
+        from integrations.rep_registry import warehouses_for_address
+        from integrations.rep_map import sender_address
+        whs = warehouses_for_address(sender_address(sender))
+    except Exception:  # noqa: BLE001 -- best-effort
+        return False
+    if len(whs) < 2:
+        return False
+    sent_dt = _parse_iso_utc(entry.get("sent") or "")
+    recv_dt = _parse_iso_utc(entry.get("received") or "")
+    heal_at = sent_dt if sent_dt is not None else (
+        recv_dt - UNPARSED_SELF_HEAL_SLACK if recv_dt is not None else None)
+    if heal_at is None:
+        return False
+    for wh in whs:
+        c_dt = _parse_iso_utc(latest_count.get(wh) or "")
+        if c_dt is None or c_dt < heal_at:
+            return False
+    return True
+
+
 def prune_unparsed_reports(now: Optional[datetime] = None,
                            max_age_days: int = UNPARSED_MAX_AGE_DAYS,
                            freshness: Optional[list] = None) -> list:
@@ -878,6 +905,8 @@ def prune_unparsed_reports(now: Optional[datetime] = None,
         if recv_dt is not None and (now - recv_dt).days > max_age_days:
             continue  # aged out
         _dist, wh = _unparsed_sender_warehouse(sender)
+        if not wh and received and _all_counted_since(sender, e, latest_count):
+            continue  # self-healed: every warehouse this rep covers counted since
         if wh and received:
             c_dt = _parse_iso_utc(latest_count.get(wh) or "")
             # Compare against when the message was SENT: that is the instant a

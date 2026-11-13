@@ -265,6 +265,58 @@ def _overlaps(a: dict, b: dict) -> bool:
     return bool(la & lb)
 
 
+_RESEND_WINDOW_HOURS = 24
+
+
+def _line_print(r: dict):
+    return sorted((str(L.get("lot_number") or ""), str(L.get("variety") or ""),
+                   float(L.get("cs_count") or 0)) for L in r.get("lines") or [])
+
+
+def _unlabelled_resend(a: dict, b: dict) -> bool:
+    """Are ``a`` and ``b`` the same sheet sent twice, one of them without the
+    warehouse/PO in its subject? Gabo sent "Daily Production " at 7:54 ET on
+    2026-11-13 and the same 616 cases as "...RIVIERA BEACH PO.014511780511"
+    six minutes later; the blank copy raised a "could not tell which
+    warehouse" alert and sat beside the real one. Same production date, same
+    lots + cases line for line, same sender, within a day; exactly one of the
+    two is identified."""
+    if bool(_identity(a)) == bool(_identity(b)):
+        return False
+    if not (a.get("lines") and b.get("lines")):
+        return False
+    if (a.get("production_date") or "") != (b.get("production_date") or ""):
+        return False
+    sa = (a.get("source_sender") or "").strip().lower()
+    sb = (b.get("source_sender") or "").strip().lower()
+    if sa and sb and sa != sb:
+        return False
+    if abs((_recv_dt(a) - _recv_dt(b)).total_seconds()) > _RESEND_WINDOW_HOURS * 3600:
+        return False
+    return _line_print(a) == _line_print(b)
+
+
+def collapse_unlabelled_resends(records: list) -> list:
+    """Retire every unidentified sheet that a labelled resend duplicates
+    (mutates ``records``). Returns the retired message ids."""
+    retired = []
+    labelled = [r for r in records if _identity(r)]
+    keep = []
+    for r in records:
+        twin = None if _identity(r) else next(
+            (x for x in labelled if _unlabelled_resend(r, x)), None)
+        if twin is None:
+            keep.append(r)
+            continue
+        mid = r.get("source_message_id") or ""
+        twin.setdefault("replaced", [])
+        if mid and mid not in twin["replaced"]:
+            twin["replaced"].append(mid)
+        retired.append(mid)
+    records[:] = keep
+    return retired
+
+
 def ingest_production_record(records: list, record: dict, *, refresh: bool = False,
                              tombstones: dict | None = None):
     """Add one parsed record to ``records`` (mutated in place).
@@ -311,6 +363,20 @@ def ingest_production_record(records: list, record: dict, *, refresh: bool = Fal
         records.append(record)
         return "parse_error", record
     ident = _identity(record)
+    for i, r in enumerate(records):
+        if not _unlabelled_resend(r, record):
+            continue
+        if ident:        # the labelled resend replaces the unlabelled copy
+            prior = [m for m in (r.get("replaced") or []) if m]
+            if r.get("source_message_id"):
+                prior.append(r["source_message_id"])
+            record["replaced"] = prior
+            records[i] = record
+            return "replaced", record
+        r.setdefault("replaced", [])  # unlabelled copy of a stored sheet
+        if mid and mid not in r["replaced"]:
+            r["replaced"].append(mid)
+        return "superseded", r
     if ident:
         for i, r in enumerate(records):
             if _identity(r) != ident or not _overlaps(r, record):
@@ -364,6 +430,9 @@ def store_parsed(items: list, *, refresh: bool = False, ledger_index: dict | Non
             if status in ("refreshed", "replaced", "superseded", "parse_error", "ingested"):
                 changed = True
             out.append((status, stored))
+        retired = collapse_unlabelled_resends(records)
+        if retired:
+            changed = True
         for mid, n in (pdf_counts or {}).items():
             for r in records:
                 if r.get("source_message_id") == mid and r.get("pdf_count") != n:
@@ -372,7 +441,7 @@ def store_parsed(items: list, *, refresh: bool = False, ledger_index: dict | Non
         if changed:
             it.save_production(records)
         newest = newest_production_date(records)
-    _report_health(out, source, newest)
+    _report_health(out, source, newest, retired=retired)
     return out
 
 
@@ -390,14 +459,20 @@ def sheet_issue_key(message_id: str) -> str:
     return "production-sheet:" + (message_id or "?")[:120]
 
 
-def _report_health(results: list, source: str, newest: str) -> None:
+def _report_health(results: list, source: str, newest: str,
+                   retired: list | None = None) -> None:
     """Feed-health side effects of a store: one issue per sheet that needs a
     look (cleared when a later copy reads clean), and -- for the webhook --
     a "sheet arrived" record. Never raises."""
     try:
         from core import feed_health
+        for mid in retired or []:
+            feed_health.clear_issue(sheet_issue_key(mid))
         ingested = 0
         for status, rec in results:
+            if status == "replaced" and rec:
+                for old_mid in rec.get("replaced") or []:
+                    feed_health.clear_issue(sheet_issue_key(old_mid))
             if not rec or status in ("duplicate", "tombstoned", "superseded"):
                 continue
             mid = rec.get("source_message_id") or ""

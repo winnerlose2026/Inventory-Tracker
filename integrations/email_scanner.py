@@ -284,6 +284,14 @@ class ScanResult:
     # Mailboxes whose listing stopped at the message budget or the page cap
     # with mail in the window still unread.
     truncated: list[str] = field(default_factory=list)
+    # Issue keys this scan PROVED resolved whatever its window: a mailbox
+    # whose folder ids resolved again, a message that downloaded after an
+    # earlier fetch failure. The route clears them; before 2026-11-13 they
+    # waited for a full, clean 14-day scan, so a one-off Graph 502 sat in the
+    # morning digest for a day.
+    resolved_keys: list[str] = field(default_factory=list)
+    # internetMessageIds downloaded this scan (retires "fetch" queue entries).
+    fetched_ids: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +352,44 @@ def failure_class(err) -> Optional[str]:
     return None
 
 
+def scan_error_issue_key(err) -> Optional[str]:
+    """The feed-health key an alert-class scan error is raised under
+    (blueprints/email._collect_scan_issues), or None. One definition, so the
+    scanner can name the key it has just proved resolved."""
+    import hashlib
+    text = str(err or "").replace("\r", " ").replace("\n", " ")[:400]
+    slug = failure_class(text)
+    if not slug:
+        return None
+    return f"{slug}:" + hashlib.sha1(
+        text.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def folders_error(upn: str) -> str:
+    return (f"ms365 {upn}: could not resolve the Sent / Drafts / "
+            "Deleted folder ids -- scanned the Inbox only (see server log)")
+
+
+def fetch_failed_error(upn: str, subject: str, sender: str) -> str:
+    return (f"fetch failed: {upn}:{(subject or '')[:80]!r} from "
+            f"{sender or '?'} could not be downloaded -- see server log")
+
+
 # A PDF that is a purchase order by its name / subject / own text. Used to
 # tell a PO the parser read NOTHING from (must be flagged) from the invoices,
 # statements and delivery paperwork the same senders also attach as PDFs.
 _PO_HINT_RE = re.compile(
     r"(?<![A-Za-z])P\.?O\.?(?![A-Za-z])|purchase\s*order", re.I)
 _NOT_PO_HINT_RE = re.compile(
-    r"\b(invoice|statement|remittance|credit memo|past due|affidavit)", re.I)
+    r"\b(invoice|statement|remittance|credit memo|past due|affidavit"
+    r"|payment advice|check\s*#)", re.I)
+# A PDF whose own text says it is a payment document, not an order. Cheney's
+# accounts-payable "Check #  $0.00" mail (2026-11-13) attaches an ACH
+# Remittance Advice whose table has a "PO Number" column -- _PO_TEXT_RE read
+# that header as "this is a purchase order" and raised a dropped-PO error.
+_PDF_NOT_PO_RE = re.compile(
+    r"remittance\s+advice|remittance\s+address|not\s+intended\s+for\s+deposit"
+    r"|pay\s+to\s+the\s+order\s+of|settled\s+the\s+items\s+listed", re.I)
 _PO_TEXT_RE = re.compile(r"purchase\s+order|\bPO\s+request\b|\bP\.?O\.?\s*(#|number|no\.?)",
                          re.I)
 
@@ -367,6 +406,8 @@ def _pdf_text_looks_like_po(pdf_bytes) -> bool:
             text += (page.extract_text() or "") + "\n"
     except Exception:  # noqa: BLE001
         return False
+    if _PDF_NOT_PO_RE.search(text):
+        return False
     return bool(_PO_TEXT_RE.search(text))
 
 
@@ -382,6 +423,8 @@ def _zero_line_po_error(po, pdf_bytes, subject, filename="") -> Optional[str]:
     if getattr(po, "lines", None):
         return None
     blob = f"{subject or ''} {filename or ''}"
+    if not getattr(po, "po_number", "") and _NOT_PO_HINT_RE.search(blob):
+        return None   # a check copy / remittance / invoice, not an order
     is_po = bool(getattr(po, "po_number", "")) or (
         bool(_PO_HINT_RE.search(blob)) and not _NOT_PO_HINT_RE.search(blob)
     ) or _pdf_text_looks_like_po(pdf_bytes)
@@ -617,8 +660,22 @@ def _carries_report_payload(msg: Message, subject: str) -> bool:
     for fname, payload in _attachments(msg):
         if payload and fname.lower().endswith(_REPORT_ATTACHMENT_EXTS):
             return True
-    blob = f"{_text_body(msg)}\n{_html_body(msg)}".lower()
+    # Only the reply's OWN part counts: the quoted thread under "I will review
+    # with purchasing tomorrow" still says "weekly usage", and Ross's two
+    # one-line iPhone replies (1-2 Nov) sat in the queue for two weeks on it.
+    # A forward is the exception -- its payload IS the quoted part.
+    text, html = _text_body(msg), _html_body(msg)
+    if not _FORWARD_SUBJECT_RE.match(subject or ""):
+        try:
+            from .usfoods_inventory_report import _own_html, _own_text
+            text, html = _own_text(text), _own_html(html)
+        except Exception:  # noqa: BLE001 -- fall back to the whole body
+            pass
+    blob = f"{text}\n{html}".lower()
     return any(mark in blob for mark in _REPORT_BODY_MARKERS)
+
+
+_FORWARD_SUBJECT_RE = re.compile(r"^\s*(fwd?|fw)\s*:", re.I)
 
 
 def _text_body(msg: Message) -> str:
@@ -1912,10 +1969,12 @@ class EmailInboxClient:
                 excluded_ids, junk_ids = self._excluded_folder_ids(user, token)
             except Exception as exc:  # noqa: BLE001
                 _log_scan_exc(exc, f"ms365 folder ids {upn}")
-                result.errors.append(
-                    f"ms365 {upn}: could not resolve the Sent / Drafts / "
-                    "Deleted folder ids -- scanned the Inbox only (see server log)")
+                result.errors.append(folders_error(upn))
                 folder = "Inbox"
+            else:
+                _k = scan_error_issue_key(folders_error(upn))
+                if _k:
+                    result.resolved_keys.append(_k)
         q = {
             "$top": str(top),
             "$select": ("id,internetMessageId,parentFolderId,subject,from,"
@@ -2000,9 +2059,7 @@ class EmailInboxClient:
                     _fid = m.get("internetMessageId") or mid
                     _fsubj = m.get("subject") or ""
                     result.errors.append(
-                        f"fetch failed: {upn}:{_fsubj[:80]!r} from "
-                        f"{_graph_from or '?'} could not be downloaded -- "
-                        "see server log")
+                        fetch_failed_error(upn, _fsubj, _graph_from))
                     result.unparsed.append({
                         "kind": "fetch", "reason": "fetch failed", "id": _fid,
                         "mailbox": upn, "sender": _graph_from,
@@ -2018,6 +2075,15 @@ class EmailInboxClient:
                         "severity": "error",
                     })
                     continue
+                # Downloaded: any earlier "could not be downloaded" alert for
+                # this very message is resolved, whatever this scan's window.
+                _okid = m.get("internetMessageId") or mid
+                result.fetched_ids.append(_okid)
+                result.resolved_keys.append(f"fetch-failed:{_okid}")
+                _k = scan_error_issue_key(fetch_failed_error(
+                    upn, m.get("subject") or "", _graph_from))
+                if _k:
+                    result.resolved_keys.append(_k)
                 try:
                     msg = email.message_from_bytes(mime_bytes)
                     events, errs, cw_pos = parse_message_with_errors(
