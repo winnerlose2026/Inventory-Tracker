@@ -9,6 +9,7 @@ same from outside). All times UTC.
                                                     (today, plus any of the last 7
                                                     days that has no burn at all)
   graph-renew             09:00 and 21:00           POST /api/graph/subscriptions/renew
+                          + hourly :35 while a renew failure is open
   production-scan         23:30 daily               POST /api/production/scan
   delivery-sync           :07/:27/:47, 10:00-03:59  POST /api/pos/delivery/sync-threads
   toast-nightly           08:15 daily               POST /api/toast/nightly-pull
@@ -245,6 +246,18 @@ def _run_graph_renew() -> None:
     _post("/api/graph/subscriptions/renew", feed="graph-renew")
 
 
+def _run_graph_renew_retry() -> None:
+    """Hourly at :35, but only while a renew failure is open: a Microsoft
+    503 at 09:00 used to wait twelve hours for the 21:00 run (2026-11-13)."""
+    try:
+        from integrations.graph_subscriptions import renew_failure_pending
+        if not renew_failure_pending():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    _post("/api/graph/subscriptions/renew", feed="graph-renew")
+
+
 def _run_production_scan() -> None:
     """Ingest Daily Production sheets from the mailbox.
 
@@ -407,6 +420,15 @@ def start_scheduler() -> BackgroundScheduler | None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+    # Renew retry -- hourly at :35, a no-op unless the last renew failed.
+    sched.add_job(
+        _run_graph_renew_retry,
+        CronTrigger(minute=35, timezone=UTC),
+        id="graph-subscriptions-renew-retry",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=600,
     )
     # Lineage delivery confirmations — every 20 min, 6am-11pm ET (10-03 UTC).
     sched.add_job(

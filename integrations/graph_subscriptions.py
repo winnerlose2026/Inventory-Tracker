@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -331,6 +332,55 @@ def create_subscriptions() -> dict:
     return {"ok": True, "results": results, "subscriptions": state["subscriptions"]}
 
 
+_TRANSIENT_RE = re.compile(r"failed: (5\d\d|429)\b")
+# Wall-clock budget for in-call retries: the scheduler's POST and gunicorn's
+# 180 s worker timeout both bound this request.
+_RETRY_BUDGET_S = 75
+_RETRY_PAUSE_S = 8
+
+
+def _is_transient(exc: Exception) -> bool:
+    """A Microsoft-side hiccup (5xx / 429 / network timeout) rather than a
+    verdict on the subscription. 2026-11-13 09:00 UTC: Graph answered 503
+    "A task was canceled" to the PATCH, the DELETE and the recreate for
+    info@ alike -- deleting a still-valid subscription on such an answer
+    could only make things worse."""
+    if isinstance(exc, RuntimeError):
+        return bool(_TRANSIENT_RE.search(str(exc)))
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError))
+
+
+def _hours_left(sub: dict) -> Optional[float]:
+    raw = (sub.get("expiration_date_time") or "").strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - datetime.now(timezone.utc)).total_seconds() / 3600
+
+
+def _fmt_et(sub: dict) -> str:
+    raw = (sub.get("expiration_date_time") or "").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("America/New_York")).strftime("%a %b %-d %-I:%M %p ET")
+    except Exception:  # noqa: BLE001
+        return raw or "unknown"
+
+
+def renew_failure_pending() -> bool:
+    """Is a renew failure open? (scheduler: hourly retry only then)."""
+    try:
+        from core import feed_health
+        issues = feed_health.snapshot().get("issues") or {}
+        return any(k.startswith("graph-subscriptions:renew") for k in issues)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def renew_subscriptions() -> dict:
     """PATCH each tracked subscription with a fresh expirationDateTime.
 
@@ -362,6 +412,8 @@ def renew_subscriptions() -> dict:
     new_expiration = _expiration_iso()
     results = []
     by_user = {s.get("user"): s for s in subs}
+    import time as _time
+    started = _time.monotonic()
 
     for sub in subs:
         sub_id = sub.get("id")
@@ -370,12 +422,27 @@ def renew_subscriptions() -> dict:
             results.append({"user": user, "ok": False, "error": "missing id"})
             continue
         try:
-            resp = _graph_request(
-                "PATCH",
-                f"{GRAPH_BASE}/subscriptions/{urllib.parse.quote(sub_id)}",
-                token,
-                body={"expirationDateTime": new_expiration},
-            )
+            try:
+                resp = _graph_request(
+                    "PATCH",
+                    f"{GRAPH_BASE}/subscriptions/{urllib.parse.quote(sub_id)}",
+                    token,
+                    body={"expirationDateTime": new_expiration},
+                )
+            except Exception as exc_first:  # noqa: BLE001
+                # One more try after a short pause when Microsoft is having a
+                # moment and there is time left in this request.
+                if not _is_transient(exc_first) or \
+                        _time.monotonic() - started > _RETRY_BUDGET_S:
+                    raise
+                _log_exc_gs(exc_first, "renew_subscriptions patch (will retry)")
+                _time.sleep(_RETRY_PAUSE_S)
+                resp = _graph_request(
+                    "PATCH",
+                    f"{GRAPH_BASE}/subscriptions/{urllib.parse.quote(sub_id)}",
+                    token,
+                    body={"expirationDateTime": new_expiration},
+                )
             sub["expiration_date_time"] = resp.get(
                 "expirationDateTime", new_expiration,
             )
@@ -385,6 +452,20 @@ def renew_subscriptions() -> dict:
         except Exception as exc:  # noqa: BLE001
             _log_exc_gs(exc, "renew_subscriptions patch")
             msg = str(exc)
+            left = _hours_left(sub)
+            if _is_transient(exc) and (left is None or left > 0):
+                # Microsoft is failing, not refusing: keep the (still valid)
+                # subscription and try again within the hour (scheduler
+                # graph-renew-retry). No delete, no recreate.
+                code = (_TRANSIENT_RE.search(msg) or [None, "a timeout"])[1]
+                results.append({
+                    "user": user, "ok": False, "transient": True,
+                    "hours_left": round(left, 1) if left is not None else None,
+                    "error": (f"renew deferred, Microsoft answered {code} "
+                              f"(temporary); the current subscription is still "
+                              f"valid until {_fmt_et(sub)}; retrying hourly"),
+                })
+                continue
             if not ("404" in msg or "ResourceNotFound" in msg):
                 # Still exists but won't renew (403/400/5xx): drop it so the
                 # recreate below doesn't leave two live subscriptions.
@@ -474,7 +555,12 @@ def renew_subscriptions() -> dict:
             st["last_state_error"] = state_error
             st["last_state_error_at"] = now_iso
     state = _update_state(_apply)
-    _report_renew_health(not failed, renew_err, state_error, len(new_subs))
+    # A deferred renew with more than a day of validity left is a warning;
+    # anything else (refused, recreate failed, < 24 h left) is an error.
+    soft = bool(failed) and all(
+        r.get("transient") and (r.get("hours_left") or 0) > 24 for r in failed)
+    _report_renew_health(not failed, renew_err, state_error, len(new_subs),
+                         severity="warn" if soft else "error")
     out = {"ok": not failed, "results": results,
            "subscriptions": state["subscriptions"]}
     if state_error:
@@ -482,7 +568,8 @@ def renew_subscriptions() -> dict:
     return out
 
 
-def _report_renew_health(ok: bool, renew_err: str, state_error: str, n: int) -> None:
+def _report_renew_health(ok: bool, renew_err: str, state_error: str, n: int,
+                         severity: str = "error") -> None:
     """Shared feed record + issues for the daily renew. Never raises."""
     try:
         from core import feed_health
@@ -494,11 +581,16 @@ def _report_renew_health(ok: bool, renew_err: str, state_error: str, n: int) -> 
                 "graph-subscriptions:state-lost",
                 "Graph mail subscriptions: " + state_error, "warn")
         if renew_err:
+            # Escalation gets its own key: issues alert once per key, so a
+            # warning that turned urgent (< 24 h of validity left) must not
+            # hide behind the first email.
+            key = ("graph-subscriptions:renew" if severity == "warn"
+                   else "graph-subscriptions:renew-urgent")
             feed_health.raise_issue(
-                "graph-subscriptions:renew",
-                "Graph mail subscription renew failed: " + renew_err, "error")
+                key, "Mail subscription renew failed: " + renew_err, severity)
         else:
             feed_health.clear_issue("graph-subscriptions:renew")
+            feed_health.clear_issue("graph-subscriptions:renew-urgent")
     except Exception as exc:  # noqa: BLE001
         _log_exc_gs(exc, "renew health")
 

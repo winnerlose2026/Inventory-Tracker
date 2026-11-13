@@ -181,7 +181,8 @@ def test_scheduler_registers_every_job(monkeypatch):
     try:
         ids = {j.id for j in sched.get_jobs()}
         assert ids == {"forecast-decrement-daily", "graph-subscriptions-renew",
-                       "graph-subscriptions-renew-pm", "production-scan-daily",
+                       "graph-subscriptions-renew-pm", "graph-subscriptions-renew-retry",
+                       "production-scan-daily",
                        "delivery-sync-20m", "toast-nightly-pull", "backup-hourly",
                        "watchdog-hourly", "scheduler-heartbeat", "catch-up-once"}
         # gunicorn.conf.py formats every job's next run time at start-up

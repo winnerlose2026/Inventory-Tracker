@@ -208,6 +208,27 @@ def _when(ts: str) -> str:
 FAILING_GRACE_HOURS = 3
 
 
+# Feeds whose job raises its own issue for the same failure; the generic
+# stale/failing alert would only say it again (the 2026-11-13 digest listed
+# one Microsoft 503 three times).
+_OWN_ISSUE_FEEDS = {
+    "graph-renew": "graph-subscriptions:renew",
+    "graph-subscriptions": "graph-subscriptions:renew",
+}
+
+
+def _has_issue(view: dict, prefix: str) -> bool:
+    issues = view.get("issues")
+    if issues is None:
+        try:
+            issues = feed_health.snapshot().get("issues") or {}
+        except Exception:  # noqa: BLE001
+            return False
+    keys = issues.keys() if isinstance(issues, dict) else [
+        (i or {}).get("key", "") for i in issues]
+    return any(str(k).startswith(prefix) for k in keys)
+
+
 def _check_feeds(view: dict, now: datetime | None = None) -> None:
     now = now or _utcnow()
     stale_keep, fail_keep = set(), set()
@@ -217,15 +238,19 @@ def _check_feeds(view: dict, now: datetime | None = None) -> None:
             # It is running right now. If it STOPS, nothing here can say so:
             # the page banner (feeds view) and the off-box task do.
             continue
+        if name in _OWN_ISSUE_FEEDS and _has_issue(view, _OWN_ISSUE_FEEDS[name]):
+            continue   # the job already raised its own, more specific issue
         if f["stale"]:
             key = "feed-stale:" + name
             stale_keep.add(key)
             limit = f.get("max_age_hours")
             feed_health.raise_issue(
                 key,
-                "%s has not completed since %s (expected at least every %s "
-                "hours)." % (label, _when(f["last_ok"]),
-                             ("%g" % limit) if limit else "few"),
+                "%s has not %s (expected at least every %s hours)."
+                % (label,
+                   ("completed since " + _when(f["last_ok"])) if f["last_ok"]
+                   else "completed successfully yet",
+                   ("%g" % limit) if limit else "few"),
                 "error" if name in REQUIRED_FEEDS or name == "scheduler" else "warn")
         elif not f["ok"]:
             last_ok = _parse(f["last_ok"])
