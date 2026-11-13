@@ -1899,8 +1899,20 @@ def build_po_ledger() -> list:
         _baked = baked_for_ledger()
     except Exception:  # noqa: BLE001 -- an overlay; never fatal to the ledger
         _baked = {}
+    try:
+        from core.util import business_today
+        from integrations.po_shipping import shipped_verdict
+        _today = business_today()
+    except Exception:  # noqa: BLE001
+        shipped_verdict = None
     for r in out:
         r["production"] = _baked.get(_norm_po_key(r.get("po_number") or ""))
+        # The Planner's "really shipped?" rule, so both tabs agree.
+        if shipped_verdict is not None:
+            try:
+                r["shipping"] = shipped_verdict(r, _today)
+            except Exception:  # noqa: BLE001 -- an overlay; never fatal
+                r["shipping"] = None
     out.sort(key=lambda x: (x.get("status") or "", x.get("ordered_at") or "", x.get("po_number") or ""))
     return out
 

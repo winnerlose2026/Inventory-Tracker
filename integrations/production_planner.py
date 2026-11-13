@@ -74,42 +74,12 @@ def build_production_guide(inv: dict, ledger: list, demand_rows: list,
     top4_floor = float(bd.get("top4_floor") or 7)
     other_floor = float(bd.get("other_floor") or 5)
 
-    def _baked_vs_ordered(po):
-        ordered = sum(float(L.get("qty") or 0) for L in (po.get("lines") or [])) \
-            or float(po.get("total_cs") or 0)
-        baked = float(((po.get("production") or {}).get("baked_cs")) or 0)
-        return baked, ordered
-
-    def _ship_passed(po):
-        sd = _parse(po.get("ship_date"))
-        return bool(sd and sd.date() <= today)
+    from integrations.po_shipping import shipped_verdict
 
     def _shipped(po):
-        """Has this PO really left the bakery?
-
-        A ship date that has merely gone by is NOT proof: the ledger turns a
-        PO "in transit" at 00:00 of its ship date whether or not a single
-        case was baked, so a PO that missed its truck silently left the bake
-        queue and never showed as late. It counts as shipped only when
-          * it has arrived, or an operator set it In Transit by hand;
-          * the ship date is verified (freight invoice / Lineage pickup);
-          * the Daily Production sheets show it fully baked; or
-          * the status says in transit and there is no ship date to doubt.
-        Dates are the bakery's (America/New_York) calendar.
-        """
-        st = (po.get("status") or "")
-        if st == "arrived":
-            return True
-        if (po.get("override") or "") == "in_transit":
-            return True
-        if not (po.get("ship_date") or "").strip():
-            return st == "in_transit"
-        if not _ship_passed(po):
-            return False
-        if (po.get("ship_date_source") or "") in ("freight", "lineage"):
-            return True
-        baked, ordered = _baked_vs_ordered(po)
-        return ordered > 0 and baked >= ordered - 1e-9
+        """See integrations.po_shipping -- the Pending POs tab uses the same
+        rule, so a PO is never "In Transit" there and LATE here."""
+        return shipped_verdict(po, today)["shipped"]
 
     # =====================================================================
     # 1) PRODUCTION QUEUE -- active POs not yet produced/shipped (bake-to-order)

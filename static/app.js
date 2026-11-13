@@ -2711,6 +2711,7 @@ function renderPendingPOs() {
   // here. Honors the same shared distributor/warehouse/search filters.
   renderInTransitSection(groups.filter(g => {
     if (g._state === 'arrived' || g._state === 'cancelled') return false;
+    if (g._state === 'late') return false;   // not proven shipped -- see Late tag
     const ship = _poDate(g.ship_date);
     if (!ship) return false;
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -2736,7 +2737,7 @@ function renderPendingPOs() {
   // Quick-filter buttons.
   if (pendingFilterMode === 'overdue') {
     // Unified on the order-date + 30-day rule (same as the Overdue tag).
-    groups = groups.filter(g => g._state === 'overdue');
+    groups = groups.filter(g => g._state === 'overdue' || g._state === 'late');
   } else if (pendingFilterMode === 'noship') {
     groups = groups.filter(g => !g.ship_date);
   } else if (pendingFilterMode === 'pallet') {
@@ -2770,7 +2771,11 @@ function renderPendingPOs() {
 // PO status tags
 // ---------------------------------------------------------------------------
 // Exactly one tag per PO, chosen by precedence:
-//   Cancelled > Arrived > Overdue > In Production > In Transit > Open
+//   Cancelled > Arrived > Late > Overdue > In Production > In Transit > Open
+//   - Late = the ship date has gone by and nothing proves it shipped (no
+//     freight/Lineage pickup, not fully baked, no operator In Transit). The
+//     server decides it (ledger row .shipping, integrations/po_shipping.py)
+//     with the same rule as the Production Planner, so the two tabs agree.
 //   - Cancelled / Arrived are terminal states.
 //   - Overdue = ordered_at + 30 days in the past (ops rule: ANY PO older
 //     than 30 days from its order date is overdue). Outranks the ship-
@@ -2784,6 +2789,7 @@ function renderPendingPOs() {
 const PENDING_TAGS = {
   arrived:       { label: 'Arrived',       cls: 'badge-green'  },
   in_transit:    { label: 'In Transit',    cls: 'badge-blue'   },
+  late:          { label: 'Late',          cls: 'badge-red'    },
   in_production: { label: 'In Production', cls: 'badge-violet' },
   overdue:       { label: 'Overdue',       cls: 'badge-red'    },
   cancelled:     { label: 'Cancelled',     cls: 'badge-gray'   },
@@ -2930,6 +2936,7 @@ function _poState(g, now, trustServer) {
   // With the ledger as the source, a PO is arrived only when the server says
   // so (its rollover is what credits on-hand); a past date alone is not.
   if (trustServer ? (g.status === 'arrived') : _isPoArrived(g, now)) return 'arrived';
+  if (trustServer && g.shipping && g.shipping.late) return 'late';
   const ordered = _poDate(g.ordered_at);
   if (ordered) {
     const cutoff = new Date(ordered);
@@ -3010,6 +3017,7 @@ function _groupsFromLedger(records) {
       transit_days: (r.transit_days === undefined || r.transit_days === null) ? null : Number(r.transit_days),
       transit_basis: r.transit_basis || '',
       production: r.production || null,
+      shipping: (r.shipping && typeof r.shipping === 'object') ? r.shipping : null,
       // Hardening fields from the ledger (absent on older servers).
       stuck: !!r.stuck,
       held_days: (r.held_days === undefined || r.held_days === null) ? null : Number(r.held_days),
@@ -3330,7 +3338,7 @@ function _pendingRowHtml(g, now) {
   const arrival = g.arrival_date ? formatDate(g.arrival_date) : '<span style="color:var(--muted)">—</span>';
   const eta = g.eta ? formatDate(g.eta) : '<span style="color:var(--muted)">—</span>';
   const palletMismatch = (Number(g.total_cs) % 56) !== 0;
-  const rowStyle = (state === 'overdue')
+  const rowStyle = (state === 'overdue' || state === 'late')
     ? ' style="background:var(--surface2)"'
     : palletMismatch
       ? ' style="background:rgba(217, 119, 6, 0.08)"'
@@ -3622,7 +3630,7 @@ function onModifyPoSelect() {
   onModifyStatusChange();
 }
 
-const _NOT_ARRIVED_STATES = ['open', 'overdue', 'in_transit', 'in_production'];
+const _NOT_ARRIVED_STATES = ['open', 'overdue', 'late', 'in_transit', 'in_production'];
 
 // Status drives stock now (server: /api/pending/set-status). Show the arrival
 // date only for "Arrived" on an inventory PO that is still on order, and let a
