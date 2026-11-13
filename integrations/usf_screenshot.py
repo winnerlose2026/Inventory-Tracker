@@ -31,8 +31,13 @@ Every row must prove itself before it can touch inventory:
 One bad row blocks the whole screenshot: a partial Houston count is worse than
 a late one.
 
-``Order`` is read for the log only. It is the open PO (393072B2 on 10/13), which
-the PO path already carries; applying it here would double count.
+``Order`` is never applied to stock. It is the open PO (393072B2 on 10/13),
+which the PO path already carries; applying it would double count. Since
+2026-11-13 it rides on the on-hand event as ``reported_on_order`` -- read-only,
+for the same on-order cross-check the other US Foods DCs get
+(integrations/ingest_health.check_on_order): a gap of more than a pallet
+between Tom's Order column and our pending POs means a PO is missing here or
+one shown pending has already arrived.
 """
 
 from __future__ import annotations
@@ -453,7 +458,10 @@ def build_events(rows: list, usage: dict, *, warehouse: str, sent_iso: str,
                 "distributor_sku": r.usf_item_no}
         if r.usf_item_no in usage:
             item["weekly_usage"] = usage[r.usf_item_no]
-        events.append({"event_type": "on_hand", "item": item, **common})
+        ev = {"event_type": "on_hand", "item": item, **common}
+        if getattr(r, "order", None) is not None:
+            ev["reported_on_order"] = float(r.order)   # cross-check only
+        events.append(ev)
         counted.add(r.usf_item_no)
     for usf, wk in sorted(usage.items()):
         if usf in counted:

@@ -90,8 +90,11 @@ WAREHOUSES: "dict[str, dict]" = {
             _rep("Jasmin Gomez", "jasmin.gomez@usfoods.com"),
             # Manassas (DC 5O) street-sales shared mailbox, in case the report
             # comes from the team alias rather than a named coordinator.
+            # Read, never chased: the chasers have only ever written to
+            # Thomas + Jasmin (made explicit 2026-11-13 when the chasers
+            # moved onto GET /api/reps).
             _rep("USF Manassas coordination",
-                 "5o-dl-streetsalescoordination@usfoods.com"),
+                 "5o-dl-streetsalescoordination@usfoods.com", no_chase=True),
             # The weekly "Product Usage Report" itself now comes from USF's
             # Salesforce customer-contact alias (Stephanie Warfle, Sales
             # Coordination Manager - AMA/MDC), and Thomas Paxson forwards it.
@@ -113,7 +116,8 @@ WAREHOUSES: "dict[str, dict]" = {
         "watch_only": False,
         "reps": [
             _rep("Sam Travlos", "sam.travlos@usfoods.com"),
-            _rep("Ozzy Corut", "ozzy.corut@usfoods.com"),
+            # Alternate sender only; the chasers write to Sam (2026-11-13).
+            _rep("Ozzy Corut", "ozzy.corut@usfoods.com", no_chase=True),
         ],
     },
     "Chicago, IL": {

@@ -90,6 +90,10 @@ def test_order_column_is_read_but_only_for_the_log():
     # The 1,120 cs on order is PO 393072B2 -- never written as on-hand.
     assert sum(e["item"]["quantity"] for e in events) == 510
     assert all(e["event_type"] == "on_hand" for e in events)
+    # ...but it rides along, read-only, for the on-order cross-check.
+    assert {e["item"]["distributor_sku"]: e.get("reported_on_order")
+            for e in events if e.get("reported_on_order") is not None} == {
+        k: float(v) for k, v in ORDER_1013.items() if v is not None}
 
 
 def test_vndr_code_glued_to_the_description_is_recovered():

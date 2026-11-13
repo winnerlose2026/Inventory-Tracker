@@ -37,7 +37,7 @@ OLD_WAREHOUSE_REPS = {
         {"name": "Thomas Paxson", "email": "thomas.paxson@usfoods.com"},
         {"name": "Jasmin Gomez", "email": "jasmin.gomez@usfoods.com"},
         {"name": "USF Manassas coordination",
-         "email": "5o-dl-streetsalescoordination@usfoods.com"},
+         "email": "5o-dl-streetsalescoordination@usfoods.com", "no_chase": True},
         {"name": "USF Customer Contact (Sales Coordination)",
          "email": "usfcustomercontact@usfoods.com", "no_chase": True},
     ],
@@ -47,7 +47,7 @@ OLD_WAREHOUSE_REPS = {
     ],
     "La Mirada, CA": [
         {"name": "Sam Travlos", "email": "sam.travlos@usfoods.com"},
-        {"name": "Ozzy Corut", "email": "ozzy.corut@usfoods.com"},
+        {"name": "Ozzy Corut", "email": "ozzy.corut@usfoods.com", "no_chase": True},
     ],
     "Chicago, IL": [{"name": "Michael Via", "email": "michael.via@usfoods.com"}],
     "Alcoa, TN": [
@@ -119,10 +119,17 @@ def test_watch_only_never_email_and_chase_variants():
         assert rec["chase_variant"] in (RR.CHASE_STANDARD, RR.CHASE_HOUSTON_SCREENSHOT)
     assert [w for w, r in RR.WAREHOUSES.items() if r["watch_only"]] == ["Alcoa, TN"]
     assert RR.WAREHOUSES["Houston, TX"]["chase_variant"] == "houston-screenshot"
-    assert RR.never_email() == ["charles.youngblood@usfoods.com",
+    assert RR.never_email() == ["5o-dl-streetsalescoordination@usfoods.com",
+                                "charles.youngblood@usfoods.com",
                                 "christy.dunn@usfoods.com",
                                 "kimberly.cobb@usfoods.com",
+                                "ozzy.corut@usfoods.com",
                                 "usfcustomercontact@usfoods.com"]
+    # The chasers write to exactly who they always have (2026-11-13, when
+    # they moved onto GET /api/reps): no team alias, no alternate sender.
+    assert RR.chase_recipients("Manassas, VA") == [
+        "thomas.paxson@usfoods.com", "jasmin.gomez@usfoods.com"]
+    assert RR.chase_recipients("La Mirada, CA") == ["sam.travlos@usfoods.com"]
     assert RR.chase_recipients("Alcoa, TN") == []
     assert RR.chase_recipients("Houston, TX") == ["tom.foley@usfoods.com"]
     assert RR.chase_recipients("Ocala, FL") == ["mross@cheneybrothers.com"]
