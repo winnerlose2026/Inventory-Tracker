@@ -400,3 +400,88 @@ def test_production_ocr_only_mode_runs_just_that_step(monkeypatch, capsys):
                   "--api-token", "t"])
     assert rc == 0 and seen == ["https://inv.example/api/production/unreadable?meta_only=1"]
     assert "no scanned sheets waiting" in capsys.readouterr().out
+
+
+# --- Lineage follow-ups: weekday holds (7135734C was re-asked Mon 9:51 AM) ----------
+
+def _m(sent, frm, text, conv="c1"):
+    return {"sent": sent, "from": frm, "text": text, "conversation_id": conv}
+
+
+def test_weekday_elapsed_skips_the_weekend():
+    fri = datetime(2026, 11, 13, 20, 43, tzinfo=timezone.utc)      # 3:43 PM ET Fri
+    mon = datetime(2026, 11, 16, 14, 51, tzinfo=timezone.utc)      # 9:51 AM ET Mon
+    got = D.weekday_elapsed(fri, mon)
+    assert timedelta(hours=18) <= got <= timedelta(hours=18, minutes=10), got
+    assert D.weekday_elapsed(mon, fri) == timedelta(0)
+
+
+def test_a_friday_reply_still_holds_the_po_on_monday():
+    msgs = [_m("2026-11-13T19:50:00Z", "JD@hhbagels.com",
+               "URGENT: PO 7135734C (US Foods, La Mirada) -- did it deliver?"),
+            _m("2026-11-13T20:43:06Z", "bmorris@onelineage.com",
+               'Per dispatch, "the driver is on site for waiting to unload."')]
+    pos = ["7135734C", "9751114C", "014511780511"]
+    mon = datetime(2026, 11, 16, 14, 51, tzinfo=timezone.utc)
+    q = D.quiet_pos(msgs, pos, mon)
+    assert set(q) == {"7135734C"}, q                    # only the PO that was asked about
+    assert "Fri 11/13" in q["7135734C"]
+    # a day of weekday time later it no longer holds
+    assert D.quiet_pos(msgs, pos, datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)) == {}
+
+
+def test_a_reply_naming_a_po_holds_that_po_for_a_business_day():
+    msgs = [_m("2026-11-16T14:57:02Z", "bmorris@onelineage.com",
+               "9751114C-delivery appt is 0830AM/20th")]
+    pos = ["7135734C", "9751114C"]
+    q = D.quiet_pos(msgs, pos, datetime(2026, 11, 16, 22, 0, tzinfo=timezone.utc))
+    assert set(q) == {"9751114C"}
+    assert D.quiet_pos(msgs, pos, datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)) == {}
+
+
+def test_an_unattributable_reply_holds_the_whole_thread_only_briefly():
+    msgs = [_m("2026-11-16T14:00:00Z", "bmorris@onelineage.com", "Checking, will advise.")]
+    pos = ["7135734C", "9751114C"]
+    assert set(D.quiet_pos(msgs, pos, datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc))) == set(pos)
+    assert D.quiet_pos(msgs, pos, datetime(2026, 11, 16, 20, 0, tzinfo=timezone.utc)) == {}
+
+
+# --- US Foods relabels columns: recognise them by meaning --------------------------
+
+def _usf_xlsx(header, rows):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(header)
+    for r in rows:
+        ws.append(r)
+    b = io.BytesIO()
+    wb.save(b)
+    return b.getvalue()
+
+
+def test_usf_report_columns_are_recognised_by_meaning():
+    from integrations import usfoods_inventory_report as R
+    rows = [[7095637, "BAGEL, PLAIN", 34, 8], [7309056, "BAGEL, EVTHG", 30, 12]]
+    for oh, use in [("Cases On Hand", "Cases"), ("Hand On Case", "Cases"),
+                    ("On-Hand (cs)", "Avg Weekly Usage"), ("QOH", "Shipped Avg Per Wk"),
+                    ("Stock", "4 Wk Avg Sold"), ("Cases in Stock", "Weekly Forecast")]:
+        rep = R.parse_report_xlsx(_usf_xlsx(["APN", "Description", oh, use], rows))
+        assert rep is not None, (oh, use)
+        got = {(l.usf_item_no, l.cases_on_hand, l.weekly_usage) for l in rep.lines}
+        assert got == {("7095637", 34, 8), ("7309056", 30, 12)}, (oh, use, got)
+
+
+def test_projections_are_not_mistaken_for_on_hand():
+    from integrations import usfoods_inventory_report as R
+    for h in ("Pot Forecast on Hand", "Pot weeks OH", "WOH plus next PO",
+              "On Hand After Next PO", "Projected On Hand"):
+        assert not R.looks_on_hand(R._norm(h)), h
+    assert R.looks_on_hand(R._norm("Hand On Case "))
+
+
+def test_a_renamed_item_heading_is_found_by_its_contents():
+    from integrations import usfoods_inventory_report as R
+    rep = R.parse_report_xlsx(_usf_xlsx(
+        ["USF Item Code", "Description", "Cases On Hand", "Cases"],
+        [[7095637, "BAGEL, PLAIN", 34, 8], [7309056, "BAGEL, EVTHG", 30, 12]]))
+    assert rep is not None and {l.usf_item_no for l in rep.lines} == {"7095637", "7309056"}

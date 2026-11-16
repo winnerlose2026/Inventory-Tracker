@@ -37,12 +37,14 @@ def test_html_report_without_a_forecast_column_warns():
 
 
 def test_xlsx_report_with_a_renamed_usage_column_warns():
+    # A heading that says nothing about usage still warns (11/16: headings
+    # that MEAN usage -- "Shipped Avg Per Wk" -- are now read as usage).
     data = _wb([["APN", "Description", "Manufacturer Product Number",
-                 "On Hand Quantity", "Shipped Avg Per Wk"],
+                 "On Hand Quantity", "Qty Moved"],
                 [7095637, "BAGEL, PLAIN", 1150, 2, 5]])
     rep = R.parse_report_xlsx(data)
     assert rep.lines and rep.lines[0].weekly_usage is None
-    assert "Shipped Avg Per Wk" in rep.warnings[0]
+    assert "Qty Moved" in rep.warnings[0]
     events, errors, _ = ES.parse_message_with_errors(
         mime("kimberly.cobb@usfoods.com", "July 27 Report",
              attachments=[("amt.xlsx", data, XLSX)]))

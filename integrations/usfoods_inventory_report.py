@@ -259,10 +259,58 @@ def _parse_header_date(label: str) -> Optional[date]:
         return None
 
 
+# --- Column recognition by meaning ------------------------------------------
+# US Foods relabels report columns without notice ("Cases On Hand" became
+# "Hand On Case" on Manassas's 11/16/2026 report and the count went unread;
+# "Weekly Average Demand" became "8 Week Average Shipped" before that). So a
+# column is recognised by what its heading MEANS, not one exact spelling.
+_ON_HAND_EXACT = ("currentonhand", "casesonhand", "caseonhand", "curroh", "onhand",
+                  "onhandquantity", "handoncase", "handoncases", "onhandcases",
+                  "onhandcase", "qoh", "oh", "stock", "instock", "casesinstock")
+# words that make an "...on hand" heading something else: La Mirada's "Pot
+# Forecast on Hand", "Pot weeks OH", "WOH plus next PO"; projections; orders.
+_NOT_ON_HAND = ("pot", "forecast", "week", "woh", "plus", "order", "avg",
+                "average", "usage", "projected", "after", "next")
+_USAGE_WORDS = ("usage", "forecast", "shipped", "demand", "movement", "sold",
+                "average", "avg", "perweek", "weekly", "wkly", "used")
+
+
+def looks_on_hand(n: str) -> bool:
+    if n in _ON_HAND_EXACT:
+        return True
+    return ("hand" in n or n.endswith("qoh")) and not any(w in n for w in _NOT_ON_HAND)
+
+
+def looks_usage(n: str) -> bool:
+    if n in ("cases", "forecast") or n.startswith("weeklyaveragedemand"):
+        return True
+    if re.match(r"^\d+week(ly)?average", n) or "averageshipped" in n:
+        return True
+    if "hand" in n or "order" in n or n.startswith("pot") or "woh" in n:
+        return False
+    return any(w in n for w in _USAGE_WORDS)
+
+
+def item_col_by_content(rows: list, header_idx: int, skip=()) -> Optional[int]:
+    """The column whose cells below the header are mostly known US Foods item
+    numbers (USF_ITEM_NO_TO_MFG) -- for a report whose item heading is new."""
+    best, best_hits = None, 0
+    body = rows[header_idx + 1: header_idx + 60]
+    width = max((len(r) for r in body), default=0)
+    for c in range(width):
+        if c in skip:
+            continue
+        hits = sum(1 for r in body if c < len(r)
+                   and _clean_code(r[c]) in USF_ITEM_NO_TO_MFG)
+        if hits > best_hits:
+            best, best_hits = c, hits
+    return best if best_hits >= 2 else None
+
+
 def _is_report_header(row: list[str]) -> bool:
     norms = [_norm(c) for c in row]
     has_item = any(n == "item" for n in norms)
-    has_on_hand = any("onhand" in n for n in norms)
+    has_on_hand = any(looks_on_hand(n) for n in norms)
     return has_item and has_on_hand
 
 
@@ -291,7 +339,7 @@ def _build_report_from_table(table: list[list[str]],
             col_mfg = idx
         elif n == "description" and col_desc is None:
             col_desc = idx
-        elif "onhand" in n and col_oh is None:
+        elif looks_on_hand(n) and col_oh is None:
             col_oh = idx
         elif n.startswith("onorder") and col_oo is None:
             col_oo = idx
@@ -536,35 +584,16 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
     _ITEM_HEADERS = ("productnumber", "productnum", "productno",
                      "usfoodsnumber", "usfnumber", "usfoodsnum", "item", "apn")
 
-    def _is_on_hand(n):
-        # Explicit set only, so "Pot Forecast on Hand" / "Pot weeks OH" /
-        # "WOH plus next PO" on the La Mirada sheet aren't mistaken for it.
-        # "onhandquantity" is the Assortment Management Tool on-hand column.
-        # "Hand On Case": Manassas's "Customer Metric Source" export, 11/16/2026
-        # (Jasmin Gomez) -- the same report with the column relabeled.
-        return n in ("currentonhand", "casesonhand", "caseonhand", "curroh",
-                     "onhand", "onhandquantity", "handoncase", "handoncases",
-                     "onhandcases", "onhandcase")
-
-    def _is_usage(n):
-        # Manassas weekly "Cases"; La Mirada weekly "Forecast"; Assortment
-        # Management Tool "Weekly Average Demand (Last 4 Weeks)", which USF
-        # renamed to "8 Week Average Shipped" (same meaning: average cases
-        # shipped per week). Accept any "<N> Week Average ..." heading and any
-        # "... Average Shipped" heading so the next rename doesn't silently
-        # drop the usage rate again -- on-hand parses either way, so a missed
-        # usage column produces no error, just a stale usage figure.
-        if n in ("cases", "forecast") or n.startswith("weeklyaveragedemand"):
-            return True
-        if re.match(r"^\d+week(ly)?average", n):
-            return True
-        return "averageshipped" in n
+    _is_on_hand = looks_on_hand
+    _is_usage = looks_usage
 
     def _find_header(sheet_rows):
         for i, row in enumerate(sheet_rows):
             norms = [_norm(c) for c in row if c is not None]
+            if not any(_is_on_hand(n) for n in norms):
+                continue
             if (any(n in _ITEM_HEADERS for n in norms)
-                    and any(_is_on_hand(n) for n in norms)):
+                    or item_col_by_content(sheet_rows, i) is not None):
                 return i
         return None
 
@@ -610,6 +639,13 @@ def parse_report_xlsx(xlsx_bytes: bytes, *, distributor: str = "",
         if raw and "time frame" in str(raw).lower() and not week_label:
             week_label = str(raw).strip()
 
+    if col_item is None and col_oh is not None:
+        # a renamed item heading: find the column by its contents
+        col_item = item_col_by_content(rows, header_idx,
+                                       skip={c for c in (col_mfg, col_desc, col_oh, col_oo)
+                                             if c is not None} | set(col_use_list))
+        if col_item is not None and col_item in col_use_list:
+            col_use_list.remove(col_item)
     if col_oh is None or col_item is None:
         return None
     # Fall back to the usage column's own header as the week label (the

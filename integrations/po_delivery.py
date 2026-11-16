@@ -68,10 +68,16 @@ FOLLOWUP_FROM = "jd@hhbagels.com"
 FOLLOWUP_TO = ("bmorris@onelineage.com", "LTransSolutionsEast@onelineage.com",
                "rwilt@onelineage.com", "dyarnold@onelineage.com")
 FOLLOWUP_CC = ("Isaiah@hhbagels.com", "Gabo@hhbagels.com")
+from zoneinfo import ZoneInfo as _ZI
+_ET = _ZI("America/New_York")
 THREAD_QUIET_FOR = timedelta(hours=4)    # someone wrote on the thread just now: wait
 SYNC_FRESH_FOR = timedelta(minutes=45)   # follow-ups only off a just-read mailbox
 MAX_FOLLOWUP_EMAILS = 10                 # per call
+# Both holds below count WEEKDAY time only (weekday_elapsed): Belinda's
+# Friday 3:43 PM reply on PO 7135734C had "expired" by Monday 9:51 AM under a
+# 48-clock-hour rule, and the server asked her again.
 ANSWERED_HOLD_FOR = timedelta(hours=48)  # Lineage replied since our last ask: don't re-ask
+REPORTER_QUIET_FOR = timedelta(hours=24) # Lineage / the dock wrote about a PO: no chase
 ASK_TEXT = {
     "schedule": ("could you send the pickup date and the delivery appointment "
                  "(date and time)? If it has already delivered, please confirm "
@@ -807,7 +813,7 @@ def answered_since_chase(rec: dict, messages: list, po_numbers: list,
     pos = [norm_po(p) for p in po_numbers]
     for m in sorted(messages, key=lambda m: m.get("sent") or "", reverse=True):
         sent = parse_dt(m.get("sent") or "")
-        if sent is None or sent <= last or now - sent >= ANSWERED_HOLD_FOR:
+        if sent is None or sent <= last or weekday_elapsed(sent, now) >= ANSWERED_HOLD_FOR:
             continue
         if not sender_may_report(m.get("from") or "") or is_auto_reply(m):
             continue
@@ -823,27 +829,63 @@ def answered_since_chase(rec: dict, messages: list, po_numbers: list,
     return None
 
 
+def weekday_elapsed(since: datetime, now: datetime) -> timedelta:
+    """Time between ``since`` and ``now`` not counting Saturdays and Sundays
+    (Eastern calendar days) -- nobody at Lineage answers over a weekend, so a
+    Friday reply is still "recent" on Monday morning."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/New_York")
+    a, b = since.astimezone(tz), now.astimezone(tz)
+    if b <= a:
+        return timedelta(0)
+    total = timedelta(0)
+    cur = a
+    while cur < b:
+        nxt = min(b, (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                                       microsecond=0))
+        if cur.weekday() < 5:
+            total += nxt - cur
+        cur = nxt
+    return total
+
+
 def quiet_pos(messages: list, po_numbers: list, now: datetime) -> dict:
-    """POs on a thread that someone wrote about within THREAD_QUIET_FOR ->
-    {po_key: reason}. A message that names some of the thread's POs quiets
-    only those; one that names none ("This order is all set", "checking,
-    will advise") quiets them all. A busy thread about one PO therefore
-    doesn't hold back the follow-up on another."""
+    """POs on a thread someone wrote about recently -> {po_key: reason}.
+
+    * Lineage / the receiving dock: a message naming a PO holds that PO for
+      REPORTER_QUIET_FOR of weekday time (they are on it; a chase on top is
+      noise). One naming no PO holds the POs the H&H message it answers
+      asked about for that long -- and, when that can't be told, every PO
+      on the thread for THREAD_QUIET_FOR only.
+    * anyone else (H&H): THREAD_QUIET_FOR, named POs or all.
+    A busy thread about one PO therefore doesn't hold back another."""
     quiet = {}
     for m in sorted(messages, key=lambda m: m.get("sent") or ""):
         sent = parse_dt(m.get("sent") or "")
-        if not sent or now - sent >= THREAD_QUIET_FOR:
+        if not sent:
             continue
         text = m.get("text") or ""
         if text.lstrip().startswith(INTERNAL_TEST_PREFIX) or is_auto_reply(m):
             continue
-        up = text.upper()
+        reporter = sender_may_report(m.get("from") or "")
+        recent = now - sent < THREAD_QUIET_FOR
+        if not recent and not (reporter and weekday_elapsed(sent, now) < REPORTER_QUIET_FOR):
+            continue
+        up = text.upper() if not reporter else own_text(text).upper()
         named = [p for p in po_numbers
                  if re.search(r"(?<![A-Z0-9])" + re.escape(p) + r"(?![A-Z0-9])", up)]
+        targets = named
+        if not named:
+            asked = asked_in_answered(m, messages, po_numbers) if reporter else []
+            targets = asked or (po_numbers if recent else [])
+        if not targets:
+            continue
         mins = int((now - sent).total_seconds() // 60)
-        why = (f"{m.get('from') or 'someone'} wrote about it {mins} min ago "
+        ago = (f"{mins} min ago" if mins < 120 else
+               f"on {sent.astimezone(_ET).strftime('%a %m/%d %I:%M %p')} ET")
+        why = (f"{m.get('from') or 'someone'} wrote about it {ago} "
                "-- giving them time")
-        for p in (named or po_numbers):
+        for p in targets:
             quiet[p] = why
     return quiet
 
