@@ -352,7 +352,7 @@ def api_production_ingest():
     record = record_from_sheet(sheet, message_id=message_id, subject=subject,
                                sender=sender, received_at=received_at)
     if ocr_used and record.get("lines"):
-        note = "read by OCR from a scanned PDF -- check the cases and lots"
+        from integrations.production_store import OCR_NOTE as note
         record["ocr"] = True
         record["warning"] = f"{record['warning']}; {note}" if record.get("warning") else note
     [(status, stored)] = store_parsed(

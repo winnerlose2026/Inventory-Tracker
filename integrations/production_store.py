@@ -455,6 +455,16 @@ def newest_production_date(records: list) -> str:
     return best
 
 
+#: Shown on a sheet read by OCR (blueprints/production ingest). Informational:
+#: the read already passed the totals / lots checks, so it raises no alert.
+OCR_NOTE = "read by OCR from a scanned PDF -- check the cases and lots"
+
+
+def _alert_worthy_warning(rec: dict) -> str:
+    parts = [w.strip() for w in (rec.get("warning") or "").split(";")]
+    return "; ".join(w for w in parts if w and w != OCR_NOTE)
+
+
 def sheet_issue_key(message_id: str) -> str:
     return "production-sheet:" + (message_id or "?")[:120]
 
@@ -473,6 +483,10 @@ def _report_health(results: list, source: str, newest: str,
             if status == "replaced" and rec:
                 for old_mid in rec.get("replaced") or []:
                     feed_health.clear_issue(sheet_issue_key(old_mid))
+            if rec and status == "duplicate" and not _alert_worthy_warning(rec):
+                # a sheet already stored clean: any alert left for it is stale
+                feed_health.clear_issue(sheet_issue_key(rec.get("source_message_id") or ""))
+                continue
             if not rec or status in ("duplicate", "tombstoned", "superseded"):
                 continue
             mid = rec.get("source_message_id") or ""
@@ -484,11 +498,11 @@ def _report_health(results: list, source: str, newest: str,
                     f"{(rec.get('parse_error') or 'unreadable')[:160]}", "error")
                 continue
             ingested += 1
-            if rec.get("warning"):
+            if _alert_worthy_warning(rec):
                 feed_health.raise_issue(
                     sheet_issue_key(mid),
-                    f"Production sheet \"{subj}\" needs a look: {rec['warning'][:300]}",
-                    "warn")
+                    f"Production sheet \"{subj}\" needs a look: "
+                    f"{_alert_worthy_warning(rec)[:300]}", "warn")
             else:
                 feed_health.clear_issue(sheet_issue_key(mid))
         if source and results:

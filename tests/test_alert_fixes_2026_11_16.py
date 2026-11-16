@@ -323,3 +323,45 @@ def test_an_ocr_read_that_does_not_add_up_is_refused():
     assert any("low confidence" in p for p in sheet_text(shaky)[1])
     no_lot = [b for b in boxes if b[3] != "1155110326"]
     assert any("lot number" in p for p in sheet_text(no_lot)[1])
+
+
+def test_an_ocr_read_sheet_raises_no_alert_and_a_repost_clears_a_stale_one(tmp_path, monkeypatch):
+    import base64
+    from core import feed_health
+    from integrations import production_store as ps
+    c = _prod_client(tmp_path, monkeypatch)
+    h = {"X-Inventory-Token": "tok"}
+    body = {"pdf_b64": base64.b64encode(_blank_pdf()).decode(),
+            "subject": "Daily Production CWMID.PO.1220440", "message_id": "<scan2>",
+            "received_at": "2026-11-05T15:44:22Z", "ocr_text": GABO_TEXT_1105}
+    assert c.post("/api/production/ingest", json=body, headers=h).get_json()["status"] == "ingested"
+    key = ps.sheet_issue_key("<scan2>")
+    assert key not in feed_health.snapshot()["issues"]
+    feed_health.raise_issue(key, "stale", "warn")         # as left by the old rule
+    assert c.post("/api/production/ingest", json=body, headers=h).get_json()["status"] == "duplicate"
+    assert key not in feed_health.snapshot()["issues"]
+
+
+# --- Manassas relabeled its on-hand column (Jasmin Gomez, 11/16 10:39 AM) ------------
+
+def test_manassas_customer_metric_source_layout_parses():
+    from integrations import usfoods_inventory_report as R
+    rows = [["Customer Name (#)", "Product Description", "APN #", "Pack Size",
+             "Mfg Code", "Cases", "Hand On Case "],
+            ["HH BAGELS (91634139)", "BAGEL, EVTHG 4 Z UNSL PARBK", 7309056,
+             "10/6/4.25 OZ", 1158, 12, 34],
+            ["HH BAGELS (91634139)", "BAGEL, PLN 4.25 Z UNSL PARBK", 7095637,
+             "10/6/4.25 OZ", 1150, 8, 34],
+            ["HH BAGELS (91634139)", "BAGEL, ONION 4.25 Z UNSL PARBK", 7928199,
+             "10/6/4.25 OZ", 1151, 1, 12]]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Customer Metric Source"
+    for r in rows:
+        ws.append(r)
+    b = io.BytesIO()
+    wb.save(b)
+    rep = R.parse_report_xlsx(b.getvalue())
+    assert rep is not None and rep.warnings == []
+    got = {(l.cases_on_hand, l.weekly_usage) for l in rep.lines}
+    assert got == {(34, 12), (34, 8), (12, 1)}, got
