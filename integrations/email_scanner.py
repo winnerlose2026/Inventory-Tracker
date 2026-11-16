@@ -339,6 +339,36 @@ _FAILURE_CLASSES = (
 )
 
 
+_PARTIAL_RE = re.compile(
+    r"^partial parse: .*? \((?P<wh>[^()]+)\): .*\[period end (?P<end>\d{4}-\d{2}-\d{2})\]")
+
+
+def drop_superseded_partials(errors: list, events: list) -> list:
+    """Drop a "partial parse ... no on-hand grid" error once the same scan
+    read an on-hand count for that warehouse from a report sent AFTER the
+    partial file's period closed -- the rep resent it, or next week's came.
+
+    Ross's 11/9/2026 Riviera Beach file had usage only; JD asked, Ross resent
+    it with stock the same afternoon, and the first file still raised "the
+    count was not refreshed" on every 6-hour scan for two weeks."""
+    counted: dict = {}
+    for e in events or []:
+        if getattr(e, "event_type", "") != "on_hand":
+            continue
+        wh = (getattr(e.item, "warehouse", "") or "").strip()
+        when = (getattr(e, "count_date", "") or getattr(e, "source_received_at", "")
+                or "")[:10]
+        if wh and when and when > counted.get(wh, ""):
+            counted[wh] = when
+    out = []
+    for err in errors or []:
+        m = _PARTIAL_RE.match(str(err))
+        if m and counted.get(m.group("wh").strip(), "") > m.group("end"):
+            continue
+        out.append(err)
+    return out
+
+
 def failure_class(err) -> Optional[str]:
     """The alert class of a scan error, or None when it is informational.
     Mailbox failures are not classed here -- they fail every run on their own
@@ -1776,6 +1806,7 @@ class EmailInboxClient:
                 "integrations/examples/email_dump.example.eml for the body "
                 "format and .env.example for the full set of env vars."
             )
+        result.errors = drop_superseded_partials(result.errors, result.events)
         return result
 
     def _ms365_token(self):

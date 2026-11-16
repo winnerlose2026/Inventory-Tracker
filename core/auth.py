@@ -111,6 +111,7 @@ SCOPE_RULES = {
         ("POST", "/api/freight/scan"),
         ("POST", "/api/production/ingest"),
         ("POST", "/api/production/scan"),
+        ("GET", "/api/production/unreadable"),
         ("POST", "/api/sales/ingest"),
         ("POST", "/api/chefs-warehouse/ingest-pos"),
         ("POST", "/api/admin/labor/ingest"),

@@ -877,7 +877,8 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
     from integrations.po_delivery import (
         HOLD_STATUSES, apply_event, confirmation_lines, delivered_at_from,
         delivered_by_sent_day, delivered_date_estimated, dock_zone, names_po,
-        own_text, parse_dt, sender_may_report, states_a_day, wall_time,
+        on_site_at, own_text, parse_dt, sender_may_report, states_a_day,
+        wall_time,
     )
     threads = cache.get("threads") or {}
     by_conv: dict = {}
@@ -906,7 +907,7 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                     continue
                 own = own_text(m.get("text") or "")
                 named = [p for p in pos if names_po(own, p)]
-                for line, _kind in confirmation_lines(m.get("text") or ""):
+                for line, kind in confirmation_lines(m.get("text") or ""):
                     on_line = [p for p in pos if names_po(line, p)]
                     if on_line:
                         ok = on_line == [key]
@@ -916,9 +917,14 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                         ok = len(pos) == 1 or _answers_only(m, key, pos, cache)
                     if not ok:
                         continue
-                    at = delivered_at_from(line, m.get("sent") or "", zone,
-                                           rec.get("delivery_appt") or "")
-                    stated = states_a_day(line)
+                    if kind == "on_site":
+                        # the truck is at the door: arrived when this was sent
+                        at = on_site_at(m.get("sent") or "", zone)
+                        stated = at is not None
+                    else:
+                        at = delivered_at_from(line, m.get("sent") or "", zone,
+                                               rec.get("delivery_appt") or "")
+                        stated = states_a_day(line)
                     estimated = False
                     if at is None and not stated:
                         day = delivered_by_sent_day(m.get("sent") or "", zone)
@@ -933,11 +939,12 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                                        "sent": m.get("sent"), "quote": line}}
                     if estimated:
                         ev["date_estimated"] = True
-                    cands.append((not stated, sent, not at[1], ev))
-        # a line that states the day first; then the oldest message (an
-        # undated "delivered" is dated by it: the earliest is the tightest);
-        # within a message, a line with a time before one without
-        for _undated, _sent, _no_time, ev in sorted(cands, key=lambda c: (c[0], c[1], c[2])):
+                    cands.append((not stated, kind == "on_site", sent, not at[1], ev))
+        # a line that states the day first; then one that says "delivered"
+        # over an "on site" relay (dispatch passes that on late); then the
+        # oldest message (an undated "delivered" is dated by it: the earliest
+        # is the tightest); within a message, a line with a time first
+        for *_rank, ev in sorted(cands, key=lambda c: c[:4]):
             ev2, why = _verify_evidence(ev, key, cache)
             if why:
                 continue

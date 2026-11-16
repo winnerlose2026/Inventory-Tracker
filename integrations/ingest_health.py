@@ -84,17 +84,58 @@ def po_days_by_warehouse(ledger: list) -> dict:
     return {k: sorted(v) for k, v in out.items()}
 
 
-def po_gap_verdict(days: list, today) -> dict:
-    """Is this warehouse overdue for a PO? ``days`` = sorted distinct dates."""
+def po_receipts_by_warehouse(ledger: list) -> dict:
+    """{(distributor, warehouse): {"open": bool, "last_arrival": date|None}}
+    ("open": a PO pending / in transit -- reported, not used to excuse).
+
+    A buyer reorders off stock on hand. While its last PO is still on the
+    way it has no reason to order again, so silence then is not a missing
+    PO. Hanover (CW Mid-Atlantic), 11/16: PO 1220440 ordered 9/30 only
+    delivered 11/10, and the gap check called it "no PO for 47 days"."""
+    out: dict = {}
+    for r in ledger or []:
+        status = (r.get("status") or "")
+        if status == "canceled" or r.get("_canceled"):
+            continue
+        wh = (r.get("warehouse") or "").strip()
+        if not wh:
+            continue
+        rec = out.setdefault(((r.get("distributor") or "").strip(), wh),
+                             {"open": False, "last_arrival": None})
+        if status in ("pending", "in_transit"):
+            rec["open"] = True
+        elif status == "arrived":
+            a = _dt(r.get("arrival_date"))
+            if a is not None and (rec["last_arrival"] is None
+                                  or a.date() > rec["last_arrival"]):
+                rec["last_arrival"] = a.date()
+    return out
+
+
+def po_gap_verdict(days: list, today, receipts: dict = None) -> dict:
+    """Is this warehouse overdue for a PO? ``days`` = sorted distinct dates.
+    ``receipts`` (po_receipts_by_warehouse entry): the silence is counted
+    from the later of the last order and the last delivery. (An open PO does
+    NOT excuse it on its own: a PO stuck in Pending would silence the check
+    for good.)"""
     if len(days) < PO_GAP_MIN_GAPS + 1:
         return {"overdue": False, "reason": "not enough history",
                 "po_days": len(days)}
     gaps = [(b - a).days for a, b in zip(days, days[1:])][-PO_GAP_MAX_GAPS:]
     median = float(statistics.median(gaps))
     since = (today - days[-1]).days
-    overdue = since > PO_GAP_FACTOR * median and since > PO_GAP_MIN_DAYS
-    return {"overdue": overdue, "median_gap_days": median, "days_since_last": since,
-            "last_po_date": days[-1].isoformat(), "gaps_used": len(gaps)}
+    receipts = receipts or {}
+    last_arrival = receipts.get("last_arrival")
+    since_stock = since
+    if last_arrival and last_arrival > days[-1]:
+        since_stock = max(0, (today - last_arrival).days)
+    overdue = since_stock > PO_GAP_FACTOR * median and since_stock > PO_GAP_MIN_DAYS
+    out = {"overdue": overdue, "median_gap_days": median, "days_since_last": since,
+           "last_po_date": days[-1].isoformat(), "gaps_used": len(gaps)}
+    if last_arrival:
+        out["last_arrival"] = last_arrival.isoformat()
+        out["days_since_arrival"] = (today - last_arrival).days
+    return out
 
 
 def check_po_cadence(now=None) -> dict:
@@ -106,18 +147,22 @@ def check_po_cadence(now=None) -> dict:
     ignore = {w.strip().lower() for w in
               os.environ.get("PO_GAP_IGNORE", "").split(";") if w.strip()}
     out = {}
-    for (dist, wh), days in sorted(po_days_by_warehouse(build_po_ledger()).items()):
+    ledger = build_po_ledger()
+    receipts = po_receipts_by_warehouse(ledger)
+    for (dist, wh), days in sorted(po_days_by_warehouse(ledger).items()):
         key = f"po-gap:{wh}"
         if wh.lower() in ignore:
             feed_health.clear_issue(key)
             continue
-        v = po_gap_verdict(days, today)
+        v = po_gap_verdict(days, today, receipts.get((dist, wh)))
         out[wh] = v
         if v["overdue"]:
+            since_arr = (f", last delivery {v['last_arrival']}"
+                         if v.get("last_arrival") else "")
             feed_health.raise_issue(
                 key,
                 f"{wh} ({dist}): no purchase order for {v['days_since_last']} "
-                f"days (last one {v['last_po_date']}); it normally orders "
+                f"days (last one {v['last_po_date']}{since_arr}); it normally orders "
                 f"about every {v['median_gap_days']:g} days. Check the "
                 "mailbox for a PO the scan did not read, or confirm with the "
                 "buyer that none was placed.", "warn")
@@ -258,4 +303,5 @@ def run_checks() -> dict:
 
 
 __all__ = ["run_checks", "check_po_cadence", "check_on_order",
-           "expire_stale_issues", "po_gap_verdict", "po_days_by_warehouse"]
+           "expire_stale_issues", "po_gap_verdict", "po_days_by_warehouse",
+           "po_receipts_by_warehouse"]

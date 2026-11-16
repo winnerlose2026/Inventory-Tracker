@@ -86,6 +86,7 @@
 /api/production/lots-by-pair GET
 /api/production/scan POST
 /api/production/summary GET
+/api/production/unreadable GET
 /api/report GET
 /api/report-status GET
 /api/report/bakery-sales GET

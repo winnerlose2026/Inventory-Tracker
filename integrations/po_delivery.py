@@ -930,6 +930,18 @@ _NOT_FULL = re.compile(
 # way a hedged "delivered" line does.
 _NOT_YET = re.compile(r"\bout\s+for\s+delivery\b", re.I)
 _ARRIVAL = re.compile(r"^\s*Arrival\s+Time\s*:\s*(\S.*?)\s*$", re.I | re.M)
+# The truck is AT the receiving dock: "Per dispatch, \"the driver is on site
+# for waiting to unload.\"" (Belinda, Fri 11/13 3:43 PM ET, PO 7135734C -- La
+# Mirada). The load has reached the DC; only the unload is left. Before
+# 11/16 nothing but the word "delivered" counted, so the PO sat held all
+# weekend and was chased again Monday.
+_ON_SITE = re.compile(
+    r"\b(?:driver|truck|trailer|load|carrier)\b[^.?!]{0,40}?"
+    r"\b(?:on[\s-]?site|at\s+the\s+(?:dock|door|receiver)|checked[\s-]+in)\b",
+    re.I)
+_ON_SITE_HEDGE = re.compile(
+    r"n't\b|\?|\b(?:not|never|no|if|whether|will|should|expected|eta|when|once|"
+    r"until|before|tomorrow|tonight|yet|scheduled|appt|appointment)\b", re.I)
 _DEPARTURE = re.compile(r"^\s*Departure\s+Time\s*:\s*\S", re.I | re.M)
 _SENTENCE = re.compile(r"[^\n.!?]+(?:[.!](?!\d)|$)", re.M)
 # A line that opens with its own PO number ("9314683Y-had to reach out ...",
@@ -1044,6 +1056,10 @@ def confirmation_lines(text: str) -> list:
     scoped_hedge = False
     for raw in _SENTENCE.findall(own):
         line = raw.strip().strip(".!").strip()
+        if (line and not _CONFIRM.search(line) and _ON_SITE.search(line)
+                and not _ON_SITE_HEDGE.search(line)):
+            out.append((line, "on_site"))
+            continue
         if not line or not (_CONFIRM.search(line) or _NOT_YET.search(line)):
             continue
         if _HEDGE.search(line) or _NOT_FULL.search(line) or _NOT_YET.search(line):
@@ -1087,6 +1103,19 @@ def delivered_at_from(line: str, sent: str, zone: str,
     if local > sent_local + DELIVERED_FUTURE_SLACK:
         return None
     return local.isoformat(timespec="seconds"), True
+
+
+def on_site_at(sent: str, zone: str) -> Optional[tuple]:
+    """(delivered_at ISO, time_known) for an "on site" line: the moment it
+    was SENT, in the dock's zone -- the truck was at the door by then.
+    Dispatch relays it minutes after check-in, so the time is the best one
+    anyone will state; a later "delivered <time>" still wins (it is read
+    first: a stated day outranks this)."""
+    from zoneinfo import ZoneInfo
+    sent_dt = parse_dt(sent)
+    if sent_dt is None:
+        return None
+    return sent_dt.astimezone(ZoneInfo(zone)).isoformat(timespec="seconds"), True
 
 
 def states_a_day(line: str) -> bool:

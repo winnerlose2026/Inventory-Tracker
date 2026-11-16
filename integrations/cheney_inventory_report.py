@@ -69,7 +69,9 @@ _DESC_KEYWORDS = [
 def warehouse_from_filename(name: str) -> str:
     """Map a Cheney per-facility filename to our canonical 'City, FL' label."""
     s = (name or "").lower()
-    if "rvb" in s or "riviera" in s:
+    # Ross types the facility by hand: "Riviers" (11/15/2026), "Rivera",
+    # "Riveria" all mean Riviera Beach -- a typo used to drop the whole file.
+    if "rvb" in s or "riviera" in s or re.search(r"r[iy]v[aeiy]{1,3}r", s):
         return "Riviera Beach, FL"
     if "ocala" in s:
         return "Ocala, FL"
@@ -91,6 +93,13 @@ def _clean_code(v: str) -> str:
     if s.endswith(".0") and s[:-2].isdigit():
         s = s[:-2]
     return s.replace(" ", "")
+
+
+def _is_section_label(*cells: str) -> bool:
+    """A grid label row ("FROZEN GROCERY") sitting in a code column: letters
+    only, no digit anywhere -- every real Cheney item # / Mfg# has digits."""
+    text = " ".join(c for c in cells if c).strip()
+    return bool(text) and not re.search(r"\d", text)
 
 
 def _desc_keyword(desc: str) -> str:
@@ -477,6 +486,12 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
             variety, unmapped = resolve_variety(
                 mfg, desc, cell("distributor_sku"), has_code_column=has_code_col)
             qty = opt_float(cell("quantity"))
+            if unmapped and qty is None and not desc and _is_section_label(
+                    mfg, cell("distributor_sku")):
+                # Cheney's stock grid opens each category with a label row
+                # in the Item # column ("FROZEN GROCERY") -- no quantity, no
+                # description, no digits. Not an item: skip it quietly.
+                continue
             if unmapped:
                 errors.append(
                     f"{warehouse}: unmapped item # (mfg={_clean_code(mfg)!r}, "
@@ -546,7 +561,8 @@ def parse_report_xlsx(xlsx_bytes: bytes, filename: str, *,
         errors.append(
             f"partial parse: {filename} ({warehouse}): the usage grid was read "
             f"but NO on-hand (Stock) grid was found -- the count was not "
-            f"refreshed. First rows seen: {seen}")
+            f"refreshed. First rows seen: {seen}"
+            + (f" [period end {as_of_iso}]" if as_of_iso else ""))
 
     if not events and not errors:
         seen = ("; ".join(headers_seen)) or "no non-empty rows"

@@ -337,15 +337,116 @@ def api_production_ingest():
     if not message_id:
         message_id = synth_message_id(pdf_bytes)
 
+    ocr_text = (body.get("ocr_text") or "").strip()
     sheet = parse_production_pdf(pdf_bytes, subject=subject, received_at=received_at)
+    if ocr_text and sheet.error and not sheet.lines:
+        # An image-only scan (Gabo's 11/5 Riviera Beach sheet): the text was
+        # read by OCR off the same PDF (scripts/production_ocr.py, run by the
+        # 6-hour cron). Parsed by the very same rules; flagged so the
+        # Production tab shows it was machine-read.
+        from integrations.production_pdf_parser import parse_production_text
+        sheet = parse_production_text(ocr_text, subject=subject, received_at=received_at)
+        ocr_used = True
+    else:
+        ocr_used = False
     record = record_from_sheet(sheet, message_id=message_id, subject=subject,
                                sender=sender, received_at=received_at)
+    if ocr_used and record.get("lines"):
+        note = "read by OCR from a scanned PDF -- check the cases and lots"
+        record["ocr"] = True
+        record["warning"] = f"{record['warning']}; {note}" if record.get("warning") else note
     [(status, stored)] = store_parsed(
         [(record, getattr(sheet, "po_body", ""), getattr(sheet, "po_subject", ""))])
     out = {"ok": True, "status": status, "record": stored}
     if status == "parse_error":
         out["error"] = sheet.error
     return jsonify(out)
+
+
+@production_bp.route("/api/production/unreadable")
+def api_production_unreadable():
+    """Production sheets stored as unreadable (image-only scans) in the last
+    ``days`` (default 30), each with its PDF(s) fetched from the mailbox, for
+    the cron's OCR step (scripts/production_ocr.py). ``meta_only=1`` skips
+    the download -- the cron's cheap "anything to do?" check.
+
+    Returns {ok, count, sheets:[{message_id, key, subject, sender,
+    received_at, parse_error, pdfs:[{name, b64}]}], errors:[str]}."""
+    import base64 as _b64
+    import json as _json
+    import urllib.parse
+    from datetime import timezone
+    from integrations.production_store import is_stub, load_tombstones
+    from inventory_tracker import load_production
+    try:
+        days = max(1, min(int(request.args.get("days") or 30), 120))
+    except (TypeError, ValueError):
+        days = 30
+    meta_only = (request.args.get("meta_only") or "0") == "1"
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:19]
+    tomb = load_tombstones() or {}
+    sheets = []
+    for r in load_production() or []:
+        key = r.get("source_message_id") or ""
+        if not key or key in tomb or not is_stub(r) or r.get("lines"):
+            continue
+        if "image-only" not in (r.get("parse_error") or ""):
+            continue
+        if (r.get("received_at") or "")[:19] < since:
+            continue
+        mid, _, n = key.partition("#")
+        sheets.append({"message_id": mid, "key": key, "pdf_index": int(n or 1),
+                       "subject": r.get("source_subject") or "",
+                       "sender": r.get("source_sender") or "",
+                       "received_at": r.get("received_at") or "",
+                       "parse_error": r.get("parse_error") or "", "pdfs": []})
+    errors = []
+    if sheets and not meta_only:
+        from integrations.email_scanner import EmailInboxClient, GRAPH_BASE
+        client = EmailInboxClient()
+        try:
+            token = client._ms365_token()
+        except Exception as exc:  # noqa: BLE001
+            _log_exc(exc, "production unreadable token")
+            return jsonify({"ok": False, "error": _safe_err(exc, "ms365 token"),
+                            "sheets": []}), 200
+        users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
+        for sh in sheets:
+            filt = urllib.parse.quote(f"internetMessageId eq '{sh['message_id']}'")
+            for user in users:
+                uq = urllib.parse.quote(user)
+                try:
+                    raw, _ = client._graph_get(
+                        f"{GRAPH_BASE}/users/{uq}/messages?$filter={filt}&$select=id", token)
+                    found = (_json.loads(raw.decode("utf-8")) or {}).get("value") or []
+                    if not found:
+                        continue
+                    gid = found[0]["id"]
+                    raw, _ = client._graph_get(
+                        f"{GRAPH_BASE}/users/{uq}/messages/{gid}/attachments", token)
+                    atts = [a for a in (_json.loads(raw.decode("utf-8")) or {}).get("value") or []
+                            if (a.get("name") or "").lower().endswith(".pdf")
+                            or (a.get("contentType") or "").lower() == "application/pdf"]
+                    a = atts[sh["pdf_index"] - 1] if len(atts) >= sh["pdf_index"] else None
+                    if a is None:
+                        errors.append(f"{sh['subject'][:60]!r}: PDF #{sh['pdf_index']} not on the email")
+                        break
+                    data = a.get("contentBytes")
+                    if not data:
+                        raw, _ = client._graph_get(
+                            f"{GRAPH_BASE}/users/{uq}/messages/{gid}/attachments/{a['id']}", token)
+                        data = (_json.loads(raw.decode("utf-8")) or {}).get("contentBytes") or ""
+                    _b64.b64decode(data)          # must be real base64
+                    sh["pdfs"].append({"name": a.get("name") or "sheet.pdf", "b64": data})
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    _log_exc(exc, "production unreadable fetch")
+                    errors.append(f"{sh['subject'][:60]!r}: could not download "
+                                  f"({_safe_err(exc, 'graph fetch')})")
+                    break
+            else:
+                errors.append(f"{sh['subject'][:60]!r}: not found in the scanned mailboxes")
+    return jsonify({"ok": True, "count": len(sheets), "sheets": sheets, "errors": errors})
 
 
 def _graph_page(url: str, token: str, *, attempts: int = 3, timeout: int = 45):
