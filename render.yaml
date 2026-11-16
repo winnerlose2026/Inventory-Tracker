@@ -222,6 +222,30 @@ services:
       - key: MAILBOXES
         value: JD@ms.hhbagels.com,info@ms.hhbagels.com
 
+  # Scanned (image-only) Daily Production sheets, read within ~10 minutes
+  # (2026-11-16). Every 10 minutes one GET /api/production/unreadable
+  # ?meta_only=1 asks whether a scanned sheet is waiting (exits at once when
+  # not); only then are the OCR deps (requirements-ocr-usf.txt) pip-installed
+  # into /tmp and scripts/production_ocr.py --commit run. A read is stored
+  # only when its rows add up to the sheet's Total Cases and every row has a
+  # lot; otherwise the run fails (Render emails JD) and the sheet stays
+  # listed. The 6-hour scan runs the same step as a backstop. Created with
+  # the Render MCP; keep in sync by hand.
+  - type: cron
+    name: production-ocr
+    runtime: python
+    plan: starter
+    branch: main
+    region: virginia
+    schedule: "*/10 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/cowork_graph_scan.py --production-ocr-only
+    envVars:
+      - key: APP_URL
+        sync: false  # https://bagel-inventory.onrender.com
+      - key: INVENTORY_API_TOKEN
+        sync: false
+
   # Lineage PO follow-ups: on weekdays, chase delivery confirmations that are
   # overdue. NOT YET CREATED in the dashboard -- create it by hand with these
   # settings once scripts/lineage_followups.py is on main. It needs only the

@@ -19,6 +19,14 @@ def api_planning_config():
     return jsonify({"ok": True, "config": load_planning_config()})
 
 
+def _trend_sales() -> list:
+    """The Toast rows the demand trend reads: two 14-day windows back from
+    today, with slack. The whole store is ~170k rows; never load it all."""
+    from datetime import timedelta
+    from inventory_tracker import load_sales
+    return load_sales(since=(business_today() - timedelta(days=40)).isoformat()) or []
+
+
 @planning_bp.route("/api/planning/demand")
 def api_planning_demand():
     """Unified demand: per warehouse-SKU direct run-rate (cases/day, freshness-
@@ -33,7 +41,7 @@ def api_planning_demand():
         "ok": True,
         "warehouse_demand": wd,
         "pool_demand": pool_demand(wd),
-        "toast_trend": toast_demand_trend(load_sales() or [],
+        "toast_trend": toast_demand_trend(_trend_sales(),
                                           today=business_today().isoformat()),
         "stale_count": sum(1 for r in wd if r.get("stale")),
         "sku_count": len(wd),
@@ -57,7 +65,7 @@ def api_planning_guide():
         ledger=build_po_ledger(),
         demand_rows=warehouse_demand(inv),
         config=cfg,
-        toast_trend=toast_demand_trend(load_sales() or [],
+        toast_trend=toast_demand_trend(_trend_sales(),
                                        today=business_today().isoformat()),
     )
     return jsonify({"ok": True, **guide})

@@ -828,7 +828,18 @@ def run(argv: list[str] | None = None) -> int:
                             .strip().lower() != "off"),
                    help="server mode: skip the Houston buyer-screen OCR step "
                         "(env USF_SCREENSHOT_OCR=off does the same).")
+    p.add_argument("--production-ocr-only", action="store_true",
+                   help="only the scanned-production-sheet OCR step (the "
+                        "10-minute production-ocr cron); exits 0 at once when "
+                        "nothing is waiting.")
     args = p.parse_args(argv)
+
+    if args.production_ocr_only:
+        app_url = (args.app_url or "").rstrip("/")
+        if not app_url or not args.api_token:
+            print("ERROR: needs APP_URL and INVENTORY_API_TOKEN", file=sys.stderr)
+            return 2
+        return _run_production_ocr(app_url, args.api_token, dry_run=bool(args.dry_run))
 
     if args.mode == "server":
         return _run_server_mode(args)

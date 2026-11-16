@@ -180,7 +180,9 @@ def main(argv=None) -> int:
             print(f"production-ocr: {label}: {out.get('status')} -- PO "
                   f"{rec.get('po_number')} {rec.get('warehouse')}, "
                   f"{rec.get('total_cases')} cs, {len(rec.get('lines') or [])} rows")
-            if out.get("status") not in ("ingested", "replaced", "refreshed"):
+            # "duplicate": the other runner (10-minute cron vs the 6-hour
+            # scan) stored it a moment earlier -- fine.
+            if out.get("status") not in ("ingested", "replaced", "refreshed", "duplicate"):
                 rc = 3
     return rc
 

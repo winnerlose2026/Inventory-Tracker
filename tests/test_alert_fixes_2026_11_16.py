@@ -2,6 +2,7 @@
 never released. Each case below is a real message or file from that week.
 """
 import io
+import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -262,12 +263,13 @@ def test_a_big_data_file_is_not_kept_in_the_parse_cache(tmp_path, monkeypatch):
     isolate(tmp_path, monkeypatch)
     monkeypatch.setattr(it, "_CACHE_MAX_BYTES", 1000)
     rows = [{"guid": i, "item": "Plain Bagel"} for i in range(200)]   # > 1000 bytes
-    it.save_sales(rows)
-    assert str(it.SALES_FILE) not in it._FILE_CACHE
-    got = it.load_sales()
-    assert got == rows and str(it.SALES_FILE) not in it._FILE_CACHE
+    big = tmp_path / "big.json"
+    it._write_json(big, rows)
+    assert str(big) not in it._FILE_CACHE
+    got = it._read_json(big, [])
+    assert got == rows and str(big) not in it._FILE_CACHE
     got.append({"guid": "x"})                       # caller owns its copy
-    assert len(it.load_sales()) == 200
+    assert len(it._read_json(big, [])) == 200
     # small files are still cached
     it.save_inventory({})
     assert str(it.INVENTORY_FILE) in it._FILE_CACHE
@@ -365,3 +367,36 @@ def test_manassas_customer_metric_source_layout_parses():
     assert rep is not None and rep.warnings == []
     got = {(l.cases_on_hand, l.weekly_usage) for l in rep.lines}
     assert got == {(34, 12), (34, 8), (12, 1)}, got
+
+
+def test_production_ocr_only_mode_runs_just_that_step(monkeypatch, capsys):
+    import importlib.util
+    import urllib.request
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "cgs_ocr_only", Path(__file__).resolve().parent.parent / "scripts" / "cowork_graph_scan.py")
+    cgs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cgs)
+    seen = []
+
+    class _R:
+        def __init__(self, body):
+            self._b = json.dumps(body).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        return _R({"ok": True, "count": 0, "sheets": [], "errors": []})
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    rc = cgs.run(["--production-ocr-only", "--app-url", "https://inv.example",
+                  "--api-token", "t"])
+    assert rc == 0 and seen == ["https://inv.example/api/production/unreadable?meta_only=1"]
+    assert "no scanned sheets waiting" in capsys.readouterr().out

@@ -43,7 +43,11 @@ KEEP_PRE_DAYS = 30
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
 
 NAME_RE = re.compile(r"^(\d{8}T\d{6}Z)-([a-z0-9][a-z0-9-]{0,39})\.tar\.gz$")
-_MEMBER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(json|jsonl)$")
+_MEMBER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(json|jsonl|sqlite3)$")
+#: The Toast sales store (integrations/sales_store.py). Copied with SQLite's
+#: online backup, never byte-copied: a raw copy of a live WAL database can
+#: be torn.
+SALES_DB_MEMBER = "sales.sqlite3"
 MANIFEST = "MANIFEST.json"
 
 # Restored only when asked for by name: live state that must not be wound
@@ -86,7 +90,8 @@ def _data_files() -> list:
     .tmp.*, .corrupt-* and lock files do not match; backups/ is a folder."""
     try:
         files = [p for p in it.DATA_DIR.iterdir()
-                 if p.is_file() and _MEMBER_RE.match(p.name)]
+                 if p.is_file() and _MEMBER_RE.match(p.name)
+                 and not p.name.endswith(".sqlite3")]
     except OSError:
         return []
     return sorted(files, key=lambda p: p.name)
@@ -116,6 +121,15 @@ SUMMARY_PARSE_MAX_BYTES = 8 * 1024 * 1024
 def _summarize_path(path) -> dict:
     """_summarize for a file on disk, without loading a big one whole."""
     size = path.stat().st_size
+    if path.name.endswith(".sqlite3"):
+        out = {"bytes": size}
+        try:
+            from integrations import sales_store
+            out.update(sales_store.describe_db(path))
+            out["valid"] = True
+        except Exception:  # noqa: BLE001
+            out["valid"] = False
+        return out
     if size <= SUMMARY_PARSE_MAX_BYTES:
         return _summarize(path.name, path.read_bytes())
     h = hashlib.sha256()
@@ -261,6 +275,13 @@ def _make_snapshot(label: str) -> dict:
                 except OSError as exc:
                     print("[backups] could not copy %s: %s" % (src.name, exc),
                           file=sys.stderr)
+            try:
+                from integrations import sales_store
+                if sales_store.backup_to(stage / SALES_DB_MEMBER):
+                    staged.append(stage / SALES_DB_MEMBER)
+            except Exception as exc:  # noqa: BLE001 -- the rest still backs up
+                print("[backups] could not back up the sales store: %s"
+                      % type(exc).__name__, file=sys.stderr)
         if not staged:
             return {"ok": False, "skipped": "empty",
                     "error": "no data files to back up yet"}
@@ -423,6 +444,48 @@ def store_upload(raw: bytes, original_name: str = "") -> dict:
     return {"ok": True, "name": name, "size": len(raw), "files": sorted(docs)}
 
 
+def _describe_db_bytes(raw: bytes) -> dict:
+    import tempfile
+    from integrations import sales_store
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite3")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return sales_store.describe_db(tmp)
+    except Exception:  # noqa: BLE001
+        return {"valid": False}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _sales_db_matches(raw: bytes) -> bool:
+    import tempfile
+    from integrations import sales_store
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite3")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        return sales_store.fingerprint(tmp) == sales_store.fingerprint()
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _current_sales() -> dict:
+    try:
+        from integrations import sales_store
+        return {"type": "sqlite", "rows": sales_store.count()}
+    except Exception as exc:  # noqa: BLE001
+        return {"unreadable": type(exc).__name__}
+
+
 def _inventory_diff(cur, new) -> dict:
     cur = cur if isinstance(cur, dict) else {}
     new = new if isinstance(new, dict) else {}
@@ -458,11 +521,33 @@ def restore(name: str, *, dry_run: bool = True, files=None) -> dict:
     if files:
         wanted = {str(f) for f in files}
     plan, docs, problems = {}, {}, []
+    sales_rows = sales_db = None     # restored into the sales store, not a file
     with it.data_lock():
         for fname in sorted(members):
+            if fname == SALES_DB_MEMBER and (wanted is None or fname in wanted):
+                same = _sales_db_matches(members[fname])
+                plan[fname] = {"snapshot": _describe_db_bytes(members[fname]),
+                               "current": _current_sales(),
+                               "action": "unchanged" if same else "replace"}
+                if not same:
+                    sales_db = members[fname]
+                continue
             if fname == MANIFEST or not fname.endswith(".json"):
                 continue
             if wanted is not None and fname not in wanted:
+                continue
+            if fname == "sales.json":
+                # A snapshot from before the sales store: its rows go into
+                # the store (unless the snapshot also carries the store).
+                if SALES_DB_MEMBER in members:
+                    continue
+                try:
+                    sales_rows = json.loads(members[fname].decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    problems.append("sales.json in the backup is not valid JSON")
+                    continue
+                plan[fname] = {"snapshot": _describe(fname, sales_rows),
+                               "current": _current_sales(), "action": "replace"}
                 continue
             if wanted is None and fname in RESTORE_SKIP_BY_DEFAULT:
                 plan[fname] = {"action": "skipped (live state; name it in "
@@ -496,7 +581,9 @@ def restore(name: str, *, dry_run: bool = True, files=None) -> dict:
         present = {p.name for p in _data_files()}
         not_in_snapshot = sorted(present - set(members))
         result = {"ok": not problems, "dry_run": bool(dry_run), "name": name,
-                  "files": plan, "would_write": sorted(p.name for p in docs),
+                  "files": plan, "would_write": sorted(p.name for p in docs)
+                  + ([SALES_DB_MEMBER] if sales_db is not None else [])
+                  + (["sales.json"] if isinstance(sales_rows, list) else []),
                   "not_in_snapshot": not_in_snapshot, "problems": problems}
         if problems:
             result["status"] = 422
@@ -513,4 +600,20 @@ def restore(name: str, *, dry_run: bool = True, files=None) -> dict:
         if docs:
             it.commit_state(docs)
         result["written"] = sorted(p.name for p in docs)
+        from integrations import sales_store
+        if sales_db is not None:
+            tmp = it.DATA_DIR / (".restore-sales-%d.sqlite3" % os.getpid())
+            try:
+                tmp.write_bytes(sales_db)
+                sales_store.restore_from(tmp)
+            finally:
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.unlink(str(tmp) + suffix)
+                    except OSError:
+                        pass
+            result["written"].append(SALES_DB_MEMBER)
+        elif isinstance(sales_rows, list):
+            sales_store.replace_all(sales_rows)
+            result["written"].append("sales.json (into the sales store)")
         return result

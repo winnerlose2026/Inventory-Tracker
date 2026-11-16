@@ -186,40 +186,17 @@ def api_sales_ingest():
     Dedupe key: (restaurant_guid, business_date, item_guid). Posting the
     same item for the same day overwrites the prior row.
     """
-    from inventory_tracker import load_sales, save_sales
+    from inventory_tracker import data_lock
+    from integrations import sales_store
     body = request.json or {}
     rows = body.get("rows") or []
     if not isinstance(rows, list):
         return jsonify({"ok": False, "error": "rows must be a list"}), 400
     replace_dates = bool(body.get("replace_dates", False))
-
-    existing = load_sales()
-    # Key existing rows.
-    by_key = {(r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid")): i
-              for i, r in enumerate(existing)}
-
-    if replace_dates:
-        seed = set((r.get("restaurant_guid"), r.get("business_date")) for r in rows)
-        existing = [r for r in existing
-                    if (r.get("restaurant_guid"), r.get("business_date")) not in seed]
-        by_key = {(r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid")): i
-                  for i, r in enumerate(existing)}
-
-    added, updated = 0, 0
-    for r in rows:
-        if not r.get("restaurant_guid") or not r.get("business_date") or not r.get("item_guid"):
-            continue
-        key = (r.get("restaurant_guid"), r.get("business_date"), r.get("item_guid"))
-        if key in by_key:
-            existing[by_key[key]] = r
-            updated += 1
-        else:
-            existing.append(r)
-            by_key[key] = len(existing) - 1
-            added += 1
-    save_sales(existing)
+    with data_lock():
+        added, updated, total = sales_store.upsert(rows, replace_dates=replace_dates)
     return jsonify({"ok": True, "added": added, "updated": updated,
-                    "total_rows": len(existing)})
+                    "total_rows": total})
 
 
 # Live (today / yesterday) Toast days: when each was last re-pulled, per
@@ -266,8 +243,8 @@ def _save_toast_fetch_log(log: dict) -> None:
 
 
 def _merge_toast_pull(new_rows: list, ok_pairs, fetched_at: str, final_before: str):
-    """Merge one Toast pull into sales.json under data_lock. Returns the
-    merged rows.
+    """Merge one Toast pull into the sales store under data_lock. Returns
+    the number of rows written.
 
     * a day that came back with rows is REPLACED wholesale;
     * a completed pull with no rows keeps what was stored, and is remembered
@@ -275,7 +252,8 @@ def _merge_toast_pull(new_rows: list, ok_pairs, fetched_at: str, final_before: s
     * every completed (guid, date) gets its fetched_at stamped;
     * failed pairs are simply absent from ``ok_pairs`` -- nothing changes.
     """
-    from inventory_tracker import data_lock, load_sales, save_sales
+    from inventory_tracker import data_lock
+    from integrations import sales_store
     got_keys = {(r.get("restaurant_guid") or "", r.get("business_date") or "")
                 for r in new_rows or []}
     newly_empty = {f"{g}|{d}" for (g, d) in (ok_pairs or set())
@@ -283,13 +261,8 @@ def _merge_toast_pull(new_rows: list, ok_pairs, fetched_at: str, final_before: s
     with data_lock():
         # Re-read under the lock: another view / the nightly pull may have
         # merged meanwhile.
-        merged = load_sales() or []
         if new_rows:
-            merged = [r for r in merged
-                      if ((r.get("restaurant_guid") or ""),
-                          (r.get("business_date") or "")) not in got_keys]
-            merged.extend(new_rows)
-            save_sales(merged)
+            sales_store.replace_days(new_rows)
         if newly_empty:
             marks = _load_toast_empty_days()
             for k in newly_empty:
@@ -300,7 +273,7 @@ def _merge_toast_pull(new_rows: list, ok_pairs, fetched_at: str, final_before: s
             for (g, d) in ok_pairs:
                 log[f"{g}|{d}"] = fetched_at
             _save_toast_fetch_log(log)
-    return merged
+    return len(new_rows or [])
 
 
 @reporting_bp.route("/api/report/toast-sales")
@@ -481,9 +454,9 @@ def api_report_toast_sales():
                                    f"location-days failed")
         if not new_rows and not ok_pairs:
             return all_rows, meta
-        merged = _merge_toast_pull(new_rows, ok_pairs, meta["fetched_at"], fresh_from)
+        _merge_toast_pull(new_rows, ok_pairs, meta["fetched_at"], fresh_from)
         meta["rows_fetched"] = len(new_rows or [])
-        return merged, meta
+        return load_sales(since=start_iso, until=end_iso), meta
 
     def _store_age(anchor_iso: str, loc_q: str) -> dict:
         """How current the stored rows for this bucket are."""
@@ -516,7 +489,25 @@ def api_report_toast_sales():
 
     # Load the full row set ONCE. If an anchor date is set we may
     # mutate this with a Toast fetch before bucketing.
-    rows = load_sales() or []
+    # Only the window the answer needs (the store is ~170k rows).
+    if end_date_q:
+        try:
+            _w_start, _w_end = _bucket_range(end_date_q)
+        except ValueError:
+            _w_start = _w_end = ""
+    else:
+        # "The most recent N buckets that have data": find the Nth newest
+        # bucket from the distinct dates alone, then load from its start.
+        from integrations import sales_store as _ss
+        _w_end, _w_start, _seen = "", "", []
+        for _d in _ss.dates():
+            _bk = _bucket_key(_d)
+            if _bk and _bk not in _seen:
+                _seen.append(_bk)
+                if len(_seen) > buckets:
+                    break
+                _w_start = _bk if period == "week" else _bk + "-01"
+    rows = load_sales(since=_w_start, until=_w_end) or []
     fetch_meta = {"rows_fetched": 0, "fetch_error": None, "fetched_at": None,
                   "live": bool(live_q), "requested": 0, "failed": 0}
     if end_date_q:
@@ -579,8 +570,9 @@ def api_report_toast_sales():
         agg["gross"]      += float(r.get("gross") or 0)
         agg["net"]        += float(r.get("net") or 0)
         agg["guid_count"] += 1  # informational; not used in render
-        # Prefer the longest/non-empty observed values for display.
-        if name and len(name) > len(agg["item"]):
+        # Prefer the longest/non-empty observed values for display; on a tie,
+        # the newest spelling (rows come oldest first).
+        if name and len(name) >= len(agg["item"]):
             agg["item"] = name
         if menu_grp and not agg["menu_group"]:
             agg["menu_group"] = menu_grp
@@ -732,7 +724,11 @@ def api_toast_nightly_pull():
     try:
         started = _time.monotonic()
         today = business_today()
-        pending = toast_nightly_targets(today, load_sales() or [], _load_toast_fetch_log(),
+        from integrations import sales_store
+        _since = (today - timedelta(days=TOAST_REPULL_LOOKBACK_DAYS + 1)).isoformat()
+        _have = [{"restaurant_guid": g, "business_date": d}
+                 for (g, d) in sales_store.pairs(since=_since)]
+        pending = toast_nightly_targets(today, _have, _load_toast_fetch_log(),
                                         days=days)
         requested = len(pending)
         if dry_run:
@@ -811,8 +807,8 @@ def api_sales_locations():
     ingested data return rows=0 — they still show in the dropdown so
     the user can pick any location for comparison.
     """
-    from inventory_tracker import load_sales, TOAST_RETAIL_LOCATIONS
-    rows = load_sales() or []
+    from inventory_tracker import TOAST_RETAIL_LOCATIONS
+    from integrations import sales_store
     # Start with the registry — every retail location guaranteed, with
     # state abbreviation so the UI can render "Penn Station, NY" without
     # any per-location lookup.
@@ -828,25 +824,16 @@ def api_sales_locations():
             "max_date":        "",
         }
     # Layer in any ingested data — increment counts + date range.
-    for r in rows:
-        guid = r.get("restaurant_guid") or ""
+    for s in sales_store.location_summary():
+        guid = s["restaurant_guid"]
         if not guid:
             continue
         slot = by_loc.setdefault(guid, {
-            "restaurant_guid": guid,
-            "location":        r.get("location") or "",
-            "state":           "",
-            "rows":            0,
-            "min_date":        r.get("business_date") or "",
-            "max_date":        r.get("business_date") or "",
-        })
-        slot["rows"] += 1
-        d = r.get("business_date") or ""
-        if d:
-            if not slot["min_date"] or d < slot["min_date"]:
-                slot["min_date"] = d
-            if not slot["max_date"] or d > slot["max_date"]:
-                slot["max_date"] = d
+            "restaurant_guid": guid, "location": s["location"], "state": "",
+            "rows": 0, "min_date": "", "max_date": ""})
+        slot["rows"] += s["rows"]
+        slot["min_date"] = s["min_date"]
+        slot["max_date"] = s["max_date"]
     return jsonify({"ok": True,
                     "locations": sorted(by_loc.values(),
                                         key=lambda x: x["location"])})

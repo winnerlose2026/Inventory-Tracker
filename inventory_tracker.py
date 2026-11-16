@@ -1108,7 +1108,10 @@ def save_freight_invoices(records: list) -> None:
 # Toast POS sales — per-location, per-day, per-item product mix.
 # One entry per (restaurant_guid, business_date, item_guid).
 # Used by the Report page Top Consumed section.
-SALES_FILE = DATA_DIR / "sales.json"
+SALES_FILE = DATA_DIR / "sales.json"       # legacy; imported once, see below
+# Since 11/2026 the rows live in SQLite (integrations/sales_store.py): the JSON
+# list had grown to 52 MB and every reader parsed all of it.
+SALES_DB_FILE = DATA_DIR / "sales.sqlite3"
 
 # Retail location registry — every Toast restaurant the integration is
 # approved on, excluding DCs and disabled locations. Surfaces in the
@@ -1159,12 +1162,19 @@ TOAST_RETAIL_LOCATIONS: list[dict] = [
 
 
 
-def load_sales() -> list:
-    return _read_json(SALES_FILE, [])
+def load_sales(since: str = "", until: str = "", restaurant_guid: str = "") -> list:
+    """Toast sales rows, optionally limited to since <= business_date <= until
+    (YYYY-MM-DD) and one store. Ask for the window you need: the whole
+    store is ~170k rows and growing."""
+    from integrations import sales_store
+    return sales_store.load(since, until, restaurant_guid)
 
 
 def save_sales(entries: list):
-    _write_json(SALES_FILE, entries)
+    """Replace the whole sales store with ``entries`` (tests / restores).
+    Normal writers use sales_store.replace_days / upsert."""
+    from integrations import sales_store
+    sales_store.replace_all(entries)
 
 
 # Bakery weekly sales -- fed from the weekly "Bakery Model - Sales v. Labor"
