@@ -131,7 +131,37 @@ def ensure_ready() -> None:
             con.executescript(_SCHEMA)
             con.commit()
         _migrate_json()
+        _expire_legacy()
         _ready.add(path)
+
+
+#: How long the renamed sales.json (and its .bak) are kept after the import,
+#: as a roll-back copy. ~100 MB on a 1 GB disk.
+LEGACY_KEEP_DAYS = 14
+
+
+def _expire_legacy(now=None) -> list:
+    """Delete sales.json.migrated and sales.json.bak once the migrated copy
+    is LEGACY_KEEP_DAYS old. Returns the names removed."""
+    import time
+    src = str(json_path())
+    mig = src + ".migrated"
+    try:
+        age_days = ((now or time.time()) - os.path.getmtime(mig)) / 86400
+    except OSError:
+        return []
+    if age_days < LEGACY_KEEP_DAYS:
+        return []
+    removed = []
+    for f in (mig, src + ".bak"):
+        try:
+            os.unlink(f)
+            removed.append(os.path.basename(f))
+        except OSError:
+            pass
+    if removed:
+        print(f"[sales_store] removed the pre-import copies: {', '.join(removed)}", flush=True)
+    return removed
 
 
 def _migrate_json() -> int:
@@ -339,6 +369,7 @@ def backup_to(dest) -> bool:
     """Consistent copy of the database at ``dest`` (SQLite online backup:
     safe while the app reads and writes). False when there is no data."""
     ensure_ready()
+    _expire_legacy()          # hourly, so the 14-day clean-up needs no restart
     if not os.path.exists(str(db_path())):
         return False
     with closing(_connect()) as src, closing(sqlite3.connect(str(dest))) as dst:

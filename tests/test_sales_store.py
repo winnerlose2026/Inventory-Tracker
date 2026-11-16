@@ -131,3 +131,18 @@ def test_restoring_a_pre_sqlite_snapshot_imports_its_sales_json(tmp_path, monkey
     assert done["ok"], done
     assert [r["restaurant_guid"] for r in it.load_sales()] == [MTH]
     assert not (tmp_path / "sales.json").exists()        # not written as a file
+
+
+def test_the_pre_import_copies_expire_after_two_weeks(tmp_path, monkeypatch):
+    import os
+    import time
+    isolate(tmp_path, monkeypatch)
+    (tmp_path / "sales.json").write_text(json.dumps([_row(UES, "2026-11-01", "a", 1)]))
+    (tmp_path / "sales.json.bak").write_text("[]")
+    S.count()
+    mig = tmp_path / "sales.json.migrated"
+    assert mig.exists() and S._expire_legacy() == []          # fresh: kept
+    old = time.time() - 15 * 86400
+    os.utime(mig, (old, old))
+    assert sorted(S._expire_legacy()) == ["sales.json.bak", "sales.json.migrated"]
+    assert not mig.exists() and S.count() == 1
