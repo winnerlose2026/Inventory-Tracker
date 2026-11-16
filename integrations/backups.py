@@ -108,6 +108,26 @@ def _summarize(name: str, raw: bytes) -> dict:
     return out
 
 
+# Files up to this size are parsed for the manifest's counts; bigger ones get
+# bytes / sha256 / line count only (parsing 52 MB of JSON costs ~10x in RAM).
+SUMMARY_PARSE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _summarize_path(path) -> dict:
+    """_summarize for a file on disk, without loading a big one whole."""
+    size = path.stat().st_size
+    if size <= SUMMARY_PARSE_MAX_BYTES:
+        return _summarize(path.name, path.read_bytes())
+    h = hashlib.sha256()
+    lines = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+            lines += chunk.count(b"\n")
+    return {"bytes": size, "sha256": h.hexdigest(), "lines": lines,
+            "parsed": False}
+
+
 def _describe(name: str, doc) -> dict:
     d = {"type": type(doc).__name__}
     if isinstance(doc, (list, dict)):
@@ -251,12 +271,11 @@ def _make_snapshot(label: str) -> dict:
         with open(partial, "wb") as raw:
             with tarfile.open(fileobj=raw, mode="w:gz") as tar:
                 for p in staged:
-                    data = p.read_bytes()
-                    manifest["files"][p.name] = _summarize(p.name, data)
-                    info = tarfile.TarInfo(p.name)
-                    info.size = len(data)
-                    info.mtime = int(p.stat().st_mtime)
-                    tar.addfile(info, io.BytesIO(data))
+                    # Streamed from the staged copy: sales.json is 52 MB, and
+                    # reading + parsing it here (on top of the Toast pull's
+                    # copy in the other worker) ran the instance out of memory.
+                    manifest["files"][p.name] = _summarize_path(p)
+                    tar.add(str(p), arcname=p.name, recursive=False)
                 mbytes = json.dumps(manifest, indent=2).encode("utf-8")
                 info = tarfile.TarInfo(MANIFEST)
                 info.size = len(mbytes)

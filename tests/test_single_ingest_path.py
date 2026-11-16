@@ -150,17 +150,26 @@ def test_cron_also_checks_houston_screenshots(monkeypatch, capsys):
             calls.append((req.full_url, None, req.get_header("X-inventory-token")))
             return _Resp(200, {"ok": True, "messages": [],
                                "last_count_at": "2026-10-13T14:26:49Z"})
+        if "/api/production/unreadable?" in req.full_url:
+            calls.append((req.full_url, None, req.get_header("X-inventory-token")))
+            return _Resp(200, {"ok": True, "count": 0, "sheets": [], "errors": []})
         return scans(req, timeout)
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("nothing pending: no install, no reader")))
     assert cgs.run(CRON_ARGS) == 0
+    # scanned production sheets: the same cheap pre-check, nothing waiting
+    assert "meta_only=1" in calls[-1][0] and "/api/production/unreadable" in calls[-1][0]
+    out = capsys.readouterr().out
+    assert "production-ocr: no scanned sheets waiting" in out
+    assert "usf-screenshots: Houston, TX nothing pending" in out
+    calls.pop()
     last = calls[-1]
     assert last[0].startswith("https://inv.example/api/email/usf-screenshots?")
     assert "meta_only=1" in last[0] and "pending_only=1" in last[0]
     assert last[2] == "tok-xyz"
-    assert "usf-screenshots: Houston, TX nothing pending" in capsys.readouterr().out
+
 
 
 def test_server_mode_waits_out_a_concurrent_scan(monkeypatch):

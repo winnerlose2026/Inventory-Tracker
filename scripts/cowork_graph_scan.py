@@ -28,7 +28,9 @@ count is waiting; only if one is does it pip-install the OCR deps
 (requirements-ocr-usf.txt) into /tmp and run scripts/usf_screenshot_ocr.py,
 which posts the counts to /api/email/ingest-events. A reader that blocks (a
 row it can't prove) fails the run so Render emails JD. Off switch:
-`--no-screenshot-ocr` or USF_SCREENSHOT_OCR=off.
+`--no-screenshot-ocr` or USF_SCREENSHOT_OCR=off. The same switch covers the
+scanned production sheets (since 2026-11-16): GET /api/production/unreadable
+pre-check, then scripts/production_ocr.py --commit.
 
 `--mode local` (or SCAN_MODE=local) keeps the old Graph-direct parse for when
 the web service itself cannot reach Graph. It now stamps documents with
@@ -592,7 +594,50 @@ def _run_server_mode(args) -> int:
     if args.screenshot_ocr:
         if _run_screenshot_ocr(app_url, token, dry_run=bool(args.dry_run)):
             rc = 1
+        # 4) Scanned (image-only) Daily Production sheets, same OCR engine.
+        if _run_production_ocr(app_url, token, dry_run=bool(args.dry_run)):
+            rc = 1
     return rc
+
+
+def _run_production_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
+    """OCR the image-only production sheets the web service could not read
+    (scripts/production_ocr.py). Pre-check first (meta_only): the deps are
+    installed and the reader run only when a scanned sheet is waiting. 0 =
+    fine, 1 = blocked / failed (the run fails, Render emails JD; the sheet
+    stays listed and is retried every run)."""
+    import subprocess
+    try:
+        req = urllib.request.Request(
+            f"{app_url}/api/production/unreadable?meta_only=1", method="GET",
+            headers={"X-Inventory-Token": token})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: production-ocr: pre-check failed: "
+              f"{_redact(str(exc), [token])}", file=sys.stderr)
+        return 1
+    if not data.get("sheets"):
+        print("production-ocr: no scanned sheets waiting")
+        return 0
+    env = _ocr_env(app_url, token)
+    why = _ensure_ocr_deps(env)
+    if why:
+        print(f"ERROR: production-ocr: {_redact(why, [token])}", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, str(HERE / "production_ocr.py")]
+    if not dry_run:
+        cmd.append("--commit")
+    try:
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: production-ocr: reader did not finish: {exc}", file=sys.stderr)
+        return 1
+    for line in (proc.stdout or "").splitlines():
+        print(_redact(line, [token]))
+    for line in (proc.stderr or "").splitlines()[-20:]:
+        print(_redact(line, [token]), file=sys.stderr)
+    return 1 if proc.returncode else 0
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +664,7 @@ def _ensure_ocr_deps(env: dict) -> str:
     itself stays OCR-free -- this only happens on a run with a screenshot
     waiting, i.e. about once a week."""
     import subprocess
-    probe = [sys.executable, "-c", "import rapidocr, onnxruntime"]
+    probe = [sys.executable, "-c", "import rapidocr, onnxruntime, pypdfium2"]
     if subprocess.run(probe, env=env, capture_output=True).returncode == 0:
         return ""
     print(f"usf-screenshots: installing OCR deps into {OCR_DEPS_DIR} ...")

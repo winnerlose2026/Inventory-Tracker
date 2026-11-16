@@ -29,6 +29,20 @@ USAGE_FILE = DATA_DIR / "usage.json"
 # readers. This turns "parse the whole file on every request" into a stat() on
 # the hot path (inventory, usage, freight, production, sales).
 _FILE_CACHE: dict = {}
+# Files larger than this are NOT kept parsed in the cache. sales.json reached
+# 52 MB by 11/2026: parsed, it is several hundred MB of Python objects, held
+# per worker AND deep-copied on every read -- the 512 MB web instance ran out
+# of memory nightly at 08:20 UTC (Toast pull at :16 + hourly backup at :20).
+# A big file is re-parsed per read instead: slower, bounded.
+_CACHE_MAX_BYTES = int(os.environ.get("DATA_CACHE_MAX_BYTES", str(8 * 1024 * 1024)))
+
+
+def _cache_put(key: str, sig: tuple, data, *, copy_in: bool = True) -> None:
+    """Store a parsed file in _FILE_CACHE unless it is too big to keep."""
+    if sig and sig[1] > _CACHE_MAX_BYTES:
+        _FILE_CACHE.pop(key, None)
+        return
+    _FILE_CACHE[key] = (sig, _copy_out(data) if copy_in else data)
 
 
 class DataFileCorrupt(RuntimeError):
@@ -83,7 +97,10 @@ def _read_json(path: Path, default):
             "%s exists (%d bytes) but is not valid JSON (%s), and %s holds "
             "nothing usable" % (path, st.st_size, type(exc).__name__, bak.name)
         ) from exc
-    _FILE_CACHE[key] = (sig, data)
+    if st.st_size > _CACHE_MAX_BYTES:
+        _FILE_CACHE.pop(key, None)
+        return data              # freshly parsed: the caller's own copy
+    _cache_put(key, sig, data, copy_in=False)
     return _copy_out(data)
 
 
@@ -255,7 +272,7 @@ def _write_json(path: Path, data):
             pass
     _CORRUPT_MAIN.discard(str(path))
     _fsync_dir(path.parent)
-    _FILE_CACHE[str(path)] = (sig, _copy_out(data))
+    _cache_put(str(path), sig, data)
 
 
 def _quarantine_corrupt(path: Path, bak: Path, exc: Exception) -> None:
@@ -353,7 +370,7 @@ def commit_state(files: dict) -> None:
             _keep_backup(path)
             os.replace(tmp, path)
             _CORRUPT_MAIN.discard(str(path))
-            _FILE_CACHE[str(path)] = (sig, _copy_out(data))
+            _cache_put(str(path), sig, data)
         _fsync_dir(DATA_DIR)
         try:
             journal.unlink()

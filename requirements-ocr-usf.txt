@@ -8,3 +8,5 @@
 # opencv-python-headless (no libGL needed), numpy and pillow itself.
 rapidocr==3.10.0
 onnxruntime>=1.20,<2
+# PDF page rendering for scanned Daily Production sheets (scripts/production_ocr.py).
+pypdfium2>=4.30

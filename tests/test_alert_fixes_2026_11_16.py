@@ -252,3 +252,74 @@ def test_ocr_text_never_overrides_a_readable_pdf(tmp_path, monkeypatch):
             headers={"X-Inventory-Token": "tok"}).get_json()
     assert sum(l["cs_count"] for l in r["record"]["lines"]) == 112
     assert not r["record"].get("ocr")
+
+
+# --- memory: the nightly out-of-memory restart (08:20 UTC, 11/14-11/16) -------------
+
+def test_a_big_data_file_is_not_kept_in_the_parse_cache(tmp_path, monkeypatch):
+    import inventory_tracker as it
+    from ingest_fakes import isolate
+    isolate(tmp_path, monkeypatch)
+    monkeypatch.setattr(it, "_CACHE_MAX_BYTES", 1000)
+    rows = [{"guid": i, "item": "Plain Bagel"} for i in range(200)]   # > 1000 bytes
+    it.save_sales(rows)
+    assert str(it.SALES_FILE) not in it._FILE_CACHE
+    got = it.load_sales()
+    assert got == rows and str(it.SALES_FILE) not in it._FILE_CACHE
+    got.append({"guid": "x"})                       # caller owns its copy
+    assert len(it.load_sales()) == 200
+    # small files are still cached
+    it.save_inventory({})
+    assert str(it.INVENTORY_FILE) in it._FILE_CACHE
+
+
+def test_backup_streams_a_big_file_without_parsing_it(tmp_path, monkeypatch):
+    import tarfile
+    from integrations import backups as B
+    monkeypatch.setattr(B, "SUMMARY_PARSE_MAX_BYTES", 100)
+    big = tmp_path / "sales.json"
+    big.write_text("[\n" + ",\n".join('{"a": %d}' % i for i in range(100)) + "\n]")
+    s = B._summarize_path(big)
+    assert s["parsed"] is False and s["bytes"] == big.stat().st_size and s["lines"] == 101
+    small = tmp_path / "inventory.json"
+    small.write_text("{}")
+    assert B._summarize_path(small)["valid"] is True
+
+
+# --- OCR rebuild of Gabo's scanned 11/5 Riviera Beach sheet (real OCR boxes) --------
+
+def _ocr_boxes():
+    import json
+    from pathlib import Path
+    p = Path(__file__).parent / "fixtures" / "production_ocr_riviera_1105.json"
+    return [tuple(b) for b in json.loads(p.read_text())]
+
+
+def test_ocr_boxes_rebuild_the_sheet_exactly():
+    from integrations.production_ocr import sheet_text
+    from integrations.production_pdf_parser import parse_production_text
+    text, problems = sheet_text(_ocr_boxes())
+    assert problems == []
+    s = parse_production_text(text, subject="DAILY PRODUCTION RIVIERA BEACH PO.014511774519",
+                              received_at="2026-11-05T15:44:22Z")
+    assert (s.po_number, s.warehouse, s.production_date, s.total_cases) == \
+        ("014511774519", "Riviera Beach, FL", "2026-11-03", 336)
+    got = {(l.variety, l.cs_count, l.lot_number) for l in s.lines}
+    assert got == {("Plain", 56, "1150110326"), ("Poppy Seed", 8, "1152110326"),
+                   ("Onion", 8, "1151110326"), ("Sesame", 72, "1153110326"),
+                   ("Whole Wheat", 32, "1156110326"), ("Asiago", 40, "1159110326"),
+                   ("Blueberry", 24, "1171110326"), ("Jalapeno Cheddar", 40, "1189110326"),
+                   ("Cinnamon Raisin", 56, "1155110326")}
+
+
+def test_an_ocr_read_that_does_not_add_up_is_refused():
+    from integrations.production_ocr import sheet_text
+    boxes = _ocr_boxes()
+    misread = [(x, y, h, "58 CS" if t == "56 CS" and y < 240 else t, s)
+               for x, y, h, t, s in boxes]                    # 56 -> 58 on Plain
+    _t, problems = sheet_text(misread)
+    assert any("add up to 338" in p for p in problems), problems
+    shaky = [(x, y, h, t, 0.5 if t == "8 CS" else s) for x, y, h, t, s in boxes]
+    assert any("low confidence" in p for p in sheet_text(shaky)[1])
+    no_lot = [b for b in boxes if b[3] != "1155110326"]
+    assert any("lot number" in p for p in sheet_text(no_lot)[1])
