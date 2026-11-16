@@ -37,14 +37,18 @@ sys.path.insert(0, str(HERE.parent))
 
 from integrations.production_ocr import sheet_text  # noqa: E402
 
-# Same engine settings the Houston reader was validated with (bounded RSS on
-# the 512 MB cron instance).
+# Memory on the 512 MB cron instance (measured on Gabo's 11/5 scan): page
+# rendered at 2x with the detector at 1600 px peaked at 464 MB and the cron
+# ran out of memory on its first self-test (11/16 17:51 UTC). 1.5x, cropped
+# to the printed area, detector capped at 1280 px: 308 MB, every row read.
+# A read that fails the checks is tried once more at 2x (~340 MB).
 _OCR_PARAMS = {
     "Global.use_cls": False,
     "Global.log_level": "warning",
     "Det.limit_type": "max",
-    "Det.limit_side_len": 1600,
+    "Det.limit_side_len": 1280,
 }
+RENDER_SCALES = (1.5, 2.0)
 _engine = None
 
 
@@ -56,7 +60,18 @@ def _get_engine():
     return _engine
 
 
-def ocr_pdf(pdf_bytes: bytes) -> list:
+def _crop_to_ink(img, pad: int = 20):
+    """The page cropped to its printed area (a scanned sheet is mostly blank
+    paper below the table)."""
+    from PIL import ImageOps
+    bb = ImageOps.invert(img.convert("L")).point(lambda v: 255 if v > 60 else 0).getbbox()
+    if not bb:
+        return img
+    return img.crop((max(0, bb[0] - pad), max(0, bb[1] - pad),
+                     min(img.width, bb[2] + pad), min(img.height, bb[3] + pad)))
+
+
+def ocr_pdf(pdf_bytes: bytes, scale: float = RENDER_SCALES[0]) -> list:
     """OCR boxes (x_left, y_center, height, text, score) for every page, the
     pages stacked top to bottom."""
     import numpy as np
@@ -65,7 +80,7 @@ def ocr_pdf(pdf_bytes: bytes) -> list:
     boxes, y_off = [], 0
     try:
         for i in range(len(doc)):
-            img = doc[i].render(scale=2).to_pil().convert("RGB")
+            img = _crop_to_ink(doc[i].render(scale=scale).to_pil().convert("RGB"))
             res = _get_engine()(np.array(img), use_det=True, use_cls=False, use_rec=True)
             if res is not None and getattr(res, "boxes", None) is not None:
                 for quad, txt, score in zip(res.boxes, res.txts, res.scores):
@@ -106,9 +121,14 @@ def _http(url: str, token: str, body: dict | None = None, timeout: int = 180) ->
 
 
 def read_one(pdf_bytes: bytes, subject: str, received_at: str) -> tuple:
-    text, problems = sheet_text(ocr_pdf(pdf_bytes))
-    if not problems:
-        problems = check_parse(text, subject, received_at)
+    """(text, problems) from the first render scale whose read passes every
+    check; the last attempt's problems when none does."""
+    for scale in RENDER_SCALES:
+        text, problems = sheet_text(ocr_pdf(pdf_bytes, scale))
+        if not problems:
+            problems = check_parse(text, subject, received_at)
+        if not problems:
+            break
     return text, problems
 
 
