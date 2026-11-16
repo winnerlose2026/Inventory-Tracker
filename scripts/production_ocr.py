@@ -120,6 +120,8 @@ def main(argv=None) -> int:
     ap.add_argument("--app-url", default=os.environ.get("APP_URL", "").rstrip("/"))
     ap.add_argument("--api-token", default=os.environ.get("INVENTORY_API_TOKEN", ""))
     ap.add_argument("--pdf", help="read a local PDF instead (prints, stores nothing)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="re-read sheets already stored by OCR and compare (stores nothing)")
     ap.add_argument("--subject", default="")
     a = ap.parse_args(argv)
 
@@ -133,6 +135,8 @@ def main(argv=None) -> int:
     if not a.app_url or not a.api_token:
         print("ERROR: APP_URL and INVENTORY_API_TOKEN are required", file=sys.stderr)
         return 2
+    if a.selftest:
+        return selftest(a)
     try:
         data = _http(f"{a.app_url}/api/production/unreadable?days={a.days}", a.api_token)
     except Exception as exc:  # noqa: BLE001
@@ -184,6 +188,38 @@ def main(argv=None) -> int:
             # scan) stored it a moment earlier -- fine.
             if out.get("status") not in ("ingested", "replaced", "refreshed", "duplicate"):
                 rc = 3
+    return rc
+
+
+def selftest(a) -> int:
+    """Prove the OCR on this machine: re-read every sheet already stored by
+    OCR (last ``--days``) and compare rows + lots with what is stored.
+    Stores nothing. 0 = all match, 3 = a mismatch, 2 = could not run."""
+    from integrations.production_pdf_parser import parse_production_text
+    try:
+        data = _http(f"{a.app_url}/api/production/unreadable?selftest=1&days={a.days}",
+                     a.api_token)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: production-ocr selftest: listing failed ({type(exc).__name__})",
+              file=sys.stderr)
+        return 2
+    sheets = [sh for sh in data.get("sheets") or [] if sh.get("pdfs")]
+    if not sheets:
+        print("production-ocr SELFTEST: no OCR-read sheets to re-read")
+        return 2
+    rc = 0
+    for sh in sheets:
+        text, problems = read_one(base64.b64decode(sh["pdfs"][0]["b64"]),
+                                  sh["subject"], sh["received_at"])
+        s = parse_production_text(text, subject=sh["subject"], received_at=sh["received_at"])
+        got = sorted((l.variety, l.cs_count, l.lot_number) for l in s.lines)
+        want = sorted((l["variety"], l["cs_count"], l["lot_number"])
+                      for l in sh.get("stored_lines") or [])
+        ok = not problems and got == want and s.po_number == sh.get("stored_po")
+        print(f"production-ocr SELFTEST {sh['subject'][:60]!r}: "
+              f"{'MATCH' if ok else 'MISMATCH'} ({len(got)} rows, PO {s.po_number})"
+              + ("" if ok else f" problems={problems} got={got} want={want}"))
+        rc = rc if ok else 3
     return rc
 
 

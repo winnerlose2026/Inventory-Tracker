@@ -383,14 +383,21 @@ def api_production_unreadable():
     except (TypeError, ValueError):
         days = 30
     meta_only = (request.args.get("meta_only") or "0") == "1"
+    # selftest=1: list sheets ALREADY read by OCR instead (with their stored
+    # lines), so the cron can prove its OCR on Render by re-reading them --
+    # dry run, compared, nothing stored.
+    selftest = (request.args.get("selftest") or "0") == "1"
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:19]
     tomb = load_tombstones() or {}
     sheets = []
     for r in load_production() or []:
         key = r.get("source_message_id") or ""
-        if not key or key in tomb or not is_stub(r) or r.get("lines"):
+        if not key or key in tomb:
             continue
-        if "image-only" not in (r.get("parse_error") or ""):
+        if selftest:
+            if not r.get("ocr"):
+                continue
+        elif not is_stub(r) or r.get("lines") or "image-only" not in (r.get("parse_error") or ""):
             continue
         if (r.get("received_at") or "")[:19] < since:
             continue
@@ -399,7 +406,12 @@ def api_production_unreadable():
                        "subject": r.get("source_subject") or "",
                        "sender": r.get("source_sender") or "",
                        "received_at": r.get("received_at") or "",
-                       "parse_error": r.get("parse_error") or "", "pdfs": []})
+                       "parse_error": r.get("parse_error") or "", "pdfs": [],
+                       **({"stored_lines": [{"variety": l.get("variety"),
+                                             "cs_count": l.get("cs_count"),
+                                             "lot_number": l.get("lot_number")}
+                                            for l in r.get("lines") or []],
+                           "stored_po": r.get("po_number") or ""} if selftest else {})})
     errors = []
     if sheets and not meta_only:
         from integrations.email_scanner import EmailInboxClient, GRAPH_BASE

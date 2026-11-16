@@ -607,6 +607,24 @@ def _run_production_ocr(app_url: str, token: str, *, dry_run: bool) -> int:
     fine, 1 = blocked / failed (the run fails, Render emails JD; the sheet
     stays listed and is retried every run)."""
     import subprocess
+    # PRODUCTION_OCR_SELFTEST=1 (cron env): re-read the sheets already stored
+    # by OCR, dry run -- proves the on-demand install and the OCR fit this
+    # instance without waiting for Gabo's next scan. Changes nothing.
+    selftest = os.environ.get("PRODUCTION_OCR_SELFTEST", "").strip() == "1"
+    if selftest:
+        print("production-ocr: SELF-TEST -- re-reading stored OCR sheets, dry run")
+        env = _ocr_env(app_url, token)
+        why = _ensure_ocr_deps(env)
+        if why:
+            print(f"ERROR: production-ocr: {_redact(why, [token])}", file=sys.stderr)
+            return 1
+        proc = subprocess.run([sys.executable, str(HERE / "production_ocr.py"), "--selftest"],
+                              env=env, capture_output=True, text=True, timeout=900)
+        for line in (proc.stdout or "").splitlines():
+            print(_redact(line, [token]))
+        for line in (proc.stderr or "").splitlines()[-20:]:
+            print(_redact(line, [token]), file=sys.stderr)
+        return 1 if proc.returncode else 0
     try:
         req = urllib.request.Request(
             f"{app_url}/api/production/unreadable?meta_only=1", method="GET",

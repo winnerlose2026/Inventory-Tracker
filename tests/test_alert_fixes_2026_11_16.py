@@ -485,3 +485,18 @@ def test_a_renamed_item_heading_is_found_by_its_contents():
         ["USF Item Code", "Description", "Cases On Hand", "Cases"],
         [[7095637, "BAGEL, PLAIN", 34, 8], [7309056, "BAGEL, EVTHG", 30, 12]]))
     assert rep is not None and {l.usf_item_no for l in rep.lines} == {"7095637", "7309056"}
+
+
+def test_selftest_lists_ocr_read_sheets_with_their_stored_lines(tmp_path, monkeypatch):
+    import base64
+    c = _prod_client(tmp_path, monkeypatch)
+    h = {"X-Inventory-Token": "tok"}
+    body = {"pdf_b64": base64.b64encode(_blank_pdf()).decode(),
+            "subject": "Daily Production CWMID.PO.1220440", "message_id": "<scan3>",
+            "received_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ocr_text": GABO_TEXT_1105}
+    assert c.post("/api/production/ingest", json=body, headers=h).get_json()["status"] == "ingested"
+    assert c.get("/api/production/unreadable?meta_only=1", headers=h).get_json()["sheets"] == []
+    st = c.get("/api/production/unreadable?selftest=1&meta_only=1", headers=h).get_json()["sheets"]
+    assert [s["message_id"] for s in st] == ["<scan3>"]
+    assert st[0]["stored_po"] == "1220440" and sum(l["cs_count"] for l in st[0]["stored_lines"]) == 112
