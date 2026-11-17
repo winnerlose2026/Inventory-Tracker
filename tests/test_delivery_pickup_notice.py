@@ -112,3 +112,29 @@ def test_past_pickups_and_actual_pickups_send_nothing(monkeypatch):
                          BASE, "conv1")]
     _out, _store, sent = _go(monkeypatch, msgs)
     assert sent == []
+
+
+def test_an_older_line_never_undoes_a_newer_pickup():
+    rec = _future_sched()
+    # the task set 4 PM off an 11/16-style later note
+    rec, ch, err = D.apply_event(rec, {
+        "po_number": "393072B2", "event": "scheduled",
+        "delivery_appt": rec["delivery_appt"], "pickup_at": "2026-10-17T16:00:00-04:00",
+        "evidence": {"message_id": "late", "sender": BELINDA,
+                     "sent": "2026-10-15T17:00:00Z", "quote": "arrive at 4Pm for pickup"}}, NOW)
+    assert ch and not err
+    _r, ch2, err2 = D.apply_event(rec, {
+        "po_number": "393072B2", "event": "pickup_scheduled",
+        "pickup_at": "2026-10-17T11:00:00-04:00",
+        "evidence": {"message_id": "early", "sender": BELINDA,
+                     "sent": "2026-10-14T12:00:00Z", "quote": "Pickup 1100AM/17th"}}, NOW)
+    assert ch2 is None and "stale" in err2
+
+
+def test_a_same_day_line_without_a_time_keeps_the_time():
+    rec = {**_future_sched(), "pickup_at": "2026-10-17T12:00:00-04:00"}
+    _r, ch, err = D.apply_event(rec, {
+        "po_number": "393072B2", "event": "pickup_scheduled", "pickup_at": "2026-10-17",
+        "evidence": {"message_id": "x", "sender": BELINDA,
+                     "sent": "2026-10-15T12:00:00Z", "quote": "Pick up scheduled 10/17"}}, NOW)
+    assert ch is None and err is None

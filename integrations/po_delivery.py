@@ -449,11 +449,22 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
             return rec, None, "pickup_at must be an ISO date/datetime"
         if not (now - timedelta(days=3) <= at <= now + APPT_FUTURE_LIMIT):
             return rec, None, f"pickup_at {ev.get('pickup_at')} is implausible"
-        cur_ev = parse_dt(rec.get("pickup_evidence_sent") or "")
+        # Stale: any message that set the current pickup -- this reader's, or
+        # the task's "scheduled" event carrying pickup_at -- newer than this
+        # one wins (11/17 dry run: Belinda's 11/12 "Pickup 1100AM/16th" would
+        # have undone the 4 PM set from her 11/16 note).
+        sets = [parse_dt(rec.get("pickup_evidence_sent") or "")]
+        sets += [parse_dt((e.get("evidence") or {}).get("sent") or "")
+                 for e in rec.get("events") or [] if "pickup_at" in e]
+        sets = [t for t in sets if t]
         new_ev = parse_dt(evid["sent"])
-        if cur_ev and new_ev and new_ev < cur_ev:
+        if sets and new_ev and new_ev <= max(sets):
             return rec, None, "stale: a newer message already set the pickup"
-        rec["pickup_at"] = str(ev["pickup_at"]).strip()
+        new_at = str(ev["pickup_at"]).strip()
+        cur = rec.get("pickup_at") or ""
+        if len(new_at) <= 10 and wall_time(cur)[:10] == new_at:
+            return rec, None, None   # same day, no time given: keep the known time
+        rec["pickup_at"] = new_at
         rec["pickup_evidence_sent"] = evid["sent"]
     elif kind == "picked_up":
         # When the truck actually left Woodside (Lineage: "picked up
