@@ -44,7 +44,8 @@ from typing import Optional
 CARRIER = "Lineage"
 
 HOLD_STATUSES = ("requested", "scheduled")
-EVENTS = ("requested", "scheduled", "rescheduled", "picked_up", "delivered", "released")
+EVENTS = ("requested", "scheduled", "rescheduled", "picked_up", "delivered", "released",
+          "pickup_scheduled")
 
 # Senders whose word can move a date. H&H's own staff only open requests.
 CARRIER_DOMAINS = ("onelineage.com", "lineagelogistics.com")
@@ -76,7 +77,14 @@ DELIVERED_FUTURE_SLACK = timedelta(hours=2)
 FOLLOWUP_FROM = "jd@hhbagels.com"
 FOLLOWUP_TO = ("bmorris@onelineage.com", "LTransSolutionsEast@onelineage.com",
                "rwilt@onelineage.com", "dyarnold@onelineage.com")
-FOLLOWUP_CC = ("Isaiah@hhbagels.com", "Gabo@hhbagels.com")
+# Gabo is NOT on the follow-ups (JD 11/17): he only gets the Woodside pickup
+# notice (PICKUP_NOTICE_TO), not the back-and-forth.
+FOLLOWUP_CC = ("Isaiah@hhbagels.com",)
+# Who prepares POs for departure at the Woodside bakery: one short email per
+# new / changed Lineage pickup date (blueprints/delivery._send_pickup_notices).
+# Override with env PICKUP_NOTICE_TO="a@hhbagels.com,b@hhbagels.com".
+PICKUP_NOTICE_TO_DEFAULT = ("Gabo@hhbagels.com",)
+PICKUP_ORIGIN_TZ = "America/New_York"     # Woodside, NY
 from zoneinfo import ZoneInfo as _ZI
 _ET = _ZI("America/New_York")
 THREAD_QUIET_FOR = timedelta(hours=4)    # someone wrote on the thread just now: wait
@@ -387,7 +395,9 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     if kind == "picked_up" and not rec_in:
         return rec_in, None, ("PO isn't tracked yet -- a pickup is recorded on a PO "
                               "Lineage has a request, schedule or delivery for")
-    if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
+    if kind == "pickup_scheduled" and not rec_in:
+        return rec_in, None, "PO isn't tracked yet -- a pickup date is recorded on a tracked PO"
+    if kind in ("scheduled", "rescheduled", "picked_up", "delivered", "pickup_scheduled"):
         if not evid["quote"]:
             return rec, None, "evidence.quote required (the line that says it)"
         allowed = (may_confirm_delivery(evid["sender"]) if kind == "delivered"
@@ -429,6 +439,22 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
             rec["pickup_at"] = str(ev["pickup_at"]).strip()
         if ev.get("confirmation_no"):
             rec["confirmation_no"] = str(ev["confirmation_no"]).strip()[:40]
+    elif kind == "pickup_scheduled":
+        # The PLANNED pickup from Woodside ("Pickup 1100AM/16th"). Doesn't
+        # change status; drives the pickup notice to the bakery.
+        if rec.get("status") == "delivered":
+            return rec, None, "already delivered; a pickup date doesn't apply"
+        at = parse_dt(ev.get("pickup_at") or "")
+        if at is None:
+            return rec, None, "pickup_at must be an ISO date/datetime"
+        if not (now - timedelta(days=3) <= at <= now + APPT_FUTURE_LIMIT):
+            return rec, None, f"pickup_at {ev.get('pickup_at')} is implausible"
+        cur_ev = parse_dt(rec.get("pickup_evidence_sent") or "")
+        new_ev = parse_dt(evid["sent"])
+        if cur_ev and new_ev and new_ev < cur_ev:
+            return rec, None, "stale: a newer message already set the pickup"
+        rec["pickup_at"] = str(ev["pickup_at"]).strip()
+        rec["pickup_evidence_sent"] = evid["sent"]
     elif kind == "picked_up":
         # When the truck actually left Woodside (Lineage: "picked up
         # 1556PM/13th"). Doesn't change status; it is the start of the
@@ -1410,3 +1436,142 @@ def appointment_from(line: str, sent: str, zone: str,
     if local < s - timedelta(days=1):
         return None                  # a past day isn't a new appointment
     return local.isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Planned pickups from Woodside, read by the server (2026-11-17)
+# ---------------------------------------------------------------------------
+# JD: Gabo "only needs to know which PO is getting picked up from the Woodside
+# Bakery and which date to prepare the POs for departure". Belinda writes
+# "PO#014511780511-Pickup 1100AM/16th and delivery 1000AM/18th"; Rojean
+# "Driver will arrive at 1000AM/18th for pickup". Firm lines only, like
+# appointment_lines.
+
+_PICKUP_HEDGE = re.compile(
+    r"\?|n't\b|\b(?:if|unless|otherwise|whether|request\w*|ask\w*|can|could|"
+    r"would|please|try\w*|hop\w*|possible|possibly|tentative\w*|pending|maybe|"
+    r"not|no|need\w*|want\w*|prefer\w*|instead\s+of|picked|arrived|loaded|"
+    r"delivered)\b", re.I)
+
+
+def pickup_part(line: str) -> str:
+    """The part of a line about the PICKUP: from the pickup cue to the next
+    "deliver..." word; if no date follows the cue ("arrive at 1000AM/18th for
+    pickup"), the words before it, back to the previous delivery word."""
+    line = line or ""
+    m = _PICKUP_CUE.search(line)
+    if not m:
+        return ""
+    d = _DELIVERY_WORD.search(line, m.end())
+    after = line[m.start():d.start() if d else len(line)]
+    if quote_dates(after):
+        return after
+    before_start = 0
+    for dm in _DELIVERY_WORD.finditer(line, 0, m.start()):
+        before_start = dm.end()
+    return line[before_start:m.end()]
+
+
+def pickup_lines(text: str) -> list:
+    """Firm pickup-date statements in a message's own words. A message whose
+    firm pickup lines disagree on the day is skipped whole."""
+    own = own_text(text or "")
+    out = []
+    for raw in re.split(r"[\n]|(?<=[.!?])\s+(?=[A-Z])", own):
+        line = raw.strip().strip(".!").strip()
+        if not line or len(line) > 220:
+            continue
+        part = pickup_part(line)
+        if not (part and quote_dates(part)):
+            continue
+        if _PICKUP_HEDGE.search(line):
+            continue
+        out.append(line)
+    days = {quote_dates(pickup_part(l))[0] for l in out}
+    return out if len(days) == 1 else []
+
+
+def pickup_from(line: str, sent: str) -> Optional[str]:
+    """ISO pickup (Woodside time) for a pickup line, or None. Day resolved
+    forward from the send day; no time stated -> date only."""
+    from zoneinfo import ZoneInfo
+    sent_dt = parse_dt(sent)
+    if sent_dt is None:
+        return None
+    tz = ZoneInfo(PICKUP_ORIGIN_TZ)
+    s = sent_dt.astimezone(tz)
+    part = pickup_part(line)
+    qd = quote_dates(part)
+    if not qd:
+        return None
+    mo, d = qd[0]
+    y = s.year
+    if mo is None:
+        mo = s.month
+        if d < s.day:
+            mo += 1
+            if mo == 13:
+                mo, y = 1, y + 1
+    elif (mo, d) < (s.month, s.day) and (s.month - mo) % 12 > 2:
+        y += 1
+    try:
+        day = datetime(y, mo, d)
+    except ValueError:
+        return None
+    if day.date() < (s - timedelta(days=1)).date():
+        return None                  # a past day isn't a planned pickup
+    clk = _clock(part)
+    if clk is None:
+        return day.date().isoformat()
+    return day.replace(hour=clk[0], minute=clk[1], tzinfo=tz).isoformat(timespec="seconds")
+
+
+def pickup_notice_to() -> tuple:
+    env = [a.strip() for a in os.environ.get("PICKUP_NOTICE_TO", "").split(",") if a.strip()]
+    return tuple(env) or PICKUP_NOTICE_TO_DEFAULT
+
+
+def pickup_label(raw: str) -> str:
+    """'2026-11-16T11:00:00-05:00' -> 'Monday 11/16, 11:00 AM'; a date only ->
+    'Monday 11/16'."""
+    local = wall_time(raw or "")
+    if len(local) < 10:
+        return raw or ""
+    try:
+        day = datetime.fromisoformat(local[:10])
+    except ValueError:
+        return local
+    out = f"{day.strftime('%A')} {day.month}/{day.day}"
+    if len(local) >= 16 and local[11:16] != "00:00":
+        h, mi = int(local[11:13]), int(local[14:16])
+        out += f", {h % 12 or 12}:{mi:02d} {'AM' if h < 12 else 'PM'}"
+    return out
+
+
+def pickup_notice(items: list) -> tuple:
+    """(subject, body) for the bakery. items: [{po_number, distributor,
+    warehouse, total_cs, pickup_at, previous}] -- previous is the pickup the
+    bakery was last told about ('' for a new one)."""
+    items = sorted(items, key=lambda i: (i.get("pickup_at") or "", i["po_number"]))
+    if len(items) == 1:
+        it = items[0]
+        subject = (f"{'UPDATED ' if it.get('previous') else ''}Woodside pickup: PO "
+                   f"{it['po_number']} - {pickup_label(it['pickup_at'])}")
+    else:
+        subject = f"Woodside pickups: {len(items)} POs"
+    lines = []
+    for it in items:
+        where = ", ".join(x for x in (it.get("distributor"), it.get("warehouse")) if x)
+        cs = it.get("total_cs") or 0
+        line = (f"- PO {it['po_number']}"
+                + (f" ({where})" if where else "")
+                + (f", {int(cs) if float(cs).is_integer() else cs} cases" if cs else "")
+                + f": pickup {pickup_label(it['pickup_at'])}")
+        if it.get("previous"):
+            line += f"  (CHANGED - was {pickup_label(it['previous'])})"
+        lines.append(line)
+    body = ("Hi Gabo,\n\nLineage has scheduled the following pickup"
+            + ("s" if len(items) > 1 else "") + " from the Woodside bakery. "
+            "Please have the PO" + ("s" if len(items) > 1 else "")
+            + " ready for departure:\n\n" + "\n".join(lines) + "\n\n" + SIGNATURE)
+    return subject, body

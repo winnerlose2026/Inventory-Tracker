@@ -555,6 +555,18 @@ def api_delivery_sync_threads():
             except Exception as exc:  # noqa: BLE001 -- never fail the sync
                 _log_exc(exc, "delivery-sync-threads schedule")
                 rescheduled = [{"applied": False, "reason": _safe_err(exc)}]
+            # Planned pickups from Woodside ("Pickup 1100AM/16th"), then the
+            # bakery's notice for any new / changed one (JD 11/17).
+            try:
+                pickups = _apply_server_pickups(dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 -- never fail the sync
+                _log_exc(exc, "delivery-sync-threads pickup")
+                pickups = [{"applied": False, "reason": _safe_err(exc)}]
+            try:
+                pickup_notice = _send_pickup_notices(dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 -- never fail the sync
+                _log_exc(exc, "delivery-sync-threads pickup notice")
+                pickup_notice = {"sent": False, "error": _safe_err(exc)}
             # Plain confirmations ("This shows delivered 0900AM/22nd") are
             # applied right here, so the Pending tab moves as soon as the
             # mail is read -- not at the task's next 9:22 / 3:22 run.
@@ -581,6 +593,8 @@ def api_delivery_sync_threads():
                             "requested_but_arrived": sorted(requested_arrived),
                             "confirmed_by_server": confirmed,
                             "rescheduled_by_server": rescheduled,
+                            "pickups_by_server": pickups,
+                            "pickup_notice": pickup_notice,
                             "threads": threads, "registered": registered,
                             "closed": [tracking[k].get("po_number") or k for k in closed
                                        if tracking[k].get("closed_reason")],
@@ -855,11 +869,13 @@ def _apply_events(events: list, limited: bool = False, dry_run: bool = False) ->
         kind = str(ev.get("event") or "").strip().lower()
         if limited:
             ev.pop("force", None)
-            if kind not in ("scheduled", "rescheduled", "picked_up", "delivered"):
+            if kind not in ("scheduled", "rescheduled", "picked_up", "delivered",
+                            "pickup_scheduled"):
                 results.append({"po_number": ev.get("po_number"), "applied": False,
                                 "reason": f"'{kind}' isn't allowed with the delivery key"})
                 continue
-        if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
+        if kind in ("scheduled", "rescheduled", "picked_up", "delivered",
+                    "pickup_scheduled"):
             ev, why = _verify_evidence(ev, key, cache, tracked=key in tracking)
             if why:
                 results.append({"po_number": ev.get("po_number"), "applied": False,
@@ -1072,6 +1088,154 @@ def _server_schedules(tracking: dict, ledger: dict, cache: dict, now) -> list:
             work = nxt
             events.append(ev)
     return events
+
+
+def _server_pickups(tracking: dict, ledger: dict, cache: dict, now) -> list:
+    """Planned Woodside pickups the server reads itself (po_delivery.
+    pickup_lines) from Lineage, on any thread about a held PO. Oldest first,
+    so the latest firm date wins."""
+    from integrations.po_delivery import (
+        HOLD_STATUSES, apply_event, is_auto_reply, names_po, own_text, parse_dt,
+        pickup_from, pickup_lines, sender_may_report,
+    )
+    threads = cache.get("threads") or {}
+    by_conv: dict = {}
+    for mid, m in (cache.get("messages") or {}).items():
+        by_conv.setdefault(m.get("conversation_id") or "", []).append({**m, "_id": mid})
+    events = []
+    for key, rec in tracking.items():
+        if rec.get("status") not in HOLD_STATUSES or rec.get("closed_reason"):
+            continue
+        req = parse_dt(rec.get("requested_at") or "")
+        cands = []
+        for conv, th in threads.items():
+            pos = list(dict.fromkeys(th.get("po_numbers") or []))
+            if key not in pos:
+                continue
+            for m in by_conv.get(conv, []):
+                sent = parse_dt(m.get("sent") or "")
+                if (sent is None or not sender_may_report(m.get("from") or "")
+                        or (req and sent < req) or is_auto_reply(m)):
+                    continue
+                own = own_text(m.get("text") or "")
+                named = [p for p in pos if names_po(own, p)]
+                for line in pickup_lines(m.get("text") or ""):
+                    on_line = [p for p in pos if names_po(line, p)]
+                    if on_line:
+                        ok = on_line == [key]
+                    elif named:
+                        ok = named == [key]
+                    else:
+                        ok = len(pos) == 1 or _answers_only(m, key, pos, cache)
+                    if ok:
+                        cands.append((sent, m, line))
+        work = rec
+        for _sent, m, line in sorted(cands, key=lambda c: c[0]):
+            at = pickup_from(line, m.get("sent") or "")
+            if at is None:
+                continue
+            ev = {"po_number": rec.get("po_number") or key, "event": "pickup_scheduled",
+                  "pickup_at": at, "source": "server",
+                  "evidence": {"message_id": m["_id"], "sender": m.get("from"),
+                               "sent": m.get("sent"), "quote": line}}
+            ev2, why = _verify_evidence(ev, key, cache, tracked=True)
+            if why:
+                continue
+            nxt, change, err = apply_event(work, ev2, now)
+            if err or not change:
+                continue
+            work = nxt
+            events.append(ev)
+    return events
+
+
+def _apply_server_pickups(dry_run: bool = False) -> list:
+    from inventory_tracker import load_po_delivery, load_po_delivery_threads
+    events = _server_pickups(load_po_delivery(), _ledger_by_po(),
+                             load_po_delivery_threads() or {}, _now())
+    if not events:
+        return []
+    out = _apply_events(events, dry_run=dry_run)
+    return [{k: r.get(k) for k in ("po_number", "applied", "reason", "change")}
+            for r in out.get("results") or []]
+
+
+def _send_new_mail(sender: str, to, cc, subject: str, body_text: str) -> None:
+    """A new (not threaded) email from ``sender``'s mailbox."""
+    from integrations.email_scanner import GRAPH_BASE
+    call, _box = _graph_call(sender)
+    rc = lambda addrs: [{"emailAddress": {"address": a}} for a in addrs]  # noqa: E731
+    call("POST", f"{GRAPH_BASE}/users/{urllib.parse.quote(sender)}/sendMail", {
+        "message": {"subject": subject,
+                    "body": {"contentType": "Text", "content": body_text},
+                    "toRecipients": rc(to), "ccRecipients": rc(cc)},
+        "saveToSentItems": True})
+
+
+def _send_pickup_notices(dry_run: bool = False) -> dict:
+    """Email the bakery (po_delivery.pickup_notice_to) about every held PO
+    whose Lineage pickup from Woodside is new or changed and still ahead.
+    One email per run. Caller holds the data lock. The notice is recorded
+    before the send and rolled back if the send fails, so it is never sent
+    twice and a failure retries on the next sync."""
+    from inventory_tracker import load_po_delivery, save_po_delivery
+    from integrations.po_delivery import (
+        FOLLOWUP_FROM, HOLD_STATUSES, parse_dt, pickup_notice, pickup_notice_to,
+    )
+    tracking = load_po_delivery()
+    ledger = _ledger_by_po()
+    now = _now()
+    items = []
+    for key, rec in tracking.items():
+        at = rec.get("pickup_at") or ""
+        dt = parse_dt(at)
+        if (rec.get("status") not in HOLD_STATUSES or rec.get("closed_reason")
+                or dt is None):
+            continue
+        if len(at) <= 10:            # date only: still ahead until that day ends
+            dt = dt + timedelta(days=1)
+        if dt < now:
+            continue                 # already gone
+        told = (rec.get("pickup_notice") or {}).get("pickup_at") or ""
+        if told == at:
+            continue
+        lr = ledger.get(key) or {}
+        items.append({"key": key, "po_number": rec.get("po_number") or key,
+                      "distributor": lr.get("distributor", ""),
+                      "warehouse": lr.get("warehouse", ""),
+                      "total_cs": lr.get("total_cs", 0),
+                      "pickup_at": at, "previous": told})
+    if not items:
+        return {"sent": False, "po_numbers": []}
+    subject, body = pickup_notice(items)
+    out = {"sent": False, "po_numbers": [i["po_number"] for i in items],
+           "to": list(pickup_notice_to()), "subject": subject}
+    if dry_run:
+        out["body"] = body
+        return out
+    before = {i["key"]: tracking[i["key"]].get("pickup_notice") for i in items}
+    for i in items:
+        tracking[i["key"]] = {**tracking[i["key"]], "pickup_notice": {
+            "pickup_at": i["pickup_at"], "at": now.isoformat(),
+            "previous": i["previous"], "to": list(pickup_notice_to())}}
+    save_po_delivery(tracking)
+    try:
+        _send_new_mail(FOLLOWUP_FROM, pickup_notice_to(), (), subject, body)
+        out["sent"] = True
+    except Exception as exc:  # noqa: BLE001 -- retry next sync
+        _log_exc(exc, "delivery pickup notice")
+        tracking = load_po_delivery()
+        for k, prev in before.items():
+            if k in tracking:
+                r = dict(tracking[k])
+                if prev is None:
+                    r.pop("pickup_notice", None)
+                else:
+                    r["pickup_notice"] = prev
+                tracking[k] = r
+        save_po_delivery(tracking)
+        out["error"] = _safe_err(exc)
+    return out
 
 
 def _apply_server_schedules(dry_run: bool = False) -> list:
