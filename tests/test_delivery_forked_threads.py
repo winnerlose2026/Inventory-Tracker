@@ -86,7 +86,7 @@ def test_a_thread_named_for_the_po_is_read_too(monkeypatch):
              other, "conv9"),
     ]
     out, store, queries = _run(monkeypatch, msgs)
-    assert any("subject%3A393072B2" in q for q in queries), queries
+    assert any("393072B2" in q for q in queries), queries
     rec = store["tracking"]["393072B2"]
     assert rec["status"] == "delivered" and rec["delivered_at"].startswith("2026-10-15")
 

@@ -36,6 +36,7 @@ is an estimate and the PO stays held until Lineage / the DC confirms.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -49,6 +50,14 @@ EVENTS = ("requested", "scheduled", "rescheduled", "picked_up", "delivered", "re
 CARRIER_DOMAINS = ("onelineage.com", "lineagelogistics.com")
 RECEIVER_DOMAINS = ("usfoods.com", "cheneybrothers.com", "chefswarehouse.com")
 HH_DOMAINS = ("hhbagels.com",)
+# Carriers Lineage hands loads to (JD 11/17: "treat that confirmation from
+# third-party carriers as the same as Lineage, but still get final
+# confirmation from Lineage too"). Their "delivered" marks the PO arrived
+# right away (delivery_final False); Lineage / the DC is then asked to
+# confirm, and their answer makes it final (and can correct the date).
+# More domains: env DELIVERY_CARRIER_DOMAINS="a.com,b.com".
+THIRD_PARTY_CARRIER_DOMAINS = ("bozelt.com", "ffex.net")
+CARRIER_NAMES = {"bozelt.com": "Bozel", "ffex.net": "FFE"}
 
 # Follow-up cadence.
 SCHEDULE_ASK_AFTER = timedelta(hours=44)     # no appointment ~2 business days in
@@ -85,6 +94,8 @@ ASK_TEXT = {
     "confirm_delivery": ("can you confirm it delivered at its {appt} appointment? "
                          "If it delivered at a different time or hasn't delivered "
                          "yet, please send the actual or updated date and time."),
+    "confirm_final": ("{reported_by} reports it delivered {delivered}. Can you confirm "
+                      "the delivery date and time on your end?"),
 }
 SIGNATURE = ("Thanks,\nJD\n\nJD Gross | Director of Bakery Operations | H&H Bagels\n"
              "office 646-669-8934\n109 West 27th Street, Suite #3B, New York, NY 10001")
@@ -223,6 +234,44 @@ def sender_may_report(addr: str) -> bool:
                for x in CARRIER_DOMAINS + RECEIVER_DOMAINS)
 
 
+def _third_party_domains() -> tuple:
+    extra = [d.strip().lower().lstrip("@")
+             for d in os.environ.get("DELIVERY_CARRIER_DOMAINS", "").split(",")
+             if d.strip()]
+    return tuple(THIRD_PARTY_CARRIER_DOMAINS) + tuple(extra)
+
+
+def is_third_party_carrier(addr: str) -> bool:
+    d = _domain(addr)
+    return bool(d) and any(d == x or d.endswith("." + x) for x in _third_party_domains())
+
+
+def may_confirm_delivery(addr: str) -> bool:
+    """Who can mark a PO delivered: Lineage, the receiving DC, or a known
+    third-party carrier (provisional -- see awaiting_final)."""
+    return sender_may_report(addr) or is_third_party_carrier(addr)
+
+
+def reporter_name(addr: str) -> str:
+    d = _domain(addr)
+    if any(d == x or d.endswith("." + x) for x in CARRIER_DOMAINS):
+        return CARRIER
+    for dom, name in CARRIER_NAMES.items():
+        if d == dom or d.endswith("." + dom):
+            return name
+    if any(d == x or d.endswith("." + x) for x in RECEIVER_DOMAINS):
+        return "the receiving DC"
+    return d or "a carrier"
+
+
+def awaiting_final(rec: dict) -> bool:
+    """Delivered on a third-party carrier's word only: the PO counts as
+    arrived, but Lineage / the DC still has to confirm. Records from before
+    this field existed are final."""
+    rec = rec or {}
+    return rec.get("status") == "delivered" and rec.get("delivery_final") is False
+
+
 def is_hh(addr: str) -> bool:
     d = _domain(addr)
     return any(d == x or d.endswith("." + x) for x in HH_DOMAINS)
@@ -331,6 +380,9 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
            ("status", "delivery_appt", "pickup_at", "delivered_at", "confirmation_no",
             "delivered_time_known")}
     old["delivered_date_estimated"] = delivered_date_estimated(rec)
+    old["delivery_final"] = rec.get("delivery_final", "")
+    old["delivery_confirmed_by"] = rec.get("delivery_confirmed_by", "")
+    estimated = keep_date = False
 
     if kind == "picked_up" and not rec_in:
         return rec_in, None, ("PO isn't tracked yet -- a pickup is recorded on a PO "
@@ -338,9 +390,13 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
     if kind in ("scheduled", "rescheduled", "picked_up", "delivered"):
         if not evid["quote"]:
             return rec, None, "evidence.quote required (the line that says it)"
-        if not sender_may_report(evid["sender"]):
+        allowed = (may_confirm_delivery(evid["sender"]) if kind == "delivered"
+                   else sender_may_report(evid["sender"]))
+        if not allowed:
             return rec, None, (f"{evid['sender'] or 'unknown sender'} can't report a "
-                               "delivery date (Lineage or the receiving DC only)")
+                               "delivery date (Lineage or the receiving DC only"
+                               + (", or a known carrier for a delivery)"
+                                  if kind == "delivered" else ")"))
 
     if kind == "requested":
         if not rec.get("requested_at"):
@@ -408,12 +464,31 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
                 and not ev.get("force")):
             return rec, None, ("an operator reopened this PO after that confirmation "
                                "-- only a newer message can confirm it again")
+        final = sender_may_report(evid["sender"])
+        was_delivered = bool(rec_in) and rec_in.get("status") == "delivered"
+        provisional = was_delivered and awaiting_final(rec_in)
+        if was_delivered and not provisional and not final:
+            return rec, None, ("already confirmed by Lineage / the DC -- a carrier's "
+                               "note doesn't change it")
+        if provisional and not final:
+            # carrier after carrier: keep the first word until Lineage answers
+            return rec, None, ("delivered on a carrier's word already; waiting for "
+                               "Lineage / the DC to confirm")
         # A date estimated from the confirmation's send day (delivered_by_sent_day)
         # marks a PO arrived; it never moves the date of one already confirmed.
         estimated = bool(ev.get("date_estimated"))
-        if estimated and rec_in and rec_in.get("status") == "delivered":
-            return rec, None, ("already confirmed delivered -- a confirmation with no "
-                               "delivery date doesn't move its date")
+        if estimated and was_delivered:
+            if provisional and final:
+                # Lineage confirms the carrier's delivery without a date: final,
+                # the carrier's date stands.
+                rec["delivery_final"] = True
+                rec["delivery_confirmed_by"] = reporter_name(evid["sender"])
+                keep_date = True
+            else:
+                return rec, None, ("already confirmed delivered -- a confirmation with no "
+                                   "delivery date doesn't move its date")
+    # (still the "delivered" event) set the date unless Lineage only finalized
+    if kind == "delivered" and not keep_date:
         # The date posted must be a date the quote states (when it states
         # any): the evidence check proves the line exists, not that the event
         # carries its date.
@@ -436,6 +511,8 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
         rec["delivered_time_known"] = bool(tk) and bool(
             re.search(r"T\d{2}:\d{2}", rec["delivered_at"])) and not estimated
         rec["delivered_date_estimated"] = estimated     # a stated date clears it
+        rec["delivery_final"] = final
+        rec["delivery_confirmed_by"] = reporter_name(evid["sender"])
 
     new = {k: rec.get(k, "") for k in old}
     new["delivered_date_estimated"] = delivered_date_estimated(rec)
@@ -515,7 +592,7 @@ def chase_exhausted(rec: dict, now: datetime) -> str:
     reschedule, or an operator reopen): MAX_CHASES of them, or
     MAX_CHASE_DAYS since the first, is enough -- another email will not
     help; someone has to call."""
-    if rec.get("status") not in HOLD_STATUSES:
+    if rec.get("status") not in HOLD_STATUSES and not awaiting_final(rec):
         return ""
     base = max([t for t in (parse_dt(e.get("at") or "")
                             for e in rec.get("events") or []
@@ -523,7 +600,8 @@ def chase_exhausted(rec: dict, now: datetime) -> str:
                default=None)
     ts = sorted(t for t in (parse_dt(c.get("at") or "")
                             for c in rec.get("chases") or []
-                            if c.get("ask") in ("schedule", "confirm_delivery"))
+                            if c.get("ask") in ("schedule", "confirm_delivery",
+                                                "confirm_final"))
                 if t and (base is None or t >= base))
     if len(ts) >= MAX_CHASES:
         return (f"{len(ts)} follow-ups sent since "
@@ -554,6 +632,8 @@ def chase_due(rec: dict, now: datetime) -> Optional[str]:
         return None
     if chase_exhausted(rec, now):
         return None
+    if awaiting_final(rec):
+        return "confirm_final"
     if st == "requested":
         since = max([t for t in (parse_dt(rec.get("requested_at") or ""), last) if t],
                     default=None)
@@ -653,7 +733,14 @@ def followup_body(items: list) -> str:
     lines = []
     for it in items:
         where = ", ".join(x for x in (it.get("distributor"), it.get("warehouse")) if x)
-        ask = ASK_TEXT[it["ask"]].format(appt=appt_label(it.get("delivery_appt") or ""))
+        dl = wall_time(it.get("delivered_at") or "")
+        delivered = (f"{int(dl[5:7])}/{int(dl[8:10])}" if len(dl) >= 10 else "")
+        if len(dl) >= 16 and dl[11:16] != "00:00":
+            delivered += " " + appt_label(it.get("delivered_at") or "").split(" ", 1)[-1]
+        ask = ASK_TEXT[it["ask"]].format(
+            appt=appt_label(it.get("delivery_appt") or ""),
+            reported_by=it.get("reported_by") or "The carrier",
+            delivered=delivered or "(no date given)")
         lines.append(f"- PO {it['po_number']}{f' ({where})' if where else ''}: {ask}")
     return ("Hi team,\n\n" + "\n".join(lines) +
             "\n\nIf any delivery date changes, please let us know on this thread.\n"
@@ -919,6 +1006,10 @@ def summary(rec: dict, now: datetime) -> dict:
         "closed_reason": rec.get("closed_reason") or "",
         "confirmation_no": rec.get("confirmation_no") or "",
         "awaiting_confirmation": awaiting_confirmation(rec, now),
+        # Delivered on a third-party carrier's word; Lineage still to confirm.
+        "awaiting_final": awaiting_final(rec),
+        "delivery_final": (rec.get("status") == "delivered" and not awaiting_final(rec)),
+        "delivery_confirmed_by": rec.get("delivery_confirmed_by") or "",
         "chase_due": chase_due(rec, now),
         # Follow-ups exhausted (MAX_CHASES / MAX_CHASE_DAYS): no more emails
         # go out; a person has to call Lineage or the DC.

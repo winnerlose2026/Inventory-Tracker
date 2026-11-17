@@ -3292,6 +3292,14 @@ function _deliveryStatusHtml(d) {
   const who = (d.last_event && d.last_event.sender) ? d.last_event.sender : '';
   const tip = escAttr(q ? `"${q}" (${who})` : `${d.carrier || 'Lineage'} delivery tracking`);
   const st = 'font-size:11px;white-space:normal;line-height:1.3;cursor:help';
+  if (d.status === 'delivered' && d.awaiting_final) {
+    // Delivered on a third-party carrier's word (counts as arrived); Lineage still to confirm
+    const by = escHtml(d.delivery_confirmed_by || 'carrier');
+    const when = d.delivered_date_estimated ? `by ${formatDate(d.delivered_local)}`
+      : `${formatDate(d.delivered_local)}${_deliveryTime(d.delivered_local)}`;
+    return `<div title="${tip}" style="${st};color:var(--green);font-weight:600">&#10003; Delivered ${when} (per ${by})</div>`
+      + `<div style="${st};color:#9A6B00">Awaiting Lineage final confirmation</div>`;
+  }
   if (d.status === 'delivered' && d.delivered_date_estimated) {
     // Confirmed with no delivery date: dated to the confirmation email (the latest it can have arrived)
     return `<div title="${tip}" style="${st};color:var(--green);font-weight:600">&#10003; Delivered by ${formatDate(d.delivered_local)} (confirmed &middot; no delivery date given)</div>`;

@@ -78,9 +78,13 @@ def _is_open(ledger_rec, trk) -> bool:
     canceled or no longer has. Until 10/22 a tracked "requested" PO stayed
     open forever, so a canceled PO kept getting "could you send the pickup
     date" emails to Lineage every 44 h."""
-    from integrations.po_delivery import HOLD_STATUSES
+    from integrations.po_delivery import HOLD_STATUSES, awaiting_final
     if _closed_reason(ledger_rec):
         return False
+    # Arrived on a third-party carrier's word: still chase Lineage for the
+    # final confirmation (JD 11/17), even though the ledger says arrived.
+    if trk and awaiting_final(trk):
+        return True
     # The ledger says ARRIVED only when nothing of the PO is still pending
     # (an operator marked it arrived, or it was absorbed into a count). A
     # tracking record nobody ever confirmed used to keep such a PO "open",
@@ -97,11 +101,11 @@ def _stamp_closed(tracking: dict, ledger: dict, now) -> list:
     """Stamp closed_reason on held records whose PO the ledger dropped or
     canceled (cleared again if it comes back, e.g. /api/admin/uncancel-po).
     Mutates ``tracking``; returns the keys that changed."""
-    from integrations.po_delivery import HOLD_STATUSES
+    from integrations.po_delivery import HOLD_STATUSES, awaiting_final
     changed = []
     for key, rec in list(tracking.items()):
         why = (_closed_reason(ledger.get(key))
-               if rec.get("status") in HOLD_STATUSES else "")
+               if rec.get("status") in HOLD_STATUSES or awaiting_final(rec) else "")
         if why and rec.get("closed_reason") != why:
             tracking[key] = {**rec, "closed_reason": why, "closed_at": now.isoformat()}
             changed.append(key)
@@ -243,10 +247,11 @@ def _held_po_numbers() -> list:
     """Tracked POs still waiting on a delivery confirmation (requested /
     scheduled, not closed), normalized, newest request first, capped."""
     from inventory_tracker import load_po_delivery
-    from integrations.po_delivery import HOLD_STATUSES, norm_po
+    from integrations.po_delivery import HOLD_STATUSES, awaiting_final, norm_po
     recs = [(r.get("requested_at") or "", norm_po(r.get("po_number") or k))
             for k, r in (load_po_delivery() or {}).items()
-            if r.get("status") in HOLD_STATUSES and not r.get("closed_reason")]
+            if (r.get("status") in HOLD_STATUSES or awaiting_final(r))
+            and not r.get("closed_reason")]
     recs.sort(reverse=True)
     return [p for _t, p in recs if p][:_MAX_HELD_PO_SEARCH]
 
@@ -330,8 +335,8 @@ def api_delivery_sync_threads():
         save_po_delivery_threads,
     )
     from integrations.po_delivery import (
-        apply_event, is_hh, norm_po, parse_dt, parse_request_blocks,
-        sender_may_report, summary,
+        apply_event, is_hh, may_confirm_delivery, norm_po, parse_dt,
+        parse_request_blocks, sender_may_report, summary,
     )
     try:
         body = request.get_json(silent=True) or {}
@@ -346,17 +351,18 @@ def api_delivery_sync_threads():
                 lookback, subject=EVIDENCE_SUBJECT, keep=_is_evidence_subject)
         except Exception as exc:  # noqa: BLE001 -- evidence is optional
             ev_msgs, ev_errors = [], [f"evidence threads: {_safe_err(exc)}"]
-        # Any thread whose SUBJECT names a held PO ("PO 9919425G", "RE: Bozel
-        # pickup - PO 9919425G ETA"), whatever else it says -- Lineage or the
-        # dock can confirm on a thread that isn't "Quote and Schedule" and
-        # doesn't say "Delivery". One OR'd search, best-effort like evidence.
+        # Any thread that names a held PO in its subject OR body ("RE: Bozel
+        # pickup - PO 9919425G ETA", FFE's "Pick up appointment" thread) --
+        # Lineage, the dock or a third-party carrier can confirm on a thread
+        # that isn't "Quote and Schedule" and doesn't say "Delivery". One
+        # OR'd search, best-effort like evidence. The evidence loop below ties
+        # each thread to the tracked POs it actually names.
         try:
             held = _held_po_numbers()
             if held:
-                q = " OR ".join(f"subject:{p}" for p in held)
+                q = " OR ".join(held)
                 po_msgs, po_errors = _fetch_thread_messages(
-                    lookback, subject=held[0], query=q,
-                    keep=lambda subj: any(p in (subj or "").upper() for p in held))
+                    lookback, subject=held[0], query=q, keep=lambda subj: True)
                 ev_msgs = list(ev_msgs) + po_msgs
                 ev_errors = list(ev_errors) + [f"po subjects: {e}" for e in po_errors]
         except Exception as exc:  # noqa: BLE001 -- evidence is optional
@@ -489,7 +495,7 @@ def api_delivery_sync_threads():
             import re as _re
             evidence_threads = []
             for conv, ms in ev_convs.items():
-                if not any(sender_may_report(m["from"]) for m in ms):
+                if not any(may_confirm_delivery(m["from"]) for m in ms):
                     continue
                 ms.sort(key=lambda m: m["sent"])
                 blob = " ".join([ms[0]["subject"]] + [m["text"] for m in ms]).upper()
@@ -913,10 +919,10 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
     delivered on such an estimate stays readable here, so the first later
     message that states the day corrects it. Lines that state a day go first."""
     from integrations.po_delivery import (
-        HOLD_STATUSES, apply_event, confirmation_lines, delivered_at_from,
-        delivered_by_sent_day, delivered_date_estimated, dock_zone, names_po,
-        on_site_at, own_text, parse_dt, sender_may_report, states_a_day,
-        wall_time,
+        HOLD_STATUSES, apply_event, awaiting_final, confirmation_lines,
+        delivered_at_from, delivered_by_sent_day, delivered_date_estimated,
+        dock_zone, may_confirm_delivery, names_po, on_site_at, own_text,
+        parse_dt, sender_may_report, states_a_day, wall_time,
     )
     threads = cache.get("threads") or {}
     by_conv: dict = {}
@@ -925,8 +931,10 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
     events = []
     for key, rec in tracking.items():
         correcting = delivered_date_estimated(rec)
-        if ((rec.get("status") not in HOLD_STATUSES and not correcting)
-                or rec.get("closed_reason")):
+        # delivered on a carrier's word: only Lineage / the DC can finalize
+        awaiting = awaiting_final(rec)
+        if ((rec.get("status") not in HOLD_STATUSES and not correcting
+             and not awaiting) or rec.get("closed_reason")):
             continue
         estimate_day = wall_time(rec.get("delivered_at") or "")[:10] if correcting else ""
         req = parse_dt(rec.get("requested_at") or "")
@@ -940,7 +948,11 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                 continue
             for m in by_conv.get(conv, []):
                 sent = parse_dt(m.get("sent") or "")
-                if (sent is None or not sender_may_report(m.get("from") or "")
+                frm = m.get("from") or ""
+                final = sender_may_report(frm)
+                if (sent is None or not may_confirm_delivery(frm)
+                        or (awaiting and not final)
+                        or (correcting and not final)
                         or (req and sent < req)):
                     continue
                 own = own_text(m.get("text") or "")
@@ -967,9 +979,9 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                     if at is None and not stated:
                         day = delivered_by_sent_day(m.get("sent") or "", zone)
                         at, estimated = ((day, False), True) if day else (None, False)
-                    if at is None or (estimated and correcting):
+                    if at is None or (estimated and correcting and not awaiting):
                         continue
-                    if correcting and at[0][:10] > estimate_day:
+                    if correcting and not awaiting and at[0][:10] > estimate_day:
                         continue      # it had arrived by the estimate: never later
                     ev = {"po_number": rec.get("po_number") or key, "event": "delivered",
                           "delivered_at": at[0], "time_known": at[1], "source": "server",
@@ -977,12 +989,14 @@ def _server_confirmations(tracking: dict, ledger: dict, cache: dict, now) -> lis
                                        "sent": m.get("sent"), "quote": line}}
                     if estimated:
                         ev["date_estimated"] = True
-                    cands.append((not stated, kind == "on_site", sent, not at[1], ev))
-        # a line that states the day first; then one that says "delivered"
+                    cands.append((not final, not stated, kind == "on_site", sent,
+                                  not at[1], ev))
+        # Lineage / the DC before a third-party carrier; then a line that
+        # states the day; then one that says "delivered"
         # over an "on site" relay (dispatch passes that on late); then the
         # oldest message (an undated "delivered" is dated by it: the earliest
         # is the tightest); within a message, a line with a time first
-        for *_rank, ev in sorted(cands, key=lambda c: c[:4]):
+        for *_rank, ev in sorted(cands, key=lambda c: c[:5]):
             ev2, why = _verify_evidence(ev, key, cache)
             if why:
                 continue
@@ -1294,7 +1308,9 @@ def api_delivery_send_followups():
             item = {"key": key, "po_number": rec.get("po_number") or key, "ask": ask,
                     "distributor": (lr or {}).get("distributor", ""),
                     "warehouse": (lr or {}).get("warehouse", ""),
-                    "delivery_appt": rec.get("delivery_appt") or ""}
+                    "delivery_appt": rec.get("delivery_appt") or "",
+                    "delivered_at": rec.get("delivered_at") or "",
+                    "reported_by": rec.get("delivery_confirmed_by") or ""}
             why = next((q[key] for q in quiet_by_conv.values() if key in q), None)
             if not why:
                 # Lineage already answered our last ask (on any thread naming
