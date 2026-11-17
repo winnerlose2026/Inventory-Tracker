@@ -236,10 +236,23 @@ def _is_evidence_subject(subject: str) -> bool:
 
 
 _MAX_THREAD_PAGES = 6
+_MAX_HELD_PO_SEARCH = 25
+
+
+def _held_po_numbers() -> list:
+    """Tracked POs still waiting on a delivery confirmation (requested /
+    scheduled, not closed), normalized, newest request first, capped."""
+    from inventory_tracker import load_po_delivery
+    from integrations.po_delivery import HOLD_STATUSES, norm_po
+    recs = [(r.get("requested_at") or "", norm_po(r.get("po_number") or k))
+            for k, r in (load_po_delivery() or {}).items()
+            if r.get("status") in HOLD_STATUSES and not r.get("closed_reason")]
+    recs.sort(reverse=True)
+    return [p for _t, p in recs if p][:_MAX_HELD_PO_SEARCH]
 
 
 def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
-                           keep=None) -> tuple:
+                           keep=None, query: str = "") -> tuple:
     """Every message whose subject matches ``subject`` (default: the "Quote
     and Schedule" threads) in the mailboxes, deduped across them (preferring
     JD's copy, whose Graph id a threaded reply needs). ``keep`` filters by
@@ -254,7 +267,7 @@ def _fetch_thread_messages(lookback_days: int, subject: str = THREAD_SUBJECT,
     users = [u.strip() for u in os.environ.get("MS365_USER", "").split(",") if u.strip()]
     users.sort(key=lambda u: 0 if u.lower().startswith("jd@") else 1)
     found, errors = {}, []
-    search = urllib.parse.quote(f'"subject:{subject}"')
+    search = urllib.parse.quote(f'"{query}"' if query else f'"subject:{subject}"')
     if keep is None:
         keep = lambda subj: subject.lower() in (subj or "").lower()  # noqa: E731
     for user in users:
@@ -333,9 +346,27 @@ def api_delivery_sync_threads():
                 lookback, subject=EVIDENCE_SUBJECT, keep=_is_evidence_subject)
         except Exception as exc:  # noqa: BLE001 -- evidence is optional
             ev_msgs, ev_errors = [], [f"evidence threads: {_safe_err(exc)}"]
+        # Any thread whose SUBJECT names a held PO ("PO 9919425G", "RE: Bozel
+        # pickup - PO 9919425G ETA"), whatever else it says -- Lineage or the
+        # dock can confirm on a thread that isn't "Quote and Schedule" and
+        # doesn't say "Delivery". One OR'd search, best-effort like evidence.
+        try:
+            held = _held_po_numbers()
+            if held:
+                q = " OR ".join(f"subject:{p}" for p in held)
+                po_msgs, po_errors = _fetch_thread_messages(
+                    lookback, subject=held[0], query=q,
+                    keep=lambda subj: any(p in (subj or "").upper() for p in held))
+                ev_msgs = list(ev_msgs) + po_msgs
+                ev_errors = list(ev_errors) + [f"po subjects: {e}" for e in po_errors]
+        except Exception as exc:  # noqa: BLE001 -- evidence is optional
+            ev_errors = list(ev_errors) + [f"po subjects: {_safe_err(exc)}"]
         ev_convs: dict = {}
+        _ev_seen = set()
         for m in ev_msgs:
-            if m["conversation_id"] not in convs:
+            k = m.get("message_id") or m.get("graph_id")
+            if m["conversation_id"] not in convs and k not in _ev_seen:
+                _ev_seen.add(k)
                 ev_convs.setdefault(m["conversation_id"], []).append(m)
         # The data lock only from here. The Graph reads above can take tens of
         # seconds and every load_inventory() -- every page of the app -- waits
@@ -372,6 +403,13 @@ def api_delivery_sync_threads():
                             requested.append({**blk, "request_message_id": m["message_id"],
                                               "request_sent": m["sent"]})
                 if not requested:
+                    # A reply whose subject was edited ("RE: Quote and Schedule
+                    # - 5 Orders - ETAs for 9751114C and 9919425G") is a NEW
+                    # Outlook conversation with no request blocks. It used to be
+                    # dropped here, so Belinda's "9919425G-delivered" on it was
+                    # never read (11/17). Read it like a one-off delivery thread:
+                    # cached, tied to the POs it names, never chased or replied on.
+                    ev_convs.setdefault(conv, []).extend(ms)
                     continue
                 jd_copy = next((m for m in reversed(ms)
                                 if m["mailbox"].lower().startswith("jd@")), None)

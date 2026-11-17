@@ -11,7 +11,7 @@ same from outside). All times UTC.
   graph-renew             09:00 and 21:00           POST /api/graph/subscriptions/renew
                           + hourly :35 while a renew failure is open
   production-scan         23:30 daily               POST /api/production/scan
-  delivery-sync           :07/:27/:47, 10:00-03:59  POST /api/pos/delivery/sync-threads
+  delivery-sync           every 10 min (:07..:57), 10:00-03:59  POST /api/pos/delivery/sync-threads
   toast-nightly           08:15 daily               POST /api/toast/nightly-pull
   backup                  hourly at :20             POST /api/admin/backup/run
   watchdog                hourly at :40             POST /api/watchdog/run
@@ -278,7 +278,7 @@ def _run_production_scan() -> None:
 
 def _run_delivery_sync() -> None:
     """Re-read the Lineage "Quote and Schedule" threads so a delivery
-    confirmation reaches the Pending POs tab (and on-hand) within ~20 minutes
+    confirmation reaches the Pending POs tab (and on-hand) within ~10 minutes
     of landing, instead of at the cloud task's next 9:22 / 3:22 run. The sync
     only reads mail and applies plain confirmations -- it never sends a
     follow-up (that stays with the task's send-followups call). 60-day
@@ -430,10 +430,10 @@ def start_scheduler() -> BackgroundScheduler | None:
         coalesce=True,
         misfire_grace_time=600,
     )
-    # Lineage delivery confirmations — every 20 min, 6am-11pm ET (10-03 UTC).
+    # Lineage delivery confirmations — every 10 min, 6am-11pm ET (10-03 UTC).
     sched.add_job(
         _run_delivery_sync,
-        CronTrigger(minute="7,27,47", hour="0-3,10-23", timezone=UTC),
+        CronTrigger(minute="7,17,27,37,47,57", hour="0-3,10-23", timezone=UTC),
         id="delivery-sync-20m",
         max_instances=1,
         coalesce=True,
@@ -493,7 +493,7 @@ def start_scheduler() -> BackgroundScheduler | None:
     log.info(
         "in-process scheduler started: forecast-burn 05:05 UTC, "
         "graph-renew 09:00 + 21:00 UTC, production-scan 23:30 UTC, "
-        "delivery-sync every 20 min 10:00-03:59 UTC, toast-nightly 08:15 UTC, "
+        "delivery-sync every 10 min 10:00-03:59 UTC, toast-nightly 08:15 UTC, "
         "backup hourly :20, watchdog hourly :40, heartbeat every 5 min, "
         "catch-up in 90 s (base=%s)",
         _self_base_url(),

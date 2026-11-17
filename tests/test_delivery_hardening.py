@@ -334,7 +334,7 @@ def test_sync_reads_the_mailbox_outside_the_lock(monkeypatch):
         return [], []
     monkeypatch.setattr(B, "_fetch_thread_messages", fetch)
     out = c.post("/api/pos/delivery/sync-threads", json={}, headers=DKEY).get_json()
-    assert out["ok"] and depths == [0, 0], out
+    assert out["ok"] and depths and set(depths) == {0}, out
     assert "OTHER" in store["tracking"]
 
 
