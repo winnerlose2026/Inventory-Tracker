@@ -822,6 +822,27 @@ def _sent_log_finish(key, *, sent, force=False, sender="", to=None, subject=""):
         _log_exc(exc, "sent log finish")
 
 
+def _merge_reply_above_quote(reply, reply_type, draft_html, draft_type):
+    """Return HTML with *reply* placed above the quoted thread in *draft_html*.
+
+    *draft_html* is the body Graph's createReply produced: the earlier
+    messages quoted the way Outlook quotes them. The reply goes right after
+    the opening <body> tag (or at the top when there is none) so recipients
+    see one normal threaded reply with the history underneath.
+    """
+    import html as _html
+    import re as _re
+    if str(reply_type).lower() != "html":
+        reply = "<div>" + _html.escape(reply or "").replace("\n", "<br>") + "</div>"
+    if str(draft_type).lower() != "html":
+        draft_html = "<div>" + _html.escape(draft_html or "").replace("\n", "<br>") + "</div>"
+    block = f"<div>{reply}</div><br>"
+    m = _re.search(r"<body\b[^>]*>", draft_html or "", flags=_re.I)
+    if m:
+        return draft_html[:m.end()] + block + draft_html[m.end():]
+    return block + (draft_html or "")
+
+
 @email_bp.route("/api/email/send", methods=["POST"])
 def api_email_send():
     """Send an email from the configured M365 mailbox via Microsoft Graph.
@@ -843,6 +864,9 @@ def api_email_send():
                                                    #   MS365_SEND_AS or listed in
                                                    #   EMAIL_SEND_ALLOWED_FROM
           "reply_to_message_id": "<graph id>",     # optional; reply in-thread
+          "quote_original": false,                 # optional; with reply_to,
+                                                   #   keep Outlook's quoted
+                                                   #   thread under the new text
           "save_to_sent_items": true,              # optional, default true
           "inline_images": [                       # optional; new mail only.
             {"cid": "hh-logo", "name": "logo.png", # <img src="cid:hh-logo">
@@ -945,6 +969,7 @@ def api_email_send():
         dry_run = bool(body.get("dry_run", False))
         save_to_sent = bool(body.get("save_to_sent_items", True))
         reply_to = (body.get("reply_to_message_id") or "").strip()
+        quote_original = bool(body.get("quote_original", False))
 
         # Sender is PINNED: a body 'from' is honoured only when it is
         # MS365_SEND_AS or listed in EMAIL_SEND_ALLOWED_FROM; anything else
@@ -1021,7 +1046,19 @@ def api_email_send():
                 if not draft_id:
                     _sent_log_finish(send_key, sent=False, force=force)
                     return jsonify({"ok": False, "error": f"createReply returned no draft id: {draft_raw[:300]}"}), 200
-                patch = {"body": {"contentType": content_type, "content": content},
+                if quote_original:
+                    # Keep the thread: put the new text above the quoted
+                    # history Graph's createReply already built (inline
+                    # images from the thread come along on the draft).
+                    dbody = draft.get("body") or {}
+                    patch_body = {"contentType": "HTML",
+                                  "content": _merge_reply_above_quote(
+                                      content, content_type,
+                                      dbody.get("content") or "",
+                                      dbody.get("contentType") or "html")}
+                else:
+                    patch_body = {"contentType": content_type, "content": content}
+                patch = {"body": patch_body,
                          "toRecipients": _recips(to)}
                 if cc:
                     patch["ccRecipients"] = _recips(cc)
