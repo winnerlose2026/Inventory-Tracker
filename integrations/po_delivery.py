@@ -402,6 +402,11 @@ def apply_event(rec: Optional[dict], ev: dict, now: datetime) -> tuple:
             return rec, None, "evidence.quote required (the line that says it)"
         allowed = (may_confirm_delivery(evid["sender"]) if kind == "delivered"
                    else sender_may_report(evid["sender"]))
+        # The planned pickup is from H&H's own Woodside dock, so H&H (JD
+        # re-sequencing loads, 11/19) may set it. Delivery dates stay
+        # Lineage / DC only.
+        if kind == "pickup_scheduled" and not allowed:
+            allowed = _domain(evid["sender"]) in HH_DOMAINS
         if not allowed:
             return rec, None, (f"{evid['sender'] or 'unknown sender'} can't report a "
                                "delivery date (Lineage or the receiving DC only"
